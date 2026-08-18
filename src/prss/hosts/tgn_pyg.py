@@ -165,8 +165,10 @@ class PyGTGNAdapter(HostAdapter):
                 root_time_by_local[int(local)] = float(t)
 
         stack: List[tuple] = []
+        root_set = set(int(x) for x in root_local_ids.tolist())
         for local in root_local_ids.tolist():
             stack.append((int(local), None, None))
+        expanded = set()
         while stack:
             local, parent_oid, t_root = stack.pop()
             if local in self._oid_by_local:
@@ -199,8 +201,14 @@ class PyGTGNAdapter(HostAdapter):
                 parent.children.append(oid)
                 parent.child_relations.append(1)
                 parent.child_delta_t.append(float(t_root))
-            for child_local, e_t in zip(child_locals, edge_ts):
-                stack.append((int(child_local), oid, float(t_root) - float(e_t)))
+            # Depth-one semantics: only ROOT occurrences expand their incoming
+            # neighbors as children.  The sampled subgraph is undirected, so
+            # mutual neighbor pairs would otherwise create cycles in the
+            # occurrence tree and infinite-loop the outside BFS.
+            if local in root_set and local not in expanded:
+                expanded.add(local)
+                for child_local, e_t in zip(child_locals, edge_ts):
+                    stack.append((int(child_local), oid, float(t_root) - float(e_t)))
         # Register roots in the caller's order.
         roots, rows = [], []
         for local in root_local_ids.tolist():

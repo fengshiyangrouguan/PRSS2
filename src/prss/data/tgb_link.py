@@ -10,6 +10,23 @@ from typing import Dict, Optional, Tuple
 import torch
 
 
+def _set_tgb_proj_dir(parent: str) -> None:
+    """Point TGB's PROJ_DIR at ``parent`` (must end with the path separator).
+
+    TGB builds its data root as a plain string concatenation ``PROJ_DIR + root``
+    where PROJ_DIR defaults to the installed package dir, so an absolute ``root``
+    would be mangled.  By setting PROJ_DIR to the parent of our absolute root and
+    passing only the directory name, the concatenation lands exactly on our
+    directory on any machine, regardless of cwd.
+    """
+    import tgb.linkproppred.dataset as _dataset
+
+    parent = parent.rstrip("/\\")
+    if not parent:
+        parent = "."
+    _dataset.PROJ_DIR = parent + "/"
+
+
 class TGBLinkDataset:
     """Thin, leak-safe wrapper around ``PyGLinkPropPredDataset``."""
 
@@ -18,6 +35,10 @@ class TGBLinkDataset:
         from tgb.linkproppred.dataset_pyg import PyGLinkPropPredDataset
 
         root = root or os.environ.get("TGB_ROOT", "datasets")
+        abs_root = os.path.abspath(root)
+        _set_tgb_proj_dir(os.path.dirname(abs_root))
+        root = os.path.basename(abs_root)
+
         self.name = name
         self._ds = PyGLinkPropPredDataset(name=name, root=root)
         self._data = self._ds.get_TemporalData()

@@ -43,6 +43,11 @@ def expand(spec: dict):
     return jobs
 
 
+def repo_root() -> Path:
+    """Repository root, derived from this module's own location (src/prss/experiment)."""
+    return Path(__file__).resolve().parents[3]
+
+
 def job_id(job: dict) -> str:
     return "{dataset}__{variant}__seed{seed:03d}".format(
         dataset=job.get("dataset", "tgbl-wiki"),
@@ -57,11 +62,16 @@ def run_job(job: dict, yaml_path: str, root: Path, gpu: int) -> int:
         return 0
     cmd = [sys.executable, "-m", "scripts.train", "--config", yaml_path]
     for key, value in job.items():
+        if isinstance(value, bool):
+            # Boolean flags (e.g. freeze_host): pass the flag only when True.
+            if value:
+                cmd.append("--" + key.replace("_", "-"))
+            continue
         cmd += ["--" + key.replace("_", "-"), str(value)]
     cmd += ["--gpu", str(gpu), "--output", str(out_dir)]
     print(f"RUN: {out_dir.name}", flush=True)
     t0 = time.time()
-    proc = subprocess.run(cmd, cwd=str(Path(yaml_path).resolve().parents[1]))
+    proc = subprocess.run(cmd, cwd=str(repo_root()))
     if proc.returncode == 0 and (out_dir / "_SUCCESS.json").exists():
         print(f"DONE: {out_dir.name} ({time.time() - t0:.0f}s)", flush=True)
         return 0

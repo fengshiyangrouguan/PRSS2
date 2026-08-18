@@ -23,7 +23,8 @@ defaults:
   spectral_interval: 50
   spectral_step_size: 0.25
   trace_roots: 8
-  grad_clip: 5.0
+  grad_clip: 0.0
+  freeze_host: false
   monitor_every: 50
 matrix:
   dataset: [tgbl-wiki]

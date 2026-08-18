@@ -12,6 +12,7 @@ from typing import Dict, Optional
 
 import numpy as np
 import torch
+from sklearn.metrics import average_precision_score, roc_auc_score
 
 from prss.compressors import InterfaceData
 from prss.hosts.tgn_pyg import TAU
@@ -21,9 +22,12 @@ EPS = 1e-7
 
 
 def _metric_bundle(y_pred_pos, y_pred_neg, evaluator, metric):
+    # Exact input format of the official TGB tgn.py baseline: the positive score
+    # is a length-1 list (per-edge), the negatives are a plain (K,) array.
+    # Wrapping the negatives in an extra list silently corrupts the ranking.
     input_dict = {
         "y_pred_pos": np.array([y_pred_pos.cpu()]),
-        "y_pred_neg": np.array([y_pred_neg.cpu()]),
+        "y_pred_neg": np.array(y_pred_neg.cpu()),
         "eval_metric": [metric],
     }
     return float(evaluator.eval(input_dict)[metric])
@@ -45,7 +49,8 @@ class TGBLinkPredictionLoop:
                  adapter, bridge, prss_core, optimizer, unrestricted_optimizer,
                  criterion, device, batch_size, n_neighbors, grad_clip,
                  lambda_resp, lambda_spec, trace_roots, spectral_warmup,
-                 spectral_interval, monitor, seed):
+                 spectral_interval, monitor, seed, freeze_host=False,
+                 tb_writer=None, monitor_every=100):
         self.dataset = dataset
         self.memory = memory
         self.gnn = gnn
@@ -74,6 +79,9 @@ class TGBLinkPredictionLoop:
         self.neg_sampler = dataset._ds.negative_sampler
         self.metric = dataset.eval_metric
         self.assoc = torch.empty(dataset.num_nodes, dtype=torch.long, device=device)
+        self.freeze_host = bool(freeze_host)
+        self.tb_writer = tb_writer
+        self.monitor_every = int(monitor_every)
 
     # ------------------------------------------------------------ state machines
     def reset_stream(self):
@@ -98,6 +106,11 @@ class TGBLinkPredictionLoop:
     def train_epoch(self, epoch: int, global_step: int) -> Dict:
         loader = self.dataset.build_loader("train", self.batch_size)
         self.reset_stream()
+        if self.freeze_host:
+            # Frozen host keeps eval-mode semantics (no dropout, read-only
+            # memory) throughout training, mirroring the old architecture.
+            self.memory.eval()
+            self.gnn.eval()
         total_task = total_resp = total_spec = total_unres = 0.0
         n_batches = 0
         batch_index = 0
@@ -126,7 +139,8 @@ class TGBLinkPredictionLoop:
                         local_ids += [int(self.assoc[src[r]]), int(self.assoc[pos_dst[r]]),
                                       int(self.assoc[neg_dst[r]])]
                     root_local_ids = torch.tensor(local_ids, device=self.device)
-                    root_times = torch.tensor([float(t[r])] * len(trace_rows), device=self.device)
+                    # One timestamp per scenario root: src / pos_dst / neg_dst per row.
+                    root_times = torch.repeat_interleave(t[trace_rows].float(), 3)
 
             z = self._forward_nodes(n_id, edge_index, e_id, root_local_ids, root_times)
             pos_out = self.link_pred(z[self.assoc[src]], z[self.assoc[pos_dst]])
@@ -195,6 +209,9 @@ class TGBLinkPredictionLoop:
                                       f"tail@k={snap.get('tail_at_k', 0):.6f} "
                                       f"gain={snap.get('captured_energy_gain', 0):.6f}", flush=True)
 
+            if self.tb_writer is not None and (batch_index % max(self.monitor_every, 1) == 0):
+                self.tb_writer.add_scalar("train/task_loss", float(task_loss.detach()),
+                                          global_step)
             total_task += float(task_loss.detach()) * batch.num_events
             total_resp += resp_v * batch.num_events
             total_spec += spec_v * batch.num_events
@@ -224,12 +241,20 @@ class TGBLinkPredictionLoop:
             self.dataset.load_test_ns()
             split_mode = "test"
         loader = self.dataset.build_loader(split, self.batch_size)
+        # Match the official baseline's eval semantics: dropout off and the
+        # memory module in read-only mode (its train-mode forward flushes the
+        # message queue, which is not the official evaluation behavior).
+        self.memory.eval()
+        self.gnn.eval()
+        self.link_pred.eval()
         if self.adapter is not None:
             self.adapter.clear_trace()
         if self.prss_core is not None:
             self.prss_core.set_spectral_updates_allowed(False)
 
         perf_list = []
+        pos_scores: list = []
+        neg_scores: list = []
         for pos_batch in loader:
             pos_batch = pos_batch.to(self.device)
             pos_src, pos_dst, pos_t, pos_msg = (
@@ -249,10 +274,27 @@ class TGBLinkPredictionLoop:
                 perf_list.append(_metric_bundle(
                     y_pred[0, :].squeeze(dim=-1), y_pred[1:, :].squeeze(dim=-1),
                     self.evaluator, self.metric))
+                # One-vs-many AUC/AP over the official sampled negatives
+                # (supplementary diagnostics; MRR remains the primary metric).
+                pos_scores.append(y_pred[0].sigmoid().cpu().numpy().reshape(-1))
+                neg_scores.append(y_pred[1:].sigmoid().cpu().numpy().reshape(-1))
             self._advance_stream(pos_src, pos_dst, pos_t, pos_msg)
 
-        return {f"test_{self.metric}" if split == "test" else f"val_{self.metric}":
-                float(torch.tensor(perf_list).mean())}
+        self.link_pred.train()
+        if not self.freeze_host:
+            self.memory.train()
+            self.gnn.train()
+        out = {f"test_{self.metric}" if split == "test" else f"val_{self.metric}":
+               float(torch.tensor(perf_list).mean())}
+        pos_arr = np.concatenate(pos_scores) if pos_scores else np.zeros(0)
+        neg_arr = np.concatenate(neg_scores) if neg_scores else np.zeros(0)
+        if pos_arr.size and neg_arr.size:
+            labels = np.concatenate([np.ones(pos_arr.size), np.zeros(neg_arr.size)])
+            scores = np.concatenate([pos_arr, neg_arr])
+            prefix = "test" if split == "test" else "val"
+            out[f"{prefix}_auc_ovm"] = float(roc_auc_score(labels, scores))
+            out[f"{prefix}_ap_ovm"] = float(average_precision_score(labels, scores))
+        return out
 
     # ------------------------------------------------------------------- auditing
     @torch.no_grad()

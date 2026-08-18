@@ -133,6 +133,71 @@ class TestPyGHost(unittest.TestCase):
         reader = core.readers[TAU]
         self.assertTrue(any(p.grad is not None for p in reader.parameters()))
 
+    def test_trace_is_finite_and_bfs_safe(self):
+        """Regression: mutual neighbors (u<->v) must not create infinite BFS.
+
+        The sampled subgraph is undirected, so both directions of an edge can
+        appear, and when both endpoints are traced roots their occurrences can
+        reference each other.  The bridge/auxiliary BFS must still terminate
+        (this was a real OOM bug from an infinite outside loop)."""
+        torch.manual_seed(3)
+        np.random.seed(3)
+        from prss.core import PRSSCore
+        from prss.hosts.tgn_pyg import PyGTGNAdapter
+
+        (memory, gnn, _, loader, mem_d, time_d, msg_d, emb_d) = self._make()
+        # Mutual pair: 1 -> 4 and 4 -> 1.
+        self._stream(loader, memory, torch.tensor([1]), torch.tensor([4]),
+                     torch.tensor([1]), torch.randn(1, msg_d))
+        self._stream(loader, memory, torch.tensor([4]), torch.tensor([1]),
+                     torch.tensor([2]), torch.randn(1, msg_d))
+
+        core = PRSSCore(self._config(mem_d, time_d, msg_d, emb_d), variant="spectral")
+        adapter = PyGTGNAdapter(memory, gnn, core, n_neighbors=4, mem_dim=mem_d,
+                                time_dim=time_d, msg_dim=msg_d, emb_dim=emb_d)
+
+        n_id = torch.tensor([1, 4])
+        n_id, eidx, eid = loader(n_id)
+        root_locals = torch.tensor([0, 1])  # both 1 and 4 are roots
+        root_times = torch.tensor([3.0, 3.0])
+        with torch.no_grad():
+            adapter.embed(n_id, eidx, torch.tensor([1, 2])[eid], torch.randn(2, msg_d)[eid],
+                          root_locals, root_times)
+        trace = adapter.trace
+        self.assertIsNotNone(trace)
+        self.assertLessEqual(len(trace.occurrences), 8)  # finite, no explosion
+        # BFS over the children graph (mirroring the bridge) must terminate and
+        # visit exactly the recorded occurrences.
+        seen = set()
+        for root in trace.roots:
+            stack = [root]
+            while stack:
+                oid = stack.pop()
+                if oid in seen:
+                    continue
+                seen.add(oid)
+                stack.extend(trace.occurrences[oid].children)
+        self.assertEqual(seen, set(trace.occurrences.keys()))
+
+    def test_evaluator_input_format_gives_correct_mrr(self):
+        """Regression: the TGB Evaluator needs per-edge (1,)-pos plus (K,)-neg.
+
+        An extra list wrapper around the negatives silently corrupts the ranking
+        and produced MRR ~ 0.007 (below random) in the first smoke run."""
+        from tgb.linkproppred.evaluate import Evaluator
+
+        from prss.training.event_loop import _metric_bundle
+
+        evaluator = Evaluator(name="tgbl-wiki")
+        # All negatives score below the positive -> rank 1 -> MRR 1.0.
+        mrr = _metric_bundle(torch.tensor(1.0),
+                             torch.tensor([0.5, 0.4, 0.3, 0.2]), evaluator, "mrr")
+        self.assertAlmostEqual(mrr, 1.0, places=4)
+        # One negative scores above the positive -> rank 2 -> MRR 0.5.
+        mrr2 = _metric_bundle(torch.tensor(0.5),
+                              torch.tensor([0.9, 0.1, 0.1, 0.1]), evaluator, "mrr")
+        self.assertAlmostEqual(mrr2, 0.5, places=4)
+
     def test_inference_without_trace_does_not_touch_spectral_state(self):
         torch.manual_seed(2)
         np.random.seed(2)

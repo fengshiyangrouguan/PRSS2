@@ -8,6 +8,13 @@ Example:
 Precedence: explicit CLI > YAML experiment file > code defaults.
 """
 
+import os
+
+# 208-core containers deadlock small BLAS/torch ops across hundreds of OpenMP
+# threads.  Pin every thread layer to 1 BEFORE importing torch; env can override.
+for _k in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS"):
+    os.environ.setdefault(_k, "1")
+
 import argparse
 import json
 import random
@@ -17,6 +24,8 @@ from pathlib import Path
 
 import numpy as np
 import torch
+
+torch.set_num_threads(int(os.environ["OMP_NUM_THREADS"]))
 
 HERE = Path(__file__).resolve().parent
 SRC = HERE.parent / "src"
@@ -63,8 +72,17 @@ def parse_args():
     p.add_argument("--spectral-interval", type=int, default=100)
     p.add_argument("--spectral-step-size", type=float, default=0.25)
     p.add_argument("--trace-roots", type=int, default=8)
+    # Optional frozen-host mode (old-architecture semantics): memory+gnn stay
+    # in eval mode and receive no gradients; link_pred and the PRSS modules
+    # train normally.  Default: off (joint training, matching the TGB baseline).
+    p.add_argument("--freeze-host", action="store_true")
     # Monitoring / resuming / smoke caps
-    p.add_argument("--grad-clip", type=float, default=5.0)
+    # NOTE: keep 0 (disabled) by default.  This host's gradients legitimately
+    # reach ~1e9 magnitude (growing memory states); GLOBAL clipping then scales
+    # every module's healthy gradients toward zero and freezes training
+    # completely (observed: loss pinned at 1.44, MRR below random).  The
+    # official TGB baseline uses no clipping either.
+    p.add_argument("--grad-clip", type=float, default=0.0)
     p.add_argument("--monitor-every", type=int, default=100)
     p.add_argument("--checkpoint-every", type=int, default=0)
     p.add_argument("--resume-from", default="")
@@ -107,6 +125,13 @@ def build_components(args, device, dataset, time_stats):
     gnn = GraphAttentionEmbedding(in_channels=args.mem_dim, out_channels=args.emb_dim,
                                   msg_dim=dataset.msg_dim,
                                   time_enc=memory.time_enc).to(device)
+    # Condition the shared TimeEncoder: raw timestamps are ~1e6 seconds, which
+    # makes its gradients ~1e6+ and, under GLOBAL gradient clipping, crushes every
+    # other module's gradients to zero (the model never learns).  Scaling the
+    # time input by 1e-6 keeps rel_t ~O(1) and the clip usable.
+    _TIME_SCALE = 1e-6
+    _time_enc_forward = memory.time_enc.forward
+    memory.time_enc.forward = lambda t: _time_enc_forward(t * _TIME_SCALE)
     link_pred = LinkPredictor(in_channels=args.emb_dim).to(device)
     criterion = torch.nn.BCEWithLogitsLoss()
 
@@ -144,6 +169,18 @@ def build_components(args, device, dataset, time_stats):
     # Parameter groups: main path (host + core); unrestricted reader stays isolated.
     main_params = list(memory.parameters()) + list(gnn.parameters()) + \
         list(link_pred.parameters())
+    if args.freeze_host:
+        # Old-architecture frozen-host semantics: the host contributes forward
+        # passes only.  eval() also disables host dropout during training.
+        # reset_state() first: switching to eval flushes ALL message stores,
+        # which must live on the model device (at __init__ time they were
+        # created CPU-side by the vendored module).
+        memory.reset_state()
+        for p in list(memory.parameters()) + list(gnn.parameters()):
+            p.requires_grad_(False)
+        memory.eval()
+        gnn.eval()
+        main_params = list(link_pred.parameters())
     unrestricted_params = []
     if prss_core is not None:
         main_params += list(prss_core.parameters())
@@ -157,7 +194,8 @@ def build_components(args, device, dataset, time_stats):
                               if unrestricted_params else None)
     return dict(memory=memory, gnn=gnn, link_pred=link_pred, neighbor_loader=neighbor_loader,
                 criterion=criterion, prss_core=prss_core, adapter=adapter, bridge=bridge,
-                optimizer=optimizer, unrestricted_optimizer=unrestricted_optimizer), \
+                optimizer=optimizer, unrestricted_optimizer=unrestricted_optimizer,
+                freeze_host=bool(args.freeze_host)), \
         (prss_core.config if prss_core is not None else None)
 
 
@@ -178,6 +216,13 @@ def main():
     out.mkdir(parents=True, exist_ok=True)
     monitor = MonitorWriter(out, fail_on_error=not args.no_fail_on_monitor_error,
                             reset_files=not bool(args.resume_from))
+    # TensorBoard writer (optional dependency): epoch-level loss / mrr / auc / ap.
+    tb_writer = None
+    try:
+        from torch.utils.tensorboard import SummaryWriter
+        tb_writer = SummaryWriter(log_dir=str(out / "tb"))
+    except Exception as exc:  # pragma: no cover
+        print(f"WARN: tensorboard unavailable ({exc}); skipping TB logs", flush=True)
 
     dataset = TGBLinkDataset(name=args.dataset, device=device)
     if args.max_train:
@@ -200,7 +245,9 @@ def main():
         n_neighbors=args.n_neighbors, grad_clip=args.grad_clip,
         lambda_resp=args.lambda_resp, lambda_spec=args.lambda_spec,
         trace_roots=args.trace_roots, spectral_warmup=args.spectral_warmup,
-        spectral_interval=args.spectral_interval, monitor=monitor, seed=args.seed)
+        spectral_interval=args.spectral_interval, monitor=monitor, seed=args.seed,
+        freeze_host=components["freeze_host"], tb_writer=tb_writer,
+        monitor_every=args.monitor_every)
 
     save_json(out / "config.json", {
         "variant": args.variant,
@@ -265,6 +312,10 @@ def main():
         with metrics_path.open("a") as f:
             f.write(json.dumps(row, allow_nan=True) + "\n")
         monitor.write_epoch(row)
+        if tb_writer is not None:
+            tb_writer.add_scalar("epoch/train_task_loss", row["train"]["train_task_loss"], epoch)
+            for key, value in val_row.items():
+                tb_writer.add_scalar(f"epoch/{key}", value, epoch)
         print(f"epoch={epoch} variant={args.variant} "
               f"train_loss={train_row['train_task_loss']:.5f} "
               f"val_{dataset.eval_metric}={score:.5f} "
@@ -329,6 +380,10 @@ def main():
         "inference_isolation": "passed",
     }
     save_json(out / "summary.json", summary)
+    if tb_writer is not None:
+        for key, value in test_row.items():
+            tb_writer.add_scalar(f"final/{key}", value, 0)
+        tb_writer.close()
     monitor.finalize(summary)
     save_json(out / "_SUCCESS.json", {"status": "complete", "best_epoch": best_epoch,
                                       "test": test_row})

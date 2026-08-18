@@ -1,4 +1,11 @@
 #!/usr/bin/env python3
+import os
+
+# 208-core containers deadlock small BLAS/torch ops across hundreds of OpenMP
+# threads.  Pin every thread layer to 1 BEFORE importing torch; env can override.
+for _k in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS"):
+    os.environ.setdefault(_k, "1")
+
 """PRSS2 inference entry: held-out one-vs-many MRR from a saved training run.
 
 Example:
@@ -11,6 +18,7 @@ components (outside encoder, readers, Gram/SVD) are hard-disabled and audited.
 """
 
 import argparse
+
 import json
 import random
 import sys
@@ -18,6 +26,8 @@ from pathlib import Path
 
 import numpy as np
 import torch
+
+torch.set_num_threads(int(os.environ["OMP_NUM_THREADS"]))
 
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parent

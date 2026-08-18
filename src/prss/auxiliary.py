@@ -64,8 +64,12 @@ def build_auxiliary(prss, trace, root_metadata, root_labels,
         }
         queue = [root_oid]
         order = []
+        visited = set()
         while queue:
             pid = queue.pop(0)
+            if pid in visited:
+                continue
+            visited.add(pid)
             order.append(pid)
             parent = trace.occurrences[pid]
             pc = contexts[pid]

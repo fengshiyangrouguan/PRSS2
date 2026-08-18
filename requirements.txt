@@ -13,3 +13,6 @@ pyyaml>=6.0
 # ---------- TGB protocol (optional, from stage 3; install torch first) ----------
 # torch-geometric==2.3.0   # version combo pinned by the TGB 2.3.0 requirements
 # tgb==2.3.0
+
+# ---------- visualization (optional) ----------
+# tensorboard   # torch.utils.tensorboard SummaryWriter; loss/mrr/auc/ap curves

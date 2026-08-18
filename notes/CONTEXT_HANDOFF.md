@@ -101,3 +101,23 @@ PRSS2/                            # git 仓库(尚无提交!)
   基线组/机制诊断缺失(C 类)。详见 `notes/DEVELOPMENT_PRSS2.md` 与 `notes/ABC_FINDINGS_EXPLAINED.md`。
 - TGN 论文官方基线(已下载 PDF 在 old/papers/ 时被删,可重下 arXiv:2006.10637):
   链接预测 AP wiki transductive 98.46±0.1 / inductive 97.81±0.1;节点分类 AUC wiki 87.81±0.3。
+
+## 9. 云端部署战报(2026-08-18,SeetaCloud 克隆实例)
+
+- **当前实例**:`ssh -p 41165 root@connect.westc.seetacloud.com`(密钥免密;数据盘
+  `/root/autodl-tmp/PRSS2` 含代码+数据集+全部修复;环境 = base conda:torch 2.8.0+cu128、
+  pyg 2.8、py-tgb 2.3.0、RTX 5090 D 32G、208 核)。
+- **部署踩坑与修复(9 项,全部已同步本地+云端)**:①208 核 OpenMP 颠簸 → 三入口锁定
+  OMP/MKL/OPENBLAS=1+关 oneDNN;②PyG 无向子图 trace 成环 → BFS 无限循环吃爆内存
+  (97%)→ 深度=1 + visited + 回归测试;③线程补丁插错位置;④runner cwd off-by-one;
+  ⑤包名 py-tgb + 缺失依赖 clint;⑥TGB 根路径字符串拼接坑 → PROJ_DIR 指向仓库根、
+  数据放 `datasets/tgbl_wiki/` 子目录;⑦MRR 评估 neg 多包一层 list → 排名全乱;
+  ⑧root_times 长度 3× 不匹配;⑨**全局 grad_clip 抹零** → 默认关闭(官方无裁剪)+
+  TimeEncoder 输入 ×1e-6 缩放。
+- **评估修复**:`evaluate_split` 补回 eval/train 模式切换(官方评估语义:关 dropout、
+  memory 只读)——旧训练器有 `tgn.eval()`,移植时遗漏。
+- **smoke 结果**(1 epoch×1 seed,修复版):vanilla val mrr 0.0908 / test 0.0602(对齐官方
+  逐字基线 0.074 量级);spectral 0.0180 微弱领先 direct 0.0119 / pca 0.0118 / random 0.0146
+  ——方向正确,1 epoch 非证据。
+- **下一步(待拍板)**:正式矩阵 30 epoch×3 seed×5 变体(顺序约 35h;建议先跑 seed 0
+  的 5 变体 ≈12h 看信号)。

@@ -103,8 +103,12 @@ class TGBLinkOutsideBridge(OutsideBridge):
         contexts = {int(root_id): self.prss.outside.root_context(root_metadata, root.tau).squeeze(0)}
         queue: List[int] = [int(root_id)]
         order: List[int] = []
+        visited = set()
         while queue:
             pid = queue.pop(0)
+            if pid in visited:
+                continue
+            visited.add(pid)
             order.append(pid)
             parent = trace.occurrences[pid]
             pc = contexts[pid]

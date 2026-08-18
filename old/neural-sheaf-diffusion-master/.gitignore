@@ -1,7 +1,0 @@
-*__pycache__/
-*.py[cod]
-*.pytest_cache
-.idea/
-datasets/
-wandb/
-*.DS_Store

@@ -1,0 +1,32 @@
+# Formal matrix: tgbl-wiki x 5 compressor variants x 3 seeds, official-scale epochs.
+# Runs on AutoDL GPU; each job is idempotent (_SUCCESS.json skip).
+name: tgbl_wiki_matrix
+root: outputs/tgbl_wiki
+defaults:
+  dataset: tgbl-wiki
+  epochs: 30
+  bs: 200
+  lr: 0.0001
+  patience: 5
+  n_neighbors: 10
+  mem_dim: 100
+  time_dim: 100
+  emb_dim: 100
+  candidate_dim: 256
+  candidate_hidden: 128
+  context_dim: 64
+  reader_hidden: 128
+  lambda_resp: 1.0
+  lambda_spec: 0.1
+  gram_ema: 0.05
+  spectral_warmup: 100
+  spectral_interval: 100
+  spectral_step_size: 0.25
+  trace_roots: 8
+  grad_clip: 5.0
+  monitor_every: 100
+  checkpoint_every: 10
+matrix:
+  dataset: [tgbl-wiki]
+  variant: [vanilla, random, pca, direct, spectral]
+  seed: [0, 1, 2]

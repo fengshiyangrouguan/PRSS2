@@ -1,0 +1,15 @@
+# PRSS2 -- dual-environment install notes (Windows CPU / AutoDL GPU)
+#
+# torch is deliberately NOT pinned here: install the wheel matching your environment FIRST.
+#   Windows CPU: pip install torch --index-url https://download.pytorch.org/whl/cpu
+#   AutoDL GPU : pip install torch==2.0.1 --index-url https://download.pytorch.org/whl/cu118
+
+# ---------- core (required on both environments) ----------
+numpy>=1.21
+pandas>=1.5
+scikit-learn>=1.2
+pyyaml>=6.0
+
+# ---------- TGB protocol (optional, from stage 3; install torch first) ----------
+# torch-geometric==2.3.0   # version combo pinned by the TGB 2.3.0 requirements
+# tgb==2.3.0

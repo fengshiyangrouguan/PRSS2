@@ -1,0 +1,4 @@
+numpy>=1.21,<2.0
+pandas>=1.3
+scikit-learn>=1.0
+# Intentionally do not install torch here on AutoDL; keep the CUDA-matched torch already provided.

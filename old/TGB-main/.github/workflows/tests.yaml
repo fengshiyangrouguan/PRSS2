@@ -1,0 +1,70 @@
+name: tests
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      run_network:
+        description: "Also run live URL reachability tests"
+        type: boolean
+        default: false
+
+jobs:
+  offline:
+    name: pytest (offline)
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+
+      - name: Install dependencies
+        # uv is used only for fast/cached installs in CI; it does not affect the
+        # published package. Install only what the tested modules import (unpinned
+        # so wheels resolve across the Python matrix), then the package itself
+        # without its heavy / pinned runtime extras (dgl, ray, ...), then tooling.
+        # --system targets the interpreter selected by setup-python above.
+        run: |
+          uv pip install --system numpy pandas scikit-learn requests clint tqdm torch torch-geometric
+          uv pip install --system -e . --no-deps
+          uv pip install --system pytest pytest-mock
+
+      - name: Run offline test suite
+        run: pytest -m "not network" -v
+
+  network:
+    name: pytest (live URLs)
+    # Opt-in only: manual dispatch with run_network=true. Keeps PR/push runs
+    # independent of the object store being reachable.
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.run_network }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+
+      - name: Install dependencies
+        run: |
+          uv pip install --system requests
+          uv pip install --system -e . --no-deps
+          uv pip install --system pytest
+
+      - name: Run URL reachability tests
+        run: pytest test/test_url_reachability.py --run-network -v

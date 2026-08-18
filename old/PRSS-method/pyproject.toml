@@ -1,0 +1,13 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "prss-tgn"
+version = "0.2.0"
+description = "Continuation-operator spectral predictive state compression for recursive TGN interfaces"
+requires-python = ">=3.9"
+dependencies = ["numpy>=1.21,<2.0", "pandas>=1.3", "scikit-learn>=1.0"]
+
+[tool.setuptools.packages.find]
+include = ["prss*"]

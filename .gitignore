@@ -1,0 +1,67 @@
+# ============================================================
+# PRSS2 根目录 .gitignore
+# ============================================================
+
+# ---------- 数据文件(大文件,不入库) ----------
+old/wikipedia.csv
+old/processed_tgn_data/
+*.npy
+*.npz
+# TGB 数据集下载目录(库源码在 old/TGB-main/tgb/ 下,不受影响)
+/old/TGB-main/datasets/
+/datasets/
+
+# ---------- 实验输出与训练产物 ----------
+outputs/
+old/PRSS-method/outputs/
+old/PRSS-method_old_021746/outputs/
+saved_models/
+saved_checkpoints/
+work/
+best.pt
+best_model.pt
+rolling_step.pt
+*.pth
+*.ckpt
+logs/
+*.log
+
+# ---------- 数据目录软链接/挂载点(训练器运行时生成) ----------
+/old/PRSS-method/data/
+/old/PRSS-method_old_021746/data/
+/data/
+
+# ---------- 下载的论文与提取产物(可随时重新下载) ----------
+old/papers/
+
+# ---------- Python 缓存与临时文件 ----------
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+
+# ---------- 训练框架产物 ----------
+wandb/
+lightning_logs/
+events.out.tfevents.*
+
+# ---------- IDE 与系统文件 ----------
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+~$*
+*.tmp
+*.bak
+
+# ---------- 环境与密钥 ----------
+.env
+.env.*
+secrets.*

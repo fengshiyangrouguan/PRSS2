@@ -168,11 +168,6 @@ def build_components(args, device, dataset):
         std_time_shift_dst=sd,
     ).to(device)
     state = unwrap_state(load_torch(args.pretrained_checkpoint, device))
-    # Self-supervised checkpoints carry their link-prediction decoder
-    # (affinity_score.*) at the top level; the supervised protocol rebuilds
-    # its own decoder, so those keys are dropped before strict validation.
-    state = {key: value for key, value in state.items()
-             if not key.startswith("affinity_score.")}
     # Memory is a runtime state produced by the pretraining stream, not a
     # parameter to carry across runs. The v1 checkpoint's memory cells are
     # sized for the un-padded node set (9228) while the vendored TGN pads one
@@ -183,8 +178,15 @@ def build_components(args, device, dataset):
                          "memory_updater.memory.last_update")
     for key in MEMORY_STATE_KEYS:
         state.pop(key, None)
+    # The vendored TGN carries its self-supervised link-prediction decoder
+    # (affinity_score.*). Official self-supervised checkpoints include it,
+    # v1 pretrained checkpoints predate it — either way the supervised run
+    # builds its own decoder, so those keys are allowed to be missing.
+    DECODER_STATE_KEYS = ("affinity_score.fc1.weight", "affinity_score.fc1.bias",
+                          "affinity_score.fc2.weight", "affinity_score.fc2.bias")
+    allowed_missing = set(MEMORY_STATE_KEYS) | set(DECODER_STATE_KEYS)
     missing, unexpected = tgn.load_state_dict(state, strict=False)
-    if set(missing) != set(MEMORY_STATE_KEYS) or unexpected:
+    if not (set(missing) <= allowed_missing) or unexpected:
         raise RuntimeError(
             "pretrained TGN mismatch: missing={}, unexpected={}".format(
                 sorted(missing), sorted(unexpected)))

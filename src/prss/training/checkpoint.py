@@ -47,14 +47,23 @@ def _restore_rng(state: Optional[Dict]) -> None:
         torch.cuda.set_rng_state_all([_cpu_byte_rng_state(x) for x in state["cuda"]])
 
 
-def _msg_store_to_cpu(store: Dict) -> list:
-    return [[(m.detach().cpu(), t.detach().cpu()) for m, t in entries]
-            for entries in store.values()]
+def _msg_store_to_cpu(store: Dict) -> Dict:
+    # PyG TGNMemory store format (2.8): {node_id: (src, dst, t, msg)}, each
+    # element a tensor (empty when reset, batched once messages arrive).
+    return {k: {node: tuple(x.detach().cpu() for x in entries)
+                for node, entries in inner.items()}
+            for k, inner in store.items()}
 
 
-def _msg_store_from_cpu(store: Dict, payload: list, device) -> None:
-    for node_key, entries in zip(store.keys(), payload):
-        store[node_key] = [(m.to(device), t.to(device)) for m, t in entries]
+def _msg_store_from_cpu(store: Dict, payload: Dict, device) -> None:
+    # ``store`` maps tag -> the memory module's *live* store dict (train.py
+    # passes ``{"s": memory.msg_s_store, "d": memory.msg_d_store}``).  Fill the
+    # inner dicts in place; clearing the outer wrapper would orphan the live
+    # stores and silently leave them empty.
+    for k, inner in store.items():
+        inner.clear()
+        inner.update({node: tuple(x.to(device) for x in entries)
+                      for node, entries in payload[k].items()})
 
 
 class CheckpointManager:
@@ -66,7 +75,14 @@ class CheckpointManager:
     def save(self, *, model_components: Dict[str, torch.nn.Module],
              optimizer, unrestricted_optimizer, epoch: int, next_batch: int,
              global_step: int, best_score: float, best_epoch: int, bad_rounds: int,
-             train_state: Dict, memory_msg_stores: Optional[Dict] = None) -> None:
+             train_state: Dict, memory_msg_stores: Optional[Dict] = None,
+             extra_payload: Optional[Dict] = None) -> None:
+        """``extra_payload`` is stored verbatim under payload["extra"].
+
+        JODIE line uses it for ``memory_backup = tgn.memory.backup_memory()``
+        so an interrupted run resumes with the exact memory state.  TGB line
+        never passes it; the key is then absent and resume behavior unchanged.
+        """
         payload = {
             "model": {k: m.state_dict() for k, m in model_components.items()},
             "optimizer": optimizer.state_dict(),
@@ -82,6 +98,7 @@ class CheckpointManager:
             "rng": _rng_state(),
             "memory_msg_stores": (_msg_store_to_cpu(memory_msg_stores)
                                   if memory_msg_stores is not None else None),
+            "extra": extra_payload,
         }
         tmp = Path(str(self.path) + ".tmp")
         torch.save(payload, tmp)

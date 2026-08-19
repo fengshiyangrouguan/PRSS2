@@ -86,11 +86,19 @@ def parse_args():
     p.add_argument("--monitor-every", type=int, default=100)
     p.add_argument("--checkpoint-every", type=int, default=0)
     p.add_argument("--resume-from", default="")
+    p.add_argument("--continue-from", default="",
+                   help="continue training from a previous run's best.pt "
+                        "(fresh optimizer and early stopping; epochs start at 0)")
     p.add_argument("--no-fail-on-monitor-error", action="store_true")
     p.add_argument("--max-train", type=int, default=0)
     p.add_argument("--max-val", type=int, default=0)
     p.add_argument("--max-test", type=int, default=0)
-    return p.parse_args()
+    args = p.parse_args()
+    # Keep the code-level defaults so later layers (YAML defaults, continue-from
+    # source config) can tell "explicitly set" from "left at default".
+    args._arg_defaults = {a.dest: a.default for a in p._actions
+                          if getattr(a, "dest", None) and a.dest != "help"}
+    return args
 
 
 def seed_all(seed):
@@ -125,13 +133,11 @@ def build_components(args, device, dataset, time_stats):
     gnn = GraphAttentionEmbedding(in_channels=args.mem_dim, out_channels=args.emb_dim,
                                   msg_dim=dataset.msg_dim,
                                   time_enc=memory.time_enc).to(device)
-    # Condition the shared TimeEncoder: raw timestamps are ~1e6 seconds, which
-    # makes its gradients ~1e6+ and, under GLOBAL gradient clipping, crushes every
-    # other module's gradients to zero (the model never learns).  Scaling the
-    # time input by 1e-6 keeps rel_t ~O(1) and the clip usable.
-    _TIME_SCALE = 1e-6
-    _time_enc_forward = memory.time_enc.forward
-    memory.time_enc.forward = lambda t: _time_enc_forward(t * _TIME_SCALE)
+    # Note: the shared TimeEncoder receives raw second-scale timestamps exactly
+    # as the official TGB baseline does (no input scaling).  The former 1e-6
+    # scale patch was removed: grad-clip is now disabled by default (matching
+    # the official baseline), so the original scaling rationale no longer
+    # applies and we keep zero implementation delta versus the official host.
     link_pred = LinkPredictor(in_channels=args.emb_dim).to(device)
     criterion = torch.nn.BCEWithLogitsLoss()
 
@@ -201,15 +207,36 @@ def build_components(args, device, dataset, time_stats):
 
 def main():
     args = parse_args()
-    defaults = {}
+    arg_defaults = args._arg_defaults
+
+    # Precedence: explicit CLI > YAML defaults > (continue-from source config)
+    # > code defaults.
     if args.config:
         import yaml
         with open(args.config) as f:
             spec = yaml.safe_load(f)
-        defaults = dict(spec.get("defaults", {}))
-    for key in defaults:
-        if getattr(args, key.replace("-", "_"), None) is None:
-            setattr(args, key.replace("-", "_"), defaults[key])
+        for key, value in (spec.get("defaults") or {}).items():
+            k = key.replace("-", "_")
+            if vars(args).get(k) == arg_defaults.get(k):
+                setattr(args, k, value)
+
+    if args.continue_from and args.resume_from:
+        raise SystemExit("--continue-from and --resume-from are mutually exclusive")
+    if args.continue_from:
+        src_cfg = Path(args.continue_from).parent / "config.json"
+        if src_cfg.exists():
+            src_cli = json.loads(src_cfg.read_text()).get("cli", {})
+            exclude = {"gpu", "output", "config", "continue_from", "resume_from"}
+            inherited = []
+            for key, value in src_cli.items():
+                if key in exclude or not isinstance(value, (int, float, str, bool)):
+                    continue
+                if vars(args).get(key) == arg_defaults.get(key):
+                    setattr(args, key, value)
+                    inherited.append(key)
+            if inherited:
+                print(f"CONTINUE_FROM 继承源参数: {sorted(inherited)}", flush=True)
+
     seed_all(args.seed)
     device = torch.device(f"cuda:{args.gpu}" if torch.cuda.is_available() else "cpu")
     out = Path(args.output)
@@ -249,6 +276,18 @@ def main():
         freeze_host=components["freeze_host"], tb_writer=tb_writer,
         monitor_every=args.monitor_every)
 
+    if args.continue_from and args.resume_from:
+        raise SystemExit("--continue-from and --resume-from are mutually exclusive")
+    if args.continue_from:
+        cont = torch.load(args.continue_from, map_location=device, weights_only=False)
+        for name in ("memory", "gnn", "link_pred"):
+            components[name].load_state_dict(cont["model"][name])
+        if components["prss_core"] is not None:
+            components["prss_core"].load_state_dict(cont["model"]["prss_core"])
+        print(f"CONTINUE_FROM {args.continue_from} (source variant "
+              f"{cont.get('variant')}) -> epochs={args.epochs} patience={args.patience}",
+              flush=True)
+
     save_json(out / "config.json", {
         "variant": args.variant,
         "dataset": args.dataset,
@@ -258,6 +297,7 @@ def main():
         "candidate_dim": args.candidate_dim if prss_config else None,
         "sanity": dataset.sanity_check(),
         "prss": prss_config.as_dict() if prss_config is not None else None,
+        "continue_from": str(args.continue_from) or None,
         "cli": vars(args),
     })
 

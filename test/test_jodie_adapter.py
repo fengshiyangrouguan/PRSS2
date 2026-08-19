@@ -21,7 +21,10 @@ from test_jodie_vendor import (
 
 
 def make_tiny_prss(variant="vanilla", n_layers=2, host_dim=8, time_dim=8,
-                   edge_dim=4, n_neighbors=4, candidate_dim=16):
+                   edge_dim=8, n_neighbors=4, candidate_dim=16, device=None):
+    # edge_dim must match make_tiny_tgn's feat_dim=8 (host.n_edge_features).
+    if device is None:
+        device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
     taus = [TAU_TEMPLATE.format(layer) for layer in range(n_layers + 1)]
     interfaces = {
         TAU_TEMPLATE.format(0): InterfaceSpec(
@@ -37,7 +40,7 @@ def make_tiny_prss(variant="vanilla", n_layers=2, host_dim=8, time_dim=8,
         parent_local_dim=jodie_preagg_dim(host_dim, time_dim, edge_dim,
                                           n_neighbors),
         root_metadata_dim=1, relation_count=2, variant=variant)
-    return config, PRSSCore(config)
+    return config, PRSSCore(config).to(device)
 
 
 def make_tiny_tgn():
@@ -58,8 +61,11 @@ def install_adapter(tgn, prss_core, n_neighbors=4):
 
 
 def forward_batch(tgn, sources, destinations, timestamps, edge_idxs, bs=8,
-                  n_neighbors=4):
-    tgn.train()
+                  n_neighbors=4, train=True):
+    # ``train=True`` leaves dropout randomness in the host attention; parity
+    # comparisons must use train=False so the adapter-vs-host contract is
+    # checked free of the host's own stochasticity.
+    tgn.train() if train else tgn.eval()
     return tgn.compute_temporal_embeddings(
         sources[:bs], destinations[:bs], destinations[:bs],
         timestamps[:bs], edge_idxs[:bs], n_neighbors)
@@ -70,17 +76,24 @@ class TestIdentityParity(unittest.TestCase):
     """With a vanilla compressor the adapter forward must equal the bare host."""
 
     def test_vanilla_forward_bitwise_matches_bare_host(self):
+        # "Vanilla" here = no compression at any interface: candidate_dim ==
+        # host_dim everywhere, so make_candidate/project pass through and the
+        # adapter must equal the bare host bitwise.
         tgn, device, (sources, destinations, timestamps, edge_idxs, labels) = \
             make_tiny_tgn()
         bare = make_tiny_tgn()[0]
         bare.load_state_dict(tgn.state_dict())
-        config, prss = make_tiny_prss(variant="vanilla")
+        config, prss = make_tiny_prss(variant="vanilla", candidate_dim=8,
+                                      device=device)
         install_adapter(tgn, prss)
 
+        # Both hosts run in eval mode: attention dropout would otherwise inject
+        # independent randomness into each forward (host-side stochasticity, not
+        # adapter-introduced), which is not what this contract is testing.
         src_emb_a, dst_emb_a, neg_emb_a = forward_batch(
-            tgn, sources, destinations, timestamps, edge_idxs)
+            tgn, sources, destinations, timestamps, edge_idxs, train=False)
         src_emb_b, dst_emb_b, neg_emb_b = forward_batch(
-            bare, sources, destinations, timestamps, edge_idxs)
+            bare, sources, destinations, timestamps, edge_idxs, train=False)
         for a, b in zip((src_emb_a, dst_emb_a, neg_emb_a),
                         (src_emb_b, dst_emb_b, neg_emb_b)):
             self.assertEqual(tuple(a.shape), tuple(b.shape))
@@ -92,12 +105,15 @@ class TestIdentityParity(unittest.TestCase):
             make_tiny_tgn()
         config, prss = make_tiny_prss(variant="vanilla")
         install_adapter(tgn, prss)
-        tgn.train()
+        # eval mode + fresh memory before each call: no dropout and no memory
+        # drift, so the two forwards can only differ if tracing itself leaks
+        # into the embedding computation.
         a, _, _ = forward_batch(tgn, sources, destinations, timestamps,
-                                edge_idxs)
+                                edge_idxs, train=False)
+        tgn.memory.__init_memory__()
         tgn.embedding_module.clear_trace()
         b, _, _ = forward_batch(tgn, sources, destinations, timestamps,
-                                edge_idxs)
+                                edge_idxs, train=False)
         self.assertTrue(torch.allclose(a, b, atol=1e-7))
 
 
@@ -177,7 +193,7 @@ class TestMultiTauAux(unittest.TestCase):
     def test_bridge_builds_layer1_and_layer2_only(self):
         tgn, device, (sources, destinations, timestamps, edge_idxs, labels) = \
             make_tiny_tgn()
-        config, prss = make_tiny_prss(variant="spectral")
+        config, prss = make_tiny_prss(variant="spectral", device=device)
         adapter = install_adapter(tgn, prss)
         bridge = JodieNodeClassificationBridge(adapter, prss)
         tgn.train()
@@ -185,7 +201,8 @@ class TestMultiTauAux(unittest.TestCase):
         adapter.set_trace_source_rows(trace_rows)
         forward_batch(tgn, sources, destinations, timestamps, edge_idxs)
         aux = bridge.build(timestamps[trace_rows],
-                           torch.tensor([1.0, 0.0], dtype=torch.float32))
+                           torch.tensor([1.0, 0.0], dtype=torch.float32,
+                                        device=device))
         self.assertEqual(set(aux.matrices_by_tau), {"tjo:layer1", "tjo:layer2"})
         self.assertNotIn("tjo:layer0", aux.matrices_by_tau)
         self.assertEqual(set(aux.occurrence_counts), {"tjo:layer1", "tjo:layer2"})

@@ -79,7 +79,7 @@ class JodieTGNAdapter(HostAdapter):
         self._local_zero_dim = host_dim + self.n_neighbors * host_dim
 
         self._trace_top_rows = set()
-        self.trace = None
+        self._trace = None
         self._next_oid = 0
 
     # ------------------------------------------------------------ tracing hooks
@@ -88,7 +88,7 @@ class JodieTGNAdapter(HostAdapter):
 
     def clear_trace(self) -> None:
         self._trace_top_rows = set()
-        self.trace = None
+        self._trace = None
 
     @property
     def trace(self) -> Optional[RecursiveTrace]:
@@ -128,13 +128,13 @@ class JodieTGNAdapter(HostAdapter):
             if 0 <= row < len(active):
                 active[row] = True
         if active.any():
-            self.trace = RecursiveTrace()
+            self._trace = RecursiveTrace()
             self._next_oid = 0
         else:
-            self.trace = None
+            self._trace = None
         z, ids = self._compute(memory, source_nodes, timestamps,
                                int(n_layers), int(n_neighbors), active)
-        if self.trace is not None:
+        if self._trace is not None:
             roots, rows = [], []
             for row in np.flatnonzero(active):
                 oid = int(ids[row])

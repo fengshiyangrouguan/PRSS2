@@ -71,7 +71,7 @@ def make_tgn(node_features, edge_features, sources, destinations,
         embedding_module_type="graph_attention", message_function="identity",
         mean_time_shift_src=ms, std_time_shift_src=ss,
         mean_time_shift_dst=md, std_time_shift_dst=sd,
-        n_neighbors=n_neighbors, aggregator_type="last"), device
+        n_neighbors=n_neighbors, aggregator_type="last").to(device), device
 
 
 @REQUIRES_NUMPY_BRIDGE
@@ -96,14 +96,20 @@ class TestVendorTGNForward(unittest.TestCase):
             self.assertTrue(torch.isfinite(emb).all())
 
     def test_memory_advances_after_batch(self):
+        """Official message loop: batch N's messages are consumed by batch
+        N+1 (memory_update_at_start), so a single first batch cannot move the
+        memory — two batches can."""
         tgn = self.tgn
         tgn.train()
-        before = tgn.memory.memory.data.clone()
         src, dst, ts = self.batch
+        # First forward only registers messages (nothing to consume yet).
+        tgn.compute_temporal_embeddings(src, dst, dst, ts,
+                                        self.edge_idxs[:8], n_neighbors=4)
+        before = tgn.memory.memory.data.clone()
+        # Second forward consumes the first batch's messages: memory moves.
         tgn.compute_temporal_embeddings(src, dst, dst, ts,
                                         self.edge_idxs[:8], n_neighbors=4)
         after = tgn.memory.memory.data.clone()
-        # The batch touches at least one memory cell; the memory must move.
         self.assertFalse(torch.equal(before, after))
 
     def test_layer0_equals_raw_source_features(self):
@@ -217,17 +223,28 @@ class TestMessageChain(unittest.TestCase):
         self.assertTrue(tgn.memory.memory.requires_grad is False)
 
     def test_clear_messages_after_update(self):
-        """Upstream invariant: messages consumed by update are cleared."""
+        """Upstream message loop: a forward registers messages at its end;
+        the following forward consumes and clears them, then registers a fresh
+        batch. Observable as: register -> consume (memory moves) -> re-register."""
         (sources, destinations, timestamps, edge_idxs, labels,
          node_features, edge_features) = make_synthetic_data()
         tgn, device = make_tgn(node_features, edge_features, sources,
                                destinations, timestamps)
         tgn.train()
         src, dst, ts = (sources[:8], destinations[:8], timestamps[:8])
+        # First forward: nothing to consume, only registration happens.
         tgn.compute_temporal_embeddings(src, dst, dst, ts, edge_idxs[:8],
                                         n_neighbors=4)
         self.assertTrue(
-            all(len(v) == 0 for v in tgn.memory.messages.values()))
+            any(len(v) > 0 for v in tgn.memory.messages.values()))
+        # Second forward: consumes the first batch (memory moves) and
+        # re-registers fresh messages for the next batch.
+        before = tgn.memory.memory.data.clone()
+        tgn.compute_temporal_embeddings(src, dst, dst, ts, edge_idxs[:8],
+                                        n_neighbors=4)
+        self.assertFalse(torch.equal(before, tgn.memory.memory.data.clone()))
+        self.assertTrue(
+            any(len(v) > 0 for v in tgn.memory.messages.values()))
 
 
 if __name__ == "__main__":

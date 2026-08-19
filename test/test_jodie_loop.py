@@ -118,10 +118,17 @@ class TestLoopSmoke(unittest.TestCase):
         sources, destinations, timestamps, edge_idxs, labels = stream
         self.tgn = tgn
         self.device = device
-        self.train = JodieData(sources, destinations, timestamps, edge_idxs,
-                               labels)
-        self.val = JodieData(sources[:20], destinations[:20], timestamps[:20],
-                             edge_idxs[:20], labels[:20])
+        # Train = rows 0..59, val = 60..79, test = 80..99: timestamps are
+        # sorted, so val/test continue the train stream (upstream semantics),
+        # never rewinding into the past (which trips the memory monotonicity
+        # assert). The test split lets replay(train)+replay(val) flow straight
+        # into evaluate(test) without replaying anything twice.
+        self.train = JodieData(sources[:60], destinations[:60],
+                               timestamps[:60], edge_idxs[:60], labels[:60])
+        self.val = JodieData(sources[60:80], destinations[60:80],
+                             timestamps[60:80], edge_idxs[60:80], labels[60:80])
+        self.test = JodieData(sources[80:], destinations[80:],
+                              timestamps[80:], edge_idxs[80:], labels[80:])
         config, prss = make_tiny_prss(variant="spectral")
         adapter = install_adapter(tgn, prss)
         logt = np.log1p(timestamps.astype(np.float64))
@@ -171,7 +178,7 @@ class TestLoopSmoke(unittest.TestCase):
         self.loop.replay_split(self.train)
         self.loop.replay_split(self.val)
         before_counts, before_r = self.loop.audit_before()
-        test_row = self.loop.evaluate_split(self.train, reset=False)
+        test_row = self.loop.evaluate_split(self.test, reset=False)
         self.loop.audit_after(before_counts, before_r, "test")
         self.loop.reenable_spectral()
         self.assertIn("auc", test_row)

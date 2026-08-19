@@ -168,6 +168,11 @@ def build_components(args, device, dataset):
         std_time_shift_dst=sd,
     ).to(device)
     state = unwrap_state(load_torch(args.pretrained_checkpoint, device))
+    # Self-supervised checkpoints carry their link-prediction decoder
+    # (affinity_score.*) at the top level; the supervised protocol rebuilds
+    # its own decoder, so those keys are dropped before strict validation.
+    state = {key: value for key, value in state.items()
+             if not key.startswith("affinity_score.")}
     # Memory is a runtime state produced by the pretraining stream, not a
     # parameter to carry across runs. The v1 checkpoint's memory cells are
     # sized for the un-padded node set (9228) while the vendored TGN pads one

@@ -43,13 +43,13 @@ def make_tiny_prss(variant="vanilla", n_layers=2, host_dim=8, time_dim=8,
     return config, PRSSCore(config).to(device)
 
 
-def make_tiny_tgn():
+def make_tiny_tgn(n_layers=2):
     (sources, destinations, timestamps, edge_idxs, labels,
      node_features, edge_features) = make_synthetic_data(
         n_nodes=32, n_interactions=100, feat_dim=8, timestamp_scale=50.0)
     tgn, device = make_tgn(
         node_features, edge_features, sources, destinations, timestamps,
-        edge_idxs, n_layers=2, n_heads=2, n_neighbors=4,
+        edge_idxs, n_layers=n_layers, n_heads=2, n_neighbors=4,
         memory_dimension=8, message_dimension=8)
     return tgn, device, (sources, destinations, timestamps, edge_idxs, labels)
 
@@ -99,6 +99,26 @@ class TestIdentityParity(unittest.TestCase):
             self.assertEqual(tuple(a.shape), tuple(b.shape))
             self.assertTrue(torch.allclose(a, b, atol=1e-5),
                             "adapter forward diverges from bare host")
+
+    def test_vanilla_forward_bitwise_matches_bare_host_l1(self):
+        """Single-layer host (official reddit config, n_layer=1): the adapter
+        recurses one level and must still equal the bare host bitwise."""
+        tgn, device, (sources, destinations, timestamps, edge_idxs, labels) = \
+            make_tiny_tgn(n_layers=1)
+        bare = make_tiny_tgn(n_layers=1)[0]
+        bare.load_state_dict(tgn.state_dict())
+        config, prss = make_tiny_prss(variant="vanilla", n_layers=1,
+                                      candidate_dim=8, device=device)
+        install_adapter(tgn, prss)
+        src_emb_a, dst_emb_a, neg_emb_a = forward_batch(
+            tgn, sources, destinations, timestamps, edge_idxs, train=False)
+        src_emb_b, dst_emb_b, neg_emb_b = forward_batch(
+            bare, sources, destinations, timestamps, edge_idxs, train=False)
+        for a, b in zip((src_emb_a, dst_emb_a, neg_emb_a),
+                        (src_emb_b, dst_emb_b, neg_emb_b)):
+            self.assertEqual(tuple(a.shape), tuple(b.shape))
+            self.assertTrue(torch.allclose(a, b, atol=1e-5),
+                            "L=1 adapter forward diverges from bare host")
 
     def test_forward_without_trace_is_bit_identical_to_traced_off(self):
         tgn, device, (sources, destinations, timestamps, edge_idxs, labels) = \

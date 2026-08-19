@@ -126,8 +126,10 @@ def load_torch(path, device):
 
 
 def unwrap_state(obj):
-    if isinstance(obj, dict) and "model_state_dict" in obj:
-        return obj["model_state_dict"]
+    if isinstance(obj, dict):
+        for key in ("model_state_dict", "tgn"):
+            if key in obj and isinstance(obj[key], dict):
+                return obj[key]
     return obj
 
 
@@ -142,7 +144,7 @@ def build_components(args, device, dataset):
     BEFORE the embedding module is swapped for the adapter."""
     full, train, val, test = dataset.splits()
     train_finder = get_neighbor_finder(train, uniform=False,
-                                       max_node_idx=int(full.unique_nodes.max()))
+                                       max_node_idx=max(full.unique_nodes))
     ms, ss, md, sd = dataset.time_stats()
     tgn = TGN(
         neighbor_finder=train_finder,
@@ -166,8 +168,18 @@ def build_components(args, device, dataset):
         std_time_shift_dst=sd,
     ).to(device)
     state = unwrap_state(load_torch(args.pretrained_checkpoint, device))
+    # Memory is a runtime state produced by the pretraining stream, not a
+    # parameter to carry across runs. The v1 checkpoint's memory cells are
+    # sized for the un-padded node set (9228) while the vendored TGN pads one
+    # zero node (9229, upstream convention), so those keys are skipped and the
+    # memory starts zeroed (reset_memory) — exactly the held-out protocol.
+    MEMORY_STATE_KEYS = ("memory.memory", "memory.last_update",
+                         "memory_updater.memory.memory",
+                         "memory_updater.memory.last_update")
+    for key in MEMORY_STATE_KEYS:
+        state.pop(key, None)
     missing, unexpected = tgn.load_state_dict(state, strict=False)
-    if missing or unexpected:
+    if set(missing) != set(MEMORY_STATE_KEYS) or unexpected:
         raise RuntimeError(
             "pretrained TGN mismatch: missing={}, unexpected={}".format(
                 sorted(missing), sorted(unexpected)))

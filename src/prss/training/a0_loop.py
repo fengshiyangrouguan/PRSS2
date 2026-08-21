@@ -24,10 +24,12 @@ import torch
 import torch.nn.functional as F
 
 from prss.a0.audit import (ResidualAccumulator, evaluate_gates,
-                           path_gain_report)
-from prss.a0.operators import OperatorRidge, chi_sigma, chi_width
+                           path_gain_report, proper_score_regret)
+from prss.a0.operators import (OperatorRidge, TensorSketchFeatures, chi_sigma,
+                               chi_width)
 from prss.a0.probes import A0Probes, propagate_root_labels, stack_by_tau
 from prss.a0.quotient import A0Quotient
+from prss.a0.weights import DensityRatioWeights
 from prss.hosts.jodie_tgn import TAU_TEMPLATE
 from prss.hosts.official_tgn import MLP
 from prss.training.jodie_loop import metric_bundle, select_trace_rows
@@ -41,7 +43,10 @@ class A0NodeClassificationLoop:
                  n_neighbors, trace_roots, trace_mode, rank_r, lambda_x,
                  lambda_gamma, lambda_audit, frac_a, frac_b, frac_c,
                  d_slice_only, gates, gate_mode, monitor, seed, out_dir,
-                 lr, n_epoch, patience, drop_out, selection_metric="auc"):
+                 lr, n_epoch, patience, drop_out, selection_metric="auc",
+                 use_weights=False, weight_calib_frac=0.2, w_min=0.1,
+                 w_max=10.0, chi_mode="meanpool", sketch_s=64,
+                 deploy_events=0):
         self.tgn = tgn
         self.adapter = adapter
         self.prss_core = prss_core
@@ -61,6 +66,19 @@ class A0NodeClassificationLoop:
         self.d_slice_only = bool(d_slice_only)
         self.gates = gates or {}
         self.gate_mode = gate_mode
+        self.use_weights = bool(use_weights)
+        self.weight_calib_frac = float(weight_calib_frac)
+        self.w_min = float(w_min)
+        self.w_max = float(w_max)
+        self.chi_mode = chi_mode
+        if self.chi_mode not in ("meanpool", "sketch"):
+            raise ValueError("unknown chi_mode {}".format(self.chi_mode))
+        self.sketch_feats = (TensorSketchFeatures(self.rank_r,
+                                                  probes.d_context,
+                                                  s=sketch_s, seed=seed)
+                             if self.chi_mode == "sketch" else None)
+        self.deploy_events = int(deploy_events)
+        self.weight_report = {}
         self.monitor = monitor
         self.seed = int(seed)
         self.out_dir = out_dir
@@ -80,13 +98,26 @@ class A0NodeClassificationLoop:
             tau: A0Quotient(tau, p=self.host_dim, m=2 * d_context)
             for tau in self.taus}
         self.operators: Dict[tuple, OperatorRidge] = {}
-        s = chi_width(self.rank_r, d_context)
+        s = (self.sketch_feats.width() if self.sketch_feats is not None
+             else chi_width(self.rank_r, d_context))
         for l in range(1, self.n_layers + 1):
             key = (TAU_TEMPLATE.format(l - 1), TAU_TEMPLATE.format(l))
             self.operators[key] = OperatorRidge(
                 child_tau=key[0], parent_tau=key[1], s=s, r=self.rank_r)
         self.top_tau = TAU_TEMPLATE.format(self.n_layers)
         self._epoch_rows: List[Dict] = []
+
+    def _chi(self, z_source, z_neigh_list, a_parent):
+        """Interaction features for one parent occurrence (mode-dependent)."""
+        if self.sketch_feats is not None:
+            z_neigh = (torch.stack(z_neigh_list, dim=0) if z_neigh_list
+                       else torch.zeros(0, self.rank_r,
+                                        dtype=z_source.dtype,
+                                        device=z_source.device))
+            return self.sketch_feats.chi(z_source, z_neigh, a_parent)
+        z_neigh_mean = (torch.stack(z_neigh_list).mean(dim=0) if z_neigh_list
+                        else torch.zeros_like(z_source))
+        return chi_sigma(z_source, z_neigh_mean, a_parent)
 
     # ------------------------------------------------------------- stream prims
     def reset_memory(self):
@@ -134,7 +165,48 @@ class A0NodeClassificationLoop:
         self.reset_memory()
         self.tgn.eval()
         self.adapter.clear_trace()
-        for k in range(steps):
+        # Context-overlap weights (doc 5.4): the first part of the A window
+        # fits per-tau density ratios; the rest accumulates the importance-
+        # corrected moments.  Unweighted mode keeps the previous behavior.
+        fit_weights = None
+        cal_rows = {tau: [] for tau in self.taus}  # (X, A) pairs for the fit
+        if self.use_weights:
+            n_cal = max(1, int(steps * self.weight_calib_frac))
+            quota = max(1, math.ceil(2000 / max(n_cal, 1)))
+            for k in range(n_cal):
+                s, e = k * self.batch_size, min(len(train.sources),
+                                                (k + 1) * self.batch_size)
+                collected = self._collect_trace(train, k, train.labels[s:e])
+                if collected is None:
+                    continue
+                _, stacks, _ = collected
+                for tau, st in stacks.items():
+                    if len(cal_rows[tau]) < quota * n_cal:
+                        n_take = min(quota, int(st["X"].shape[0]))
+                        cal_rows[tau].append((st["X"][:n_take].detach(),
+                                              st["A"][:n_take].detach()))
+                self.adapter.clear_trace()
+            fit_weights = {}
+            self.weight_report = {}
+            for tau in self.taus:
+                if not cal_rows[tau]:
+                    continue
+                x_rows = torch.cat([r[0] for r in cal_rows[tau]], dim=0)
+                a_rows = torch.cat([r[1] for r in cal_rows[tau]], dim=0)
+                model = DensityRatioWeights(self.w_min, self.w_max)
+                model.fit(x_rows, a_rows)
+                w = model.weights(x_rows, a_rows)
+                fit_weights[tau] = model
+                self.weight_report[tau] = {
+                    "n_cal": int(x_rows.shape[0]),
+                    "ess": DensityRatioWeights.ess(w),
+                    "ess_frac": DensityRatioWeights.ess(w) / x_rows.shape[0],
+                    "w_mean": float(w.mean().item()),
+                    "w_max": float(w.max().item()),
+                }
+        acc_start = max(1, int(steps * self.weight_calib_frac)) \
+            if self.use_weights else 0
+        for k in range(acc_start, steps):
             s, e = k * self.batch_size, min(len(train.sources),
                                             (k + 1) * self.batch_size)
             collected = self._collect_trace(train, k, train.labels[s:e])
@@ -142,7 +214,10 @@ class A0NodeClassificationLoop:
                 continue
             _, stacks, _ = collected
             for tau, st in stacks.items():
-                self.quotients[tau].accumulate(st["X"], st["U"])
+                w = None
+                if fit_weights and tau in fit_weights:
+                    w = fit_weights[tau].weights(st["X"], st["A"])
+                self.quotients[tau].accumulate(st["X"], st["U"], w=w)
             self.adapter.clear_trace()
         solve_info = {}
         for tau, q in self.quotients.items():
@@ -186,10 +261,8 @@ class A0NodeClassificationLoop:
                         z_neigh.append(zc)
                 if z_source is None:
                     continue
-                z_neigh_mean = (torch.stack(z_neigh).mean(dim=0)
-                                if z_neigh else torch.zeros_like(z_source))
                 a_parent = self.probes.probe_a(occ.local_features.detach())
-                phi = chi_sigma(z_source, z_neigh_mean, a_parent)
+                phi = self._chi(z_source, z_neigh, a_parent)
                 key = self._operator_key(occ)
                 acc[key]["phi"].append(phi)
                 acc[key]["z"].append(z_by_oid[occ.occurrence_id])
@@ -227,6 +300,12 @@ class A0NodeClassificationLoop:
                   for tau in self.taus}
         closure_sums = {key: 0.0 for key in self.operators}
         closure_n = {key: 0 for key in self.operators}
+        # Proper-score rows (uniform per-batch quota keeps the window bounded).
+        proper_quota = max(1, math.ceil(20000 / max(steps, 1)))
+        proper_z = {tau: [] for tau in self.taus}
+        proper_x = {tau: [] for tau in self.taus}
+        proper_y = {tau: [] for tau in self.taus}
+        lev_rows = {key: [] for key in self.operators}
         total_rows = 0
         for k in range(steps):
             s, e = k * self.batch_size, min(len(train.sources),
@@ -242,6 +321,11 @@ class A0NodeClassificationLoop:
                 pred_z[tau].accumulate(z_rows, st["U"])
                 pred_x[tau].accumulate(st["X"], st["U"])
                 total_rows += int(st["X"].shape[0])
+                n_take = min(proper_quota, int(st["X"].shape[0]))
+                proper_z[tau].append(z_rows[:n_take].detach())
+                proper_x[tau].append(st["X"][:n_take].detach().to(
+                    dtype=torch.float64))
+                proper_y[tau].append(st["Y"][:n_take].detach())
             for occ in trace.occurrences.values():
                 if occ.metadata.get("layer", 0) < 1:
                     continue
@@ -259,10 +343,8 @@ class A0NodeClassificationLoop:
                         z_neigh.append(zc)
                 if z_source is None:
                     continue
-                z_neigh_mean = (torch.stack(z_neigh).mean(dim=0)
-                                if z_neigh else torch.zeros_like(z_source))
                 a_parent = self.probes.probe_a(occ.local_features.detach())
-                phi = chi_sigma(z_source, z_neigh_mean, a_parent)
+                phi = self._chi(z_source, z_neigh, a_parent)
                 key = self._operator_key(occ)
                 op = self.operators[key]
                 z_rec = op.predict(phi.unsqueeze(0))[0]
@@ -271,9 +353,17 @@ class A0NodeClassificationLoop:
                 diff = sigma * (z_rich - z_rec)
                 closure_sums[key] += float((diff * diff).sum().item())
                 closure_n[key] += 1
+                if len(lev_rows[key]) < proper_quota:
+                    lev_rows[key].append(phi.detach())
             self.adapter.clear_trace()
 
         audit = {"ess": total_rows}
+        if self.weight_report:
+            audit["context_weights"] = self.weight_report
+            audit["ess_frac_min"] = min(
+                v["ess_frac"] for v in self.weight_report.values())
+        else:
+            audit["ess_frac_min"] = 1.0
         per_tau_pred = {}
         rank_tails = []
         for tau in self.taus:
@@ -290,6 +380,17 @@ class A0NodeClassificationLoop:
                 - per_tau_pred[tau]["unrestricted_ridge_residual"])
         audit["rank_tail_max"] = max(rank_tails) if rank_tails else 0.0
         audit["prediction_by_tau"] = per_tau_pred
+        # Proper-score regret per interface (doc 5.7.2): the compressed vs
+        # rich readout gap under the log/Brier scoring rules, depth-stratified.
+        proper_regret = {}
+        for tau in self.taus:
+            if proper_z[tau]:
+                proper_regret[tau] = proper_score_regret(
+                    torch.cat(proper_z[tau], dim=0),
+                    torch.cat(proper_x[tau], dim=0),
+                    torch.cat(proper_y[tau], dim=0),
+                    lambda_reg=self.lambda_audit)
+        audit["proper_score_regret_by_tau"] = proper_regret
         closure_by_sigma = {}
         for key, op in self.operators.items():
             name = "{}->{}".format(*key)
@@ -304,8 +405,22 @@ class A0NodeClassificationLoop:
             (v["closure_residual"] for v in closure_by_sigma.values()),
             default=0.0)
         audit["sibling_support"] = {
-            "{}->{}".format(*key): op.condition_number
+            "{}->{}".format(*key): {
+                "condition_number": op.condition_number,
+                "effective_rank": op.effective_rank,
+            }
             for key, op in self.operators.items()}
+        # Train-to-audit leverage/OOD scores (doc 5.7.6): h_i in [0,1] for
+        # in-support rows with mean s/n; rows with h_i >> 1 are OOD.
+        for key, op in self.operators.items():
+            name = "{}->{}".format(*key)
+            if lev_rows[key]:
+                h = op.leverage(torch.stack(lev_rows[key], dim=0))
+                audit["sibling_support"][name].update({
+                    "leverage_mean": float(h.mean().item()),
+                    "leverage_max": float(h.max().item()),
+                    "leverage_frac_gt_1": float((h > 1.0).float().mean().item()),
+                })
         audit.update(path_gain_report(list(self.operators.values())))
         gate_out = evaluate_gates(audit, self.gates, mode=self.gate_mode,
                                   phase="C")
@@ -454,6 +569,127 @@ class A0NodeClassificationLoop:
         out["delta_ap"] = test_a["ap"] - test_b["ap"]
         return out
 
+    # -------------------------------------------------------------- deployment
+    def _lift_map(self, q):
+        """Min-norm lift of an r-dim state back into the host width:
+        P_lift = (R Rᵀ + εI)^{-1} R, so deploy-time preagg blocks can feed
+        the same fixed context probe (z @ P_lift is host-width)."""
+        r_mat = q.r_matrix
+        eye = torch.eye(int(r_mat.shape[0]), dtype=torch.float64,
+                        device=r_mat.device)
+        gram_inv = torch.linalg.inv(
+            r_mat @ r_mat.transpose(0, 1) + 1e-6 * eye)
+        return (gram_inv @ r_mat).clone()
+
+    @torch.no_grad()
+    def deploy_recursive(self, data, max_events=None, verbose=False):
+        """Doc 5.8 deployment: leaf-to-root recursion of r-dimensional states
+        through the frozen B̂, no host memory, no host aggregate.
+
+        Reports deploy-vs-rich root-state deviation, wall time per event, and
+        the state footprint (r vs the host embedding width).
+        """
+        host = self.adapter.host
+        n_events = (int(max_events) if max_events
+                    else min(len(data.sources), 500))
+        lifts = {tau: self._lift_map(q) for tau, q in self.quotients.items()}
+        device = self.device
+        zero_time = torch.zeros(1, 1, device=device)
+        # Upstream TimeEncode emits (1, 1, time_dim); take the single row.
+        source_time = host.time_encoder(zero_time)[0, 0]
+
+        def deploy_state(v, ts):
+            """Recursive r-state of node v at time ts (full tree, B̂ at every
+            internal node)."""
+            def recurse(node, t, layer):
+                if layer == 0:
+                    x0 = host.node_features[int(node)].to(device).float()
+                    return self.quotients[TAU_TEMPLATE.format(0)].project(
+                        x0.unsqueeze(0))[0]
+                child_tau = TAU_TEMPLATE.format(layer - 1)
+                tau = TAU_TEMPLATE.format(layer)
+                z_src = recurse(node, t, layer - 1)
+                neighbors, eidxs, etimes = \
+                    host.neighbor_finder.get_temporal_neighbor(
+                        np.asarray([node]), np.asarray([t]),
+                        n_neighbors=self.n_neighbors)
+                z_neigh, blocks = [], []
+                for j in range(self.n_neighbors):
+                    nb = int(neighbors[0, j])
+                    if nb == 0:
+                        blocks.append(None)
+                        continue
+                    z_j = recurse(nb, float(etimes[0, j]), layer - 1)
+                    z_neigh.append(z_j)
+                    edge_t = host.time_encoder(torch.tensor(
+                        [[float(t) - float(etimes[0, j])]],
+                        device=device))[0, 0]
+                    edge_f = host.edge_features[
+                        int(eidxs[0, j])].to(device)
+                    lift = lifts[child_tau]
+                    blocks.append((z_j, edge_t, edge_f))
+                # Deploy preagg: source/neighbor blocks lifted into host width,
+                # edge time/features and mask as in the training packing.
+                lift_child = lifts[child_tau]
+                src_block = (z_src @ lift_child).float()
+                rows = [src_block, source_time]
+                for j in range(self.n_neighbors):
+                    b = blocks[j]
+                    if b is None:
+                        rows.extend([torch.zeros_like(src_block),
+                                     torch.zeros_like(source_time),
+                                     torch.zeros(int(host.n_edge_features),
+                                                 device=device)])
+                    else:
+                        z_j, edge_t, edge_f = b
+                        rows.extend([(z_j @ lift_child).float(), edge_t,
+                                     edge_f])
+                mask = torch.zeros(self.n_neighbors, device=device)
+                for j in range(self.n_neighbors):
+                    if blocks[j] is None:
+                        mask[j] = 1.0
+                rows.append(mask)
+                flat = torch.cat(rows, dim=-1)
+                if flat.shape[-1] != self.probes.preagg_dim:
+                    raise ValueError("deploy preagg width mismatch: {} vs {}"
+                                     .format(flat.shape[-1],
+                                             self.probes.preagg_dim))
+                a_deploy = self.probes.probe_a(flat)
+                chi = self._chi(z_src, z_neigh, a_deploy)
+                op = self.operators[(child_tau, tau)]
+                return op.predict(chi.unsqueeze(0))[0]
+            return recurse(v, ts, self.n_layers)
+
+        import time
+        start = time.time()
+        rich_devs = []
+        n_done = 0
+        for k in range(0, n_events, self.batch_size):
+            s, e = k, min(n_events, k + self.batch_size)
+            src_emb = self._forward(data.sources[s:e], data.destinations[s:e],
+                                    data.timestamps[s:e], data.edge_idxs[s:e])
+            z_rich = self.quotients[self.top_tau].project(src_emb)
+            for i, row in enumerate(range(s, e)):
+                z_dep = deploy_state(int(data.sources[row]),
+                                     float(data.timestamps[row]))
+                dev = float((self.quotients[self.top_tau].sigma
+                             * (z_rich[i] - z_dep)).norm().item())
+                rich_devs.append(dev)
+                n_done += 1
+        elapsed = max(time.time() - start, 1e-9)
+        return {
+            "events": n_done,
+            "deploy_vs_rich_deviation_mean": float(
+                sum(rich_devs) / max(len(rich_devs), 1)),
+            "deploy_vs_rich_deviation_max": max(rich_devs, default=0.0),
+            "wall_seconds": elapsed,
+            "events_per_second": n_done / elapsed,
+            "state_dim_deployed": self.rank_r,
+            "state_dim_host": self.host_dim,
+            "state_bytes_per_node_deployed": self.rank_r * 4,
+            "state_bytes_per_node_host": self.host_dim * 4,
+        }
+
     # --------------------------------------------------------------------- run
     def run(self, train, val, test) -> Dict:
         n_total = self._num_batches(train)
@@ -481,6 +717,9 @@ class A0NodeClassificationLoop:
         summary.update(d_info)
         # G4's gate key is auc_delta (the A0-minus-baseline test AUC gap).
         summary["auc_delta"] = d_info.get("delta_auc")
+        if self.deploy_events > 0:
+            summary["deployment"] = self.deploy_recursive(
+                train, max_events=self.deploy_events)
         summary["gates_d"] = evaluate_gates(
             summary, self.gates, mode=self.gate_mode, phase="D")
         if self.gate_mode == "stop" and summary["gates_d"].get("failed_gates"):

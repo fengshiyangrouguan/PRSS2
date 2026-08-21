@@ -59,8 +59,13 @@ class A0Quotient:
         self.solved = False
 
     @torch.no_grad()
-    def accumulate(self, x: torch.Tensor, u: torch.Tensor) -> None:
-        """Batch-accumulate (x rows, u rows); x must be the detach'ed lift."""
+    def accumulate(self, x: torch.Tensor, u: torch.Tensor,
+                   w: torch.Tensor = None) -> None:
+        """Batch-accumulate (x rows, u rows) with optional row weights.
+
+        Unweighted rows count n += batch size; weighted rows count the weight
+        sum (importance-corrected moments, theory doc 5.4).
+        """
         if self.solved:
             raise RuntimeError("quotient {} already frozen".format(self.tau))
         x = x.detach().to(dtype=torch.float64)
@@ -68,19 +73,27 @@ class A0Quotient:
         if x.shape[-1] != self.p or u.shape[-1] != self.m:
             raise ValueError("width mismatch for {}: x {}, u {}".format(
                 self.tau, x.shape, u.shape))
+        if w is not None:
+            w = w.detach().to(dtype=torch.float64)
+            if w.shape[0] != x.shape[0]:
+                raise ValueError("weight count mismatch for {}".format(
+                    self.tau))
         if self.c_ux.device != x.device:
             self.c_ux = self.c_ux.to(x.device)
             self.c_xx = self.c_xx.to(x.device)
             self.s_x = self.s_x.to(x.device)
             self.s_u = self.s_u.to(x.device)
-        self.c_ux.add_(u.transpose(0, 1) @ x)
-        self.c_xx.add_(x.transpose(0, 1) @ x)
-        self.s_x.add_(x.sum(dim=0))
-        self.s_u.add_(u.sum(dim=0))
-        self.n += int(x.shape[0])
+        wu = u * w.unsqueeze(-1) if w is not None else u
+        wx = x * w.unsqueeze(-1) if w is not None else x
+        self.c_ux.add_(wu.transpose(0, 1) @ x)
+        self.c_xx.add_(wx.transpose(0, 1) @ x)
+        self.s_x.add_(wx.sum(dim=0))
+        self.s_u.add_(wu.sum(dim=0))
+        self.n += float(w.sum().item()) if w is not None else int(x.shape[0])
 
     def centered_moments(self):
-        """Streaming-centered C_xx/N and C_ux/N."""
+        """Streaming-centered C_xx/n and C_ux/n (weight-aware: n is the
+        accumulated weight sum, means are the weighted means)."""
         if self.n == 0:
             raise RuntimeError("quotient {} has no accumulated rows".format(self.tau))
         mu_x = self.s_x / self.n

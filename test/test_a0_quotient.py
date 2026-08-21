@@ -15,9 +15,12 @@ import unittest
 import torch
 
 from prss.a0.audit import (closure_residual, evaluate_gates, path_gain_report,
-                           prediction_residuals, relative_residual)
-from prss.a0.operators import OperatorRidge, chi_sigma, chi_width
+                           prediction_residuals, proper_score_regret,
+                           relative_residual)
+from prss.a0.operators import (OperatorRidge, TensorSketchFeatures, chi_sigma,
+                               chi_width)
 from prss.a0.quotient import A0Quotient, randomized_svd
+from prss.a0.weights import DensityRatioWeights
 
 
 def _seeded(seed=0):
@@ -280,6 +283,74 @@ class TestXorContextSwitch(unittest.TestCase):
 # ------------------------------------------------- recursive operators (phase B)
 
 
+class TestDensityRatioWeights(unittest.TestCase):
+    """Importance weights correct a context distribution that depends on the
+    history (doc 5.4): observed pi(C|H) vs the history-free rho."""
+
+    def _stream(self, n, gen):
+        """H binary uniform; C = H w.p. 0.9 (biased); Y independent Bernoulli."""
+        h_v = torch.randint(0, 2, (n,), generator=gen)
+        c_v = torch.where(torch.rand(n, generator=gen) < 0.9, h_v, 1 - h_v)
+        y_v = torch.randint(0, 2, (n,), generator=gen).float()
+        h = torch.nn.functional.one_hot(h_v, 2).float()
+        c = torch.nn.functional.one_hot(c_v, 2).float()
+        return h, c, y_v
+
+    def test_weights_correct_biased_moments(self):
+        gen = _seeded(29)
+        n = 20000
+        h, c, y = self._stream(n, gen)
+        model = DensityRatioWeights()
+        model.fit(h, c)
+        w = model.weights(h, c)
+        # ESS drops well below n in the biased setting (context carries H).
+        ess = DensityRatioWeights.ess(w)
+        self.assertLess(ess / n, 0.85)
+        # True rho-marginal moment: E_u[a(C)⊗phi_Y | H=0] = [.25]*4.
+        phi = torch.stack([1 - y, y], dim=-1)
+        u = torch.cat([c * phi[:, :1], c * phi[:, 1:]], dim=-1)
+        mask0 = h[:, 0] > 0.5
+        true = torch.full((4,), 0.25, dtype=torch.float64)
+        mu_unw = u[mask0].double().mean(dim=0)
+        mu_w = (u[mask0].double() * w[mask0].unsqueeze(-1)).sum(dim=0) \
+            / w[mask0].sum()
+        err_unw = float((mu_unw - true).norm())
+        err_w = float((mu_w - true).norm())
+        # The raw observed moment is far off (0.9/0.1 split vs 0.5/0.5); the
+        # weighted moment recovers the reference-measure value.
+        self.assertGreater(err_unw, 0.3)
+        self.assertLess(err_w, 0.5 * err_unw)
+        # Individual cells: biased [0.45, 0.05, ...] -> corrected ~0.25.
+        self.assertAlmostEqual(float(mu_w[0]), 0.25, delta=0.03)
+        self.assertAlmostEqual(float(mu_w[1]), 0.25, delta=0.03)
+
+    def test_weighted_quotient_matches_reference_moment(self):
+        """The weighted quotient accumulation feeds the corrected moments
+        into solve() unchanged, and weighting visibly changes the moments."""
+        gen = _seeded(30)
+        h, c, y = self._stream(8000, gen)
+        model = DensityRatioWeights()
+        model.fit(h, c)
+        w = model.weights(h, c)
+        phi = torch.stack([1 - y, y], dim=-1)
+        u = torch.cat([c * phi[:, :1], c * phi[:, 1:]], dim=-1)
+        q_w = A0Quotient("t", p=2, m=4)
+        q_w.accumulate(h, u, w=w)
+        q_0 = A0Quotient("t", p=2, m=4)
+        q_0.accumulate(h, u)
+        cxx_w, cux_w = q_w.centered_moments()
+        _, cux_0 = q_0.centered_moments()
+        self.assertTrue(torch.isfinite(cxx_w).all())
+        self.assertTrue(torch.isfinite(cux_w).all())
+        self.assertGreater(float((cux_w - cux_0).abs().max()), 0.01)
+        # Weighted count is the weight sum, not the row count.
+        self.assertAlmostEqual(q_w.n, float(w.sum().item()), places=2)
+        self.assertEqual(int(q_0.n), 8000)
+
+
+# ------------------------------------------------- recursive operators (phase B)
+
+
 class TestOperatorRidge(unittest.TestCase):
     def test_chi_layout(self):
         gen = _seeded(20)
@@ -321,6 +392,70 @@ class TestOperatorRidge(unittest.TestCase):
         op.solve()
         manual = float(torch.linalg.norm(op.b_matrix[:, 1:1 + r], ord=2))
         self.assertAlmostEqual(op.gain(), manual, places=5)
+
+    def test_tensor_sketch_deterministic_and_width(self):
+        r, d_c, s = 4, 6, 32
+        sk = TensorSketchFeatures(r, d_c, s=s, seed=0)
+        gen = _seeded(31)
+        z_s = torch.randn(r, generator=gen)
+        z_n = torch.randn(3, r, generator=gen)
+        a = torch.randn(d_c, generator=gen)
+        chi1 = sk.chi(z_s, z_n, a)
+        chi2 = sk.chi(z_s, z_n, a)
+        self.assertEqual(chi1.shape[-1], 3 * s)
+        self.assertTrue(torch.equal(chi1, chi2))
+
+    def test_tensor_sketch_neighbor_symmetry(self):
+        """Unordered neighbors: permuting the neighbor list must not change
+        the power-sum-symmetrized sketch."""
+        r, d_c, s = 4, 6, 32
+        sk = TensorSketchFeatures(r, d_c, s=s, seed=0)
+        gen = _seeded(32)
+        z_s = torch.randn(r, generator=gen)
+        z_n = torch.randn(4, r, generator=gen)
+        a = torch.randn(d_c, generator=gen)
+        perm = torch.tensor([2, 0, 3, 1])
+        chi_a = sk.chi(z_s, z_n, a)
+        chi_b = sk.chi(z_s, z_n[perm], a)
+        self.assertTrue(torch.allclose(chi_a, chi_b, atol=1e-10))
+
+    def test_sketch_ridge_recovers_its_own_operator_class(self):
+        """A linear operator on the sketch features is recoverable by the
+        sketch ridge (self-consistency of the feature class)."""
+        r, d_c, s = 4, 6, 32
+        sk = TensorSketchFeatures(r, d_c, s=s, seed=0)
+        gen = _seeded(33)
+        n = 2000
+        z_s = torch.randn(n, r, generator=gen)
+        z_n = torch.randn(n, 3, r, generator=gen)
+        a = torch.randn(n, d_c, generator=gen)
+        phi = torch.stack([sk.chi(z_s[i], z_n[i], a[i]) for i in range(n)])
+        w_true = torch.randn(3 * s, r, generator=gen)
+        z_rich = phi.double() @ w_true.double()
+        op = OperatorRidge("tjo:layer0", "tjo:layer1", s=3 * s, r=r)
+        op.accumulate(phi, z_rich)
+        op.solve(lambda_gamma=1e-6)
+        pred = op.predict(phi[:100])
+        target = z_rich[:100].double()
+        rel = float((pred - target).abs().max() / target.abs().max())
+        self.assertLess(rel, 1e-3)
+
+    def test_leverage_scores_in_support_and_ood(self):
+        """In-support rows have mean leverage s/n and stay below 1 for a
+        well-conditioned design; far-outside rows score >> 1 (OOD flag)."""
+        gen = _seeded(28)
+        r, s = 3, 1 + 3 * 3 + 2
+        op = OperatorRidge("tjo:layer0", "tjo:layer1", s=s, r=r)
+        n = 100
+        phi = torch.randn(n, s, generator=gen)
+        op.accumulate(phi, torch.randn(n, r, generator=gen))
+        op.solve(lambda_gamma=1e-3)
+        h_in = op.leverage(phi)
+        self.assertLess(abs(float(h_in.mean()) - s / n), 0.03)
+        self.assertLess(float(h_in.max()), 1.0)
+        h_ood = op.leverage(phi + 3.0)
+        self.assertGreater(float(h_ood.mean()), 1.0)
+        self.assertGreater(float(h_ood.max()), 2.0)
 
 
 # ----------------------------------------------------------------- audit (C)
@@ -384,6 +519,25 @@ class TestAudit(unittest.TestCase):
         report = path_gain_report(ops)
         self.assertEqual(set(report["gain_by_parent_layer"]), {1, 2})
         self.assertGreater(report["path_gain_product"], 0.0)
+
+    def test_proper_score_regret_semantics(self):
+        """Same readout class on compressed vs rich features: full-information
+        coordinates carry ~zero regret; independent noise carries positive
+        regret under both scoring rules."""
+        gen = _seeded(27)
+        n = 2000
+        x = torch.randn(n, 6, generator=gen)
+        w_true = torch.randn(6, generator=gen)
+        y = (torch.sigmoid(x @ w_true) > torch.rand(n, generator=gen)).float()
+        # Full information: z contains everything.
+        full = proper_score_regret(x, x, y)
+        self.assertLess(abs(full["log_regret"]), 0.02)
+        self.assertLess(abs(full["brier_regret"]), 0.005)
+        # Noise coordinates: regret must be positive (compression costs).
+        z_noise = torch.randn(n, 4, generator=gen)
+        bad = proper_score_regret(z_noise, x, y)
+        self.assertGreater(bad["log_regret"], 0.0)
+        self.assertGreater(bad["brier_regret"], 0.0)
 
 
 if __name__ == "__main__":

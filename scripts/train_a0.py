@@ -74,6 +74,14 @@ def parse_args():
                    help="Phase-A ridge on C_xx")
     p.add_argument("--lambda-gamma", type=float, default=1e-3,
                    help="Phase-B ridge on the interaction design")
+    p.add_argument("--chi-mode", choices=["meanpool", "sketch"],
+                   default="meanpool",
+                   help="Interaction feature class (doc 5.6)")
+    p.add_argument("--sketch-s", type=int, default=64,
+                   help="TensorSketch bucket count (sketch mode)")
+    p.add_argument("--deploy-events", type=int, default=0,
+                   help="Doc 5.8: audit the r-dim recursive deployment on the "
+                        "first N train events (0 disables)")
     p.add_argument("--lambda-audit", type=float, default=1e-3,
                    help="Phase-C audit ridge")
     p.add_argument("--frac-a", type=float, default=0.2)
@@ -84,6 +92,14 @@ def parse_args():
     p.add_argument("--trace-roots", type=int, default=16)
     p.add_argument("--trace-mode", default="evenly_spaced",
                    choices=["positive_first", "evenly_spaced", "off"])
+    # Context-overlap weights (doc 5.4).
+    p.add_argument("--use-weights", action="store_true",
+                   help="Importance-correct the conditional moments to a "
+                        "history-independent reference context measure")
+    p.add_argument("--weight-calib-frac", type=float, default=0.2,
+                   help="Fraction of the A window used to fit the density ratios")
+    p.add_argument("--w-min", type=float, default=0.1)
+    p.add_argument("--w-max", type=float, default=10.0)
     # Phase D readout training.
     p.add_argument("--lr", type=float, default=3e-4)
     p.add_argument("--n-epoch", type=int, default=10)
@@ -91,6 +107,7 @@ def parse_args():
     p.add_argument("--selection-metric", choices=["auc", "ap"], default="auc")
     # Failure gates (None = report only; set to enforce in stop mode).
     p.add_argument("--gate-mode", choices=["report", "stop"], default="report")
+    p.add_argument("--g0-min-ess-frac", type=float, default=None)
     p.add_argument("--g1-max-rank-tail", type=float, default=None)
     p.add_argument("--g2-max-closure-resid", type=float, default=None)
     p.add_argument("--g3-max-gain-product", type=float, default=None)
@@ -242,6 +259,7 @@ def main():
     tgn = components["tgn"]
 
     gates = {
+        "G0": args.g0_min_ess_frac,
         "G1": args.g1_max_rank_tail,
         "G2": args.g2_max_closure_resid,
         "G3": args.g3_max_gain_product,
@@ -264,6 +282,8 @@ def main():
         "frac_b": args.frac_b,
         "frac_c": args.frac_c,
         "d_slice_only": args.d_slice_only,
+        "use_weights": args.use_weights,
+        "weight_calib_frac": args.weight_calib_frac,
         "gate_mode": args.gate_mode,
         "gates": gates,
         "train": {"pairs": train.n_interactions,
@@ -302,6 +322,13 @@ def main():
         d_slice_only=args.d_slice_only,
         gates=gates,
         gate_mode=args.gate_mode,
+        use_weights=args.use_weights,
+        weight_calib_frac=args.weight_calib_frac,
+        w_min=args.w_min,
+        w_max=args.w_max,
+        chi_mode=args.chi_mode,
+        sketch_s=args.sketch_s,
+        deploy_events=args.deploy_events,
         monitor=monitor,
         seed=args.seed,
         out_dir=out,

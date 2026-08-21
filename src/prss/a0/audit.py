@@ -76,6 +76,71 @@ def relative_residual(features, targets, lambda_reg: float) -> float:
                      1e-12))
 
 
+# ------------------------------------------------------------ proper scores
+
+def _logistic_ridge(features, targets, lambda_reg=1e-3, n_iter=20):
+    """IRLS fit of a logistic readout p = sigmoid(F w); returns w (float64).
+
+    A strict proper scoring rule (log/Brier) evaluates this same small
+    readout class on compressed vs rich histories (theory doc 5.7.2).
+    """
+    features = features.detach().to(dtype=torch.float64)
+    targets = targets.detach().to(dtype=torch.float64)
+    d = features.shape[-1]
+    w = torch.zeros(d, dtype=torch.float64, device=features.device)
+    eye = torch.eye(d, dtype=torch.float64, device=features.device)
+    for _ in range(int(n_iter)):
+        eta = features @ w
+        p = torch.sigmoid(eta).clamp_min(1e-6)
+        wt = (p * (1.0 - p)).clamp_min(1e-6)
+        working = eta + (targets - p) / wt
+        fw = features * wt.sqrt().unsqueeze(-1)
+        gram = fw.transpose(0, 1) @ fw + lambda_reg * eye
+        rhs = (fw.transpose(0, 1) @ (working * wt.sqrt())).unsqueeze(-1)
+        chol = torch.linalg.cholesky(gram)
+        w = torch.cholesky_solve(rhs, chol).squeeze(-1)
+    return w
+
+
+def _score(p, y):
+    p = p.clamp(1e-9, 1.0 - 1e-9)
+    log_score = float(-(y * p.log() + (1.0 - y) * (1.0 - p).log()).mean())
+    brier = float(((p - y) ** 2).mean())
+    return log_score, brier
+
+
+def proper_score_regret(z_rows, x_rows, y_rows, lambda_reg=1e-3,
+                        fit_frac=0.6, n_iter=20) -> Dict:
+    """Log/Brier regret of the compressed readout vs the rich-history readout.
+
+    ``z_rows`` (n, r) compressed coordinates, ``x_rows`` (n, p) rich history,
+    ``y_rows`` (n,) labels.  The first fit_frac rows fit the logistic
+    readouts; the rest evaluate both scores (lower is better, so a positive
+    regret means the compression costs prediction quality).
+    """
+    n = int(z_rows.shape[0])
+    n_fit = max(1, int(n * fit_frac))
+    if n < 2 * max(2, z_rows.shape[-1]):
+        return {"n": n, "n_fit": n_fit, "n_eval": 0,
+                "log_regret": float("nan"), "brier_regret": float("nan")}
+    y = y_rows.detach().to(dtype=torch.float64)
+    w_z = _logistic_ridge(z_rows[:n_fit], y[:n_fit], lambda_reg, n_iter)
+    w_x = _logistic_ridge(x_rows[:n_fit], y[:n_fit], lambda_reg, n_iter)
+    p_z = torch.sigmoid(z_rows[n_fit:].to(dtype=torch.float64) @ w_z)
+    p_x = torch.sigmoid(x_rows[n_fit:].to(dtype=torch.float64) @ w_x)
+    log_z, brier_z = _score(p_z, y[n_fit:])
+    log_x, brier_x = _score(p_x, y[n_fit:])
+    return {
+        "n": n, "n_fit": n_fit, "n_eval": n - n_fit,
+        "log_score_compressed": log_z,
+        "log_score_rich": log_x,
+        "brier_compressed": brier_z,
+        "brier_rich": brier_x,
+        "log_regret": log_z - log_x,
+        "brier_regret": brier_z - brier_x,
+    }
+
+
 def prediction_residuals(u_rows, x_rows, z_rows, lambda_audit: float) -> Dict:
     """G1 support: eps_pred on the r-dimensional coordinate vs the unrestricted
     (full-x) ridge baseline on the same rows."""
@@ -126,7 +191,7 @@ def path_gain_report(operators) -> Dict:
 
 GATE_DEFS = {
     # gate: (audit_key, comparator, doc)
-    "G0": ("ess", "min", "context-overlap identifiability"),
+    "G0": ("ess_frac_min", "min", "context-overlap identifiability"),
     "G1": ("rank_tail_max", "max", "fixed-budget compressibility"),
     "G2": ("closure_residual_max", "max", "recursive closure"),
     "G3": ("path_gain_product", "max", "deep-tree stability"),

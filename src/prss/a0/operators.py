@@ -1,11 +1,15 @@
 """A0 phase B: per-constructor recursive operators by convex ridge.
 
 Each constructor sigma maps one source child plus a variable-length neighbor
-sibling set to the parent interface (the TGN recursion).  Fixed multiaffine
-interaction features (theory doc 5.6, mean-pooled siblings in this first
-version, no TensorSketch):
+sibling set to the parent interface (the TGN recursion).  Two fixed
+interaction feature classes (theory doc 5.6):
 
-    chi_sigma(z_s, z_bar_n, a) = [1; z_s; z_bar_n; z_s ⊙ z_bar_n; a]
+- ``meanpool``: chi = [1; z_s; z_bar_n; z_s ⊙ z_bar_n; a] (exact multiaffine
+  on the mean-pooled sibling summary);
+- ``sketch``: TensorSketch features over the augmented tensor product
+  b(o) ⊗ [1; z_s] ⊗ ⊗_i [1; z_i] — per-factor CountSketch maps, sibling
+  symmetry via power sums, width 3s (Pham-Pagh style, no explicit
+  Kronecker).
 
 The operator is a one-shot multi-output ridge solve on an independent data
 window; B̂ is frozen afterwards (never a gradient parameter).
@@ -16,7 +20,7 @@ import torch
 
 def chi_sigma(z_source: torch.Tensor, z_neigh_mean: torch.Tensor,
               a_parent: torch.Tensor) -> torch.Tensor:
-    """Fixed interaction features for one constructor step.
+    """Fixed mean-pool interaction features for one constructor step.
 
     ``z_source`` (r,), ``z_neigh_mean`` (r,) (zero vector when there are no
     neighbor children), ``a_parent`` (d_c,).  Returns (s,) with s = 1+3r+d_c.
@@ -34,6 +38,70 @@ def chi_width(r: int, d_context: int) -> int:
     return 1 + 3 * r + d_context
 
 
+class TensorSketchFeatures:
+    """Fixed CountSketch maps for the augmented tensor-product features.
+
+    Each factor ([1; z_s], [1; z_i], a) gets its own seed-fixed CountSketch
+    (s buckets, random signs); the sketch of the tensor product is the
+    elementwise product of the factor sketches.  Unordered neighbors are
+    symmetrized by power sums (first and second order), so the width is 3s
+    regardless of the neighbor count (doc 5.6 eq. 9).
+    """
+
+    def __init__(self, r: int, d_context: int, s: int = 64, seed: int = 0):
+        self.r = int(r)
+        self.d_context = int(d_context)
+        self.s = int(s)
+        gen = torch.Generator().manual_seed(int(seed) + 9173)
+        self.h_src = torch.randint(0, self.s, (self.r + 1,), generator=gen)
+        self.sg_src = (torch.randint(0, 2, (self.r + 1,), generator=gen)
+                       * 2 - 1).float()
+        self.h_nb = torch.randint(0, self.s, (self.r + 1,), generator=gen)
+        self.sg_nb = (torch.randint(0, 2, (self.r + 1,), generator=gen)
+                      * 2 - 1).float()
+        self.h_obs = torch.randint(0, self.s, (self.d_context,), generator=gen)
+        self.sg_obs = (torch.randint(0, 2, (self.d_context,), generator=gen)
+                       * 2 - 1).float()
+
+    def width(self) -> int:
+        return 3 * self.s
+
+    def _sketch(self, x, h, sg):
+        """x (..., d) -> (..., s) CountSketch (bucket sums with signs)."""
+        flat = x.reshape(-1, x.shape[-1]).double()
+        out = torch.zeros(flat.shape[0], self.s, dtype=torch.float64,
+                          device=x.device)
+        idx = h.to(device=x.device).expand(flat.shape[0], -1)
+        vals = flat * sg.to(dtype=x.dtype, device=x.device)
+        out.scatter_add_(1, idx, vals)
+        return out.reshape(*x.shape[:-1], self.s)
+
+    def chi(self, z_source: torch.Tensor, z_neighbors: torch.Tensor,
+            a_parent: torch.Tensor) -> torch.Tensor:
+        """Sketch chi for one constructor step.
+
+        ``z_source`` (r,), ``z_neighbors`` (k, r) (may be empty), ``a_parent``
+        (d_c,).  Returns (3s,).
+        """
+        one = torch.ones(1, device=z_source.device, dtype=z_source.dtype)
+        s_src = self._sketch(torch.cat([one, z_source.double()]),
+                             self.h_src, self.sg_src)
+        s_obs = self._sketch(a_parent.double().unsqueeze(0),
+                             self.h_obs, self.sg_obs).squeeze(0)
+        nb_sum = torch.zeros(self.s, dtype=torch.float64, device=z_source.device)
+        nb_sq = torch.zeros_like(nb_sum)
+        if z_neighbors.shape[0] > 0:
+            aug = torch.cat([torch.ones(z_neighbors.shape[0], 1,
+                                        device=z_source.device,
+                                        dtype=torch.float64),
+                             z_neighbors.double()], dim=-1)
+            sk = self._sketch(aug, self.h_nb, self.sg_nb)
+            nb_sum = sk.sum(dim=0)
+            nb_sq = (sk * sk).sum(dim=0)
+        return torch.cat([s_src * s_obs, nb_sum * s_obs, nb_sq * s_obs],
+                         dim=-1)
+
+
 class OperatorRidge:
     """Streaming ΦᵀΦ / ΦᵀZ plus one-shot frozen ridge B̂ for one constructor."""
 
@@ -48,6 +116,7 @@ class OperatorRidge:
         self.b_matrix = None        # (r, s) frozen
         self.condition_number = None
         self.effective_rank = None
+        self._chol_l = None         # ridge design Cholesky (leverage scores)
 
     @torch.no_grad()
     def accumulate(self, phi: torch.Tensor, z_rich: torch.Tensor) -> None:
@@ -77,6 +146,7 @@ class OperatorRidge:
         a = self.phi_phi + lambda_gamma * eye
         chol = torch.linalg.cholesky(a)
         self.b_matrix = torch.cholesky_solve(self.phi_z, chol).transpose(0, 1)
+        self._chol_l = chol  # kept for leverage/OOD scores
         design = self.phi_phi / max(self.n, 1)
         eig = torch.linalg.eigvalsh(design).clamp_min(0.0)
         if float(eig[-1].item()) > 0:
@@ -94,6 +164,24 @@ class OperatorRidge:
                 self.child_tau, self.parent_tau))
         b_t = self.b_matrix.transpose(0, 1).to(device=phi.device)
         return phi.double() @ b_t
+
+    @torch.no_grad()
+    def leverage(self, phi: torch.Tensor) -> torch.Tensor:
+        """Hat-diagonal scores h_i = ‖L⁻¹ φ_i‖² under the ridge design.
+
+        For in-support rows h_i ∈ [0, 1] with mean s/n; rows with h_i ≫ 1
+        live outside the training support (doc 5.7.6: train-to-deploy OOD
+        score — collinear brothers concentrate leverage and OOD rows stick
+        out).
+        """
+        if self._chol_l is None:
+            raise RuntimeError("operator {}->{} not solved".format(
+                self.child_tau, self.parent_tau))
+        phi = phi.detach().to(dtype=torch.float64)
+        l = self._chol_l.to(device=phi.device)
+        solved = torch.linalg.solve_triangular(
+            l, phi.transpose(0, 1), upper=False).transpose(0, 1)
+        return (solved * solved).sum(dim=-1)
 
     def gain(self) -> float:
         """Estimated Lipschitz gain on the source-child block of chi.

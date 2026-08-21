@@ -56,7 +56,8 @@ class TestA0LoopSmoke(unittest.TestCase):
             lambda_gamma=1e-3, lambda_audit=1e-3, frac_a=0.2, frac_b=0.2,
             frac_c=0.2, d_slice_only=False, gates=None, gate_mode="report",
             monitor=monitor, seed=0, out_dir=self.out_dir, lr=3e-4,
-            n_epoch=2, patience=3, drop_out=0.1, selection_metric="auc")
+            n_epoch=2, patience=3, drop_out=0.1, selection_metric="auc",
+            deploy_events=8)
 
     def test_four_phases_run_and_outputs(self):
         summary = self.loop.run(self.train, self.val, self.test)
@@ -86,6 +87,14 @@ class TestA0LoopSmoke(unittest.TestCase):
             self.assertTrue(np.isfinite(summary[head]["test"]["nll"]))
             self.assertIn("auc", summary[head]["test"])
         self.assertIn("delta_auc", summary)
+        # Deployment audit (doc 5.8): r-dim recursion ran with finite state
+        # deviation and a smaller footprint than the host width.
+        self.assertIn("deployment", summary)
+        dep = summary["deployment"]
+        self.assertEqual(dep["events"], 8)
+        self.assertTrue(np.isfinite(dep["deploy_vs_rich_deviation_mean"]))
+        self.assertEqual(dep["state_dim_deployed"], 3)
+        self.assertLess(dep["state_dim_deployed"], dep["state_dim_host"])
         # Four output files.
         for name in ("metrics.jsonl", "summary.json", "_SUCCESS.json"):
             self.assertTrue((self.out_dir / name).exists(), name)

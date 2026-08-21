@@ -46,6 +46,9 @@ class ResidualAccumulator:
         if f.shape[-1] != self.ftf.shape[0] or t.shape[-1] != self.ftt.shape[1]:
             raise ValueError("width mismatch: {} vs {}".format(
                 (f.shape, t.shape), (self.ftf.shape, self.ftt.shape)))
+        if self.ftf.device != f.device:
+            self.ftf = self.ftf.to(f.device)
+            self.ftt = self.ftt.to(f.device)
         self.ftf.add_(f.transpose(0, 1) @ f)
         self.ftt.add_(f.transpose(0, 1) @ t)
         self.tt_sum += float((t * t).sum().item())

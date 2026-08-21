@@ -31,10 +31,10 @@ class A0Probes:
         generator = torch.Generator()
         generator.manual_seed(int(seed) + 7717)
         p_c = torch.randn(self.d_context, self.preagg_dim,
-                          device=device, dtype=torch.float32,
-                          generator=generator)
+                          dtype=torch.float32, generator=generator)
         # Row-normalized so every context row lives on a comparable scale.
-        self.p_c = p_c / (p_c.norm(dim=-1, keepdim=True).clamp_min(1e-8))
+        p_c = p_c / (p_c.norm(dim=-1, keepdim=True).clamp_min(1e-8))
+        self.p_c = p_c.to(device)
         self.device = device
 
     def probe_a(self, local_features: torch.Tensor) -> torch.Tensor:
@@ -80,6 +80,11 @@ def stack_by_tau(trace, oid_labels: Dict[int, float], probes: A0Probes,
     """
     by_tau: Dict[str, Dict[str, List[torch.Tensor]]] = {}
     for occ in trace.occurrences.values():
+        # Skip occurrences unreachable from any root: the host builds padded
+        # neighbor occurrences (node 0) that the parent's mask drops, and a
+        # cut without a root has no label to condition on (doc 4.4).
+        if occ.occurrence_id not in oid_labels:
+            continue
         tau = occ.tau
         x = occ.state.candidate.detach()
         a = probes.probe_a(occ.local_features.detach())

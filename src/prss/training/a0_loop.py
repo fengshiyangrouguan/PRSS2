@@ -167,11 +167,13 @@ class A0NodeClassificationLoop:
                                             train.labels[s:e])
             if collected is None:
                 continue
-            trace, _, _ = collected
+            trace, _, oid_labels = collected
             z_by_oid = self._z_by_oid(trace)
             for occ in trace.occurrences.values():
                 if occ.metadata.get("layer", 0) < 1:
                     continue
+                if occ.occurrence_id not in oid_labels:
+                    continue  # padded-neighbor orphan: no root label (probes.py)
                 z_source = None
                 z_neigh = []
                 for cid, rel in zip(occ.children, occ.child_relations):
@@ -233,7 +235,7 @@ class A0NodeClassificationLoop:
                                             train.labels[s:e])
             if collected is None:
                 continue
-            trace, stacks, _ = collected
+            trace, stacks, oid_labels = collected
             z_by_oid = self._z_by_oid(trace)
             for tau, st in stacks.items():
                 z_rows = self.quotients[tau].project(st["X"])
@@ -243,6 +245,8 @@ class A0NodeClassificationLoop:
             for occ in trace.occurrences.values():
                 if occ.metadata.get("layer", 0) < 1:
                     continue
+                if occ.occurrence_id not in oid_labels:
+                    continue  # padded-neighbor orphan: no root label (probes.py)
                 z_source = None
                 z_neigh = []
                 for cid, rel in zip(occ.children, occ.child_relations):

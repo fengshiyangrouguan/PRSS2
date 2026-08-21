@@ -60,6 +60,9 @@ class OperatorRidge:
         if phi.shape[-1] != self.s or z_rich.shape[-1] != self.r:
             raise ValueError("width mismatch for {}->{}: phi {}, z {}".format(
                 self.child_tau, self.parent_tau, phi.shape, z_rich.shape))
+        if self.phi_phi.device != phi.device:
+            self.phi_phi = self.phi_phi.to(phi.device)
+            self.phi_z = self.phi_z.to(phi.device)
         self.phi_phi.add_(phi.transpose(0, 1) @ phi)
         self.phi_z.add_(phi.transpose(0, 1) @ z_rich)
         self.n += int(phi.shape[0])

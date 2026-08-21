@@ -68,6 +68,11 @@ class A0Quotient:
         if x.shape[-1] != self.p or u.shape[-1] != self.m:
             raise ValueError("width mismatch for {}: x {}, u {}".format(
                 self.tau, x.shape, u.shape))
+        if self.c_ux.device != x.device:
+            self.c_ux = self.c_ux.to(x.device)
+            self.c_xx = self.c_xx.to(x.device)
+            self.s_x = self.s_x.to(x.device)
+            self.s_u = self.s_u.to(x.device)
         self.c_ux.add_(u.transpose(0, 1) @ x)
         self.c_xx.add_(x.transpose(0, 1) @ x)
         self.s_x.add_(x.sum(dim=0))

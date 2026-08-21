@@ -6,7 +6,7 @@
 
 ---
 
-# 第一部分：给人看的
+# 第一部分
 
 ## 1. A0 是什么（一句话）
 
@@ -194,7 +194,48 @@ cd /root/autodl-tmp/PRSS2
 
 辅助：`plot_tb_json.py --json --outdir [--epoch-steps]`（TB JSON 画图）、`tb_export.py --logdir --outdir [--epochs-per-step]`（TensorBoard 导出 PNG）、`protocol_ab.py --checkpoint [--gpu] [--output]`（协议 A/B 诊断，输出 JSON）。
 
-## 6. summary 的审计表怎么看
+## 6. 调参指南
+
+A0 的设计让调参有章可循：**每个参数都有对应的审计指标当导航，不是盲调**。
+
+### 6.1 第一档：真正需要调的（A0 线核心 5 个）
+
+| 参数 | 默认 | 调什么 | 调参技巧（审计导航） |
+|---|---|---|---|
+| `--r` | 32 | 压缩预算 | **看 `rank_tail_max` 定**：跑完 C 阶段后——tail 大（>0.2）说明 r 不够用，往上加；tail 小且 r=32→64 分数不涨，说明 32 已饱和。正式实验建议直接跑 r∈{16,32,64} 三点画 Pareto（维度 vs AUC），论文里这也是呈现方式，不浪费 |
+| `--lambda-gamma` | 1e-3 | 阶段 B 设计正则 | **看 `sibling_support` 条件数**：cond < 100 → λ 可降到 1e-4；cond 1e7+（wiki 真实数据很可能，冒烟实测 8700 万）→ λ 加大到 1e-2~1e-1，否则 B̂ 在共线方向过拟合噪声 |
+| `--lambda-x` | 1e-4 | 阶段 A 白化正则 | 诊断信号：solve 后 R 行范数爆炸 / z 幅度异常 → λ 太小；C_xx 条件差（特征共线）→ 加到 1e-3~1e-2 |
+| `--frac-a` | 0.2 | A 窗口比例 | **看 quotient 的 n（行数）**：n 应远大于 p=172。wiki 全量 0.2 够（~5 万行）；数据 <2 万行时 A 提到 0.3（R 是最重要的估计，值得多吃） |
+| `--trace-roots` | 16 | A/B/C 采样密度 | 统计质量 ∝ 这个数。时间允许就往上加（32）；冒烟时减小到 4~8 |
+
+### 6.2 第二档：实验设计型选项（不是调参，是对照组）
+
+| 参数 | 用法 |
+|---|---|
+| `--chi-mode meanpool/sketch` | meanpool 保基线，sketch 作升级对照（邻居多时表达力强）。两个都跑，比较 closure_residual |
+| `--use-weights` | **先关跑一轮** → 若结果异常或怀疑上下文与历史强耦合 → 开权重跑第二轮对比。开权重要看 `ess_frac_min`：<0.2 说明修正勉强（G0 预警） |
+| `--d-context` | 与 r 配合：u 宽 = 2×d_context 必须 ≥ 预期的有效秩，否则 M 被 clamp。看谱的显著值数量，d_context 至少取显著秩的一半以上 |
+| `--deploy-events` | 调完所有参数后最后开，只看不调（部署偏差/吞吐是产出不是输入） |
+
+### 6.3 第三档：不要动的（动了就破坏对比口径）
+
+- **宿主超参**（`--bs/n-degree/n-layer/message-dim/memory-dim/drop-out`）：必须与预训练 checkpoint 一致，改了权重就对不上；
+- **D 阶段默认**（`--lr 3e-4 / --n-epoch 10 / --patience 3`）：与 JODIE 线同口径，baseline decoder 的 0.8871 self-check 锚点依赖这些默认值——**改了锚点就复现不了，连 baseline 是不是对都不知道**；
+- **TGB 线 `--grad-clip` 必须 0**（代码注释里实测踩过：这个宿主梯度合法到 1e9，开裁剪直接冻死训练）；
+- **门阈值不是调参**：先 `--gate-mode report` 跑出真实值，再按"真实值 × 1.5"定阈值写进预注册，之后 `stop` 模式执行。
+
+### 6.4 通用方法论（六条）
+
+1. **先跑后调**：A0 的审计表就是调参地图——每个参数有专属诊断指标（r↔rank_tail、λ_gamma↔cond、frac_a↔n），永远先看数再动手；
+2. **一次只改一个**：双头设计下 A0 参数只影响 A0 头、baseline 不动——单次变更的因果干净；
+3. **小数据验证合法性**：`--max-train 3000` 冒烟先确认参数组合不爆数值，全量只跑确定配置（省 GPU 时间）；
+4. **λ 的尺度启发式**：λ 要和设计矩阵特征值尺度匹配——cond 大就加大 λ，判断标准是 B̂ 的 condition_number 和 leverage 分数回到合理区间；
+5. **调参目标是被审计，不是刷分**：目标 = G0–G3 过线 + G4 非负，不是无脑最高 AUC——这是文档的哲学，也防审稿人质疑"增益是调参调出来的"；
+6. **seed 是最后一道**：固定投影 P_c 和 trace 采样都受 seed 影响，定参后 3 seeds 报方差。
+
+**实用建议**：wiki 全量第一轮先跑 `--r 32` + `--gate-mode report`（不带门阈值），跑完看审计表 → 用 6.1 的第 1、2 条调整 λ/r → 第二轮再跑 `stop` 模式 + r=64。这样 6 个 run 里前 2 个是"诊断 run"，后面 4 个才是正式对比 run，不浪费。
+
+## 7. summary 的审计表怎么看
 
 | 字段 | 白话 | 健康标准 |
 |---|---|---|
@@ -207,7 +248,7 @@ cd /root/autodl-tmp/PRSS2
 | `deployment.deploy_vs_rich_deviation_mean` | r 维递归状态 vs 宿主前向状态的偏差 | 小 = 部署保真 |
 | `deployment.state_bytes_per_node_*` | 每节点状态内存（r×4B vs host×4B） | A0 的成本优势证据 |
 
-## 7. 验证口径与锚点（预注册判据）
+## 8. 验证口径与锚点（预注册判据）
 
 - **A0 vs vanilla = run 内部双头**：同一次前向训练 A0 readout（z_root，r 维）与 baseline decoder（x_root，宿主维），各自 val 早停，同 test 段。`delta_auc = A0 − baseline` 直接可读。
 - **baseline decoder 是内置 self-check**：wiki 上应复现 **0.8871 ± 0.002**（train_jodie vanilla 锚点）。不复现 = 宿主装配有 bug，该 run 的 A0 数字一并作废。
@@ -215,7 +256,7 @@ cd /root/autodl-tmp/PRSS2
 - **TGB wiki 五变体锚点**（test_mrr）：spectral 0.3897 > pca 0.3633 > vanilla 0.3369 > random 0.3190 > direct 0.2936。
 - 正式实验跑前先写好 `docs/a0_preregistration.md`（文档 11.4 五个"若…则…"断言 + 阈值，commit 留时间戳）。
 
-## 8. 云端环境速查
+## 9. 云端环境速查
 
 | 项 | 值 |
 |---|---|
@@ -229,7 +270,7 @@ cd /root/autodl-tmp/PRSS2
 
 # 第二部分：给 Claude Code 的协议与坑
 
-## 9. 操作约定（必须遵守）
+## 10. 操作约定（必须遵守）
 
 1. **耗时操作先征得用户同意**（训练/下载/全量测试）；本机单测与合成实验可直接跑。
 2. **部署流程**：本地开发 + 本机单测 → commit + push（GitHub）→ scp 到云端对应路径 → 云端 `pytest` + 冒烟 → 下载 `outputs/` 归档本地。
@@ -238,7 +279,7 @@ cd /root/autodl-tmp/PRSS2
 5. **图表 CJK 限制**：本机 matplotlib 缺中文字体，图内 suptitle/标签用英文。
 6. **测试分工**：本机 `pytest test/test_a0_quotient.py`（纯 torch）；`test/test_a0_loop.py` 与 `test_jodie_*` 数值测试需要 numpy bridge → 云端跑；本机 `test_tgb_smoke` 因 tgb 未装必然失败（环境问题，非回归）。
 
-## 10. 已知坑清单（新会话必读）
+## 11. 已知坑清单（新会话必读）
 
 1. **numpy bridge 本机坏**（torch.from_numpy 失败）→ 数值测试必须云端；纯 torch 构造可本机。
 2. **padding 邻居孤儿 occurrence**：jodie_tgn 为 mask 掉的 node-0 邻居也建了 occurrence 但父不引用 → `propagate_root_labels` 覆盖不到。A/B/C 阶段一律只处理 roots 可达的 occ（probes.py 的 stack_by_tau 内跳过，loop 的父遍历 `if occ.occurrence_id not in oid_labels: continue`）。
@@ -252,7 +293,7 @@ cd /root/autodl-tmp/PRSS2
 10. **部署 lift 方向**：`P_lift = (RRᵀ+εI)⁻¹R`（r×p），用法 `z @ P_lift` → host 宽度。
 11. **冒烟小数据的退化现象**（非 bug）：3000 行 cap 下 rank_tail=0（正例太少）、cond 爆表（B 窗口 6 batch）、deploy 偏差大——全量数据才有统计意义。
 
-## 11. 未完成工作清单（接手方向）
+## 12. 未完成工作清单（接手方向）
 
 | 类别 | 项 | 依据 |
 |---|---|---|
@@ -261,7 +302,7 @@ cd /root/autodl-tmp/PRSS2
 | 实验 | wiki 全量 r=32/64 × seeds（预注册先行）、enron、11.3 全基线列表 | 文档 11 |
 | 文档 | `docs/a0_preregistration.md` 预注册预测 | 文档 11.4 |
 
-## 12. 版本记录
+## 13. 版本记录
 
 - 2026-08-21：A0 训练线初版（commit 44e289a）→ GPU 修复（6e795d2）→ 合成实验套件（8919845）→ 方法补全五件套（7849986：proper-score 分层 / leverage-OOD / 重要性权重+G0 / TensorSketch / 递归部署 v2）。云端 29 项测试全绿，冒烟四件套跑通。
-- 2026-08-21：使用文档首版（1c63c16）+ 五入口全参数速查（本节 5.1–5.5）。
+- 2026-08-21：使用文档首版（1c63c16）+ 五入口全参数速查（5.1–5.5）+ 调参指南（第 6 节，三档分类 + 六条方法论）。

@@ -86,7 +86,115 @@ cd /root/autodl-tmp/PRSS2
 
 **输出四件套**（与 JODIE 线同约定）：`config.json`（一次性）、`metrics.jsonl`（D 阶段每 epoch 一行）、`summary.json`（含 audit 表 + 部署审计 + 双头指标）、`_SUCCESS.json`（哨兵，status=complete/stopped + stop_reason）。
 
-## 5. summary 的审计表怎么看
+## 5. 全部入口参数速查（五入口全量）
+
+### 5.1 `scripts/train_a0.py`（A0 四阶段线）
+
+| 参数 | 默认 | 说明 |
+|---|---|---|
+| `-d/--data` | wikipedia | 数据集名（ml_{name}.csv 三件套） |
+| `--data-dir` | 必填 | 数据目录（本机 `old/processed_tgn_data`） |
+| `--pretrained-checkpoint` | 必填 | 预训练 TGN 权重（云端 `outputs/pretrained/tgn-wikipedia.pth`） |
+| `--output` | 必填 | 输出目录（四件套） |
+| `--seed` / `--gpu` | 0 / 0 | |
+| `--bs` | 100 | 批大小（时间序连续切片） |
+| `--n-degree` | 10 | 邻居数（决定 preagg 宽度） |
+| `--n-head` / `--n-layer` | 2 / 2 | 宿主注意力头/层数（必须与预训练一致） |
+| `--drop-out` / `--message-dim` / `--memory-dim` | 0.1 / 100 / 172 | 宿主超参（必须与预训练一致） |
+| `--r` | 32 | **压缩维数（固定预算）** |
+| `--d-context` | 32 | 上下文探针宽度（u 宽 = 2×d_context） |
+| `--lambda-x` | 1e-4 | 阶段 A 白化 ridge |
+| `--lambda-gamma` | 1e-3 | 阶段 B 交互设计 ridge |
+| `--lambda-audit` | 1e-3 | 阶段 C 审计 ridge |
+| `--chi-mode` | meanpool | `sketch` = TensorSketch 交互特征 |
+| `--sketch-s` | 64 | sketch 模式桶数（χ 宽 = 3s） |
+| `--deploy-events` | 0 | >0 开启 r 维递归部署审计（前 N 事件） |
+| `--frac-a/--frac-b/--frac-c` | 0.2 | train 流内 A/B/C 窗口比例（和必须 <1） |
+| `--d-slice-only` | 关 | D 阶段只用 C 后剩余行（默认全 train） |
+| `--trace-roots` | 16 | 每 batch 追迹根数（A/B/C 采样密度） |
+| `--trace-mode` | evenly_spaced | 根选择：`evenly_spaced` / `positive_first` / `off` |
+| `--use-weights` | 关 | 重要性权重 + 真 G0（A 窗口前 20% 估密度比） |
+| `--weight-calib-frac` | 0.2 | 权重校准占 A 窗口比例 |
+| `--w-min` / `--w-max` | 0.1 / 10.0 | 权重截断区间 |
+| `--lr` | 3e-4 | D 阶段双头学习率（各自 Adam） |
+| `--n-epoch` / `--patience` | 10 / 3 | D 阶段轮数与早停耐心（双头独立早停） |
+| `--selection-metric` | auc | 早停指标：`auc` / `ap` |
+| `--gate-mode` | report | `stop` = 门失败即终止（不换求解器回环） |
+| `--g0-min-ess-frac` | None | G0：ESS 占比下限（如 0.2） |
+| `--g1-max-rank-tail` | None | G1：谱尾上限 |
+| `--g2-max-closure-resid` | None | G2：闭合残差上限 |
+| `--g3-max-gain-product` | None | G3：路径增益积上限 |
+| `--g4-min-auc-delta` | None | G4：A0−baseline AUC 差下限 |
+| `--monitor-every` / `--no-fail-on-monitor-error` | 50 / 关 | 监控频率 / 容忍监控报错 |
+| `--max-train/--max-val/--max-test` | 0 | 冒烟截断（0=不限） |
+
+### 5.2 `scripts/train_jodie.py`（JODIE 节点分类线，旧谱压缩 5 变体）
+
+| 参数 | 默认 | 说明 |
+|---|---|---|
+| `--variant` | spectral | `vanilla` / `random` / `pca` / `direct` / `spectral`（vanilla = 纯官方宿主无 PRSS） |
+| `-d/--data` | wikipedia | `wikipedia` / `reddit`（mooc/lastfm 标签全 0 跑不了） |
+| `--data-dir` / `--pretrained-checkpoint` / `--output` | 必填 | 同上 |
+| `--seed` / `--gpu` / `--bs` | 0 / 0 / 100 | |
+| `--n-degree` / `--n-head` / `--n-layer` | 10 / 2 / 2 | 宿主（与预训练一致；官方 reddit checkpoint 是 L=1） |
+| `--n-epoch` / `--lr` / `--patience` | 10 / 3e-4 / 3 | 监督微调（BCE 无负采样，负例=自然 label 0 行） |
+| `--drop-out` / `--message-dim` / `--memory-dim` | 0.1 / 100 / 172 | 宿主超参 |
+| `--finetune-host` | 关 | 冻结宿主 = 官方协议；开 = 微调宿主 |
+| `--selection-metric` | auc | 早停指标 `auc` / `ap` |
+| `--candidate-dim` / `--candidate-hidden` | 256 / 128 | 候选加宽与 builder 隐宽 |
+| `--context-dim` / `--reader-hidden` | 64 / 128 | outside 上下文与 reader 隐宽 |
+| `--lambda-resp` / `--lambda-spec` | 1.0 / 0.1 | 响应/谱损失系数 |
+| `--gram-ema` | 0.05 | 谱 Gram 指数移动平均系数 |
+| `--spectral-warmup` / `--spectral-interval` | 200 / 200 | 谱求解热身/间隔（步） |
+| `--spectral-step-size` | 0.25 | Grassmann 步长 |
+| `--trace-roots` / `--trace-mode` | 8 / positive_first | 追迹根数/B1 钩子（`positive_first` / `evenly_spaced` / `off`） |
+| `--no-early-stop` | 关 | B4 诊断钩子：跑满 n-epoch 不早停 |
+| `--grad-clip` | 5.0 | 梯度裁剪 |
+| `--monitor-every` / `--checkpoint-every` | 50 / 50 | 监控/滚动 checkpoint 频率（0=关） |
+| `--resume-from` | 空 | 滚动 checkpoint 恢复（含 memory backup） |
+| `--no-fail-on-monitor-error` / `--max-train/--max-val/--max-test` | 关 / 0 | |
+
+### 5.3 `scripts/train.py`（TGB 链路预测线，5 变体）
+
+| 参数 | 默认 | 说明 |
+|---|---|---|
+| `--config` | 空 | YAML 实验文件（提供默认值） |
+| `--variant` | spectral | `vanilla` / `random` / `pca` / `direct` / `spectral` |
+| `--dataset` | tgbl-wiki | TGB 数据集名 |
+| `--seed` / `--gpu` / `--output` | 0 / 0 / 必填 | |
+| `--epochs` / `--bs` / `--lr` / `--patience` | 30 / 200 / 1e-4 / 5 | 训练超参 |
+| `--n-neighbors` | 10 | 采样邻居数 |
+| `--mem-dim` / `--time-dim` / `--emb-dim` | 100 / 100 / 100 | 宿主 memory/时间/嵌入维度 |
+| `--candidate-dim` / `--candidate-hidden` | 256 / 128 | 同上表 |
+| `--context-dim` / `--reader-hidden` | 64 / 128 | 同上表 |
+| `--lambda-resp` / `--lambda-spec` | 1.0 / 0.1 | 同上表 |
+| `--gram-ema` | 0.05 | 同上表 |
+| `--spectral-warmup` / `--spectral-interval` | 100 / 100 | 同上表（TGB 线默认 100） |
+| `--spectral-step-size` / `--trace-roots` | 0.25 / 8 | 同上表 |
+| `--freeze-host` | 关 | 冻结宿主模式（旧架构语义） |
+| `--grad-clip` | **0.0（保持！）** | ⚠️ 此宿主梯度合法可达 ~1e9，开裁剪会冻死训练（loss 钉在 1.44） |
+| `--monitor-every` / `--checkpoint-every` | 100 / 0 | 监控/滚动 checkpoint |
+| `--resume-from` / `--continue-from` | 空 | 恢复滚动 checkpoint / 从 best.pt 继续（新优化器新早停） |
+| `--no-fail-on-monitor-error` / `--max-train/--max-val/--max-test` | 关 / 0 | |
+
+### 5.4 `scripts/inference.py`（TGB 推理）
+
+| 参数 | 默认 | 说明 |
+|---|---|---|
+| `--checkpoint` | 必填 | train.py 产出的 best.pt（config.json 自动同目录读取） |
+| `--split` | test | `val` / `test` |
+| `--output` | 必填 | 推理结果目录 |
+| `--gpu` / `--bs` | 0 / 200 | |
+
+### 5.5 `scripts/run_a0_synthetic.py`（合成实验）与辅助脚本
+
+| 参数 | 默认 | 说明 |
+|---|---|---|
+| `--exp` | 全部 | `mod8` / `xor` / `shared_dag` / `path_gain` / `circular` 单个跑 |
+
+辅助：`plot_tb_json.py --json --outdir [--epoch-steps]`（TB JSON 画图）、`tb_export.py --logdir --outdir [--epochs-per-step]`（TensorBoard 导出 PNG）、`protocol_ab.py --checkpoint [--gpu] [--output]`（协议 A/B 诊断，输出 JSON）。
+
+## 6. summary 的审计表怎么看
 
 | 字段 | 白话 | 健康标准 |
 |---|---|---|
@@ -99,7 +207,7 @@ cd /root/autodl-tmp/PRSS2
 | `deployment.deploy_vs_rich_deviation_mean` | r 维递归状态 vs 宿主前向状态的偏差 | 小 = 部署保真 |
 | `deployment.state_bytes_per_node_*` | 每节点状态内存（r×4B vs host×4B） | A0 的成本优势证据 |
 
-## 6. 验证口径与锚点（预注册判据）
+## 7. 验证口径与锚点（预注册判据）
 
 - **A0 vs vanilla = run 内部双头**：同一次前向训练 A0 readout（z_root，r 维）与 baseline decoder（x_root，宿主维），各自 val 早停，同 test 段。`delta_auc = A0 − baseline` 直接可读。
 - **baseline decoder 是内置 self-check**：wiki 上应复现 **0.8871 ± 0.002**（train_jodie vanilla 锚点）。不复现 = 宿主装配有 bug，该 run 的 A0 数字一并作废。
@@ -107,7 +215,7 @@ cd /root/autodl-tmp/PRSS2
 - **TGB wiki 五变体锚点**（test_mrr）：spectral 0.3897 > pca 0.3633 > vanilla 0.3369 > random 0.3190 > direct 0.2936。
 - 正式实验跑前先写好 `docs/a0_preregistration.md`（文档 11.4 五个"若…则…"断言 + 阈值，commit 留时间戳）。
 
-## 7. 云端环境速查
+## 8. 云端环境速查
 
 | 项 | 值 |
 |---|---|
@@ -121,7 +229,7 @@ cd /root/autodl-tmp/PRSS2
 
 # 第二部分：给 Claude Code 的协议与坑
 
-## 8. 操作约定（必须遵守）
+## 9. 操作约定（必须遵守）
 
 1. **耗时操作先征得用户同意**（训练/下载/全量测试）；本机单测与合成实验可直接跑。
 2. **部署流程**：本地开发 + 本机单测 → commit + push（GitHub）→ scp 到云端对应路径 → 云端 `pytest` + 冒烟 → 下载 `outputs/` 归档本地。
@@ -130,7 +238,7 @@ cd /root/autodl-tmp/PRSS2
 5. **图表 CJK 限制**：本机 matplotlib 缺中文字体，图内 suptitle/标签用英文。
 6. **测试分工**：本机 `pytest test/test_a0_quotient.py`（纯 torch）；`test/test_a0_loop.py` 与 `test_jodie_*` 数值测试需要 numpy bridge → 云端跑；本机 `test_tgb_smoke` 因 tgb 未装必然失败（环境问题，非回归）。
 
-## 9. 已知坑清单（新会话必读）
+## 10. 已知坑清单（新会话必读）
 
 1. **numpy bridge 本机坏**（torch.from_numpy 失败）→ 数值测试必须云端；纯 torch 构造可本机。
 2. **padding 邻居孤儿 occurrence**：jodie_tgn 为 mask 掉的 node-0 邻居也建了 occurrence 但父不引用 → `propagate_root_labels` 覆盖不到。A/B/C 阶段一律只处理 roots 可达的 occ（probes.py 的 stack_by_tau 内跳过，loop 的父遍历 `if occ.occurrence_id not in oid_labels: continue`）。
@@ -144,7 +252,7 @@ cd /root/autodl-tmp/PRSS2
 10. **部署 lift 方向**：`P_lift = (RRᵀ+εI)⁻¹R`（r×p），用法 `z @ P_lift` → host 宽度。
 11. **冒烟小数据的退化现象**（非 bug）：3000 行 cap 下 rank_tail=0（正例太少）、cond 爆表（B 窗口 6 batch）、deploy 偏差大——全量数据才有统计意义。
 
-## 10. 未完成工作清单（接手方向）
+## 11. 未完成工作清单（接手方向）
 
 | 类别 | 项 | 依据 |
 |---|---|---|
@@ -153,6 +261,7 @@ cd /root/autodl-tmp/PRSS2
 | 实验 | wiki 全量 r=32/64 × seeds（预注册先行）、enron、11.3 全基线列表 | 文档 11 |
 | 文档 | `docs/a0_preregistration.md` 预注册预测 | 文档 11.4 |
 
-## 11. 版本记录
+## 12. 版本记录
 
 - 2026-08-21：A0 训练线初版（commit 44e289a）→ GPU 修复（6e795d2）→ 合成实验套件（8919845）→ 方法补全五件套（7849986：proper-score 分层 / leverage-OOD / 重要性权重+G0 / TensorSketch / 递归部署 v2）。云端 29 项测试全绿，冒烟四件套跑通。
+- 2026-08-21：使用文档首版（1c63c16）+ 五入口全参数速查（本节 5.1–5.5）。

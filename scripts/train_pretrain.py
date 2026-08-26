@@ -250,7 +250,16 @@ def main():
             best_epoch = epoch
             best_kf = row.get("kf")
             bad_rounds = 0
-            payload = {"model": {"tgn": tgn.state_dict()},
+            # Save the host in its OFFICIAL namespace: temporarily swap the
+            # adapter out so tgn.state_dict() has upstream keys
+            # (embedding_module.attention_models.*), not the wrapped
+            # adapter namespace (embedding_module.host.*).
+            if adapter is not None:
+                tgn.embedding_module = adapter.host
+            host_sd = tgn.state_dict()
+            if adapter is not None:
+                tgn.embedding_module = adapter
+            payload = {"model": {"tgn": host_sd},
                        "epoch": epoch, "val_ap": best_ap}
             if compressor is not None:
                 payload["model"]["compressor"] = compressor.state_dict()

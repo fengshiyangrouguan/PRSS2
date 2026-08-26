@@ -188,6 +188,19 @@ def build_components(args, device, dataset):
     if args.pretrained_checkpoint:
         pretrained_payload = load_torch(args.pretrained_checkpoint, device)
         state = unwrap_state(pretrained_payload)
+        # Compatibility: stage-1 checkpoints written by the pre-fix
+        # train_pretrain saved the wrapped adapter namespace
+        # (embedding_module.host.* / embedding_module.compressor.*).  Map it
+        # back onto the official host namespace; compressor keys ride along
+        # separately via the payload's model.compressor block.
+        if any(k.startswith("embedding_module.host.")
+               for k in state):
+            state = {
+                ("embedding_module." + k[len("embedding_module.host."):])
+                if k.startswith("embedding_module.host.") else k: v
+                for k, v in state.items()
+                if not k.startswith("embedding_module.compressor.")
+            }
         # Memory is a runtime state produced by the pretraining stream, not a
         # parameter to carry across runs (shape differs across node sets).
         MEMORY_STATE_KEYS = ("memory.memory", "memory.last_update",

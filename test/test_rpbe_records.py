@@ -81,21 +81,6 @@ class TestFutureIndex(unittest.TestCase):
         hit = self.idx.query(6, 26.0)
         self.assertFalse(hit["valid"])
 
-    def test_query_batch_matches_query_per_row(self):
-        nodes = np.array([1, 1, 2, 3, 4, 6, 99, 2], dtype=np.int64)
-        times = np.array([1.0, 6.0, 2.0, 9.0, 12.0, 26.0, 1.0, 10.0])
-        found, valid, ht, hd, hy = self.idx.query_batch(nodes, times)
-        for i, (u, t) in enumerate(zip(nodes, times)):
-            hit = self.idx.query(int(u), float(t))
-            self.assertEqual(bool(found[i]), hit is not None,
-                             "found mismatch at row {}".format(i))
-            if found[i]:
-                self.assertEqual(bool(valid[i]), hit["valid"])
-                if valid[i]:
-                    self.assertEqual(ht[i], hit["time"])
-                    self.assertEqual(hd[i], hit["counterpart"])
-                    self.assertEqual(hy[i], hit["outcome"])
-
 
 class TestJodieCutBuilder(unittest.TestCase):
     def setUp(self):

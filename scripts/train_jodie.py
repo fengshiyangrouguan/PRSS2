@@ -321,6 +321,7 @@ def main():
     best_score = -float("inf")
     best_epoch = -1
     bad_rounds = 0
+    best_kf = None
     if args.resume_from:
         resume = ckpt.load(
             model_components={"tgn": tgn, "decoder": components["decoder"],
@@ -370,6 +371,7 @@ def main():
         if improved:
             best_score = float(score) if score_is_finite else -float("inf")
             best_epoch = epoch
+            best_kf = train_row.get("kf")
             bad_rounds = 0
             torch.save({
                 "model": {"decoder": components["decoder"].state_dict(),
@@ -417,6 +419,7 @@ def main():
         "best_validation_score": float(best_score),
         "test": test_row,
         "pretrained_checkpoint": str(args.pretrained_checkpoint),
+        "kf": best_kf if best_kf is not None else None,
     }
     save_json(out / "summary.json", summary)
     monitor.finalize(summary)

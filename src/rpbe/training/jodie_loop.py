@@ -128,6 +128,9 @@ class JodieNodeClassificationLoop:
 
         total_task = total_kf = 0.0
         n_batches = 0
+        kf_sum = {}
+        kf_count = 0
+        skipped_types = set()
         train_probs, train_labels = [], []
         num_batch = math.ceil(len(train.sources) / self.batch_size)
         for k in range(num_batch):
@@ -171,6 +174,10 @@ class JodieNodeClassificationLoop:
                         kf_v = float(kf_term.detach())
                         kf_detail = {tau: float(j.detach())
                                      for tau, j in scores.items()}
+                        for tau, jv in kf_detail.items():
+                            kf_sum[tau] = kf_sum.get(tau, 0.0) + jv
+                        kf_count += 1
+                        skipped_types.update(skipped)
                         self.monitor.validate_kf(
                             kf_detail, {tau: self.rpbe_cfg.m
                                         for tau in kf_detail}, global_step)
@@ -210,9 +217,19 @@ class JodieNodeClassificationLoop:
 
         train_metrics = metric_bundle(np.concatenate(train_labels),
                                       np.concatenate(train_probs))
+        kf_out = None
+        if kf_count and self.rpbe_cfg is not None:
+            kf_out = {
+                "J": {tau: v / kf_count for tau, v in kf_sum.items()},
+                "J_frac": {tau: v / kf_count / self.rpbe_cfg.m
+                           for tau, v in kf_sum.items()},
+                "skipped_types": sorted(skipped_types),
+                "kf_loss": total_kf / max(n_batches, 1),
+            }
         return {
             "train_task_loss": total_task / max(n_batches, 1),
             "train_kf_loss": total_kf / max(n_batches, 1),
+            "kf": kf_out,
             "train": train_metrics,
             "n_batches": n_batches,
             "global_step": global_step,

@@ -201,6 +201,7 @@ def main():
     best_ap = -1.0
     best_epoch = -1
     bad_rounds = 0
+    best_kf = None
     for epoch in range(args.n_epoch):
         t0 = time.time()
         row = loop.train_epoch(epoch, global_step, train)
@@ -226,6 +227,7 @@ def main():
         if val_row["val_ap"] > best_ap + 1e-12:
             best_ap = float(val_row["val_ap"])
             best_epoch = epoch
+            best_kf = row.get("kf")
             bad_rounds = 0
             payload = {"model": {"tgn": tgn.state_dict()},
                        "epoch": epoch, "val_ap": best_ap}
@@ -242,6 +244,7 @@ def main():
     summary = {
         "data": args.data, "seed": args.seed, "best_epoch": int(best_epoch),
         "best_val_ap": float(best_ap), "stage1_rpbe": bool(args.stage1_rpbe),
+        "kf": best_kf if best_kf is not None else None,
     }
     save_json(out / "summary.json", summary)
     monitor.finalize(summary)

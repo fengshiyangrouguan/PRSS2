@@ -67,6 +67,9 @@ class TGNPretrainLoop:
         self.tgn.train(True)
         num_batch = math.ceil(len(train.sources) / self.batch_size)
         total_link = total_kf = 0.0
+        kf_sum = {}
+        kf_count = 0
+        skipped_types = set()
         n_steps = 0
         for k in range(0, num_batch, self.backprop_every):
             self.optimizer.zero_grad(set_to_none=True)
@@ -113,10 +116,15 @@ class TGNPretrainLoop:
                         if scores:
                             kf_term = kf_loss(scores, self.rpbe_cfg.alphas)
                             total_kf += float(kf_term.detach())
+                            kf_detail = {tau: float(j.detach())
+                                         for tau, j in scores.items()}
+                            for tau, jv in kf_detail.items():
+                                kf_sum[tau] = kf_sum.get(tau, 0.0) + jv
+                            kf_count += 1
+                            skipped_types.update(skipped)
                             self.monitor.validate_kf(
-                                {tau: float(j.detach())
-                                 for tau, j in scores.items()},
-                                {tau: self.rpbe_cfg.m for tau in scores},
+                                kf_detail, {tau: self.rpbe_cfg.m
+                                            for tau in kf_detail},
                                 global_step)
                             loss = loss + self.lambda_kf * kf_term
 
@@ -138,8 +146,18 @@ class TGNPretrainLoop:
             if self.tgn.use_memory:
                 self.tgn.memory.detach_memory()
             n_steps += 1
+        kf_out = None
+        if kf_count and self.rpbe_cfg is not None:
+            kf_out = {
+                "J": {tau: v / kf_count for tau, v in kf_sum.items()},
+                "J_frac": {tau: v / kf_count / self.rpbe_cfg.m
+                           for tau, v in kf_sum.items()},
+                "skipped_types": sorted(skipped_types),
+                "kf_loss": total_kf / max(n_steps, 1),
+            }
         return {"train_link_loss": total_link / max(n_steps, 1),
                 "train_kf_loss": total_kf / max(n_steps, 1),
+                "kf": kf_out,
                 "n_steps": n_steps, "global_step": global_step}
 
     # --------------------------------------------------------------- evaluation

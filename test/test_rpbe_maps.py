@@ -80,6 +80,16 @@ class TestPsiBehavior(unittest.TestCase):
         b = self.maps.psi(base_context(counterpart=77 + 4096), 1.0)
         self.assertTrue(torch.equal(a, b))
 
+    def test_pv_batch_matches_pv_per_row(self):
+        contexts = [base_context(counterpart=i, delta_t=1000.0 * (i + 1),
+                                 role=i % 2, query_type=i % 2)
+                    for i in range(6)]
+        outcomes = [0.0, 1.0, 1.0, 0.0, 1.0, 0.0]
+        batch = self.maps.pv_batch(contexts, outcomes)
+        for i, (c, y) in enumerate(zip(contexts, outcomes)):
+            self.assertTrue(torch.equal(batch[i], self.maps.psi(c, y)),
+                            "pv_batch row {} diverges from pv".format(i))
+
 
 if __name__ == "__main__":
     unittest.main()

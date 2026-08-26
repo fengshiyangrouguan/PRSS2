@@ -101,6 +101,55 @@ class FixedMaps(nn.Module):
         """One joint-test row for one cut."""
         return self.psi(context, outcome)
 
+    # ----------------------------------------------------------- batch path
+    def pv_batch(self, contexts, outcomes) -> torch.Tensor:
+        """Vectorized joint tests: [N, m], no gradient, one pass.
+
+        ``contexts`` is a list of context dicts, ``outcomes`` a float list;
+        the per-row small-operator storm of ``pv`` is avoided by batching the
+        RFF pass, the categorical gathers and a single index_add.
+        """
+        n = len(contexts)
+        if n == 0:
+            return torch.zeros((0, self.m), dtype=self.rff_w.dtype,
+                               device=self.rff_w.device)
+        dev = self.rff_w.device
+        with torch.no_grad():
+            deltas = torch.tensor(
+                [float(c["delta_t"]) for c in contexts],
+                dtype=self.rff_w.dtype, device=dev).reshape(n, 1) \
+                / float(self.cfg.delta_t_scale)
+            rff = torch.cos(deltas @ self.rff_w + self.rff_b)        # [N, d_c]
+            partners = torch.tensor(
+                [int(c["counterpart"]) % self.num_counter_bins
+                 for c in contexts], dtype=torch.long, device=dev)
+            roles = torch.tensor([int(c["role"]) % 2 for c in contexts],
+                                 dtype=torch.long, device=dev)
+            queries = torch.tensor([int(c["query_type"]) % 2
+                                    for c in contexts],
+                                   dtype=torch.long, device=dev)
+            cat = (self.categorical_c[partners]
+                   + self.categorical_c[self.num_counter_bins + roles]
+                   + self.categorical_c[self.num_counter_bins + 2 + queries])
+            c_vec = rff + cat.to(rff.dtype)                          # [N, d_c]
+            y_idx = torch.tensor([1 if float(y) > 0.5 else 0
+                                  for y in outcomes],
+                                 dtype=torch.long, device=dev)
+            f_vec = self.future_table[y_idx].to(rff.dtype)           # [N, d_f]
+            body = torch.cat([
+                torch.ones(n, 1, dtype=c_vec.dtype, device=dev), c_vec],
+                dim=1)                                               # [N, 1+d_c]
+            prod = torch.einsum("ni,nj->nij", body, f_vec).reshape(n, -1)
+            flat = prod.reshape(-1)
+            row_idx = (self.sketch_indices[0]
+                       + torch.arange(n, device=dev) * self._sketch_full_dim)
+            out = torch.zeros((n, self.m), dtype=flat.dtype, device=dev)
+            out.view(-1).index_add_(
+                0, (self.sketch_indices[1] + torch.arange(n, device=dev)
+                    * self.m).view(-1),
+                flat[row_idx] * self.sketch_signs)
+            return out
+
     # ------------------------------------------------------------------ audit
     def isolation_fingerprint(self) -> dict:
         """Seed/version + content hash of every frozen buffer."""

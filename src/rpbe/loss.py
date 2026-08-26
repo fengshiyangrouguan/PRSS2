@@ -77,7 +77,7 @@ def kf_scores_from_rows(rows: List, interfaces: Dict[str, int], fixed_maps,
             skipped.append(tau)
             continue
         zs = torch.stack([r.z for r in tau_rows])                    # [M, r]
-        ps = torch.stack([fixed_maps.pv(r.context, r.outcome)
-                          for r in tau_rows])                        # [M, m]
+        ps = fixed_maps.pv_batch([r.context for r in tau_rows],
+                                 [r.outcome for r in tau_rows])      # [M, m]
         scores[tau] = kf_score(zs, ps, eps=eps)
     return scores, skipped

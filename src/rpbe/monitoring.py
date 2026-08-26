@@ -48,64 +48,6 @@ def tensor_summary(x: Optional[torch.Tensor]) -> Dict:
     }
 
 
-def candidate_stats(trace) -> Dict:
-    if trace is None:
-        return {}
-    by_tau = {}
-    for occ in trace.occurrences.values():
-        by_tau.setdefault(occ.tau, []).append(occ.state.candidate.detach())
-    out = {}
-    for tau, vals in by_tau.items():
-        x = torch.stack(vals, dim=0)
-        finite = torch.isfinite(x)
-        coord_std = torch.nan_to_num(x.float(), nan=0.0, posinf=0.0, neginf=0.0).std(dim=0, unbiased=False)
-        out[tau] = {
-            **tensor_summary(x),
-            "rows": int(x.shape[0]),
-            "dim": int(x.shape[-1]),
-            "coord_std_mean": float(coord_std.mean().item()),
-            "coord_std_min": float(coord_std.min().item()),
-            "coord_std_max": float(coord_std.max().item()),
-            "finite_fraction": float(finite.float().mean().item()),
-        }
-    return out
-
-
-def matrix_stats(matrices_by_tau: Dict[str, torch.Tensor]) -> Dict:
-    """Exact finiteness accounting plus descriptive reader-matrix statistics.
-
-    Finiteness is a hard invariant: never derive it from a floating-point mean of a
-    boolean mask (CUDA reductions can make a value that is mathematically 1.0 appear as
-    the adjacent float below 1.0).  Count finite/nonfinite entries as integers.
-    """
-    out = {}
-    for tau, B in matrices_by_tau.items():
-        detached = B.detach()
-        finite_mask = torch.isfinite(detached)
-        total = int(detached.numel())
-        nonfinite_count = int((~finite_mask).sum(dtype=torch.int64).item()) if total else 0
-        finite_count = total - nonfinite_count
-        exact_all_finite = (nonfinite_count == 0)
-
-        safe = torch.nan_to_num(detached.float(), nan=0.0, posinf=0.0, neginf=0.0)
-        norm = safe.norm(dim=(-1, -2))
-        out[tau] = {
-            "occurrences": int(B.shape[0]),
-            "response_rows": int(B.shape[-2]),
-            "candidate_dim": int(B.shape[-1]),
-            "elements": total,
-            "finite_count": finite_count,
-            "nonfinite_count": nonfinite_count,
-            "all_finite": bool(exact_all_finite),
-            "fro_mean": float(norm.mean().item()) if norm.numel() else 0.0,
-            "fro_std": float(norm.std(unbiased=False).item()) if norm.numel() else 0.0,
-            "fro_min": float(norm.min().item()) if norm.numel() else 0.0,
-            "fro_max": float(norm.max().item()) if norm.numel() else 0.0,
-            "finite_fraction": (float(finite_count) / float(total) if total else 1.0),
-        }
-    return out
-
-
 def module_finiteness(module: Optional[torch.nn.Module]) -> Dict:
     if module is None:
         return {"parameters": 0, "finite_fraction": 1.0}
@@ -129,21 +71,17 @@ def module_finiteness(module: Optional[torch.nn.Module]) -> Dict:
 
 class MonitorWriter:
     def __init__(self, run_dir: Path, fail_on_error: bool = True,
-                 orth_tol: float = 5e-4, gram_sym_tol: float = 1e-6,
-                 response_gap_warn: float = 0.25, reset_files: bool = True):
+                 reset_files: bool = True):
         self.root = Path(run_dir) / "monitor"
         self.root.mkdir(parents=True, exist_ok=True)
         self.step_path = self.root / "step_metrics.jsonl"
         self.epoch_path = self.root / "epoch_metrics.jsonl"
         self.alert_path = self.root / "alerts.jsonl"
-        self.snap_dir = self.root / "projection_snapshots"
-        self.snap_dir.mkdir(parents=True, exist_ok=True)
+        self.fingerprint_path = self.root / "rpbe_fingerprints.jsonl"
         self.fail_on_error = bool(fail_on_error)
-        self.orth_tol = float(orth_tol)
-        self.gram_sym_tol = float(gram_sym_tol)
-        self.response_gap_warn = float(response_gap_warn)
         if reset_files:
-            for p in (self.step_path, self.epoch_path, self.alert_path):
+            for p in (self.step_path, self.epoch_path, self.alert_path,
+                      self.fingerprint_path):
                 if p.exists():
                     p.unlink()
 
@@ -165,19 +103,19 @@ class MonitorWriter:
             if v is None:
                 self.alert("error", "nonfinite_loss", f"{name}={value}", step=step)
 
-    def validate_spectral(self, spectral: Dict, step: int):
-        for name, snap in spectral.items():
-            orth = float(snap.get("row_orthogonality_relative", 0.0))
-            sym = float(snap.get("gram_symmetry_relative", 0.0))
-            # The direct ablation learns R end-to-end without an orthogonality
-            # constraint; its snapshot flags that the invariant does not apply.
-            if snap.get("projection_expected_orthogonal", True):
-                if not math.isfinite(orth) or orth > self.orth_tol:
-                    self.alert("error", "quotient_not_row_orthonormal",
-                               f"{name} orthogonality={orth:.3e}", step=step, interface=name)
-            if not math.isfinite(sym) or sym > self.gram_sym_tol:
-                self.alert("error", "gram_not_symmetric",
-                           f"{name} symmetry={sym:.3e}", step=step, interface=name)
+    def validate_kf(self, kf_by_tau: Dict[str, float], dims: Dict[str, int],
+                    step: int):
+        """Per-interface Ky Fan score bounds: 0 <= J_tau <= d_tau."""
+        for tau, j in kf_by_tau.items():
+            v = _finite_float(j)
+            d = int(dims.get(tau, 0))
+            if v is None:
+                self.alert("error", "nonfinite_kf_score",
+                           f"{tau} J={j}", step=step, interface=tau)
+                continue
+            if v < 0 or v > d + 1e-4:
+                self.alert("error", "kf_score_out_of_bounds",
+                           f"{tau} J={v:.6f} dim={d}", step=step, interface=tau)
 
     def write_step(self, row: Dict):
         self._append(self.step_path, row)
@@ -185,16 +123,9 @@ class MonitorWriter:
     def write_epoch(self, row: Dict):
         self._append(self.epoch_path, row)
 
-    def save_projection_snapshot(self, epoch: int, prss):
-        if prss is None:
-            return
-        payload = {}
-        for tau, compressor in prss.quotients.items():
-            payload[tau] = {
-                "R": compressor.projection().detach().cpu(),
-                "snapshot": compressor.snapshot(),
-            }
-        torch.save(payload, self.snap_dir / f"epoch_{int(epoch):04d}.pt")
+    def save_fingerprint(self, epoch: int, fingerprint: Dict):
+        self._append(self.fingerprint_path, {"epoch": int(epoch),
+                                             "fingerprint": fingerprint})
 
     def finalize(self, summary: Dict):
         alerts = []

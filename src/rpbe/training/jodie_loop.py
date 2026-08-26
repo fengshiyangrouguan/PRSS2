@@ -22,6 +22,7 @@ import torch.nn.functional as F
 from sklearn.metrics import average_precision_score, roc_auc_score
 
 from rpbe.loss import kf_loss, kf_scores_from_rows
+from rpbe.training.isolation import assert_clean, rpbe_fingerprint
 
 EPS = 1e-7
 
@@ -170,6 +171,9 @@ class JodieNodeClassificationLoop:
                         kf_v = float(kf_term.detach())
                         kf_detail = {tau: float(j.detach())
                                      for tau, j in scores.items()}
+                        self.monitor.validate_kf(
+                            kf_detail, {tau: self.rpbe_cfg.m
+                                        for tau in kf_detail}, global_step)
                         main_loss = task_loss + self.lambda_kf * kf_term
                     else:
                         main_loss = task_loss
@@ -224,6 +228,7 @@ class JodieNodeClassificationLoop:
         """
         if reset:
             self.reset_memory()
+        before = rpbe_fingerprint(self.fixed_maps)
         self.tgn.eval()
         self.decoder.eval()
         if self.adapter is not None:
@@ -241,6 +246,9 @@ class JodieNodeClassificationLoop:
                 observed_dims = {"source": int(src_emb.shape[-1])}
             probs.append(self.decoder(src_emb).sigmoid().cpu().numpy())
             labels.append(split.labels[s:e])
+        trace_created = bool(self.adapter is not None
+                             and self.adapter.trace is not None)
+        assert_clean(before, self.fixed_maps, trace_created, "evaluate_split")
         out = metric_bundle(np.concatenate(labels), np.concatenate(probs))
         out["embedding_dims_observed"] = observed_dims or {}
         return out
@@ -248,6 +256,7 @@ class JodieNodeClassificationLoop:
     @torch.no_grad()
     def replay_split(self, split: object) -> None:
         """Rebuild the stream from zero over a split, no scores (test setup)."""
+        before = rpbe_fingerprint(self.fixed_maps)
         self.tgn.eval()
         if self.adapter is not None:
             self.adapter.clear_trace()
@@ -258,3 +267,6 @@ class JodieNodeClassificationLoop:
                 split.sources[s:e], split.destinations[s:e],
                 split.timestamps[s:e], split.edge_idxs[s:e],
                 grad_enabled=False)
+        trace_created = bool(self.adapter is not None
+                             and self.adapter.trace is not None)
+        assert_clean(before, self.fixed_maps, trace_created, "replay_split")

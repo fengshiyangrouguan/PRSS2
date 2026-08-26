@@ -1,46 +1,35 @@
-"""Validation/test spectral-isolation audit.
+"""Validation/test isolation audit for the RPBE component.
 
-Hard invariant: held-out evaluation must never touch Gram statistics, run a
-spectral solve, or change any quotient R.
+The new "three zeros": during evaluation nothing may build a computation-tree
+trace, the fixed measurement maps (buffers / seed / normalization) must not be
+touched, and no training-state flag may be flipped back.  ``assert_clean``
+hard-fails on any violation.
 """
 
-from typing import Dict
-
-import torch
+from typing import Dict, Optional
 
 
-def counts_of_spectral(prss) -> Dict:
-    if prss is None:
-        return {"gram": 0, "svd": 0}
-    gram = sum(int(q.snapshot().get("reader_gram_updates", 0))
-               for q in prss.quotients.values())
-    svd = sum(int(q.snapshot().get("spectral_updates", 0))
-              for q in prss.quotients.values())
-    return {"gram": gram, "svd": svd}
+def rpbe_fingerprint(fixed_maps) -> Optional[Dict]:
+    if fixed_maps is None:
+        return None
+    return fixed_maps.isolation_fingerprint()
 
 
-def r_copies(prss) -> Dict:
-    if prss is None:
-        return {}
-    return {tau: q.projection().detach().cpu().clone()
-            for tau, q in prss.quotients.items()}
-
-
-def r_max_change(before: Dict, prss) -> float:
-    if prss is None:
-        return 0.0
-    values = []
-    for tau, old in before.items():
-        values.append(float((old - prss.quotients[tau].projection().detach().cpu()).abs().max()))
-    return max(values) if values else 0.0
-
-
-def assert_clean(before_counts: Dict, before_r: Dict, prss, trace_created: bool,
+def assert_clean(before: Optional[Dict], fixed_maps, trace_created: bool,
                  label: str) -> None:
-    """Raise if counts, R, or trace changed across a held-out evaluation."""
-    after_counts = counts_of_spectral(prss)
-    r_change = r_max_change(before_r, prss)
-    if before_counts != after_counts or r_change != 0.0 or trace_created:
+    """Compare the pre-evaluation fingerprint with the post-evaluation one."""
+    if fixed_maps is None:
+        assert not trace_created, (
+            "{}: a trace was built without a fixed-measurement component"
+            .format(label))
+        return
+    after = rpbe_fingerprint(fixed_maps)
+    if before is None:
+        raise RuntimeError("{}: no pre-evaluation fingerprint captured"
+                           .format(label))
+    if trace_created:
         raise RuntimeError(
-            f"{label} mutated spectral state: counts {before_counts} -> {after_counts}, "
-            f"R_change={r_change}, trace_created={trace_created}")
+            "{}: computation-tree trace built during evaluation".format(label))
+    if after != before:
+        raise RuntimeError(
+            "{}: fixed measurement maps changed during evaluation".format(label))

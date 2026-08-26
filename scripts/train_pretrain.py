@@ -215,6 +215,8 @@ def main():
         epoch_row = {"epoch": epoch, "global_step": global_step,
                      "train": row, "val": val_row,
                      "epoch_seconds": time.time() - t0}
+        if fixed_maps is not None:
+            monitor.save_fingerprint(epoch, fixed_maps.isolation_fingerprint())
         monitor.write_epoch(epoch_row)
         print(f"epoch={epoch} train_link={row['train_link_loss']:.4f} "
               f"train_kf={row['train_kf_loss']:.6f} "

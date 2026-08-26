@@ -20,6 +20,7 @@ import torch.nn.functional as F
 from sklearn.metrics import average_precision_score, roc_auc_score
 
 from rpbe.loss import kf_loss, kf_scores_from_rows
+from rpbe.training.isolation import assert_clean, rpbe_fingerprint
 from rpbe.training.jodie_loop import select_trace_rows
 
 EPS = 1e-7
@@ -112,6 +113,11 @@ class TGNPretrainLoop:
                         if scores:
                             kf_term = kf_loss(scores, self.rpbe_cfg.alphas)
                             total_kf += float(kf_term.detach())
+                            self.monitor.validate_kf(
+                                {tau: float(j.detach())
+                                 for tau, j in scores.items()},
+                                {tau: self.rpbe_cfg.m for tau in scores},
+                                global_step)
                             loss = loss + self.lambda_kf * kf_term
 
                 total_link += float(link_loss.detach())
@@ -140,6 +146,7 @@ class TGNPretrainLoop:
     @torch.no_grad()
     def evaluate_edge_prediction(self, split, neg_seed: int) -> Dict:
         """AP/AUC over split edges vs fixed-seed negative destinations."""
+        before = rpbe_fingerprint(self.fixed_maps)
         self.tgn.eval()
         if self.adapter is not None:
             self.adapter.clear_trace()
@@ -160,6 +167,10 @@ class TGNPretrainLoop:
             labels.append(np.zeros(size))
         probs = np.concatenate(probs)
         labels = np.concatenate(labels)
+        trace_created = bool(self.adapter is not None
+                             and self.adapter.trace is not None)
+        assert_clean(before, self.fixed_maps, trace_created,
+                     "evaluate_edge_prediction")
         auc = float(roc_auc_score(labels, probs))
         ap = float(average_precision_score(labels, probs))
         return {"val_ap": ap, "val_auc": auc}

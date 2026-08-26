@@ -1,14 +1,15 @@
-"""PRSS adapter for the official twitter-research TGN host (JODIE protocol).
+"""RPBE adapter for the official twitter-research TGN host (JODIE protocol).
 
 The official ``GraphEmbedding`` computes a recursive L-layer temporal-attention
 tree per query node: layer l's occurrence has children = its own layer-(l-1)
 embedding plus the ``n_degree`` layer-(l-1) embeddings of its temporal
-neighbors.  Each recursive layer is one PRSS interface (``tjo:layer{l}``), so
-the host computation tree maps 1:1 onto the outside continuation tree.
+neighbors.  Each recursive layer is one interface (``tjo:layer{l}``), so the
+host computation tree maps 1:1 onto the cut tree.
 
 The host aggregate is never replaced: the adapter computes the vanilla
-aggregate, widens it into the candidate, projects it, and passes only the
-quotient up.  Without tracing the forward is bit-identical to the official
+aggregate and passes it, with the children states, through the recursive
+compressor ``z_v = Gamma(o_v, {z_children}, xi)``.  With no compressor
+attached (``compressor=None``) the forward is bit-identical to the official
 host.  The memory lives entirely inside TGN; the adapter only wraps
 ``embedding_module``.
 """
@@ -19,7 +20,7 @@ import numpy as np
 import torch
 
 from rpbe.hosts.base import HostAdapter
-from rpbe.state import QuotientState, RecursiveOccurrence, RecursiveTrace
+from rpbe.state import OccurrenceState, RecursiveOccurrence, RecursiveTrace
 
 TAU_TEMPLATE = "tjo:layer{}"
 
@@ -28,7 +29,7 @@ def jodie_preagg_dim(host_dim: int, time_dim: int, edge_dim: int,
                      n_neighbors: int) -> int:
     """Width of the exact aggregate-input packing:
     [source_lower, source_time, n x (neighbor_lower, edge_time, edge_features),
-     mask] (order identical to the v1 exact_preagg)."""
+     mask]."""
     return host_dim + time_dim + n_neighbors * (host_dim + time_dim + edge_dim) \
         + n_neighbors
 
@@ -37,19 +38,19 @@ class JodieTGNAdapter(HostAdapter):
     """Wraps the official ``GraphAttentionEmbedding``; ``TGN.compute_temporal_embeddings``
     keeps its exact call surface (``compute_embedding`` with numpy arrays)."""
 
-    def __init__(self, host_embedding, prss_core, n_neighbors: int):
+    def __init__(self, host_embedding, compressor=None, n_neighbors: int = 10):
         super().__init__()
         if not hasattr(host_embedding, "aggregate"):
             raise ValueError(
-                "PRSS requires TGN graph_attention/graph_sum recursive embedding")
+                "RPBE requires TGN graph_attention/graph_sum recursive embedding")
         if not hasattr(host_embedding, "time_encoder"):
-            raise ValueError("PRSS requires a host time_encoder")
+            raise ValueError("RPBE requires a host time_encoder")
         self.host = host_embedding
-        self.prss = prss_core
+        self.compressor = compressor
         self.n_neighbors = int(n_neighbors)
         if self.n_neighbors <= 0:
             raise ValueError(
-                "PRSS requires n_neighbors > 0 so the host interface width is fixed")
+                "RPBE requires n_neighbors > 0 so the host interface width is fixed")
 
         self.embedding_dimension = host_embedding.embedding_dimension
         self.device = host_embedding.device
@@ -60,23 +61,15 @@ class JodieTGNAdapter(HostAdapter):
 
         self.taus = [TAU_TEMPLATE.format(layer)
                      for layer in range(self.n_layers + 1)]
-        if sorted(prss_core.config.interfaces) != sorted(self.taus):
-            raise ValueError("PRSS interface keys must be {}".format(self.taus))
-        host_dim = self.embedding_dimension
-        time_dim = self.n_time_features
-        edge_dim = self.n_edge_features
-        for tau in self.taus:
-            spec = prss_core.config.interface(tau)
-            if spec.host_dim != host_dim:
-                raise ValueError("host_dim must equal embedding_dimension for {}".format(tau))
-        self.preagg_dim = jodie_preagg_dim(host_dim, time_dim, edge_dim,
+        self.preagg_dim = jodie_preagg_dim(self.embedding_dimension,
+                                           self.n_time_features,
+                                           self.n_edge_features,
                                            self.n_neighbors)
-        if prss_core.config.parent_local_dim != self.preagg_dim:
-            raise ValueError("config.parent_local_dim must equal jodie_preagg_dim "
-                             "({})".format(self.preagg_dim))
-        # C1: outside must not see the subtree's own states; the child-state
-        # block (source_lower + neighbor_lower) is zeroed in local_features.
-        self._local_zero_dim = host_dim + self.n_neighbors * host_dim
+        # C1 (legacy): the child-state block of local_features is zeroed.
+        # Nothing consumes local_features today; the field is kept for
+        # diagnostics.
+        self._local_zero_dim = self.embedding_dimension \
+            + self.n_neighbors * self.embedding_dimension
 
         self._trace_top_rows = set()
         self._trace = None
@@ -93,17 +86,6 @@ class JodieTGNAdapter(HostAdapter):
     @property
     def trace(self) -> Optional[RecursiveTrace]:
         return self._trace
-
-    def traced_candidates(self, tau: Optional[str] = None) -> Optional[torch.Tensor]:
-        """Detached candidate rows of the current trace (PCA statistic source)."""
-        if self.trace is None:
-            return None
-        values = [occ.state.candidate.detach()
-                  for occ in self.trace.occurrences.values()
-                  if tau is None or occ.tau == tau]
-        if not values:
-            return None
-        return torch.stack(values, dim=0)
 
     @property
     def neighbor_finder(self):
@@ -158,15 +140,20 @@ class JodieTGNAdapter(HostAdapter):
         ids = np.full(len(source_nodes), -1, dtype=np.int64)
         if layer == 0:
             tau = TAU_TEMPLATE.format(0)
-            cand = self.prss.make_candidate(tau, raw_source)
-            z = self.prss.project(tau, cand)
+            # No children: identity passes the raw state through untouched.
+            z = raw_source if self.compressor is None else self.compressor.compress(
+                tau=tau, own_input=raw_source,
+                child_states=None, child_edge=None, child_roles=None,
+                child_delta_t=None, mask=None)
             if self.trace is not None and active.any():
                 local = torch.zeros(len(source_nodes), self.preagg_dim,
                                     device=device, dtype=raw_source.dtype)
                 for row in np.flatnonzero(active):
                     ids[row] = self._new_occurrence(
-                        tau, raw_source[row].detach(), cand[row], z[row],
-                        local[row], [], [], [])
+                        tau, z[row], local[row], [], [], [],
+                        node=int(source_nodes[row]),
+                        time=float(timestamps[row]),
+                        own_raw=raw_source[row].detach())
             return z, ids
 
         tau = TAU_TEMPLATE.format(layer)
@@ -204,8 +191,25 @@ class JodieTGNAdapter(HostAdapter):
         ], dim=-1)
         if flat_preagg.shape[-1] != self.preagg_dim:
             raise ValueError("preagg width mismatch")
-        cand = self.prss.make_candidate(tau, vanilla, flat_preagg)
-        z = self.prss.project(tau, cand)
+
+        if self.compressor is None:
+            z = vanilla
+        else:
+            child_states = torch.cat([
+                source_lower.unsqueeze(1), neighbor_lower], dim=1)  # [b, 1+n, d]
+            roles = torch.zeros(b, 1 + n_neighbors, device=device)
+            roles[:, 1:] = 1.0
+            deltas = torch.zeros(b, 1 + n_neighbors, device=device)
+            deltas[:, 1:] = edge_deltas
+            child_edge = torch.cat([
+                source_time.unsqueeze(1), edge_time], dim=1)  # [b, 1+n, time_dim]
+            full_mask = torch.cat([
+                torch.zeros(b, 1, dtype=torch.bool, device=device), mask],
+                dim=1)
+            z = self.compressor.compress(
+                tau=tau, own_input=raw_source, child_states=child_states,
+                child_edge=child_edge, child_roles=roles,
+                child_delta_t=deltas, mask=full_mask)
 
         if self.trace is not None and active.any():
             local = flat_preagg.detach().clone()
@@ -224,21 +228,25 @@ class JodieTGNAdapter(HostAdapter):
                         relations.append(1)
                         deltas.append(float(edge_deltas_np[row, j]))
                 ids[row] = self._new_occurrence(
-                    tau, vanilla[row].detach(), cand[row], z[row], local[row],
-                    children, relations, deltas)
+                    tau, z[row], local[row], children, relations, deltas,
+                    node=int(source_nodes[row]),
+                    time=float(timestamps[row]),
+                    own_raw=raw_source[row].detach())
         return z, ids
 
-    def _new_occurrence(self, tau, raw, cand, z, local, children, relations,
-                        deltas):
+    def _new_occurrence(self, tau, z, local, children, relations, deltas, *,
+                        node: int, time: float, own_raw):
         oid = self._next_oid
         self._next_oid += 1
         self.trace.add(RecursiveOccurrence(
             occurrence_id=oid, tau=tau,
-            state=QuotientState(tau=tau, raw=raw, candidate=cand, quotient=z),
+            state=OccurrenceState(tau=tau, z=z),
             local_features=local,
             children=list(children),
             child_relations=list(relations),
             child_delta_t=list(deltas),
-            metadata={"layer": int(tau.split(":")[1][len("layer"):])},
+            metadata={"layer": int(tau.split(":")[1][len("layer"):]),
+                      "node": int(node), "time": float(time),
+                      "own_raw": own_raw},
         ))
         return oid

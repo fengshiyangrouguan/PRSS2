@@ -1,4 +1,4 @@
-"""Typed inside/outside states and traces for recursive hosts."""
+"""Typed states and computation-tree traces for recursive hosts."""
 
 from dataclasses import dataclass, field
 from typing import Any, Dict, List
@@ -7,22 +7,29 @@ import torch
 
 
 @dataclass
-class QuotientState:
+class OccurrenceState:
+    """The compressed state actually propagated to the parent: z only.
+
+    ``tau`` is the interface type of this occurrence.  The old quotient-era
+    raw/candidate fields are gone with the spectral architecture.
+    """
+
     tau: str
-    raw: torch.Tensor
-    candidate: torch.Tensor
-    quotient: torch.Tensor
+    z: torch.Tensor
 
 
 @dataclass
 class RecursiveOccurrence:
     occurrence_id: int
     tau: str
-    state: QuotientState
+    state: OccurrenceState
     local_features: torch.Tensor
     children: List[int] = field(default_factory=list)
     child_relations: List[int] = field(default_factory=list)
     child_delta_t: List[float] = field(default_factory=list)
+    # Contract keys: ``node`` (global node id), ``time`` (as-of time = the
+    # query timestamp of the tree, for every occurrence), ``own_raw`` (the
+    # bottleneck pre-input o_v).  Filled by the host adapter.
     metadata: Dict[str, Any] = field(default_factory=dict)
 
 

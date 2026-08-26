@@ -1,0 +1,252 @@
+#!/usr/bin/env python3
+"""Stage-1 self-supervised pretraining entry (official TGN protocol).
+
+Clones ``old/tgn/train_self_supervised.py``: BCE link prediction with negative
+destinations, val-AP early stopping, memory reset per epoch, detach after
+every backward.  With ``--stage1-rpbe`` the RPBE component (compressor + fixed
+maps + LINK cut builder) trains jointly with the host from step 0.
+
+Example:
+    python -m scripts.train_pretrain -d wikipedia \
+        --data-dir old/processed_tgn_data --output outputs/pretrained/wikipedia
+"""
+
+import os
+
+for _k in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS"):
+    os.environ.setdefault(_k, "1")
+
+import argparse
+import json
+import random
+import sys
+import time
+from pathlib import Path
+
+import numpy as np
+import torch
+
+torch.set_num_threads(int(os.environ["OMP_NUM_THREADS"]))
+
+HERE = Path(__file__).resolve().parent
+SRC = HERE.parent / "src"
+if str(SRC) not in sys.path:
+    sys.path.insert(0, str(SRC))
+
+from rpbe.compressor import RecursiveCompressor
+from rpbe.config import RPBConfig
+from rpbe.data.jodie import JodieDataset
+from rpbe.hosts.jodie_bridge import build_cut_builder
+from rpbe.hosts.jodie_tgn import JodieTGNAdapter, TAU_TEMPLATE
+from rpbe.hosts.official_tgn import TGN, get_neighbor_finder
+from rpbe.maps import FixedMaps
+from rpbe.monitoring import MonitorWriter
+from rpbe.records import LINK
+from rpbe.training.pretrain_loop import TGNPretrainLoop
+
+
+def parse_args():
+    p = argparse.ArgumentParser("Official TGN self-supervised pretraining (stage 1)")
+    p.add_argument("-d", "--data", default="wikipedia")
+    p.add_argument("--data-dir", required=True)
+    p.add_argument("--output", required=True)
+    p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--gpu", type=int, default=0)
+    p.add_argument("--bs", type=int, default=200)
+    p.add_argument("--n-degree", type=int, default=10)
+    p.add_argument("--n-head", type=int, default=2)
+    p.add_argument("--n-epoch", type=int, default=50)
+    p.add_argument("--n-layer", type=int, default=2)
+    p.add_argument("--lr", type=float, default=1e-4)
+    p.add_argument("--patience", type=int, default=5)
+    p.add_argument("--drop-out", type=float, default=0.1)
+    p.add_argument("--message-dim", type=int, default=100)
+    p.add_argument("--memory-dim", type=int, default=172)
+    p.add_argument("--backprop-every", type=int, default=1)
+    p.add_argument("--grad-clip", type=float, default=0.0,
+                   help="0 disables (official protocol has no clipping)")
+    # RPBE (stage-1 joint pretraining).
+    p.add_argument("--stage1-rpbe", action="store_true",
+                   help="Jointly train host + Gamma_theta with the Ky Fan term")
+    p.add_argument("--kf-lambda", type=float, default=1.0)
+    p.add_argument("--rpbe-width", type=int, default=128)
+    p.add_argument("--sketch-dim", type=int, default=256)
+    p.add_argument("--neg-per-cut", type=int, default=4)
+    p.add_argument("--min-cuts-per-type", type=int, default=32)
+    p.add_argument("--ridge-eps", type=float, default=1e-4)
+    p.add_argument("--rpbe-seed", type=int, default=0)
+    p.add_argument("--trace-roots", type=int, default=8)
+    # Monitoring / caps.
+    p.add_argument("--monitor-every", type=int, default=50)
+    p.add_argument("--no-fail-on-monitor-error", action="store_true")
+    p.add_argument("--max-train", type=int, default=0)
+    p.add_argument("--max-val", type=int, default=0)
+    return p.parse_args()
+
+
+def seed_all(seed):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
+def save_json(path, obj):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w") as f:
+        json.dump(obj, f, indent=2, allow_nan=True)
+
+
+def cap_data(data, cap):
+    if not cap or len(data.sources) <= cap:
+        return data
+    return data.slice(0, cap)
+
+
+def main():
+    args = parse_args()
+    seed_all(args.seed)
+    device = torch.device(f"cuda:{args.gpu}" if torch.cuda.is_available() else "cpu")
+    out = Path(args.output)
+    out.mkdir(parents=True, exist_ok=True)
+    monitor = MonitorWriter(out, fail_on_error=not args.no_fail_on_monitor_error,
+                            reset_files=True)
+
+    dataset = JodieDataset(args.data, data_dir=args.data_dir,
+                           use_validation=True)
+    full, train, val, test = dataset.splits()
+    train = cap_data(train, args.max_train)
+    val = cap_data(val, args.max_val)
+    train_finder = get_neighbor_finder(train, uniform=False,
+                                       max_node_idx=max(full.unique_nodes))
+    full_finder = get_neighbor_finder(full, uniform=False,
+                                      max_node_idx=max(full.unique_nodes))
+    ms, ss, md, sd = dataset.time_stats()
+    tgn = TGN(
+        neighbor_finder=train_finder,
+        node_features=dataset.node_features,
+        edge_features=dataset.edge_features,
+        device=device,
+        n_layers=args.n_layer,
+        n_heads=args.n_head,
+        dropout=args.drop_out,
+        use_memory=True,
+        message_dimension=args.message_dim,
+        memory_dimension=args.memory_dim,
+        memory_update_at_start=True,
+        embedding_module_type="graph_attention",
+        message_function="identity",
+        aggregator_type="last",
+        n_neighbors=args.n_degree,
+        mean_time_shift_src=ms,
+        std_time_shift_src=ss,
+        mean_time_shift_dst=md,
+        std_time_shift_dst=sd,
+    ).to(device)
+
+    compressor = adapter = fixed_maps = cut_builder = rpbe_cfg = None
+    if args.stage1_rpbe:
+        host_dim = int(tgn.embedding_dimension)
+        taus = [TAU_TEMPLATE.format(l) for l in range(args.n_layer + 1)]
+        delta_scale = float(np.median(np.diff(np.sort(full.timestamps)))) or 1.0
+        rpbe_cfg = RPBConfig(
+            interfaces={tau: host_dim for tau in taus},
+            own_dims={tau: host_dim for tau in taus},
+            width_D=args.rpbe_width, m=args.sketch_dim,
+            lambda_kf=args.kf_lambda, ridge_eps=args.ridge_eps,
+            delta_t_scale=delta_scale, neg_per_cut=args.neg_per_cut,
+            min_cuts_per_type=args.min_cuts_per_type,
+            rpbe_seed=args.rpbe_seed)
+        compressor = RecursiveCompressor(rpbe_cfg).to(device)
+        adapter = JodieTGNAdapter(tgn.embedding_module, compressor,
+                                  n_neighbors=args.n_degree)
+        tgn.embedding_module = adapter
+        fixed_maps = FixedMaps(rpbe_cfg).to(device)
+        cut_builder = build_cut_builder(dataset, stage=LINK, cfg=rpbe_cfg,
+                                        seed=args.rpbe_seed,
+                                        delta_t_scale=delta_scale)
+
+    main_params = [p for p in tgn.parameters() if p.requires_grad]
+    if compressor is not None:
+        main_params.extend(p for p in compressor.parameters()
+                           if p.requires_grad)
+    seen = set()
+    main_params = [p for p in main_params
+                   if not (id(p) in seen or seen.add(id(p)))]
+    optimizer = torch.optim.Adam(main_params, lr=args.lr)
+    loop = TGNPretrainLoop(
+        tgn=tgn, optimizer=optimizer, device=device, batch_size=args.bs,
+        n_neighbors=args.n_degree, backprop_every=args.backprop_every,
+        grad_clip=args.grad_clip, monitor=monitor, seed=args.seed,
+        adapter=adapter, cut_builder=cut_builder, fixed_maps=fixed_maps,
+        rpbe_cfg=rpbe_cfg, lambda_kf=args.kf_lambda,
+        trace_roots=args.trace_roots)
+
+    save_json(out / "config.json", {
+        "data": args.data,
+        "data_dir": str(Path(args.data_dir).resolve()),
+        "seed": args.seed,
+        "device": str(device),
+        "host_dim": int(tgn.embedding_dimension),
+        "train_pairs": len(train.sources),
+        "val_pairs": len(val.sources),
+        "stage1_rpbe": bool(args.stage1_rpbe),
+        "rpbe": rpbe_cfg.as_dict() if rpbe_cfg is not None else None,
+        "cli": vars(args),
+    })
+
+    global_step = 0
+    best_ap = -1.0
+    best_epoch = -1
+    bad_rounds = 0
+    for epoch in range(args.n_epoch):
+        t0 = time.time()
+        row = loop.train_epoch(epoch, global_step, train)
+        global_step = row["global_step"]
+
+        # Official semantics: validation runs on the full graph's neighbor
+        # finder; memory resets at the next epoch start so no backup needed.
+        tgn.embedding_module.neighbor_finder = full_finder
+        val_row = loop.evaluate_edge_prediction(val, neg_seed=0)
+        tgn.embedding_module.neighbor_finder = train_finder
+
+        epoch_row = {"epoch": epoch, "global_step": global_step,
+                     "train": row, "val": val_row,
+                     "epoch_seconds": time.time() - t0}
+        monitor.write_epoch(epoch_row)
+        print(f"epoch={epoch} train_link={row['train_link_loss']:.4f} "
+              f"train_kf={row['train_kf_loss']:.6f} "
+              f"val_ap={val_row['val_ap']:.4f} val_auc={val_row['val_auc']:.4f} "
+              f"sec={epoch_row['epoch_seconds']:.1f}", flush=True)
+
+        if val_row["val_ap"] > best_ap + 1e-12:
+            best_ap = float(val_row["val_ap"])
+            best_epoch = epoch
+            bad_rounds = 0
+            payload = {"model": {"tgn": tgn.state_dict()},
+                       "epoch": epoch, "val_ap": best_ap}
+            if compressor is not None:
+                payload["model"]["compressor"] = compressor.state_dict()
+            torch.save(payload, out / "best.pt")
+        else:
+            bad_rounds += 1
+            if bad_rounds >= args.patience:
+                print(f"early_stop epoch={epoch} best_epoch={best_epoch} "
+                      f"best_ap={best_ap:.6f}", flush=True)
+                break
+
+    summary = {
+        "data": args.data, "seed": args.seed, "best_epoch": int(best_epoch),
+        "best_val_ap": float(best_ap), "stage1_rpbe": bool(args.stage1_rpbe),
+    }
+    save_json(out / "summary.json", summary)
+    monitor.finalize(summary)
+    save_json(out / "_SUCCESS.json", {"status": "complete",
+                                      "best_epoch": int(best_epoch)})
+    print(json.dumps(summary, indent=2), flush=True)
+
+
+if __name__ == "__main__":
+    main()

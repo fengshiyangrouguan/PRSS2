@@ -6,19 +6,22 @@ sampling), BCE, memory reset at epoch start, chronological train -> validation
 replay (no reset between train and val, upstream semantics), best held-out
 selection, then zero-memory train+val replay before the held-out test.
 
-RPBE hooks (adapter / cut builder / Ky Fan term) are wired in a later step;
-this file currently implements the pure-host loop, which is bit-identical to
-the official protocol when no RPBE component is constructed.
+RPBE hooks: when an adapter + cut builder are attached, each training batch
+traces a few roots, builds CutRecord rows over the computation tree, computes
+the per-interface Ky Fan score and adds ``lambda_kf * (-sum alpha J)`` to the
+task loss (one backward, one optimizer over host + compressor + decoder).
+Evaluation never builds cuts and never touches the fixed maps.
 """
 
 import math
-import time
 from typing import Dict
 
 import numpy as np
 import torch
 import torch.nn.functional as F
 from sklearn.metrics import average_precision_score, roc_auc_score
+
+from rpbe.loss import kf_loss, kf_scores_from_rows
 
 EPS = 1e-7
 
@@ -73,11 +76,13 @@ def select_trace_rows(labels, max_roots: int, seed: int, batch_index: int,
 
 
 class JodieNodeClassificationLoop:
-    """Owns the official-TGN stream and trains host + decoder jointly or frozen."""
+    """Owns the official-TGN stream; RPBE hooks are all optional."""
 
     def __init__(self, *, tgn, decoder, optimizer, device, batch_size, n_neighbors,
                  grad_clip, monitor, seed, finetune_host=False,
-                 selection_metric="auc"):
+                 selection_metric="auc", adapter=None, cut_builder=None,
+                 fixed_maps=None, rpbe_cfg=None, lambda_kf=1.0,
+                 trace_roots=8, trace_mode="positive_first"):
         self.tgn = tgn
         self.decoder = decoder
         self.optimizer = optimizer
@@ -89,6 +94,15 @@ class JodieNodeClassificationLoop:
         self.seed = int(seed)
         self.finetune_host = bool(finetune_host)
         self.selection_metric = selection_metric
+        self.adapter = adapter
+        self.cut_builder = cut_builder
+        self.fixed_maps = fixed_maps
+        self.rpbe_cfg = rpbe_cfg
+        self.lambda_kf = float(lambda_kf)
+        self.trace_roots = int(trace_roots)
+        self.trace_mode = trace_mode
+        self.rpbe_on = bool(adapter is not None and cut_builder is not None
+                            and fixed_maps is not None and rpbe_cfg is not None)
 
     # ------------------------------------------------------------- stream state
     def reset_memory(self):
@@ -111,7 +125,7 @@ class JodieNodeClassificationLoop:
         self.tgn.train(self.finetune_host)
         self.decoder.train()
 
-        total_task = 0.0
+        total_task = total_kf = 0.0
         n_batches = 0
         train_probs, train_labels = [], []
         num_batch = math.ceil(len(train.sources) / self.batch_size)
@@ -126,20 +140,51 @@ class JodieNodeClassificationLoop:
             labels_t = torch.from_numpy(labels_np).float().to(self.device)
             self.optimizer.zero_grad(set_to_none=True)
 
+            trace_rows = []
+            if self.adapter is not None:
+                trace_rows = select_trace_rows(
+                    labels_np, self.trace_roots, self.seed, global_step,
+                    self.trace_mode)
+                self.adapter.set_trace_source_rows(trace_rows)
+
             src_emb, _, _ = self._full_official_embedding_call(
                 sources, dests, times, edge_idxs,
-                grad_enabled=self.finetune_host)
+                grad_enabled=(self.finetune_host or self.rpbe_on))
             logits = self.decoder(src_emb)
             pred = logits.sigmoid()
             # Upstream node-classification objective exactly: sigmoid + BCE.
             task_loss = F.binary_cross_entropy(pred, labels_t)
 
+            kf_v = 0.0
+            kf_detail = {}
+            if self.rpbe_on and trace_rows and self.adapter.trace is not None:
+                cuts = self.cut_builder.build(self.adapter.trace,
+                                              batch_seed=global_step)
+                if cuts:
+                    scores, skipped = kf_scores_from_rows(
+                        cuts, self.rpbe_cfg.interfaces, self.fixed_maps,
+                        min_cuts_per_type=self.rpbe_cfg.min_cuts_per_type,
+                        eps=self.rpbe_cfg.ridge_eps)
+                    if scores:
+                        kf_term = kf_loss(scores, self.rpbe_cfg.alphas)
+                        kf_v = float(kf_term.detach())
+                        kf_detail = {tau: float(j.detach())
+                                     for tau, j in scores.items()}
+                        main_loss = task_loss + self.lambda_kf * kf_term
+                    else:
+                        main_loss = task_loss
+                else:
+                    main_loss = task_loss
+            else:
+                main_loss = task_loss
+
             self.monitor.validate_losses({
                 "task": float(task_loss.detach()),
-                "main_total": float(task_loss.detach()),
+                "kf": kf_v,
+                "main_total": float(main_loss.detach()),
             }, global_step)
 
-            task_loss.backward()
+            main_loss.backward()
             if self.grad_clip > 0:
                 torch.nn.utils.clip_grad_norm_(
                     [p for p in self.optimizer.param_groups[0]["params"]
@@ -149,12 +194,13 @@ class JodieNodeClassificationLoop:
 
             # Upstream truncation invariant: detach the memory graph when the
             # host can carry gradients.
-            if self.tgn.use_memory and self.finetune_host:
+            if self.tgn.use_memory and (self.finetune_host or self.rpbe_on):
                 self.tgn.memory.detach_memory()
 
             train_probs.append(pred.detach().cpu().numpy())
             train_labels.append(labels_np)
             total_task += float(task_loss.detach())
+            total_kf += kf_v
             n_batches += 1
             global_step += 1
 
@@ -162,6 +208,7 @@ class JodieNodeClassificationLoop:
                                       np.concatenate(train_probs))
         return {
             "train_task_loss": total_task / max(n_batches, 1),
+            "train_kf_loss": total_kf / max(n_batches, 1),
             "train": train_metrics,
             "n_batches": n_batches,
             "global_step": global_step,
@@ -179,6 +226,8 @@ class JodieNodeClassificationLoop:
             self.reset_memory()
         self.tgn.eval()
         self.decoder.eval()
+        if self.adapter is not None:
+            self.adapter.clear_trace()
         probs, labels = [], []
         observed_dims = None
         for k in range(math.ceil(len(split.sources) / self.batch_size)):
@@ -200,6 +249,8 @@ class JodieNodeClassificationLoop:
     def replay_split(self, split: object) -> None:
         """Rebuild the stream from zero over a split, no scores (test setup)."""
         self.tgn.eval()
+        if self.adapter is not None:
+            self.adapter.clear_trace()
         for k in range(math.ceil(len(split.sources) / self.batch_size)):
             s, e = k * self.batch_size, min(len(split.sources),
                                             (k + 1) * self.batch_size)

@@ -8,4 +8,13 @@ over fixed joint tests ``psi(c,y)`` of real future continuations.  Deployment
 keeps only the recursive compressor wrapped around the host aggregate.
 """
 
+from rpbe.compressor import RecursiveCompressor
+from rpbe.config import RPBConfig
+from rpbe.loss import kf_loss, kf_score
+from rpbe.maps import FixedMaps
+from rpbe.records import CutRecord
+
+__all__ = ["CutRecord", "FixedMaps", "RPBConfig", "RecursiveCompressor",
+           "kf_loss", "kf_score"]
+
 __version__ = "3.0.0"

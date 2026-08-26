@@ -38,9 +38,15 @@ SRC = HERE.parent / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
+from rpbe.compressor import RecursiveCompressor
+from rpbe.config import RPBConfig
 from rpbe.data.jodie import JodieDataset
+from rpbe.hosts.jodie_bridge import build_cut_builder
+from rpbe.hosts.jodie_tgn import JodieTGNAdapter, TAU_TEMPLATE
 from rpbe.hosts.official_tgn import MLP, TGN, get_neighbor_finder
+from rpbe.maps import FixedMaps
 from rpbe.monitoring import MonitorWriter
+from rpbe.records import NODE_CLASS
 from rpbe.training.checkpoint import CheckpointManager
 from rpbe.training.jodie_loop import JodieNodeClassificationLoop
 
@@ -66,8 +72,23 @@ def parse_args():
     p.add_argument("--message-dim", type=int, default=100)
     p.add_argument("--memory-dim", type=int, default=172)
     p.add_argument("--finetune-host", action="store_true",
-                   help="Jointly fine-tune the pretrained host (default: frozen)")
+                   help="Jointly fine-tune the pretrained host "
+                        "(default: follows --rpbe)")
     p.add_argument("--selection-metric", choices=["auc", "ap"], default="auc")
+    # RPBE (stage-2 joint fine-tuning with the Ky Fan component loss).
+    p.add_argument("--rpbe", action="store_true",
+                   help="Attach the RPBE component (compressor + fixed maps "
+                        "+ cut builder + Ky Fan term)")
+    p.add_argument("--kf-lambda", type=float, default=1.0)
+    p.add_argument("--rpbe-width", type=int, default=128)
+    p.add_argument("--sketch-dim", type=int, default=256)
+    p.add_argument("--neg-per-cut", type=int, default=4)
+    p.add_argument("--min-cuts-per-type", type=int, default=32)
+    p.add_argument("--ridge-eps", type=float, default=1e-4)
+    p.add_argument("--rpbe-seed", type=int, default=0)
+    p.add_argument("--trace-roots", type=int, default=8)
+    p.add_argument("--trace-mode", default="positive_first",
+                   choices=["positive_first", "evenly_spaced", "off"])
     # Diagnostics.
     p.add_argument("--no-early-stop", action="store_true")
     # Monitoring / resume / smoke caps.
@@ -153,8 +174,10 @@ def build_components(args, device, dataset):
         mean_time_shift_dst=md,
         std_time_shift_dst=sd,
     ).to(device)
+    pretrained_payload = None
     if args.pretrained_checkpoint:
-        state = unwrap_state(load_torch(args.pretrained_checkpoint, device))
+        pretrained_payload = load_torch(args.pretrained_checkpoint, device)
+        state = unwrap_state(pretrained_payload)
         # Memory is a runtime state produced by the pretraining stream, not a
         # parameter to carry across runs (shape differs across node sets).
         MEMORY_STATE_KEYS = ("memory.memory", "memory.last_update",
@@ -177,17 +200,62 @@ def build_components(args, device, dataset):
             p.requires_grad_(False)
         tgn.eval()
 
+    # ------------------------------- RPBE component --------------------------
+    compressor = adapter = fixed_maps = cut_builder = rpbe_cfg = None
+    if args.rpbe:
+        # RPBE implies joint fine-tuning of the host (the switch is "unplugged"
+        # when off, so there is no frozen-RPBE configuration).
+        args.finetune_host = True
+        for p in tgn.parameters():
+            p.requires_grad_(True)
+        host_dim = int(tgn.embedding_dimension)
+        taus = [TAU_TEMPLATE.format(l) for l in range(args.n_layer + 1)]
+        delta_scale = float(np.median(np.diff(np.sort(full.timestamps)))) or 1.0
+        rpbe_cfg = RPBConfig(
+            interfaces={tau: host_dim for tau in taus},
+            own_dims={tau: host_dim for tau in taus},
+            width_D=args.rpbe_width, m=args.sketch_dim,
+            lambda_kf=args.kf_lambda, ridge_eps=args.ridge_eps,
+            delta_t_scale=delta_scale, neg_per_cut=args.neg_per_cut,
+            min_cuts_per_type=args.min_cuts_per_type,
+            rpbe_seed=args.rpbe_seed)
+        compressor = RecursiveCompressor(rpbe_cfg).to(device)
+        adapter = JodieTGNAdapter(tgn.embedding_module, compressor,
+                                  n_neighbors=args.n_degree)
+        # Swap AFTER pretrained-key validation and freezing.
+        tgn.embedding_module = adapter
+        fixed_maps = FixedMaps(rpbe_cfg).to(device)
+        cut_builder = build_cut_builder(dataset, stage=NODE_CLASS, cfg=rpbe_cfg,
+                                        seed=args.rpbe_seed,
+                                        delta_t_scale=delta_scale)
+        # Carry the stage-1 compressor over when the checkpoint provides one
+        # (--stage1-rpbe product); otherwise Gamma starts from scratch here.
+        if pretrained_payload is not None and isinstance(pretrained_payload, dict):
+            model = pretrained_payload.get("model") or {}
+            if isinstance(model, dict) and isinstance(model.get("compressor"), dict):
+                missing, unexpected = compressor.load_state_dict(
+                    model["compressor"], strict=False)
+                if missing or unexpected:
+                    raise RuntimeError(
+                        "stage-1 compressor mismatch: missing={}, unexpected={}"
+                        .format(sorted(missing), sorted(unexpected)))
+
     # Exact upstream decoder type/dimension.
     decoder = MLP(dataset.node_features.shape[1], drop=args.drop_out).to(device)
 
     main_params = list(decoder.parameters())
     if args.finetune_host:
         main_params.extend(p for p in tgn.parameters() if p.requires_grad)
+    if compressor is not None:
+        main_params.extend(p for p in compressor.parameters()
+                           if p.requires_grad)
     seen = set()
     main_params = [p for p in main_params
                    if not (id(p) in seen or seen.add(id(p)))]
     optimizer = torch.optim.Adam(main_params, lr=args.lr)
-    return dict(tgn=tgn, decoder=decoder, optimizer=optimizer)
+    return dict(tgn=tgn, decoder=decoder, optimizer=optimizer,
+                compressor=compressor, adapter=adapter, fixed_maps=fixed_maps,
+                cut_builder=cut_builder, rpbe_cfg=rpbe_cfg)
 
 
 def main():
@@ -216,7 +284,11 @@ def main():
         device=device, batch_size=args.bs, n_neighbors=args.n_degree,
         grad_clip=args.grad_clip, monitor=monitor,
         seed=args.seed, finetune_host=args.finetune_host,
-        selection_metric=args.selection_metric)
+        selection_metric=args.selection_metric,
+        adapter=components["adapter"], cut_builder=components["cut_builder"],
+        fixed_maps=components["fixed_maps"], rpbe_cfg=components["rpbe_cfg"],
+        lambda_kf=args.kf_lambda, trace_roots=args.trace_roots,
+        trace_mode=args.trace_mode)
 
     save_json(out / "config.json", {
         "data": args.data,
@@ -236,7 +308,8 @@ def main():
         "finetune_host": bool(args.finetune_host),
         "protocol": "upstream TGN node classification + matched corrections "
                     "(held-out val early stop, zero-memory replay test)",
-        "rpbe": False,
+        "rpbe": components["rpbe_cfg"].as_dict()
+                if components["rpbe_cfg"] is not None else False,
         "cli": vars(args),
     })
 
@@ -250,7 +323,9 @@ def main():
     bad_rounds = 0
     if args.resume_from:
         resume = ckpt.load(
-            model_components={"tgn": tgn, "decoder": components["decoder"]},
+            model_components={"tgn": tgn, "decoder": components["decoder"],
+                              **({"compressor": components["compressor"]}
+                                 if components["compressor"] is not None else {})},
             optimizer=components["optimizer"], device=device)
         start_epoch = int(resume["epoch"])
         global_step = int(resume["global_step"])
@@ -298,7 +373,9 @@ def main():
             bad_rounds = 0
             torch.save({
                 "model": {"decoder": components["decoder"].state_dict(),
-                          "tgn": tgn.state_dict()},
+                          "tgn": tgn.state_dict(),
+                          **({"compressor": components["compressor"].state_dict()}
+                             if components["compressor"] is not None else {})},
                 "epoch": epoch, "score": float(best_score),
             }, out / "best.pt")
         else:
@@ -310,7 +387,9 @@ def main():
                 break
         if args.checkpoint_every > 0 and (epoch + 1) % args.checkpoint_every == 0:
             ckpt.save(model_components={
-                "tgn": tgn, "decoder": components["decoder"]},
+                "tgn": tgn, "decoder": components["decoder"],
+                **({"compressor": components["compressor"]}
+                   if components["compressor"] is not None else {})},
                 optimizer=components["optimizer"],
                 epoch=epoch + 1, next_batch=0, global_step=global_step,
                 best_score=best_score, best_epoch=best_epoch,
@@ -322,6 +401,8 @@ def main():
     best = load_torch(out / "best.pt", device)
     for name in ("decoder", "tgn"):
         components[name].load_state_dict(best["model"][name])
+    if components["compressor"] is not None:
+        components["compressor"].load_state_dict(best["model"]["compressor"])
 
     loop.reset_memory()
     loop.replay_split(train)

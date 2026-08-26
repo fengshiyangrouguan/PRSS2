@@ -1,14 +1,20 @@
-"""Cut builder for the JODIE node-classification stage (placeholder).
+"""Cut-builder factory for the JODIE line.
 
-The real implementation (CutRecord construction from the adapter trace plus a
-node-grouped, time-sorted FutureIndex) lands with ``rpbe/records.py``.  This
-stub exists so the package imports cleanly in the pure-host build.
+Builds the node-grouped, time-sorted FutureIndex over the *full* stream (with
+split flags) and wraps it in a :class:`rpbe.records.JodieCutBuilder` for one
+training stage: LINK (stage 1, self-supervised pretraining) or NODE_CLASS
+(stage 2, node classification).
 """
 
+from rpbe.records import FutureIndex, JodieCutBuilder
 
-class JodieNodeClassificationBridge:
-    """Rewritten as the stage-2 CutBuilder in a later step."""
 
-    def __init__(self, *args, **kwargs):
-        raise NotImplementedError(
-            "JodieNodeClassificationBridge is implemented in the records step")
+def build_cut_builder(dataset, *, stage: str, cfg, seed: int = 0,
+                      delta_t_scale: float = 1e6) -> JodieCutBuilder:
+    full = dataset.full
+    index = FutureIndex(full.sources, full.destinations, full.timestamps,
+                        full.labels, val_time=dataset.val_time,
+                        test_time=dataset.test_time)
+    cfg.delta_t_scale = float(delta_t_scale) if delta_t_scale > 0 else 1.0
+    return JodieCutBuilder(index, stage=stage, neg_per_cut=cfg.neg_per_cut,
+                           seed=int(seed))

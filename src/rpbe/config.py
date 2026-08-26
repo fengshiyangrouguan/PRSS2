@@ -22,7 +22,7 @@ class RPBConfig:
     ridge_eps: float = 1e-4              # relative ridge (x tr(Sigma)/dim)
     delta_t_scale: float = 1e6           # fixed scale for continuous delta_t RFF
     neg_per_cut: int = 4                 # stage-1 negative rows per cut
-    min_cuts_per_type: int = 32          # skip a tau's term below this many rows
+    min_cuts_per_type: int = 16          # skip a tau's term below this many rows
     rpbe_seed: int = 0                   # fixed-measurement seed (independent of host)
 
     def __post_init__(self):

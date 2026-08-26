@@ -72,10 +72,10 @@ def parse_args():
     p.add_argument("--rpbe-width", type=int, default=128)
     p.add_argument("--sketch-dim", type=int, default=256)
     p.add_argument("--neg-per-cut", type=int, default=4)
-    p.add_argument("--min-cuts-per-type", type=int, default=32)
+    p.add_argument("--min-cuts-per-type", type=int, default=16)
     p.add_argument("--ridge-eps", type=float, default=1e-4)
     p.add_argument("--rpbe-seed", type=int, default=0)
-    p.add_argument("--trace-roots", type=int, default=8)
+    p.add_argument("--trace-roots", type=int, default=32)
     # Monitoring / caps.
     p.add_argument("--monitor-every", type=int, default=50)
     p.add_argument("--no-fail-on-monitor-error", action="store_true")

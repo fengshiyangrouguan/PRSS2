@@ -1,0 +1,209 @@
+"""JODIE node-classification training loop on the official TGN host (stage 2).
+
+Protocol clone of upstream ``official_tgn/train_supervised.py`` plus the v1
+matched corrections: supervised epochs over natural labels (no negative
+sampling), BCE, memory reset at epoch start, chronological train -> validation
+replay (no reset between train and val, upstream semantics), best held-out
+selection, then zero-memory train+val replay before the held-out test.
+
+RPBE hooks (adapter / cut builder / Ky Fan term) are wired in a later step;
+this file currently implements the pure-host loop, which is bit-identical to
+the official protocol when no RPBE component is constructed.
+"""
+
+import math
+import time
+from typing import Dict
+
+import numpy as np
+import torch
+import torch.nn.functional as F
+from sklearn.metrics import average_precision_score, roc_auc_score
+
+EPS = 1e-7
+
+
+def metric_bundle(labels, probs):
+    """AUC/AP/NLL plus the diagnostics the v1 protocol reported."""
+    labels = np.asarray(labels).astype(np.float64)
+    probs = np.clip(np.asarray(probs).astype(np.float64), EPS, 1 - EPS)
+    auc = float(roc_auc_score(labels, probs)) if len(np.unique(labels)) > 1 else float("nan")
+    ap = float(average_precision_score(labels, probs)) if labels.sum() > 0 else 0.0
+    nll = float(-(labels * np.log(probs) + (1 - labels) * np.log(1 - probs)).mean())
+    pos = labels > 0.5
+    neg = ~pos
+    return {
+        "auc": auc,
+        "ap": ap,
+        "nll": nll,
+        "positive_nll": float(-np.log(probs[pos]).mean()) if pos.any() else float("nan"),
+        "negative_nll": float(-np.log(1 - probs[neg]).mean()) if neg.any() else float("nan"),
+        "positives": int(pos.sum()),
+        "pairs": int(len(labels)),
+        "positive_rate": float(pos.mean()),
+        "mean_prob_positive": float(probs[pos].mean()) if pos.any() else float("nan"),
+        "mean_prob_negative": float(probs[neg].mean()) if neg.any() else float("nan"),
+    }
+
+
+def select_trace_rows(labels, max_roots: int, seed: int, batch_index: int,
+                      mode: str = "positive_first") -> list:
+    """How traced roots are picked within a batch (positive-first, v1 semantics)."""
+    if mode == "off" or max_roots <= 0:
+        return []
+    labels = np.asarray(labels)
+    if mode == "evenly_spaced":
+        if len(labels) == 0:
+            return []
+        rng = np.random.RandomState(seed + 104729 * (batch_index + 1))
+        rows = np.linspace(0, len(labels) - 1,
+                           min(max_roots, len(labels))).astype(np.int64)
+        return [int(r) for r in rows]
+    if mode != "positive_first":
+        raise ValueError("unknown trace mode {}".format(mode))
+    pos = np.flatnonzero(labels > 0.5).tolist()
+    neg = np.flatnonzero(labels <= 0.5).tolist()
+    chosen = pos[:max_roots]
+    remain = max_roots - len(chosen)
+    if remain > 0 and neg:
+        rng = np.random.RandomState(seed + 104729 * (batch_index + 1))
+        chosen.extend(neg if len(neg) <= remain
+                      else rng.choice(neg, size=remain, replace=False).tolist())
+    return sorted(chosen)
+
+
+class JodieNodeClassificationLoop:
+    """Owns the official-TGN stream and trains host + decoder jointly or frozen."""
+
+    def __init__(self, *, tgn, decoder, optimizer, device, batch_size, n_neighbors,
+                 grad_clip, monitor, seed, finetune_host=False,
+                 selection_metric="auc"):
+        self.tgn = tgn
+        self.decoder = decoder
+        self.optimizer = optimizer
+        self.device = device
+        self.batch_size = int(batch_size)
+        self.n_neighbors = int(n_neighbors)
+        self.grad_clip = float(grad_clip)
+        self.monitor = monitor
+        self.seed = int(seed)
+        self.finetune_host = bool(finetune_host)
+        self.selection_metric = selection_metric
+
+    # ------------------------------------------------------------- stream state
+    def reset_memory(self):
+        if self.tgn.use_memory:
+            self.tgn.memory.__init_memory__()
+
+    def _full_official_embedding_call(self, sources, destinations, timestamps,
+                                      edge_idxs, grad_enabled):
+        """Exactly the src/dst/dst call of upstream train_supervised.py."""
+        ctx = torch.enable_grad() if grad_enabled else torch.no_grad()
+        with ctx:
+            return self.tgn.compute_temporal_embeddings(
+                sources, destinations, destinations, timestamps, edge_idxs,
+                self.n_neighbors)
+
+    # ----------------------------------------------------------------- training
+    def train_epoch(self, epoch: int, global_step: int, train: object) -> Dict:
+        """One supervised epoch over the chronological train stream."""
+        self.reset_memory()
+        self.tgn.train(self.finetune_host)
+        self.decoder.train()
+
+        total_task = 0.0
+        n_batches = 0
+        train_probs, train_labels = [], []
+        num_batch = math.ceil(len(train.sources) / self.batch_size)
+        for k in range(num_batch):
+            s, e = k * self.batch_size, min(len(train.sources),
+                                            (k + 1) * self.batch_size)
+            sources = train.sources[s:e]
+            dests = train.destinations[s:e]
+            times = train.timestamps[s:e]
+            edge_idxs = train.edge_idxs[s:e]
+            labels_np = train.labels[s:e]
+            labels_t = torch.from_numpy(labels_np).float().to(self.device)
+            self.optimizer.zero_grad(set_to_none=True)
+
+            src_emb, _, _ = self._full_official_embedding_call(
+                sources, dests, times, edge_idxs,
+                grad_enabled=self.finetune_host)
+            logits = self.decoder(src_emb)
+            pred = logits.sigmoid()
+            # Upstream node-classification objective exactly: sigmoid + BCE.
+            task_loss = F.binary_cross_entropy(pred, labels_t)
+
+            self.monitor.validate_losses({
+                "task": float(task_loss.detach()),
+                "main_total": float(task_loss.detach()),
+            }, global_step)
+
+            task_loss.backward()
+            if self.grad_clip > 0:
+                torch.nn.utils.clip_grad_norm_(
+                    [p for p in self.optimizer.param_groups[0]["params"]
+                     if p.grad is not None], max_norm=self.grad_clip,
+                    error_if_nonfinite=True)
+            self.optimizer.step()
+
+            # Upstream truncation invariant: detach the memory graph when the
+            # host can carry gradients.
+            if self.tgn.use_memory and self.finetune_host:
+                self.tgn.memory.detach_memory()
+
+            train_probs.append(pred.detach().cpu().numpy())
+            train_labels.append(labels_np)
+            total_task += float(task_loss.detach())
+            n_batches += 1
+            global_step += 1
+
+        train_metrics = metric_bundle(np.concatenate(train_labels),
+                                      np.concatenate(train_probs))
+        return {
+            "train_task_loss": total_task / max(n_batches, 1),
+            "train": train_metrics,
+            "n_batches": n_batches,
+            "global_step": global_step,
+        }
+
+    # --------------------------------------------------------------- evaluation
+    @torch.no_grad()
+    def evaluate_split(self, split: object, *, reset: bool = False) -> Dict:
+        """AUC/AP/NLL over one split; advances the stream with ground truth.
+
+        ``reset=False`` continues from the memory left by the previous split
+        (upstream semantics: validation follows the train stream).
+        """
+        if reset:
+            self.reset_memory()
+        self.tgn.eval()
+        self.decoder.eval()
+        probs, labels = [], []
+        observed_dims = None
+        for k in range(math.ceil(len(split.sources) / self.batch_size)):
+            s, e = k * self.batch_size, min(len(split.sources),
+                                            (k + 1) * self.batch_size)
+            src_emb, _, _ = self._full_official_embedding_call(
+                split.sources[s:e], split.destinations[s:e],
+                split.timestamps[s:e], split.edge_idxs[s:e],
+                grad_enabled=False)
+            if observed_dims is None:
+                observed_dims = {"source": int(src_emb.shape[-1])}
+            probs.append(self.decoder(src_emb).sigmoid().cpu().numpy())
+            labels.append(split.labels[s:e])
+        out = metric_bundle(np.concatenate(labels), np.concatenate(probs))
+        out["embedding_dims_observed"] = observed_dims or {}
+        return out
+
+    @torch.no_grad()
+    def replay_split(self, split: object) -> None:
+        """Rebuild the stream from zero over a split, no scores (test setup)."""
+        self.tgn.eval()
+        for k in range(math.ceil(len(split.sources) / self.batch_size)):
+            s, e = k * self.batch_size, min(len(split.sources),
+                                            (k + 1) * self.batch_size)
+            self._full_official_embedding_call(
+                split.sources[s:e], split.destinations[s:e],
+                split.timestamps[s:e], split.edge_idxs[s:e],
+                grad_enabled=False)

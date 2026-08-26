@@ -10,11 +10,11 @@ import unittest
 import numpy as np
 import torch
 
-from prss.config import InterfaceSpec, PRSSConfig
-from prss.core import PRSSCore
-from prss.hosts.jodie_bridge import JodieNodeClassificationBridge
-from prss.hosts.jodie_tgn import JodieTGNAdapter, TAU_TEMPLATE, jodie_preagg_dim
-from prss.training.isolation import assert_clean, counts_of_spectral, r_copies
+from rpbe.config import InterfaceSpec, PRSSConfig
+from rpbe.core import PRSSCore
+from rpbe.hosts.jodie_bridge import JodieNodeClassificationBridge
+from rpbe.hosts.jodie_tgn import JodieTGNAdapter, TAU_TEMPLATE, jodie_preagg_dim
+from rpbe.training.isolation import assert_clean, counts_of_spectral, r_copies
 
 from test_jodie_vendor import (
     REQUIRES_NUMPY_BRIDGE, make_synthetic_data, make_tgn)

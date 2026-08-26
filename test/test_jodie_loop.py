@@ -10,9 +10,9 @@ import unittest
 import numpy as np
 import torch
 
-from prss.data.jodie import JodieData
-from prss.hosts.jodie_bridge import JodieNodeClassificationBridge
-from prss.training.jodie_loop import (JodieNodeClassificationLoop,
+from rpbe.data.jodie import JodieData
+from rpbe.hosts.jodie_bridge import JodieNodeClassificationBridge
+from rpbe.training.jodie_loop import (JodieNodeClassificationLoop,
                                       metric_bundle, select_trace_rows)
 
 from test_jodie_adapter import (make_tiny_prss, make_tiny_tgn,
@@ -135,7 +135,7 @@ class TestLoopSmoke(unittest.TestCase):
         bridge = JodieNodeClassificationBridge(
             adapter, prss, log_time_mean=float(logt.mean()),
             log_time_std=float(logt.std() + 1e-8))
-        from prss.hosts.official_tgn import MLP
+        from rpbe.hosts.official_tgn import MLP
         decoder = MLP(dim=8, drop=0.1).to(device)
         main_params = list(decoder.parameters()) + list(prss.parameters())
         unrestricted = list(prss.unrestricted.parameters())
@@ -188,7 +188,7 @@ class TestLoopSmoke(unittest.TestCase):
         tgn, device, stream = make_tiny_tgn()
         sources, destinations, timestamps, edge_idxs, labels = stream
         train = JodieData(sources, destinations, timestamps, edge_idxs, labels)
-        from prss.hosts.official_tgn import MLP
+        from rpbe.hosts.official_tgn import MLP
         decoder = MLP(dim=8, drop=0.1).to(device)
         loop = JodieNodeClassificationLoop(
             tgn=tgn, decoder=decoder, adapter=None, bridge=None,

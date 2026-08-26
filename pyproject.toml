@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "prss2"
-version = "2.0.0"
-description = "Predictive Recursive State Sheaf: predictive spectral quotient compression for recursive temporal graph hosts"
+version = "3.0.0"
+description = "RPBE: predictive recursive compression via a Ky Fan spectral score on recursive temporal graph hosts"
 requires-python = ">=3.9"
 dependencies = [
   "numpy>=1.21",
@@ -13,9 +13,6 @@ dependencies = [
   "scikit-learn>=1.2",
   "pyyaml>=6.0",
 ]
-
-[project.optional-dependencies]
-tgb = ["tgb==2.3.0", "torch-geometric==2.3.0"]
 
 [tool.setuptools.packages.find]
 where = ["src"]

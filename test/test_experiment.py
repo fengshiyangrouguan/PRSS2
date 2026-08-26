@@ -4,8 +4,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from prss.experiment.runner import expand, job_id, load_experiment
-from prss.experiment.summarize import summarize
+from rpbe.experiment.runner import expand, job_id, load_experiment
+from rpbe.experiment.summarize import summarize
 
 
 SPEC = {

@@ -5,8 +5,8 @@ from pathlib import Path
 
 import torch
 
-from prss.config import InterfaceSpec, PRSSConfig
-from prss.core import PRSSCore
+from rpbe.config import InterfaceSpec, PRSSConfig
+from rpbe.core import PRSSCore
 
 SRC_DIR = Path(__file__).resolve().parents[1] / "src"
 

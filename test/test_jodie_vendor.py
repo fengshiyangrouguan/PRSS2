@@ -13,7 +13,7 @@ import unittest
 import numpy as np
 import torch
 
-from prss.hosts.official_tgn import TGN, MLP, NeighborFinder, get_neighbor_finder
+from rpbe.hosts.official_tgn import TGN, MLP, NeighborFinder, get_neighbor_finder
 
 
 def _numpy_bridge_ok():

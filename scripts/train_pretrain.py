@@ -42,6 +42,7 @@ from rpbe.hosts.official_tgn import TGN, get_neighbor_finder
 from rpbe.maps import FixedMaps
 from rpbe.monitoring import MonitorWriter
 from rpbe.records import LINK
+from rpbe.training.checkpoint import CheckpointManager
 from rpbe.training.pretrain_loop import TGNPretrainLoop
 
 
@@ -76,9 +77,12 @@ def parse_args():
     p.add_argument("--ridge-eps", type=float, default=1e-4)
     p.add_argument("--rpbe-seed", type=int, default=0)
     p.add_argument("--trace-roots", type=int, default=32)
-    # Monitoring / caps.
+    # Monitoring / resume / caps.
     p.add_argument("--monitor-every", type=int, default=50)
     p.add_argument("--no-fail-on-monitor-error", action="store_true")
+    p.add_argument("--checkpoint-every", type=int, default=1,
+                   help="Exact rolling checkpoint every N epochs; 0 disables")
+    p.add_argument("--resume-from", default="")
     p.add_argument("--max-train", type=int, default=0)
     p.add_argument("--max-val", type=int, default=0)
     return p.parse_args()
@@ -213,7 +217,23 @@ def main():
     best_epoch = -1
     bad_rounds = 0
     best_kf = None
-    for epoch in range(args.n_epoch):
+    start_epoch = 0
+    ckpt = CheckpointManager(out / "rolling_step.pt")
+    if args.resume_from:
+        payload = ckpt.load(
+            model_components={"tgn": tgn,
+                              **({"compressor": compressor}
+                                 if compressor is not None else {})},
+            optimizer=optimizer, device=device)
+        start_epoch = int(payload["epoch"])
+        global_step = int(payload["global_step"])
+        best_ap = float(payload.get("best_score", -1.0))
+        best_epoch = int(payload.get("best_epoch", -1))
+        bad_rounds = int(payload.get("bad_rounds", 0))
+        print(f"RESUME epoch={start_epoch} global_step={global_step} "
+              f"from={args.resume_from}", flush=True)
+
+    for epoch in range(start_epoch, args.n_epoch):
         t0 = time.time()
         row = loop.train_epoch(epoch, global_step, train)
         global_step = row["global_step"]
@@ -270,6 +290,18 @@ def main():
                 print(f"early_stop epoch={epoch} best_epoch={best_epoch} "
                       f"best_ap={best_ap:.6f}", flush=True)
                 break
+        if args.checkpoint_every > 0 and (epoch + 1) % args.checkpoint_every == 0:
+            ckpt.save(model_components={
+                "tgn": tgn,
+                **({"compressor": compressor}
+                   if compressor is not None else {})},
+                optimizer=optimizer,
+                epoch=epoch + 1, next_batch=0, global_step=global_step,
+                best_score=best_ap, best_epoch=best_epoch,
+                bad_rounds=bad_rounds, train_state={},
+                extra_payload={"memory_backup":
+                               tgn.memory.backup_memory()
+                               if tgn.use_memory else None})
 
     summary = {
         "data": args.data, "seed": args.seed, "best_epoch": int(best_epoch),

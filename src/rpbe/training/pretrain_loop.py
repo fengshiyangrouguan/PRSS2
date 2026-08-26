@@ -48,7 +48,6 @@ class TGNPretrainLoop:
         self.trace_roots = int(trace_roots)
         self.rpbe_on = bool(adapter is not None and cut_builder is not None
                             and fixed_maps is not None and rpbe_cfg is not None)
-        self._neg_rng = np.random.RandomState(int(seed))
 
     # ------------------------------------------------------------- stream state
     def reset_memory(self):
@@ -57,9 +56,11 @@ class TGNPretrainLoop:
 
     def _sample_negatives(self, data, size: int) -> np.ndarray:
         # RandEdgeSampler semantics: negatives drawn from the destination
-        # column (the official uniform-over-destinations protocol).
+        # column (the official uniform-over-destinations protocol).  Drawn
+        # from the GLOBAL numpy stream so CheckpointManager's RNG restore
+        # makes resumed runs exact continuations.
         dst = np.asarray(data.destinations)
-        return self._neg_rng.choice(dst, size=size, replace=True)
+        return np.random.choice(dst, size=size, replace=True)
 
     # ----------------------------------------------------------------- training
     def train_epoch(self, epoch: int, global_step: int, train) -> Dict:

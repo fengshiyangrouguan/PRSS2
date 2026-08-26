@@ -7,11 +7,11 @@ neighbors.  Each recursive layer is one interface (``tjo:layer{l}``), so the
 host computation tree maps 1:1 onto the cut tree.
 
 The host aggregate is never replaced: the adapter computes the vanilla
-aggregate and passes it, with the children states, through the recursive
-compressor ``z_v = Gamma(o_v, {z_children}, xi)``.  With no compressor
-attached (``compressor=None``) the forward is bit-identical to the official
-host.  The memory lives entirely inside TGN; the adapter only wraps
-``embedding_module``.
+aggregate (over the children's compressed states) and passes it to the
+recursive compressor as the child-aggregation token, which stacks A/G/Q on
+top.  With no compressor attached (``compressor=None``) the forward is
+bit-identical to the official host.  The memory lives entirely inside TGN;
+the adapter only wraps ``embedding_module``.
 """
 
 from typing import Optional, Sequence
@@ -140,11 +140,10 @@ class JodieTGNAdapter(HostAdapter):
         ids = np.full(len(source_nodes), -1, dtype=np.int64)
         if layer == 0:
             tau = TAU_TEMPLATE.format(0)
-            # No children: identity passes the raw state through untouched.
+            # No children: identity passes the raw state through untouched;
+            # the compressor receives it in both slots (own input == aggregate).
             z = raw_source if self.compressor is None else self.compressor.compress(
-                tau=tau, own_input=raw_source,
-                child_states=None, child_edge=None, child_roles=None,
-                child_delta_t=None, mask=None)
+                tau=tau, own_input=raw_source, aggregate_output=raw_source)
             if self.trace is not None and active.any():
                 local = torch.zeros(len(source_nodes), self.preagg_dim,
                                     device=device, dtype=raw_source.dtype)
@@ -192,24 +191,11 @@ class JodieTGNAdapter(HostAdapter):
         if flat_preagg.shape[-1] != self.preagg_dim:
             raise ValueError("preagg width mismatch")
 
-        if self.compressor is None:
-            z = vanilla
-        else:
-            child_states = torch.cat([
-                source_lower.unsqueeze(1), neighbor_lower], dim=1)  # [b, 1+n, d]
-            roles = torch.zeros(b, 1 + n_neighbors, device=device)
-            roles[:, 1:] = 1.0
-            deltas = torch.zeros(b, 1 + n_neighbors, device=device)
-            deltas[:, 1:] = edge_deltas
-            child_edge = torch.cat([
-                source_time.unsqueeze(1), edge_time], dim=1)  # [b, 1+n, time_dim]
-            full_mask = torch.cat([
-                torch.zeros(b, 1, dtype=torch.bool, device=device), mask],
-                dim=1)
-            z = self.compressor.compress(
-                tau=tau, own_input=raw_source, child_states=child_states,
-                child_edge=child_edge, child_roles=roles,
-                child_delta_t=deltas, mask=full_mask)
+        # The host aggregate (with children's compressed states as input) is
+        # the child-aggregation token of Gamma; the compressor stacks A/G/Q on
+        # top without touching the aggregation itself.
+        z = vanilla if self.compressor is None else self.compressor.compress(
+            tau=tau, own_input=raw_source, aggregate_output=vanilla)
 
         if self.trace is not None and active.any():
             local = flat_preagg.detach().clone()

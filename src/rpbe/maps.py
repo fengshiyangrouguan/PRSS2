@@ -141,13 +141,15 @@ class FixedMaps(nn.Module):
                 dim=1)                                               # [N, 1+d_c]
             prod = torch.einsum("ni,nj->nij", body, f_vec).reshape(n, -1)
             flat = prod.reshape(-1)
-            row_idx = (self.sketch_indices[0]
-                       + torch.arange(n, device=dev) * self._sketch_full_dim)
+            row_off = (torch.arange(n, device=dev) * self._sketch_full_dim
+                       ).unsqueeze(1)
+            col_off = (torch.arange(n, device=dev) * self.m).unsqueeze(1)
+            row_idx = (self.sketch_indices[0].unsqueeze(0) + row_off).reshape(-1)
+            col_idx = (self.sketch_indices[1].unsqueeze(0) + col_off).reshape(-1)
             out = torch.zeros((n, self.m), dtype=flat.dtype, device=dev)
             out.view(-1).index_add_(
-                0, (self.sketch_indices[1] + torch.arange(n, device=dev)
-                    * self.m).view(-1),
-                flat[row_idx] * self.sketch_signs)
+                0, col_idx,
+                flat[row_idx] * self.sketch_signs.repeat(n))
             return out
 
     # ------------------------------------------------------------------ audit

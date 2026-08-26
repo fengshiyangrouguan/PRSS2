@@ -105,6 +105,16 @@ def cap_data(data, cap):
     return data.slice(0, cap)
 
 
+def make_tb_writer(out):
+    """TensorBoard writer under <out>/tb; degrades to None without the dep."""
+    try:
+        from torch.utils.tensorboard import SummaryWriter
+        return SummaryWriter(log_dir=str(Path(out) / "tb"))
+    except ImportError:
+        print("WARN: tensorboard not installed; skipping TB output", flush=True)
+        return None
+
+
 def main():
     args = parse_args()
     seed_all(args.seed)
@@ -113,6 +123,7 @@ def main():
     out.mkdir(parents=True, exist_ok=True)
     monitor = MonitorWriter(out, fail_on_error=not args.no_fail_on_monitor_error,
                             reset_files=True)
+    tb_writer = make_tb_writer(out)
 
     dataset = JodieDataset(args.data, data_dir=args.data_dir,
                            use_validation=True)
@@ -223,6 +234,16 @@ def main():
               f"train_kf={row['train_kf_loss']:.6f} "
               f"val_ap={val_row['val_ap']:.4f} val_auc={val_row['val_auc']:.4f} "
               f"sec={epoch_row['epoch_seconds']:.1f}", flush=True)
+        if tb_writer is not None:
+            tb_writer.add_scalar("epoch/val_ap", val_row["val_ap"], epoch)
+            tb_writer.add_scalar("epoch/val_auc", val_row["val_auc"], epoch)
+            tb_writer.add_scalar("epoch/train_link_loss",
+                                 row["train_link_loss"], epoch)
+            if row.get("kf"):
+                tb_writer.add_scalar("epoch/kf_loss",
+                                     row["kf"]["kf_loss"], epoch)
+                for tau, frac in row["kf"]["J_frac"].items():
+                    tb_writer.add_scalar("epoch/J_frac/" + tau, frac, epoch)
 
         if val_row["val_ap"] > best_ap + 1e-12:
             best_ap = float(val_row["val_ap"])
@@ -247,6 +268,8 @@ def main():
         "kf": best_kf if best_kf is not None else None,
     }
     save_json(out / "summary.json", summary)
+    if tb_writer is not None:
+        tb_writer.close()
     monitor.finalize(summary)
     save_json(out / "_SUCCESS.json", {"status": "complete",
                                       "best_epoch": int(best_epoch)})

@@ -148,6 +148,16 @@ def cap_data(data, cap):
     return data.slice(0, cap)
 
 
+def make_tb_writer(out):
+    """TensorBoard writer under <out>/tb; degrades to None without the dep."""
+    try:
+        from torch.utils.tensorboard import SummaryWriter
+        return SummaryWriter(log_dir=str(Path(out) / "tb"))
+    except ImportError:
+        print("WARN: tensorboard not installed; skipping TB output", flush=True)
+        return None
+
+
 def build_components(args, device, dataset):
     full, train, val, test = dataset.splits()
     train_finder = get_neighbor_finder(train, uniform=False,
@@ -269,6 +279,7 @@ def main():
         metrics_path.unlink()
     monitor = MonitorWriter(out, fail_on_error=not args.no_fail_on_monitor_error,
                             reset_files=not bool(args.resume_from))
+    tb_writer = make_tb_writer(out)
 
     dataset = JodieDataset(args.data, data_dir=args.data_dir,
                            use_validation=True)
@@ -364,6 +375,20 @@ def main():
               f"val_auc={val_row['auc']:.5f} val_ap={val_row['ap']:.5f} "
               f"val_nll={val_row['nll']:.5f} val_pos={val_row['positives']} "
               f"sec={row['epoch_seconds']:.1f}", flush=True)
+        if tb_writer is not None:
+            tb_writer.add_scalar("epoch/train_auc",
+                                 train_row["train"]["auc"], epoch)
+            tb_writer.add_scalar("epoch/train_ap",
+                                 train_row["train"]["ap"], epoch)
+            tb_writer.add_scalar("epoch/val_auc", val_row["auc"], epoch)
+            tb_writer.add_scalar("epoch/val_ap", val_row["ap"], epoch)
+            tb_writer.add_scalar("epoch/train_task_loss",
+                                 train_row["train_task_loss"], epoch)
+            if train_row.get("kf"):
+                tb_writer.add_scalar("epoch/kf_loss",
+                                     train_row["kf"]["kf_loss"], epoch)
+                for tau, frac in train_row["kf"]["J_frac"].items():
+                    tb_writer.add_scalar("epoch/J_frac/" + tau, frac, epoch)
 
         score_is_finite = bool(np.isfinite(score))
         improved = (best_epoch < 0) or (
@@ -422,6 +447,10 @@ def main():
         "kf": best_kf if best_kf is not None else None,
     }
     save_json(out / "summary.json", summary)
+    if tb_writer is not None:
+        tb_writer.add_scalar("final/test_auc", test_row["auc"], 0)
+        tb_writer.add_scalar("final/test_ap", test_row["ap"], 0)
+        tb_writer.close()
     monitor.finalize(summary)
     save_json(out / "_SUCCESS.json", {"status": "complete",
                                       "best_epoch": int(best_epoch),

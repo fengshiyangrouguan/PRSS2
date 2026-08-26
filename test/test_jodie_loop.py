@@ -22,6 +22,11 @@ class _FakeMonitor:
         for k, v in losses.items():
             assert np.isfinite(v), (k, v)
 
+    def validate_kf(self, kf_by_tau, dims, step):
+        for tau, j in kf_by_tau.items():
+            assert np.isfinite(j), (tau, j)
+            assert 0.0 <= j <= dims[tau] + 1e-4, (tau, j, dims[tau])
+
 
 class TestSelectTraceRows(unittest.TestCase):
     def test_positives_first_uses_all_positives(self):

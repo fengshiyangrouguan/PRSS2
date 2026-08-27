@@ -116,6 +116,16 @@ class TestWhiteningInvariance(unittest.TestCase):
 
 
 class TestGradientIsolation(unittest.TestCase):
+    def test_kf_score_hard_detaches_p(self):
+        # API-level isolation: even if a caller passes a grad-connected P,
+        # the score must cut it (no gradient can flow into the fixed tests).
+        z = _rand(100, 4, seed=19).requires_grad_(True)
+        p = _rand(100, 8, seed=20).requires_grad_(True)
+        j = kf_score(z, p, eps=1e-4)
+        j.backward()
+        self.assertIsNone(p.grad,
+                          "P must be detached inside kf_score")
+
     def test_p_side_has_no_grad_and_j_backprops_to_z(self):
         z = _rand(200, 6, seed=13).requires_grad_(True)
         p = _rand(200, 10, seed=14)

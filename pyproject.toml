@@ -3,7 +3,7 @@ requires = ["setuptools>=61"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "prss2"
+name = "rpbe"
 version = "3.0.0"
 description = "RPBE: predictive recursive compression via a Ky Fan spectral score on recursive temporal graph hosts"
 requires-python = ">=3.9"

@@ -30,7 +30,7 @@ class TGNPretrainLoop:
     def __init__(self, *, tgn, optimizer, device, batch_size, n_neighbors,
                  backprop_every, grad_clip, monitor, seed,
                  adapter=None, cut_builder=None, fixed_maps=None,
-                 rpbe_cfg=None, lambda_kf=1.0, trace_roots=8):
+                 rpbe_cfg=None, trace_roots=8):
         self.tgn = tgn
         self.optimizer = optimizer
         self.device = device
@@ -44,7 +44,8 @@ class TGNPretrainLoop:
         self.cut_builder = cut_builder
         self.fixed_maps = fixed_maps
         self.rpbe_cfg = rpbe_cfg
-        self.lambda_kf = float(lambda_kf)
+        # Single source of truth: the component weight lives in RPBConfig.
+        self.lambda_kf = float(rpbe_cfg.lambda_kf) if rpbe_cfg is not None else 0.0
         self.trace_roots = int(trace_roots)
         self.rpbe_on = bool(adapter is not None and cut_builder is not None
                             and fixed_maps is not None and rpbe_cfg is not None)
@@ -106,6 +107,8 @@ class TGNPretrainLoop:
                 pos_prob, neg_prob = self.tgn.compute_edge_probabilities(
                     sources, dests, negatives, times, edge_idxs,
                     self.n_neighbors)
+                # Upstream self-supervised objective exactly (sigmoid+BCE;
+                # kept byte-compatible with the official baseline).
                 link_loss = (F.binary_cross_entropy(
                     pos_prob.squeeze(), torch.ones(size, device=self.device))
                     + F.binary_cross_entropy(

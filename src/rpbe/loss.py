@@ -25,6 +25,20 @@ def _ridge(eps: float, sigma: torch.Tensor, jitter: float = 1e-12) -> torch.Tens
     return rel + jitter
 
 
+def _cholesky_retry(mat: torch.Tensor, tries: int = 3) -> torch.Tensor:
+    """Cholesky with escalating absolute jitter (a constant Z/P would make
+    the relative ridge vanish; the jitter keeps the factorization alive)."""
+    jitter = 1e-12
+    for _ in range(tries):
+        try:
+            return torch.linalg.cholesky(mat)
+        except RuntimeError:
+            n = mat.shape[0]
+            mat = mat + jitter * torch.eye(n, dtype=mat.dtype, device=mat.device)
+            jitter *= 10.0
+    return torch.linalg.cholesky(mat)
+
+
 def kf_score_fixed(z_c: torch.Tensor, p_c: torch.Tensor,
                    szz: torch.Tensor, spp: torch.Tensor,
                    eps: float = 1e-4) -> torch.Tensor:
@@ -39,9 +53,9 @@ def kf_score_fixed(z_c: torch.Tensor, p_c: torch.Tensor,
     """
     m = z_c.shape[0]
     szp = z_c.t() @ p_c / m
-    lz = torch.linalg.cholesky(szz + _ridge(eps, szz) * torch.eye(
+    lz = _cholesky_retry(szz + _ridge(eps, szz) * torch.eye(
         szz.shape[0], dtype=szz.dtype, device=szz.device))
-    lp = torch.linalg.cholesky(spp + _ridge(eps, spp) * torch.eye(
+    lp = _cholesky_retry(spp + _ridge(eps, spp) * torch.eye(
         spp.shape[0], dtype=spp.dtype, device=spp.device))
     w = torch.cholesky_solve(szp, lz)             # [r, m] = (S_ZZ+e)^-1 S_ZP
     s = torch.cholesky_solve(szp.t(), lp)         # [m, r] = (S_PP+e)^-1 S_PZ
@@ -67,6 +81,7 @@ def kf_score(Z: torch.Tensor, P: torch.Tensor, eps: float = 1e-4) -> torch.Tenso
     """
     if Z.shape[0] < 2:
         raise ValueError("kf_score needs at least 2 rows")
+    P = P.detach()                                 # hard API-level isolation
     z = Z - Z.mean(dim=0, keepdim=True)
     p = P - P.mean(dim=0, keepdim=True)           # P constant -> no grad anyway
     m = z.shape[0]
@@ -185,9 +200,9 @@ class KyFanTracker:
                 skipped.append(tau)
                 continue
             r = int(self.interfaces[tau])
-            lz = torch.linalg.cholesky(a + _ridge(self.eps, a) * torch.eye(
+            lz = _cholesky_retry(a + _ridge(self.eps, a) * torch.eye(
                 r, dtype=a.dtype, device=a.device))
-            lp = torch.linalg.cholesky(d + _ridge(self.eps, d) * torch.eye(
+            lp = _cholesky_retry(d + _ridge(self.eps, d) * torch.eye(
                 d.shape[0], dtype=d.dtype, device=d.device))
             w = torch.cholesky_solve(b, lz)           # [r, m] = (A+e)^-1 B
             s = torch.cholesky_solve(b.t(), lp)       # [m, r] = (D+e)^-1 B^T

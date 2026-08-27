@@ -200,7 +200,7 @@ def main():
         n_neighbors=args.n_degree, backprop_every=args.backprop_every,
         grad_clip=args.grad_clip, monitor=monitor, seed=args.seed,
         adapter=adapter, cut_builder=cut_builder, fixed_maps=fixed_maps,
-        rpbe_cfg=rpbe_cfg, lambda_kf=args.kf_lambda,
+        rpbe_cfg=rpbe_cfg,
         trace_roots=args.trace_roots)
 
     save_json(out / "config.json", {

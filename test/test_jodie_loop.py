@@ -143,7 +143,7 @@ class TestLoopSmoke(unittest.TestCase):
             device=self.device, batch_size=8, n_neighbors=4, grad_clip=5.0,
             monitor=_FakeMonitor(), seed=0, finetune_host=True,
             adapter=adapter, cut_builder=cut_builder, fixed_maps=fixed_maps,
-            rpbe_cfg=rpbe_cfg, lambda_kf=1.0, trace_roots=4)
+            rpbe_cfg=rpbe_cfg, trace_roots=4)
 
     def test_pure_host_train_eval_replay(self):
         loop = self._make_loop(rpbe=False)

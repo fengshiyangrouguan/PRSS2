@@ -315,7 +315,7 @@ def main():
         selection_metric=args.selection_metric,
         adapter=components["adapter"], cut_builder=components["cut_builder"],
         fixed_maps=components["fixed_maps"], rpbe_cfg=components["rpbe_cfg"],
-        lambda_kf=args.kf_lambda, trace_roots=args.trace_roots,
+        trace_roots=args.trace_roots,
         trace_mode=args.trace_mode)
 
     save_json(out / "config.json", {

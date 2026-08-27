@@ -82,7 +82,7 @@ class JodieNodeClassificationLoop:
     def __init__(self, *, tgn, decoder, optimizer, device, batch_size, n_neighbors,
                  grad_clip, monitor, seed, finetune_host=False,
                  selection_metric="auc", adapter=None, cut_builder=None,
-                 fixed_maps=None, rpbe_cfg=None, lambda_kf=1.0,
+                 fixed_maps=None, rpbe_cfg=None,
                  trace_roots=8, trace_mode="positive_first"):
         self.tgn = tgn
         self.decoder = decoder
@@ -99,7 +99,9 @@ class JodieNodeClassificationLoop:
         self.cut_builder = cut_builder
         self.fixed_maps = fixed_maps
         self.rpbe_cfg = rpbe_cfg
-        self.lambda_kf = float(lambda_kf)
+        # Single source of truth: the component weight lives in RPBConfig
+        # (a CLI/cfg duplication would silently diverge).
+        self.lambda_kf = float(rpbe_cfg.lambda_kf) if rpbe_cfg is not None else 0.0
         self.trace_roots = int(trace_roots)
         self.trace_mode = trace_mode
         self.rpbe_on = bool(adapter is not None and cut_builder is not None
@@ -163,6 +165,8 @@ class JodieNodeClassificationLoop:
             logits = self.decoder(src_emb)
             pred = logits.sigmoid()
             # Upstream node-classification objective exactly: sigmoid + BCE.
+            # (BCEWithLogits would be numerically stabler, but the protocol
+            # stays byte-compatible with the upstream baseline.)
             task_loss = F.binary_cross_entropy(pred, labels_t)
 
             kf_v = 0.0

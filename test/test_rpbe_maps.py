@@ -43,6 +43,18 @@ class TestDeterminism(unittest.TestCase):
         self.assertEqual(a.isolation_fingerprint(), b.isolation_fingerprint())
         self.assertNotEqual(a.isolation_fingerprint(), c.isolation_fingerprint())
 
+    def test_fingerprint_detects_buffer_and_scale_changes(self):
+        a = FixedMaps(make_cfg(seed=5))
+        fp0 = a.isolation_fingerprint()
+        # Flip one entry deep in a buffer (past the old 4096-entry window).
+        with torch.no_grad():
+            a.categorical_c[-1, -1] *= -1
+        self.assertNotEqual(a.isolation_fingerprint(), fp0,
+                            "buffer change must change the fingerprint")
+        # A different measurement scale must change it too.
+        b = FixedMaps(make_cfg(seed=5, delta_t_scale=2.5))
+        self.assertNotEqual(b.isolation_fingerprint(), fp0)
+
 
 class TestPsiBehavior(unittest.TestCase):
     def setUp(self):

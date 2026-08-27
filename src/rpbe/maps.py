@@ -50,15 +50,24 @@ class FixedMaps(nn.Module):
             (self.d_c,), generator=torch.Generator().manual_seed(seed + 4)) * 6.2832,
             persistent=True)
 
-        # CountSketch: one signed hash per full tensor-product row
-        # [1; phi_C] (x) phi_Y has (d_c+1) * d_f rows, k nonzeros per column.
+        # CountSketch: every input coordinate of the full tensor product
+        # [1; phi_C] (x) phi_Y ((d_c+1) * d_f rows) is mapped at least once
+        # (standard sketch guarantee — the old random-only construction could
+        # drop coordinates entirely), plus k-1 random repetitions.
         k = 10
         full_dim = (self.d_c + 1) * self.d_f
         g = torch.Generator().manual_seed(seed + 5)
-        self._sketch_nnz = k * self.m
-        rows = torch.randint(0, full_dim, (self._sketch_nnz,), generator=g)
-        cols = torch.randint(0, self.m, (self._sketch_nnz,), generator=g)
-        signs = torch.randint(0, 2, (self._sketch_nnz,), generator=g) * 2 - 1
+        base_rows = torch.arange(full_dim)
+        base_cols = torch.arange(full_dim) % self.m
+        base_signs = torch.ones(full_dim, dtype=torch.int64)
+        extra_n = (k - 1) * full_dim
+        extra_rows = torch.randint(0, full_dim, (extra_n,), generator=g)
+        extra_cols = torch.randint(0, self.m, (extra_n,), generator=g)
+        extra_signs = torch.randint(0, 2, (extra_n,), generator=g) * 2 - 1
+        self._sketch_nnz = full_dim + extra_n
+        rows = torch.cat([base_rows, extra_rows])
+        cols = torch.cat([base_cols, extra_cols])
+        signs = torch.cat([base_signs, extra_signs])
         sketch_indices = torch.stack([rows, cols], dim=0)  # [2, nnz]
         self.register_buffer("sketch_indices", sketch_indices, persistent=True)
         self.register_buffer("sketch_signs", signs, persistent=True)
@@ -154,13 +163,17 @@ class FixedMaps(nn.Module):
 
     # ------------------------------------------------------------------ audit
     def isolation_fingerprint(self) -> dict:
-        """Seed/version + content hash of every frozen buffer."""
+        """Seed/version + FULL byte hash of every frozen buffer and of the
+        measurement-affecting config (delta_t_scale)."""
         h = hashlib.sha256()
         h.update(str(self.cfg.rpbe_seed).encode())
         h.update(str(self._sketch_full_dim).encode())
+        h.update(str(float(self.cfg.delta_t_scale)).encode())
         for name in ("categorical_c", "future_table", "rff_w", "rff_b",
                      "sketch_indices", "sketch_signs"):
             buf = getattr(self, name)
-            h.update(buf.reshape(-1)[: min(buf.numel(), 4096)]
-                     .detach().cpu().to(torch.int64).numpy().tobytes())
-        return {"seed": int(self.cfg.rpbe_seed), "sha256": h.hexdigest()}
+            h.update(buf.detach().cpu().reshape(-1).contiguous()
+                     .numpy().tobytes())
+        return {"seed": int(self.cfg.rpbe_seed),
+                "delta_t_scale": float(self.cfg.delta_t_scale),
+                "sha256": h.hexdigest()}

@@ -393,3 +393,11 @@ python -m scripts.train_jodie --rpbe -d wikipedia \
 - `src/rpbe/state.py` —— trace 与 rpbe 包之间的数据契约
 - 新增：`src/rpbe/{records,maps,compressor,loss,config}.py`
 - 新增：`test/test_rpbe_*.py`
+
+---
+
+## 九、口径声明（审计后钉死，论文写作必须遵守）
+
+1. **压缩率口径**：当前实现 `r_τ ≡ host_dim`（JODIE=172），压缩率恒为 1.0。Ky Fan balancing 的作用是"在宿主宽度预算内选择预测方向"，**不是维度压缩**。论文不得声称"实现了 32 维低秩压缩 / SVD balancing"。若要做 r_τ < host_dim 的真实压缩，需在 adapter 加"降维—宿主内升维"哑铃结构（另立开发项）。
+2. **协议沿用项**（有意保留官方行为，需在协议描述中如实注明）：`time_stats()` 用全流统计（官方原样，测试分布信息参与标准化）；任务 loss 用 `sigmoid+BCE`（与官方逐位一致，`BCEWithLogits` 未采用）；vendored attention 的 `.squeeze()`（官方代码，batch=1 隐患由官方承担）；stage-2 的 `positive_first` 根选择无重要性权重（记为已知采样偏置）。
+3. **已知近似**：Ky Fan 统计为跨批 EMA + 累计样本门控（批级总体近似，历史 detach）；白化为 batch 估计 + ridge（非冻结参考标尺）；link 负采样池为 train 区 destination（on-policy 覆盖限制，算法稿已声明）。

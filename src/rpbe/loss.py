@@ -150,12 +150,14 @@ def kf_adjoint(wf_result: dict, eps: float, strict: bool = False):
 def kf_vjp_batch(z_b: torch.Tensor, p_b: torch.Tensor, w_b: torch.Tensor,
                  mu_z: torch.Tensor, mu_p: torch.Tensor,
                  adjoints: dict) -> torch.Tensor:
-    """Pass-2 surrogate for one batch: <A, S_b(theta)>.
+    """Moment-adjoint surrogate for one batch: <A, S_b(theta)>.
 
-    ``z_b`` carries gradient; ``p_b``, ``w_b``, ``mu_z``, ``mu_p`` and the
-    adjoints are all detached constants.  The batched moments are centered
-    with the SAME global detached means, so the per-batch terms add up to
-    the exact gradient of the whole-window score.
+    Reference implementation for the A/B tests (sixth review keeps it as
+    one of the three gradient paths).  ``z_b`` carries gradient; ``p_b``,
+    ``w_b``, ``mu_z``, ``mu_p`` and the adjoints are all detached
+    constants.  The batched moments are centered with the SAME global
+    detached means, so the per-batch terms add up to the exact gradient
+    of the whole-window score.
     """
     zc = z_b.double() - mu_z
     pc = p_b.double() - mu_p
@@ -166,6 +168,50 @@ def kf_vjp_batch(z_b: torch.Tensor, p_b: torch.Tensor, w_b: torch.Tensor,
     return ((adjoints["M2_zz"] * mzz_b).sum()
             + (adjoints["M2_zp"] * mzp_b).sum()
             + (adjoints["M2_pp"] * mpp_b).sum())
+
+
+def latent_z_adjoint(z_rows, p_rows, w, cut_ids, mu_z, mu_p, D,
+                     eps, strict=False):
+    """Contract the moment adjoint onto CUT-LEVEL z-adjoints.
+
+    At window close, the whole-window score F(S) is replayed on the
+    window's z ROWS as small-matrix leaves (p, weights, global means and
+    D are detached constants from the Welford pass); one backward yields
+    ``g_i = grad_{z_i} L_KF`` per row, and horizons of one cut are merged
+    ``g_v = sum_h g_{v,h}``.  Pass 2 then uses the LINEAR surrogate
+
+        L~_KF(theta) = sum_v <sg(g_v), z_v(theta)>
+
+    whose gradient at the current parameters equals the exact gradient of
+    the whole-window Ky Fan score — same first-order contract as the
+    moment-adjoint form, but pass 2 needs NO p, NO moments and NO
+    re-walk: just index the traced z and take dot products.
+
+    Returns ``(j_float, g_by_cut, score_diag)``; ``g_by_cut`` maps the
+    cut_id tuple to the merged gradient tensor [r].
+    """
+    z = z_rows.clone().double().requires_grad_(True)
+    zc = z - mu_z
+    pc = p_rows.double() - mu_p
+    sw = w.double().sqrt().reshape(-1, 1)
+    mzz = (zc * sw).t() @ (zc * sw)
+    mzp = (zc * sw).t() @ (pc * sw)
+    mpp = (pc * sw).t() @ (pc * sw)
+    j, score_diag = _score_from_covs(mzz / D, mzp / D, mpp / D, eps)
+    if score_diag["failed"] is not None:
+        if strict:
+            raise RuntimeError("latent_z_adjoint close failed: {}"
+                               .format(score_diag))
+        return None, None, score_diag
+    j.backward()
+    g = z.grad.detach()               # [M, r]
+    g_by_cut: Dict[tuple, torch.Tensor] = {}
+    for cid, gi in zip(cut_ids, g):
+        if cid in g_by_cut:
+            g_by_cut[cid] = g_by_cut[cid] + gi
+        else:
+            g_by_cut[cid] = gi
+    return float(j.detach()), g_by_cut, score_diag
 
 
 def _joint_min_eig(czz, czp, cpp) -> float:
@@ -453,7 +499,8 @@ class KFMomentWindow:
             if win is None:
                 win = {"zs_list": [], "ps_list": [], "weights_list": [],
                        "row_seen": set(), "cut_seen": set(),
-                       "cut_ids_list": [], "tree_seen": set()}
+                       "cut_ids_list": [], "batch_cut_counts": [],
+                       "tree_seen": set()}
                 self._windows[tau] = win
             # Cross-batch dedupe on row_id (cut + horizon).  cut_id is
             # globally unique (adapter-wide occurrence counter), so a
@@ -472,6 +519,7 @@ class KFMomentWindow:
                 win["cut_seen"].add(cut_ids[i])
                 win["tree_seen"].add(tree_ids[i])
                 win["cut_ids_list"].append(cut_ids[i])
+            win["batch_cut_counts"].append(len(fresh))
             # Graph-connected rows (float32); the close stacks them once
             # and casts to float64.  P is already gradient-free.
             win["zs_list"].append(zs.float())
@@ -584,18 +632,25 @@ class KFMomentWindow:
 
     # ---------------------------------------------------------- replay close
     def close_replay(self):
-        """Moment-Adjoint close (pass-1 -> pass-2 bridge).
+        """Latent-adjoint close (pass-1 -> pass-2 bridge).
 
         Accumulates the stored (detached) rows through WeightedWelford,
-        derives the small-matrix adjoints ``A = grad_S F(S)`` and returns
-        ``(closed, adjoints, diagnostics)`` where ``closed[tau]`` is the
-        REAL window score ``F(S_W)`` (the number to log — never the
-        surrogate), and ``adjoints[tau] = (adj, wf_result)`` feeds the
-        pass-2 replay.  All nonempty windows close together (same shared-
-        graph argument as the direct path).
+        contracts the score onto CUT-LEVEL z-adjoints via
+        :func:`latent_z_adjoint` and returns
+        ``(closed, replay_plan, diagnostics)``:
+
+        * ``closed[tau]`` — the REAL window score ``F(S_W)`` (the number
+          to log, never the surrogate);
+        * ``replay_plan[tau]["by_batch"][b]`` — ``[(occurrence_id, g), ...]``
+          for batch ``b`` of the window: pass 2 only indexes the traced z
+          and sums ``<sg(g), z>`` (no p, no moments, no re-walk);
+        * ``diagnostics[tau]`` — the usual matrix diagnostics.
+
+        All nonempty windows close together (same shared-graph argument
+        as the direct path).
         """
         closed: Dict[str, float] = {}
-        adjoints: Dict[str, tuple] = {}
+        replay_plan: Dict[str, dict] = {}
         diagnostics: Dict[str, dict] = {}
         nonempty = [tau for tau, win in self._windows.items()
                     if win is not None and len(win["cut_seen"]) > 0]
@@ -607,10 +662,12 @@ class KFMomentWindow:
             wf = WeightedWelford(int(z_all.shape[1]), int(p_all.shape[1]))
             wf.add(z_all, p_all, w, win["cut_ids_list"])
             r = wf.result()
-            j, adj, score_diag = kf_adjoint(r, self.eps, self.strict)
+            j, g_by_cut, score_diag = latent_z_adjoint(
+                z_all, p_all, w, win["cut_ids_list"],
+                r["mu_z"], r["mu_p"], r["D"], self.eps, self.strict)
             if j is None:
                 closed[tau] = 0.0
-                adjoints[tau] = None
+                replay_plan[tau] = {"by_batch": [[]]}
                 diagnostics[tau] = {"failed": score_diag["failed"],
                                     "W": r["W"], "D_cut": r["D"],
                                     "M_unique": int(len(win["cut_seen"])),
@@ -619,14 +676,26 @@ class KFMomentWindow:
                 czz = r["M2_zz"] / r["D"]
                 cpp = r["M2_pp"] / r["D"]
                 czp = r["M2_zp"] / r["D"]
+                # Slice the merged per-cut gradients back into per-batch
+                # lists aligned with the pass-2 replay order.
+                by_batch = []
+                pos = 0
+                for cnt in win["batch_cut_counts"]:
+                    batch_rows = []
+                    for cid in win["cut_ids_list"][pos:pos + cnt]:
+                        g = g_by_cut.get(cid)
+                        if g is not None:
+                            batch_rows.append((cid[1], g.float()))
+                    by_batch.append(batch_rows)
+                    pos += cnt
                 closed[tau] = float(j)
-                adjoints[tau] = (adj, r)
+                replay_plan[tau] = {"by_batch": by_batch}
                 diagnostics[tau] = self._diagnostics(
                     win, czz, czp, cpp, torch.tensor(j, dtype=torch.float64),
                     0.0, score_diag)
         for tau in nonempty:
             self._windows.pop(tau)
-        return closed, adjoints, diagnostics
+        return closed, replay_plan, diagnostics
 
     def window_ready(self) -> bool:
         """All nonempty windows have reached their unique-cut threshold."""

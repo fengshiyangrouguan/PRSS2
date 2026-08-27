@@ -84,16 +84,29 @@ class MonitorWriter:
                       self.fingerprint_path):
                 if p.exists():
                     p.unlink()
+        # Alerts are buffered in memory and flushed in batches (a per-batch
+        # open/write/close + stdout flush was a measurable per-batch cost
+        # in the profile).  Errors flush immediately.
+        self._alert_buffer: list = []
 
     @staticmethod
     def _append(path: Path, obj: Dict):
         with path.open("a") as f:
             f.write(json.dumps(obj, allow_nan=True) + "\n")
 
+    def _flush_alerts(self):
+        if self._alert_buffer:
+            with self.alert_path.open("a") as f:
+                for row in self._alert_buffer:
+                    f.write(json.dumps(row, allow_nan=True) + "\n")
+            self._alert_buffer = []
+
     def alert(self, severity: str, code: str, message: str, **meta):
         row = {"severity": severity, "code": code, "message": message, **meta}
-        self._append(self.alert_path, row)
-        print(f"MONITOR_{severity.upper()} code={code} {message}", flush=True)
+        self._alert_buffer.append(row)
+        if severity == "error" or len(self._alert_buffer) >= 200:
+            self._flush_alerts()
+        print(f"MONITOR_{severity.upper()} code={code} {message}")
         if severity == "error" and self.fail_on_error:
             raise RuntimeError(f"monitor invariant failed [{code}]: {message}")
 
@@ -128,6 +141,7 @@ class MonitorWriter:
                                              "fingerprint": fingerprint})
 
     def finalize(self, summary: Dict):
+        self._flush_alerts()
         alerts = []
         if self.alert_path.exists():
             alerts = [json.loads(x) for x in self.alert_path.read_text().splitlines() if x.strip()]

@@ -23,13 +23,15 @@ class RecursiveOccurrence:
     occurrence_id: int
     tau: str
     state: OccurrenceState
-    local_features: torch.Tensor
     children: List[int] = field(default_factory=list)
     child_relations: List[int] = field(default_factory=list)
     child_delta_t: List[float] = field(default_factory=list)
     # Contract keys: ``node`` (global node id), ``time`` (as-of time = the
     # query timestamp of the tree, for every occurrence), ``own_raw`` (the
     # bottleneck pre-input o_v).  Filled by the host adapter.
+    #
+    # ``local_features`` was removed: it cloned the full per-batch preagg
+    # matrix (~GiB of wasted storage per epoch) while nothing consumed it.
     metadata: Dict[str, Any] = field(default_factory=dict)
 
 

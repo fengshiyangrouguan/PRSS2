@@ -25,7 +25,6 @@ def make_trace(root_rows=(0, 2), as_of_times=(10.0, 12.0)):
         trace.add(RecursiveOccurrence(
             occurrence_id=oid, tau=tau,
             state=OccurrenceState(tau=tau, z=torch.randn(4)),
-            local_features=torch.zeros(1),
             children=list(children),
             child_relations=[0] * len(children),
             child_delta_t=[0.0] * len(children),
@@ -130,7 +129,7 @@ class TestJodieCutBuilder(unittest.TestCase):
         trace.add(RecursiveOccurrence(
             occurrence_id=0, tau="tjo:layer1",
             state=OccurrenceState(tau="tjo:layer1", z=torch.randn(4)),
-            local_features=torch.zeros(1), children=[],
+            children=[],
             child_relations=[], child_delta_t=[],
             metadata={"layer": 1, "node": 4, "time": 12.0,
                       "own_raw": torch.randn(4)}))

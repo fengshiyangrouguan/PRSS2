@@ -9,7 +9,8 @@ import unittest
 
 import torch
 
-from rpbe.loss import kf_score, kf_score_fixed
+from rpbe.loss import KyFanTracker, kf_score, kf_score_fixed
+from rpbe.records import CutRecord
 
 
 def _rand(*shape, seed):
@@ -171,6 +172,82 @@ class TestGradientIsolation(unittest.TestCase):
         j_now = kf_score(z, p, eps=1e-4)
         self.assertGreater(float(j_now), -1e-6)
         self.assertLessEqual(float(j_now), 6.0 + 1e-3)
+
+
+class _FakeMaps:
+    """Deterministic P rows (independent of Z) for tracker tests."""
+
+    def __init__(self, m):
+        self.m = m
+
+    def pv(self, context, outcome):
+        g = torch.Generator().manual_seed(
+            int(context["counterpart"]) * 7919 + int(context["delta_t"]))
+        return torch.randn(self.m, generator=g)
+
+
+def make_cut_rows(n_cuts, r, m, rows_per_cut=1):
+    rows = []
+    for c in range(n_cuts):
+        z = torch.randn(r)
+        for k in range(rows_per_cut):
+            rows.append(CutRecord(
+                tree_id=0, cut_id=c, occurrence_id=c, tau="t",
+                node=c, time=float(c), z=z,
+                context={"delta_t": float(c * 7 + k), "counterpart": c + k,
+                         "role": 0, "query_type": 0},
+                outcome=float(k == 0)))
+    return rows
+
+
+class TestKyFanTracker(unittest.TestCase):
+    def test_gate_blocks_small_sample_saturation(self):
+        # The audit counterexample: r=32 with 16 unique cuts per batch would
+        # saturate on independent noise (J -> min(r, M-1)); the gate
+        # (min_ratio*r = 64) must hold the score back.
+        tr = KyFanTracker({"t": 32}, min_ratio=2.0, min_abs=64,
+                          fixed_maps=_FakeMaps(256))
+        scores, skipped = tr.update(make_cut_rows(16, 32, 256))
+        self.assertEqual(scores, {})
+        self.assertIn("t", skipped)
+
+    def test_score_appears_once_enough_unique_cuts_accumulate(self):
+        tr = KyFanTracker({"t": 8}, ema_rho=0.2, min_ratio=2.0, min_abs=64,
+                          fixed_maps=_FakeMaps(64))
+        scores = {}
+        skipped = []
+        for _ in range(6):
+            s, sk = tr.update(make_cut_rows(60, 8, 64))
+            scores.update(s)
+            skipped.append(sk)
+        self.assertIn("t", scores)
+        n_eff = tr.effective_n("t")
+        self.assertGreaterEqual(n_eff, 64)
+
+    def test_independent_noise_does_not_saturate(self):
+        # With M_unique >> r and independent P, J stays far below its
+        # saturation bound min(r, M-1) — the small-sample false maximum is
+        # gone by construction (gated) and the accumulated score is honest.
+        tr = KyFanTracker({"t": 8}, ema_rho=0.1, min_ratio=2.0, min_abs=64,
+                          fixed_maps=_FakeMaps(64))
+        scores = {}
+        for _ in range(8):
+            s, _ = tr.update(make_cut_rows(50, 8, 64))
+            scores.update(s)
+        j = float(scores["t"].detach())
+        n_eff = tr.effective_n("t")
+        bound = min(8, max(1, int(n_eff) - 1))
+        self.assertLess(j, 0.5 * bound,
+                        "independent noise score {} too close to the "
+                        "saturation bound {}".format(j, bound))
+
+    def test_dedup_weights_unique_cuts(self):
+        # 5 rows per cut (1 pos + 4 neg) must count as ONE unique sample:
+        # the effective n accumulates per unique cut.
+        tr = KyFanTracker({"t": 4}, min_ratio=1.0, min_abs=2,
+                          fixed_maps=_FakeMaps(16))
+        tr.update(make_cut_rows(20, 4, 16, rows_per_cut=5))
+        self.assertAlmostEqual(tr.effective_n("t"), 20.0, places=1)
 
 
 if __name__ == "__main__":

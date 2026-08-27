@@ -22,7 +22,9 @@ class RPBConfig:
     ridge_eps: float = 1e-4              # relative ridge (x tr(Sigma)/dim)
     delta_t_scale: float = 1e6           # fixed scale for continuous delta_t RFF
     neg_per_cut: int = 4                 # stage-1 negative rows per cut
-    min_cuts_per_type: int = 16          # skip a tau's term below this many rows
+    kf_ema_rho: float = 0.05             # EMA rate of the per-tau running stats
+    kf_min_ratio: float = 2.0            # gate: effective n >= ratio * r_tau
+    kf_min_abs: int = 64                 # gate: effective n >= this floor
     rpbe_seed: int = 0                   # fixed-measurement seed (independent of host)
 
     def __post_init__(self):
@@ -39,8 +41,10 @@ class RPBConfig:
             raise ValueError("width/m/d_c/d_f must be positive")
         if self.ridge_eps <= 0 or self.delta_t_scale <= 0:
             raise ValueError("ridge_eps and delta_t_scale must be positive")
-        if self.min_cuts_per_type < 1:
-            raise ValueError("min_cuts_per_type must be >= 1")
+        if not 0 < self.kf_ema_rho <= 1:
+            raise ValueError("kf_ema_rho must be in (0, 1]")
+        if self.kf_min_ratio <= 0 or self.kf_min_abs < 2:
+            raise ValueError("kf_min_ratio > 0 and kf_min_abs >= 2")
 
     def alpha(self, tau: str) -> float:
         return float(self.alphas.get(tau, 1.0))
@@ -58,6 +62,8 @@ class RPBConfig:
             "ridge_eps": self.ridge_eps,
             "delta_t_scale": self.delta_t_scale,
             "neg_per_cut": self.neg_per_cut,
-            "min_cuts_per_type": self.min_cuts_per_type,
+            "kf_ema_rho": self.kf_ema_rho,
+            "kf_min_ratio": self.kf_min_ratio,
+            "kf_min_abs": self.kf_min_abs,
             "rpbe_seed": self.rpbe_seed,
         }

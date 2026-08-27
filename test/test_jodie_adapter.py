@@ -179,23 +179,6 @@ class TestTraceStructure(unittest.TestCase):
 
         return walk(root_id)
 
-    def test_c1_local_zeroing(self):
-        """Legacy C1: the child-state block of local_features stays zeroed."""
-        sources, destinations, timestamps, edge_idxs, labels = self.stream
-        self.adapter.set_trace_source_rows([1])
-        forward_batch(self.tgn, sources, destinations, timestamps, edge_idxs)
-        trace = self.adapter.trace
-        zero_dim = self.adapter._local_zero_dim  # host_dim + n*host_dim
-        for occ in trace.occurrences.values():
-            if occ.tau == "tjo:layer0":
-                self.assertTrue((occ.local_features == 0).all())
-            else:
-                local = occ.local_features
-                self.assertTrue((local[:zero_dim] == 0).all(),
-                                "child-state block must be zeroed (C1)")
-                self.assertGreater(local[zero_dim:].abs().sum().item(), 0.0,
-                                   "parent-side features must survive")
-
     def test_trace_records_z_with_grad(self):
         """OccurrenceState carries z only; with a grad-enabled host forward
         the traced z is graph-connected."""

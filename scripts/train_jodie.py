@@ -84,7 +84,9 @@ def parse_args():
     p.add_argument("--rpbe-width", type=int, default=128)
     p.add_argument("--sketch-dim", type=int, default=256)
     p.add_argument("--neg-per-cut", type=int, default=4)
-    p.add_argument("--min-cuts-per-type", type=int, default=16)
+    p.add_argument("--kf-ema-rho", type=float, default=0.05)
+    p.add_argument("--kf-min-ratio", type=float, default=2.0)
+    p.add_argument("--kf-min-abs", type=int, default=64)
     p.add_argument("--ridge-eps", type=float, default=1e-4)
     p.add_argument("--rpbe-seed", type=int, default=0)
     p.add_argument("--trace-roots", type=int, default=32)
@@ -241,7 +243,8 @@ def build_components(args, device, dataset):
             width_D=args.rpbe_width, m=args.sketch_dim,
             lambda_kf=args.kf_lambda, ridge_eps=args.ridge_eps,
             delta_t_scale=delta_scale, neg_per_cut=args.neg_per_cut,
-            min_cuts_per_type=args.min_cuts_per_type,
+            kf_ema_rho=args.kf_ema_rho, kf_min_ratio=args.kf_min_ratio,
+            kf_min_abs=args.kf_min_abs,
             rpbe_seed=args.rpbe_seed)
         compressor = RecursiveCompressor(rpbe_cfg).to(device)
         adapter = JodieTGNAdapter(tgn.embedding_module, compressor,

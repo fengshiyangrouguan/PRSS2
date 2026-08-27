@@ -117,7 +117,7 @@ class TestLoopSmoke(unittest.TestCase):
             cfg = RPBConfig(
                 interfaces={"tjo:layer0": 8, "tjo:layer1": 8, "tjo:layer2": 8},
                 own_dims={"tjo:layer0": 8, "tjo:layer1": 8, "tjo:layer2": 8},
-                width_D=16, m=64, min_cuts_per_type=4, rpbe_seed=0,
+                width_D=16, m=64, kf_min_abs=4, rpbe_seed=0,
                 delta_t_scale=1.0)
             rpbe_cfg = cfg
             compressor = RecursiveCompressor(cfg).to(self.device)

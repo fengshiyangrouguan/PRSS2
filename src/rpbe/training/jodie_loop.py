@@ -21,7 +21,7 @@ import torch
 import torch.nn.functional as F
 from sklearn.metrics import average_precision_score, roc_auc_score
 
-from rpbe.loss import kf_loss, kf_scores_from_rows
+from rpbe.loss import KyFanTracker, kf_loss
 from rpbe.training.isolation import assert_clean, rpbe_fingerprint
 
 EPS = 1e-7
@@ -104,6 +104,11 @@ class JodieNodeClassificationLoop:
         self.trace_mode = trace_mode
         self.rpbe_on = bool(adapter is not None and cut_builder is not None
                             and fixed_maps is not None and rpbe_cfg is not None)
+        self.kf_tracker = (KyFanTracker(
+            rpbe_cfg.interfaces, ema_rho=rpbe_cfg.kf_ema_rho,
+            min_ratio=rpbe_cfg.kf_min_ratio, min_abs=rpbe_cfg.kf_min_abs,
+            eps=rpbe_cfg.ridge_eps, fixed_maps=fixed_maps)
+            if self.rpbe_on else None)
 
     # ------------------------------------------------------------- stream state
     def reset_memory(self):
@@ -129,6 +134,7 @@ class JodieNodeClassificationLoop:
         total_task = total_kf = 0.0
         n_batches = 0
         kf_sum = {}
+        kf_count_tau = {}
         kf_count = 0
         skipped_types = set()
         train_probs, train_labels = [], []
@@ -164,11 +170,21 @@ class JodieNodeClassificationLoop:
             if self.rpbe_on and trace_rows and self.adapter.trace is not None:
                 cuts = self.cut_builder.build(self.adapter.trace,
                                               batch_seed=global_step)
-                if cuts:
-                    scores, skipped = kf_scores_from_rows(
-                        cuts, self.rpbe_cfg.interfaces, self.fixed_maps,
-                        min_cuts_per_type=self.rpbe_cfg.min_cuts_per_type,
-                        eps=self.rpbe_cfg.ridge_eps)
+                if not cuts:
+                    # Monitoring hole fix: a batch with no valid cuts must be
+                    # visible, not silent.
+                    self.monitor.alert("warning", "kf_no_cuts",
+                                       "batch produced no valid cuts",
+                                       step=global_step)
+                    main_loss = task_loss
+                else:
+                    scores, skipped = self.kf_tracker.update(cuts)
+                    skipped_types.update(skipped)
+                    if skipped:
+                        self.monitor.alert(
+                            "warning", "kf_gated_tau",
+                            "gated below min unique cuts: {}"
+                            .format(sorted(skipped)), step=global_step)
                     if scores:
                         kf_term = kf_loss(scores, self.rpbe_cfg.alphas)
                         kf_v = float(kf_term.detach())
@@ -176,16 +192,19 @@ class JodieNodeClassificationLoop:
                                      for tau, j in scores.items()}
                         for tau, jv in kf_detail.items():
                             kf_sum[tau] = kf_sum.get(tau, 0.0) + jv
+                            kf_count_tau[tau] = kf_count_tau.get(tau, 0) + 1
                         kf_count += 1
-                        skipped_types.update(skipped)
-                        self.monitor.validate_kf(
-                            kf_detail, {tau: self.rpbe_cfg.m
-                                        for tau in kf_detail}, global_step)
+                        # J bound is min(r, n-1) with the EFFECTIVE sample
+                        # size, not the P sketch dim.
+                        dims = {}
+                        for tau in kf_detail:
+                            n_eff = self.kf_tracker.effective_n(tau)
+                            dims[tau] = int(min(self.rpbe_cfg.interfaces[tau],
+                                                max(1, n_eff - 1)))
+                        self.monitor.validate_kf(kf_detail, dims, global_step)
                         main_loss = task_loss + self.lambda_kf * kf_term
                     else:
                         main_loss = task_loss
-                else:
-                    main_loss = task_loss
             else:
                 main_loss = task_loss
 
@@ -219,10 +238,18 @@ class JodieNodeClassificationLoop:
                                       np.concatenate(train_probs))
         kf_out = None
         if kf_count and self.rpbe_cfg is not None:
+            # Per-tau denominators: each tau averages over its own scored
+            # batches, and J_frac uses the saturation-aware bound
+            # min(r_tau, n_eff-1), not the sketch dim m.
+            j_frac = {}
+            for tau, v in kf_sum.items():
+                n_eff = self.kf_tracker.effective_n(tau)
+                bound = min(self.rpbe_cfg.interfaces[tau], max(1, n_eff - 1))
+                j_frac[tau] = (v / kf_count_tau.get(tau, 1)) / bound
             kf_out = {
-                "J": {tau: v / kf_count for tau, v in kf_sum.items()},
-                "J_frac": {tau: v / kf_count / self.rpbe_cfg.m
-                           for tau, v in kf_sum.items()},
+                "J": {tau: v / kf_count_tau.get(tau, 1)
+                      for tau, v in kf_sum.items()},
+                "J_frac": j_frac,
                 "skipped_types": sorted(skipped_types),
                 "kf_loss": total_kf / max(n_batches, 1),
             }

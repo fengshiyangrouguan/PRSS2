@@ -61,15 +61,9 @@ class JodieTGNAdapter(HostAdapter):
 
         self.taus = [TAU_TEMPLATE.format(layer)
                      for layer in range(self.n_layers + 1)]
-        self.preagg_dim = jodie_preagg_dim(self.embedding_dimension,
-                                           self.n_time_features,
-                                           self.n_edge_features,
-                                           self.n_neighbors)
-        # C1 (legacy): the child-state block of local_features is zeroed.
-        # Nothing consumes local_features today; the field is kept for
-        # diagnostics.
-        self._local_zero_dim = self.embedding_dimension \
-            + self.n_neighbors * self.embedding_dimension
+        # ``jodie_preagg_dim`` remains exported for interface-width docs but
+        # the adapter no longer materializes the preagg packing (the only
+        # consumer, local_features, was removed as wasted GiB-scale storage).
 
         self._trace_top_rows = set()
         self._trace = None
@@ -145,11 +139,9 @@ class JodieTGNAdapter(HostAdapter):
             z = raw_source if self.compressor is None else self.compressor.compress(
                 tau=tau, own_input=raw_source, aggregate_output=raw_source)
             if self.trace is not None and active.any():
-                local = torch.zeros(len(source_nodes), self.preagg_dim,
-                                    device=device, dtype=raw_source.dtype)
                 for row in np.flatnonzero(active):
                     ids[row] = self._new_occurrence(
-                        tau, z[row], local[row], [], [], [],
+                        tau, z[row], [], [], [],
                         node=int(source_nodes[row]),
                         time=float(timestamps[row]),
                         own_raw=raw_source[row].detach())
@@ -179,18 +171,6 @@ class JodieTGNAdapter(HostAdapter):
             layer, source_lower, source_time, neighbor_lower, edge_time,
             edge_features, mask)
 
-        b = len(source_nodes)
-        flat_preagg = torch.cat([
-            source_lower,
-            source_time.reshape(b, -1),
-            neighbor_lower.reshape(b, -1),
-            edge_time.reshape(b, -1),
-            edge_features.reshape(b, -1),
-            mask.to(source_lower.dtype).reshape(b, -1),
-        ], dim=-1)
-        if flat_preagg.shape[-1] != self.preagg_dim:
-            raise ValueError("preagg width mismatch")
-
         # The host aggregate (with children's compressed states as input) is
         # the child-aggregation token of Gamma; the compressor stacks A/G/Q on
         # top without touching the aggregation itself.
@@ -198,8 +178,8 @@ class JodieTGNAdapter(HostAdapter):
             tau=tau, own_input=raw_source, aggregate_output=vanilla)
 
         if self.trace is not None and active.any():
-            local = flat_preagg.detach().clone()
-            local[:, :self._local_zero_dim] = 0.0
+            # Perf: read the numpy neighbors array, never CUDA scalar bools.
+            np_neighbors = np.asarray(neighbors)
             for row in np.flatnonzero(active):
                 children, relations, deltas = [], [], []
                 sid = int(source_ids[row])
@@ -209,25 +189,24 @@ class JodieTGNAdapter(HostAdapter):
                     deltas.append(0.0)
                 for j in range(n_neighbors):
                     nid = int(neighbor_ids[row, j])
-                    if nid >= 0 and not bool(mask[row, j]):
+                    if nid >= 0 and int(np_neighbors[row, j]) != 0:
                         children.append(nid)
                         relations.append(1)
                         deltas.append(float(edge_deltas_np[row, j]))
                 ids[row] = self._new_occurrence(
-                    tau, z[row], local[row], children, relations, deltas,
+                    tau, z[row], children, relations, deltas,
                     node=int(source_nodes[row]),
                     time=float(timestamps[row]),
                     own_raw=raw_source[row].detach())
         return z, ids
 
-    def _new_occurrence(self, tau, z, local, children, relations, deltas, *,
+    def _new_occurrence(self, tau, z, children, relations, deltas, *,
                         node: int, time: float, own_raw):
         oid = self._next_oid
         self._next_oid += 1
         self.trace.add(RecursiveOccurrence(
             occurrence_id=oid, tau=tau,
             state=OccurrenceState(tau=tau, z=z),
-            local_features=local,
             children=list(children),
             child_relations=list(relations),
             child_delta_t=list(deltas),

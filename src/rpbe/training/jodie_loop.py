@@ -221,6 +221,15 @@ class JodieNodeClassificationLoop:
                                     max(1, m_u - 1)))
                             self.monitor.validate_kf(kf_detail, dims,
                                                      global_step)
+                            for tau, jv in kf_detail.items():
+                                if diag[tau].get("failed"):
+                                    self.monitor.alert(
+                                        "warning", "kf_window_failed",
+                                        f"{tau} {diag[tau]['failed']} "
+                                        f"scale_z={diag[tau].get('scale_z', float('nan')):.3e} "
+                                        f"scale_p={diag[tau].get('scale_p', float('nan')):.3e} "
+                                        f"M={diag[tau]['M_unique_trees']}",
+                                        step=global_step, interface=tau)
                             # ONE backward for the whole window.
                             total = window_task + self.lambda_kf * kf_term
                             self.optimizer.zero_grad(set_to_none=True)

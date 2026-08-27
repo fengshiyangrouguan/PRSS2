@@ -10,9 +10,17 @@ explicit inverses.  The training loss maximizes the per-interface score
 (equivalently minimizes the positive form sum_tau alpha_tau (d_tau - J_tau)
 which differs only by a theta-constant).
 
-Ridge terms are relative to trace/dim so the same epsilon behaves across
-scales, plus an absolute jitter so a constant Z/P cannot make the Cholesky
-fail outright.
+Numerical contract (after the cloud crash review, 2026-08-27):
+* covariances are built by DIRECT centering of the stacked rows in float64
+  — never raw-moment accumulation ``E[zz^T] - E[z]E[z]^T``, which loses the
+  signal to catastrophic cancellation when z carries a large DC offset;
+* before Cholesky every covariance is normalized by its mean diagonal
+  (``A = Czz / mean(diag Czz)``, gradient connected), so the ridge
+  ``eps * I`` is scale-free: a collapsed z scale can neither blow J up
+  (``J ~ c^2/(c^2+delta) -> 0``) nor break the factorization;
+* Cholesky failures are NOT papered over with a floor: the window is
+  skipped (differentiable zero, no gradient), its full matrix diagnostics
+  are reported, and ``strict=True`` raises (debug runs).
 """
 
 from typing import Dict, List, Tuple
@@ -20,48 +28,85 @@ from typing import Dict, List, Tuple
 import torch
 
 
-def _ridge(eps: float, sigma: torch.Tensor, jitter: float = 1e-6) -> torch.Tensor:
-    """Ridge that tracks the z scale: ``(eps + jitter) * trace/dim`` plus a
-    tiny absolute floor.
+def _covs(zc: torch.Tensor, pc: torch.Tensor, den: float):
+    """Covariances from CENTERED float64 rows, explicitly symmetrized.
 
-    The OLD absolute jitter (1e-12) broke down when z collapsed: with
-    ``C_ZZ ~ a*I`` and ``a -> 0`` the relative part ``eps*trace/dim ~ 1e-14``
-    fell below the absolute jitter, ridge ~ 1e-12 dominated, and
-    ``(C_ZZ+ridge)^-1 ~ 1e12`` made ``J ~ a/1e-12`` explode past ``dim``
-    (cloud crash ``kf_score_out_of_bounds tjo:layer0 J=245.09 dim=172``).
-    A scale-following ridge restores the scale invariance of the score.
-    The 1e-14 floor only matters for trace ~ 0, which ``_j_from_covs``
-    already intercepts via the allclose check.
+    Returns ``(czz, cpp, czp, sym_err)`` where ``sym_err`` is the
+    asymmetry of ``czz`` measured BEFORE symmetrization — a moment-algebra
+    bug shows up there as a large value.
     """
-    rel = (eps + jitter) * torch.trace(sigma).clamp(min=0.0) / sigma.shape[0]
-    return rel + 1e-14
+    czz = zc.t() @ zc / den
+    cpp = pc.t() @ pc / den
+    czp = zc.t() @ pc / den
+    sym_err = float((czz - czz.t()).detach().abs().max())
+    return 0.5 * (czz + czz.t()), 0.5 * (cpp + cpp.t()), czp, sym_err
 
 
-def _cholesky_retry(mat: torch.Tensor, tries: int = 8) -> torch.Tensor:
-    """Cholesky with escalating jitter, then a relative diagonal floor.
+def _score_from_covs(czz: torch.Tensor, czp: torch.Tensor,
+                     cpp: torch.Tensor, eps: float):
+    """Scale-normalized Ky Fan score with gradient; ``(J, diag)``.
 
-    The caller's ridge scales with trace/dim, so a covariance that is merely
-    NEAR-singular — z directions whose variance collapsed over training (the
-    last Cholesky pivot goes ~0) — can still fail through the escalations,
-    which stay absolute.  The final floor adds ``(rel * 1e-2 + 1e-6) * I``:
-    by Weyl, the smallest eigenvalue of the result is at least ``1e-6``, so
-    the factorization cannot fail and a near-singular window close can never
-    crash training (the crashed run loses hours; a slightly inflated score
-    is the correct degradation).
+    ``diag["failed"]`` is ``None`` on success, else a short code.  The
+    normalization ``A = Czz / mean(diag Czz)`` keeps the ridge ``eps * I``
+    scale-free and keeps the score exactly scale-invariant in ``Z`` and
+    ``P``; ``mean(diag)`` is NOT detached so the gradient path is the true
+    gradient of the normalized objective.
     """
-    n = mat.shape[0]
-    rel = float(torch.trace(mat).detach().clamp(min=0.0)) / n
-    jitter = 1e-12
-    for _ in range(tries):
-        try:
-            return torch.linalg.cholesky(mat)
-        except RuntimeError:
-            mat = mat + (jitter + rel * 1e-8) * torch.eye(
-                n, dtype=mat.dtype, device=mat.device)
-            jitter *= 10.0
-    floor = rel * 1e-2 + 1e-6
-    return torch.linalg.cholesky(
-        mat + floor * torch.eye(n, dtype=mat.dtype, device=mat.device))
+    sz = czz.diagonal().mean()
+    sp = cpp.diagonal().mean()
+    if float(sz.detach()) <= 0.0 or float(sp.detach()) <= 0.0:
+        return None, {"failed": "nonpositive_scale",
+                      "scale_z": float(sz.detach()),
+                      "scale_p": float(sp.detach())}
+    a = czz / sz
+    b = cpp / sp
+    c = czp / torch.sqrt(sz * sp)
+    r, q = a.shape[0], b.shape[0]
+    a = 0.5 * (a + a.t()) + eps * torch.eye(r, dtype=a.dtype, device=a.device)
+    b = 0.5 * (b + b.t()) + eps * torch.eye(q, dtype=b.dtype, device=b.device)
+    lz, info_z = torch.linalg.cholesky_ex(a)
+    lp, info_p = torch.linalg.cholesky_ex(b)
+    if bool((info_z != 0).any()) or bool((info_p != 0).any()):
+        return None, {"failed": "cholesky",
+                      "info_z": int(info_z.max().item()),
+                      "info_p": int(info_p.max().item()),
+                      "scale_z": float(sz.detach()),
+                      "scale_p": float(sp.detach())}
+    w = torch.linalg.solve_triangular(lz, c, upper=False)    # Lz^-1 C
+    k = torch.linalg.solve_triangular(lp, w.t(), upper=False).t()  # w Lp^-T
+    return k.square().sum(), {"failed": None,
+                              "scale_z": float(sz.detach()),
+                              "scale_p": float(sp.detach())}
+
+
+def _matrix_diag(name: str, x: torch.Tensor) -> dict:
+    """Spectral diagnostics (no grad): effective rank via spectral entropy,
+    min/max eigenvalue, eigenvalue condition number."""
+    evals = torch.linalg.eigvalsh(x.detach().double())
+    lam = evals.clamp(min=0.0)
+    total = float(lam.sum())
+    q = lam / max(total, 1e-12)
+    r_eff = 0.0
+    if total > 0.0:
+        r_eff = float(torch.exp(-(q * torch.log(q.clamp(min=1e-300))).sum()))
+    emin = float(evals.min())
+    emax = float(evals.max())
+    return {"{}_r_eff".format(name): r_eff,
+            "{}_min_eig".format(name): emin,
+            "{}_max_eig".format(name): emax,
+            "{}_cond".format(name): emax / max(emin, 1e-30)}
+
+
+def _joint_min_eig(czz, czp, cpp) -> float:
+    """Smallest eigenvalue of the joint [[Czz, Czp],[Czp^T, Cpp]] matrix.
+
+    Negative here means the three matrices are NOT consistent with any
+    distribution (a moment-algebra / covariance-construction bug).
+    """
+    top = torch.cat([czz, czp], dim=1)
+    bot = torch.cat([czp.t(), cpp], dim=1)
+    joint = torch.cat([top, bot], dim=0)
+    return float(torch.linalg.eigvalsh(joint.detach().double()).min())
 
 
 def kf_score_fixed(z_c: torch.Tensor, p_c: torch.Tensor,
@@ -74,14 +119,20 @@ def kf_score_fixed(z_c: torch.Tensor, p_c: torch.Tensor,
     gradcheck target, and (b) a future fixed-reference-scale variant, which
     must precompute ``szz``/``spp`` once from a frozen calibration model
     and add an explicit covariance constraint — it is NOT what ``kf_score``
-    currently uses.
+    currently uses.  A Cholesky failure here is a caller bug (the inputs
+    are fixed statistics), so it asserts instead of degrading.
     """
     m = z_c.shape[0]
     szp = z_c.t() @ p_c / m
-    lz = _cholesky_retry(szz + _ridge(eps, szz) * torch.eye(
-        szz.shape[0], dtype=szz.dtype, device=szz.device))
-    lp = _cholesky_retry(spp + _ridge(eps, spp) * torch.eye(
-        spp.shape[0], dtype=spp.dtype, device=spp.device))
+    r = szz.shape[0]
+    rz = eps * torch.trace(szz) / r
+    rp = eps * torch.trace(spp) / spp.shape[0]
+    lz, iz = torch.linalg.cholesky_ex(
+        szz + rz * torch.eye(r, dtype=szz.dtype, device=szz.device))
+    lp, ip = torch.linalg.cholesky_ex(
+        spp + rp * torch.eye(spp.shape[0], dtype=spp.dtype, device=spp.device))
+    assert not bool((iz != 0).any()), "fixed C_ZZ must stay PSD"
+    assert not bool((ip != 0).any()), "fixed C_PP must stay PSD"
     w = torch.cholesky_solve(szp, lz)             # [r, m] = (S_ZZ+e)^-1 S_ZP
     s = torch.cholesky_solve(szp.t(), lp)         # [m, r] = (S_PP+e)^-1 S_PZ
     return (w * s.t()).sum()  # tr[(S_ZZ+e)^-1 S_ZP (S_PP+e)^-1 S_PZ]
@@ -100,6 +151,10 @@ def kf_score(Z: torch.Tensor, P: torch.Tensor, eps: float = 1e-4) -> torch.Tenso
     objective.  The P-side statistics carry no gradient because P is a fixed
     measurement (``psi`` runs under no_grad).
 
+    Implementation: direct centering in float64, scale-normalized Cholesky
+    (see module docstring).  A degenerate window (nonpositive scale or
+    non-PSD after the ridge) yields a differentiable zero instead of a crash.
+
     ``kf_score_fixed`` below is the core for a genuinely fixed reference
     scale (precomputed once from a frozen calibration model + an explicit
     scale constraint), which this implementation does NOT use.
@@ -107,12 +162,14 @@ def kf_score(Z: torch.Tensor, P: torch.Tensor, eps: float = 1e-4) -> torch.Tenso
     if Z.shape[0] < 2:
         raise ValueError("kf_score needs at least 2 rows")
     P = P.detach()                                 # hard API-level isolation
-    z = Z - Z.mean(dim=0, keepdim=True)
-    p = P - P.mean(dim=0, keepdim=True)           # P constant -> no grad anyway
-    m = z.shape[0]
-    szz = z.t() @ z / m                           # normalization term: full grad
-    spp = p.t() @ p / m
-    return kf_score_fixed(z, p, szz, spp, eps=eps)
+    zc = (Z - Z.mean(dim=0, keepdim=True)).double()
+    pc = (P - P.mean(dim=0, keepdim=True)).double()
+    m = zc.shape[0]
+    czz, cpp, czp, _ = _covs(zc, pc, float(m))
+    j, diag = _score_from_covs(czz, czp, cpp, eps)
+    if diag["failed"] is not None:
+        return Z.sum() * 0.0                       # differentiable zero
+    return j.float()
 
 
 def kf_loss(scores: Dict[str, torch.Tensor], alphas: Dict[str, float]) -> torch.Tensor:
@@ -135,35 +192,47 @@ def score_rows_by_type(rows: List, state_dims: Dict[str, int]) -> Dict[str, list
 def dedup_cut_rows(rows: List, fixed_maps):
     """One row per unique cut: z appears once, P rows of one cut are averaged.
 
-    Returns ``(keys, zs, ps)`` where ``keys`` are ``(node, time, tau)``
-    triples — the cross-batch identity of a cut (``cut_id`` is only unique
-    within one trace).  The link stage no longer fabricates negative rows
-    (each cut carries ONE real future continuation), so the dedup is a
-    defensive layer for any residual repetition.
+    Returns ``(keys, tree_ids, zs, ps)`` where ``keys`` are
+    ``(node, time, tau)`` triples — the cross-batch identity of a cut
+    (``cut_id`` is only unique within one trace) — and ``tree_ids`` the
+    identity of the trace each cut came from (independent samples for the
+    window gate are counted per TREE, not per cut: several cuts of one
+    trace share the same history and are not independent).
     """
     by_cut: Dict[int, list] = {}
     for r in rows:
         by_cut.setdefault(int(r.cut_id), []).append(r)
-    keys, zs, ps = [], [], []
+    keys, tree_ids, zs, ps = [], [], [], []
     for _, cut_rows in by_cut.items():
         r0 = cut_rows[0]
         keys.append((int(r0.node), float(r0.time), str(r0.tau)))
+        tree_ids.append(int(r0.tree_id))
         zs.append(r0.z)
         p_rows = [fixed_maps.pv(r.context, r.outcome) for r in cut_rows]
         ps.append(torch.stack(p_rows).mean(dim=0) if len(p_rows) > 1
                   else p_rows[0])
-    return keys, torch.stack(zs), torch.stack(ps)
+    return keys, tree_ids, torch.stack(zs), torch.stack(ps)
 
 
 class KFMomentWindow:
-    """Cross-microbatch moment accumulation for the Ky Fan score.
+    """Cross-microbatch accumulation for the Ky Fan score.
 
-    Per tau, accumulate (M, sum z, sum p, sum zz^T, sum pp^T, sum zp^T) over
-    temporal microbatches.  All z-carrying quantities stay graph-connected;
-    the window closes when M — counted in UNIQUE cut ids seen IN THIS WINDOW —
-    reaches ``max(min_ratio * d_tau, min_abs)``.  Only then J_tau is computed
-    (once) from the window moments, and the caller performs ONE backward for
-    the accumulated task loss plus the Ky Fan term.  The window then resets.
+    Per tau, accumulate the graph-connected z rows and the (constant) p
+    rows of unique cuts.  The window closes when the number of unique cut
+    TREES seen in this window reaches ``max(min_ratio * d_tau, min_abs)``
+    — cuts of one trace share their history, so only distinct trees count
+    as independent samples.  Only then J_tau is computed (once) and the
+    caller performs ONE backward for the accumulated task loss plus the
+    Ky Fan term.  The window then resets.
+
+    The close path follows the numerical contract in the module docstring:
+    direct float64 centering of the stacked rows (no raw-moment algebra),
+    explicit symmetrization, scale normalization (gradient connected),
+    ``cholesky_ex``.  A failing close (nonpositive scale or non-PSD after
+    the ridge) contributes a differentiable zero — the window takes no
+    part in the backward — and its full matrix diagnostics are reported,
+    so the failure is visible instead of papered over.  ``strict=True``
+    raises instead (debug runs).
 
     This is not a second trainer or a calibration pass: it is just a Ky Fan
     minibatch large enough that the small-sample CCA saturation (fake full
@@ -171,12 +240,14 @@ class KFMomentWindow:
     """
 
     def __init__(self, state_dims: Dict[str, int], *, min_ratio: float = 2.0,
-                 min_abs: int = 64, eps: float = 1e-4, fixed_maps=None):
+                 min_abs: int = 64, eps: float = 1e-4, fixed_maps=None,
+                 strict: bool = False):
         self.state_dims = dict(state_dims)
         self.min_ratio = float(min_ratio)
         self.min_abs = int(min_abs)
         self.eps = float(eps)
         self.fixed_maps = fixed_maps
+        self.strict = bool(strict)
         self._windows: Dict[str, dict] = {}
 
     def _threshold(self, tau: str) -> float:
@@ -188,8 +259,10 @@ class KFMomentWindow:
 
         Returns ``(closed, diagnostics, gated)``:
         ``closed`` = {tau: J} for windows that closed this step (graph-
-        connected J, one per tau); ``diagnostics`` = per-tau {M, J_shuffled,
-        cond_zz, cond_pp} (detached); ``gated`` = taus still accumulating.
+        connected J, one per tau; a failed close contributes a
+        differentiable zero); ``diagnostics`` = per-tau {M_unique,
+        M_unique_trees, J_shuffled, ...} (detached); ``gated`` = taus still
+        accumulating.
         """
         by_tau = score_rows_by_type(rows, self.state_dims)
         closed: Dict[str, torch.Tensor] = {}
@@ -198,12 +271,11 @@ class KFMomentWindow:
         for tau, tau_rows in by_tau.items():
             if self.fixed_maps is None:
                 raise ValueError("KFMomentWindow requires fixed_maps")
-            keys, zs, ps = dedup_cut_rows(tau_rows, self.fixed_maps)
+            keys, tree_ids, zs, ps = dedup_cut_rows(tau_rows, self.fixed_maps)
             win = self._windows.get(tau)
             if win is None:
-                win = {"m": 0, "sz": None, "sp": None, "szz": None,
-                       "spp": None, "szp": None, "seen": set(),
-                       "zs_list": [], "ps_list": []}
+                win = {"zs_list": [], "ps_list": [], "seen": set(),
+                       "seen_trees": set(), "tree_count": 0}
                 self._windows[tau] = win
             # Cross-batch dedupe on the cut's (node, as-of time, tau)
             # identity: cut_id repeats across traces, the triple does not
@@ -216,18 +288,13 @@ class KFMomentWindow:
             zs = zs[fresh]
             ps = ps[fresh]
             win["seen"].update(keys[i] for i in fresh)
-            zs = zs.float()                       # never AMP fp16 moments
-            ps = ps.float()
-            win["m"] += len(fresh)
-            win["sz"] = zs.sum(0) if win["sz"] is None else win["sz"] + zs.sum(0)
-            win["sp"] = ps.sum(0) if win["sp"] is None else win["sp"] + ps.sum(0)
-            win["szz"] = zs.t() @ zs if win["szz"] is None else win["szz"] + zs.t() @ zs
-            win["spp"] = ps.t() @ ps if win["spp"] is None else win["spp"] + ps.t() @ ps
-            win["szp"] = zs.t() @ ps if win["szp"] is None else win["szp"] + zs.t() @ ps
-            # Detached row copies for the shuffled diagnostic only.
-            win["zs_list"].append(zs.detach())
-            win["ps_list"].append(ps.detach())
-            if win["m"] < self._threshold(tau):
+            win["seen_trees"].update(tree_ids[i] for i in fresh)
+            win["tree_count"] = len(win["seen_trees"])
+            # Graph-connected rows (float32); the close stacks them once
+            # and casts to float64.  P is already gradient-free.
+            win["zs_list"].append(zs.float())
+            win["ps_list"].append(ps.float())
+            if win["tree_count"] < self._threshold(tau):
                 gated.append(tau)
         # ALL non-empty windows close together: the z graphs of different
         # taus share the same per-batch forward graph, so an asynchronous
@@ -235,68 +302,71 @@ class KFMomentWindow:
         # window length is therefore set by the slowest (root) interface —
         # which is exactly the interface the depth-balancing exists for.
         nonempty = [tau for tau, win in self._windows.items()
-                    if win is not None and win["m"] > 0]
-        if nonempty and all(self._windows[tau]["m"] >= self._threshold(tau)
-                            for tau in nonempty):
+                    if win is not None and win["tree_count"] > 0]
+        if nonempty and all(self._windows[tau]["tree_count"]
+                            >= self._threshold(tau) for tau in nonempty):
             for tau in nonempty:
                 win = self._windows[tau]
-                m = float(win["m"])
-                zbar = win["sz"] / m
-                pbar = win["sp"] / m
-                czz = win["szz"] / m - torch.outer(zbar, zbar)
-                czp = win["szp"] / m - torch.outer(zbar, pbar)
-                cpp = win["spp"] / m - torch.outer(pbar, pbar)
-                closed[tau] = _j_from_covs(czz, czp, cpp, self.eps, zs)
-                diagnostics[tau] = self._diagnostics(win, czz, cpp)
+                closed[tau], diagnostics[tau] = self._close(win)
             for tau in nonempty:
                 self._windows.pop(tau)
         return closed, diagnostics, gated
 
-    def _diagnostics(self, win, czz, cpp) -> dict:
+    def _close(self, win: dict):
+        """Close one window: stack, center in float64, score, diagnose."""
+        z_all = torch.cat(win["zs_list"], dim=0).double()   # graph-connected
+        p_all = torch.cat(win["ps_list"], dim=0).double()   # constant
+        assert z_all.shape[0] == p_all.shape[0], \
+            "Z and P must come from the same rows/mask ({} vs {})".format(
+                z_all.shape[0], p_all.shape[0])
+        m = float(z_all.shape[0])
+        zc = z_all - z_all.mean(0, keepdim=True)
+        pc = p_all - p_all.mean(0, keepdim=True)
+        czz, cpp, czp, sym_err = _covs(zc, pc, m - 1.0)
+        j, score_diag = _score_from_covs(czz, czp, cpp, self.eps)
+        if score_diag["failed"] is not None:
+            if self.strict:
+                raise RuntimeError(
+                    "KFMomentWindow close failed: {}".format(score_diag))
+            j = z_all.sum() * 0.0                     # no gradient contribution
+        diag = self._diagnostics(win, czz, czp, cpp, j, sym_err, score_diag)
+        return j.float(), diag
+
+    def _diagnostics(self, win, czz, czp, cpp, j, sym_err, score_diag) -> dict:
         with torch.no_grad():
-            z_all = torch.cat(win["zs_list"], dim=0)   # [M, d] detached
-            p_all = torch.cat(win["ps_list"], dim=0)   # [M, m] detached
+            z_all = torch.cat([z.detach() for z in win["zs_list"]], dim=0)
+            p_all = torch.cat(win["ps_list"], dim=0)
             m = float(z_all.shape[0])
             # Shuffled score: permute the SAMPLE pairing of P (column
             # permutations are trace-invariant and would prove nothing).
             perm = torch.randperm(int(m), generator=torch.Generator(
                 device="cpu").manual_seed(int(m * 7919) % (2 ** 31)))
-            zc = z_all - z_all.mean(0, keepdim=True)
-            pc = p_all[perm] - p_all[perm].mean(0, keepdim=True)
-            czp_shuffled = zc.t() @ pc / m
-            j_shuffled = _j_from_covs(czz.detach(), czp_shuffled,
-                                      cpp.detach(), self.eps, None)
-            cond_zz = float(torch.linalg.cond(czz.detach()))
-            cond_pp = float(torch.linalg.cond(cpp.detach()))
-        return {"M_unique": int(m), "J_shuffled": float(j_shuffled),
-                "cond_zz": cond_zz, "cond_pp": cond_pp}
+            zc = (z_all - z_all.mean(0, keepdim=True)).double()
+            pc = (p_all[perm] - p_all[perm].mean(0, keepdim=True)).double()
+            czzs, cpps, czps, _ = _covs(zc, pc, m - 1.0)
+            j_shuffled, _ = _score_from_covs(czzs, czps, cpps, self.eps)
+            d = {"M_unique": int(m),
+                 "M_unique_trees": int(win["tree_count"]),
+                 "J_shuffled": (float(j_shuffled) if j_shuffled is not None
+                                else float("nan")),
+                 "J_real_minus_shuffled":
+                     (float(j.detach())
+                      - (float(j_shuffled) if j_shuffled is not None
+                         else float("nan"))),
+                 "symmetry_error": sym_err,
+                 "joint_min_eig": _joint_min_eig(czz, czp, cpp),
+                 "failed": score_diag["failed"]}
+            d.update(_matrix_diag("zz", czz))
+            d.update(_matrix_diag("pp", cpp))
+            d.update(score_diag)
+            return d
 
     def window_m(self, tau: str) -> int:
         win = self._windows.get(tau)
-        return int(win["m"]) if win is not None else 0
+        return int(win["tree_count"]) if win is not None else 0
 
     def reset(self):
         """Discard all open windows (used at epoch drain: the accumulated
-        moments' z graphs are consumed by the task-only backward, so the
+        z rows' graphs are consumed by the task-only backward, so the
         unfinished window cannot survive into the next epoch)."""
         self._windows.clear()
-
-
-def _j_from_covs(czz, czp, cpp, eps, zs_for_zero):
-    """J = tr[(C_ZZ+e)^-1 C_ZP (C_PP+e)^-1 C_PZ], constant-safe.
-
-    A constant Z makes C_ZZ zero; return a differentiable zero instead of
-    letting a vanishing ridge feed Cholesky.
-    """
-    if torch.allclose(czz, torch.zeros_like(czz), atol=1e-12) \
-            or torch.allclose(cpp, torch.zeros_like(cpp), atol=1e-12):
-        # Differentiable zero: keeps the graph connected without a score.
-        return czp.sum() * 0.0
-    r = czz.shape[0]
-    lz = _cholesky_retry(czz + _ridge(eps, czz) * torch.eye(
-        r, dtype=czz.dtype, device=czz.device))
-    lp = _cholesky_retry(cpp + _ridge(eps, cpp) * torch.eye(
-        cpp.shape[0], dtype=cpp.dtype, device=cpp.device))
-    w = torch.cholesky_solve(czp, lz)
-    s = torch.cholesky_solve(czp.t(), lp)
-    return (w * s.t()).sum()

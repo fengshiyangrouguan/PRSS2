@@ -16,7 +16,7 @@ class RPBConfig:
     state_dims: Mapping[str, int]        # tau -> d_tau (host-required width)
     own_dims: Mapping[str, int]          # tau -> dim of o_v (host input width)
     width_D: int = 128                   # shared core working width
-    m: int = 256                         # sketch output dim (loss test dim)
+    m: int = 64                          # sketch output dim (loss test dim)
     d_c: int = 32                        # context feature dim
     d_f: int = 32                        # future feature dim
     lambda_kf: float = 1.0               # weight of the component loss in the total
@@ -24,8 +24,8 @@ class RPBConfig:
     ridge_eps: float = 1e-4              # relative ridge (x tr(Sigma)/dim)
     delta_t_scale: float = 1e6           # fixed scale for continuous delta_t RFF
     cuts_per_tau: int = 32              # depth-balanced cuts per interface/batch
-    kf_min_ratio: float = 2.0            # window: unique cuts >= ratio * d_tau
-    kf_min_abs: int = 64                 # gate: effective n >= this floor
+    kf_min_ratio: float = 2.0            # window: unique trees >= ratio * d_tau
+    kf_min_abs: int = 1024               # gate: effective tree count >= this floor
     rpbe_seed: int = 0                   # fixed-measurement seed (independent of host)
 
     def __post_init__(self):

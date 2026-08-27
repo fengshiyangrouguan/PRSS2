@@ -10,7 +10,8 @@ import unittest
 import numpy as np
 import torch
 
-from rpbe.loss import KFMomentWindow, kf_score, kf_score_fixed
+from rpbe.loss import (KFMomentWindow, _covs, _score_from_covs, dedup_cut_rows,
+                       kf_score, kf_score_fixed)
 from rpbe.records import CutRecord
 
 
@@ -203,7 +204,8 @@ def make_cut_rows(n_cuts, r, m, rows_per_cut=1, offset=0):
         z = torch.randn(r)
         for k in range(rows_per_cut):
             rows.append(CutRecord(
-                tree_id=0, cut_id=offset + c, occurrence_id=offset + c,
+                tree_id=offset + c, cut_id=offset + c,
+                occurrence_id=offset + c,
                 tau="t", node=offset + c, time=float(offset + c), z=z,
                 context={"delta_t": float(c * 7 + k), "counterpart": c + k,
                          "role": 0, "query_type": 0},
@@ -277,7 +279,7 @@ class TestKFMomentWindow(unittest.TestCase):
             rows = []
             for i in range(n):
                 rows.append(CutRecord(
-                    tree_id=0, cut_id=i, occurrence_id=i, tau="t",
+                    tree_id=i, cut_id=i, occurrence_id=i, tau="t",
                     node=i, time=float(i), z=z[i],
                     context={"delta_t": 0.0, "counterpart": i, "role": 0,
                              "query_type": 0},
@@ -296,7 +298,7 @@ class TestKFMomentWindow(unittest.TestCase):
                            fixed_maps=_FakeMaps(16))
         n = 20
         rows = [CutRecord(
-            tree_id=0, cut_id=i, occurrence_id=i, tau="t",
+            tree_id=i, cut_id=i, occurrence_id=i, tau="t",
             node=i, time=float(i), z=torch.ones(4),
             context={"delta_t": 0.0, "counterpart": i, "role": 0,
                      "query_type": 0}, outcome=0.0)
@@ -325,7 +327,7 @@ class TestKFMomentWindow(unittest.TestCase):
         rows = []
         for i in range(n):
             rows.append(CutRecord(
-                tree_id=0, cut_id=i, occurrence_id=i, tau="t",
+                tree_id=i, cut_id=i, occurrence_id=i, tau="t",
                 node=i, time=float(i), z=z[i],
                 context={"delta_t": 0.0, "counterpart": i, "role": 0,
                          "query_type": 0}, outcome=0.0))
@@ -359,7 +361,7 @@ class TestKFMomentWindow(unittest.TestCase):
         rows = []
         for i in range(n):
             rows.append(CutRecord(
-                tree_id=0, cut_id=i, occurrence_id=i, tau="t",
+                tree_id=i, cut_id=i, occurrence_id=i, tau="t",
                 node=i, time=float(i), z=z[i],
                 context={"delta_t": 0.0, "counterpart": i, "role": 0,
                          "query_type": 0}, outcome=0.0))
@@ -369,6 +371,159 @@ class TestKFMomentWindow(unittest.TestCase):
         self.assertTrue(np.isfinite(j), "near-singular C_ZZ must not crash")
         self.assertGreaterEqual(j, -1e-6)
         self.assertLessEqual(j, r + 1e-3)
+
+
+class TestReviewRegression(unittest.TestCase):
+    """Regression tests from the cloud-crash review (2026-08-27).
+
+    The review found the crash report mis-diagnosed the two failures: a
+    collapsed z scale CANNOT blow J up (``J(c) ~ c^2/(c^2+delta) -> 0``),
+    and a Cholesky pivot near zero is not evidence of a collapsed
+    coordinate.  The real suspects are raw-moment cancellation and
+    high-dimensional small-sample CCA saturation.  These tests pin the
+    corrected numerical contract.
+    """
+
+    def test_scale_invariance_across_orders_of_magnitude(self):
+        # Z -> 10^k Z for k = -12..12: the score must be (almost) exactly
+        # invariant and stay within [0, min(r, m)] — a collapsed z scale
+        # must never blow J past dim (the old absolute-jitter failure).
+        z = _rand(400, 6, seed=30)
+        p = _rand(400, 10, seed=31)
+        j0 = float(kf_score(z, p, eps=1e-6))
+        for k in range(-12, 13):
+            j = float(kf_score(10.0 ** k * z, p, eps=1e-6))
+            self.assertAlmostEqual(j, j0, delta=1e-3 * max(1.0, j0),
+                                   msg="10^{} scale drift changed J".format(k))
+            self.assertGreaterEqual(j, -1e-6)
+            self.assertLessEqual(j, 6.0 + 1e-3)
+
+    def test_large_dc_offset_no_catastrophic_cancellation(self):
+        # Z = 1e4 * 1 + 1e-3 * noise: raw-moment accumulation
+        # (E[zz^T] - E[z]E[z]^T) in float32 loses the signal to
+        # catastrophic cancellation; direct float64 centering must recover
+        # the same score as the noise alone.
+        n, r, mdim = 500, 6, 12
+        g = torch.Generator().manual_seed(40)
+        noise = torch.randn(n, r, generator=g)
+        z_offset = 1e4 + 1e-3 * noise
+        p = _rand(n, mdim, seed=41)
+        j_off = float(kf_score(z_offset, p, eps=1e-6))
+        j_plain = float(kf_score(noise, p, eps=1e-6))
+        self.assertAlmostEqual(j_off, j_plain, delta=1e-2,
+                               msg="DC offset must not change the score")
+
+    def test_window_matches_direct_centered_score(self):
+        # The window close path (float64, den = M-1) must agree term by
+        # term with a manual stack-center of the same rows.
+        n, r, mdim = 300, 8, 64
+        rows = make_cut_rows(n, r, mdim, offset=700)
+        maps = _FakeMaps(mdim)
+        w = KFMomentWindow({"t": r}, min_ratio=1.0, min_abs=64,
+                           fixed_maps=maps)
+        closed, diag, gated = w.add(rows)
+        self.assertIn("t", closed)
+        keys, tids, zs, ps = dedup_cut_rows(rows, maps)
+        zc = (zs.double() - zs.double().mean(0, keepdim=True))
+        pc = (ps.double() - ps.double().mean(0, keepdim=True))
+        czz, cpp, czp, _ = _covs(zc, pc, float(zc.shape[0] - 1))
+        j_manual, d = _score_from_covs(czz, czp, cpp, 1e-4)
+        self.assertIsNone(d["failed"])
+        self.assertTrue(torch.allclose(closed["t"], j_manual.float(),
+                                       atol=1e-4),
+                        "window close must match the direct computation")
+
+    def test_z_and_p_share_one_row_mask(self):
+        # Z and P must come from the same rows, the same dedup mask and the
+        # same denominator — a mismatch silently corrupts the score.
+        n, r, mdim = 200, 8, 64
+        rows = make_cut_rows(n, r, mdim)
+        keys, tids, zs, ps = dedup_cut_rows(rows, _FakeMaps(mdim))
+        self.assertEqual(zs.shape[0], ps.shape[0],
+                         "Z and P rows must match after dedup")
+        self.assertEqual(len(keys), zs.shape[0])
+        self.assertEqual(len(tids), zs.shape[0])
+        # A cut with several rows_per_cut still contributes ONE row pair.
+        dup = make_cut_rows(n, r, mdim, rows_per_cut=3)
+        k2, t2, z2, p2 = dedup_cut_rows(dup, _FakeMaps(mdim))
+        self.assertEqual(z2.shape[0], n)
+        self.assertEqual(p2.shape[0], n)
+        # The close path asserts the invariant itself.
+        w = KFMomentWindow({"t": r}, min_ratio=1.0, min_abs=64,
+                           fixed_maps=_FakeMaps(mdim))
+        closed, diag, gated = w.add(rows)
+        self.assertIn("t", closed)
+        self.assertEqual(diag["t"]["M_unique"], n)
+
+    def test_independent_noise_saturation_regime_344_172_256(self):
+        # The review's sharper problem: with M=344, d_z=172, d_p=256 the
+        # centered rows force an intersection of dim
+        # d_z + d_p - (M-1) = 85, so independent noise scores ~128 — the
+        # epoch-19 J=62.6 was mostly geometry, not learned future
+        # information.  In that regime J_real must match J_shuffled.
+        r, mdim, n = 172, 256, 344
+        g = torch.Generator().manual_seed(77)
+        z = torch.randn(n, r, generator=g)
+        p = torch.randn(n, mdim, generator=g)
+        w = KFMomentWindow({"t": r}, min_ratio=1.0, min_abs=64,
+                           fixed_maps=None)
+        class _Stub:
+            def pv(self, ctx, y):
+                return p[ctx["counterpart"] % n]
+        w.fixed_maps = _Stub()
+        rows = [CutRecord(
+            tree_id=i, cut_id=i, occurrence_id=i, tau="t",
+            node=i, time=float(i), z=z[i],
+            context={"delta_t": 0.0, "counterpart": i, "role": 0,
+                     "query_type": 0}, outcome=0.0)
+            for i in range(n)]
+        closed, diag, gated = w.add(rows)
+        self.assertIn("t", closed)
+        j = float(closed["t"].detach())
+        jsh = diag["t"]["J_shuffled"]
+        # Independent noise: nothing to claim, both scores must agree.
+        self.assertLess(abs(j - jsh) / max(jsh, 1.0), 0.1,
+                        "independent-noise J_real ({:.1f}) must match "
+                        "J_shuffled ({:.1f})".format(j, jsh))
+        self.assertLessEqual(j, r + 1e-3)
+
+    def test_window_radial_derivative_vanishes(self):
+        # Wrapper-level (full window close path) scale invariance: both the
+        # analytic radial derivative <grad J, Z> and the finite difference
+        # must vanish — the signature that no half-gradient wrapper slipped
+        # into the windowed path.
+        n, r, mdim = 300, 8, 64
+        g = torch.Generator().manual_seed(55)
+        z = torch.randn(n, r, generator=g)
+        p = torch.randn(n, mdim, generator=g)
+        class _Stub:
+            def pv(self, ctx, y):
+                return p[ctx["counterpart"] % n]
+        def close_with(zs):
+            w = KFMomentWindow({"t": r}, min_ratio=1.0, min_abs=64,
+                               fixed_maps=_Stub())
+            rows = [CutRecord(
+                tree_id=i, cut_id=i, occurrence_id=i, tau="t",
+                node=i, time=float(i), z=zs[i],
+                context={"delta_t": 0.0, "counterpart": i, "role": 0,
+                         "query_type": 0}, outcome=0.0)
+                for i in range(n)]
+            closed, _, _ = w.add(rows)
+            return closed["t"]
+        zz = z.clone().requires_grad_(True)
+        j = close_with(zz)
+        grad = torch.autograd.grad(j, zz)[0]
+        d_auto = float((grad * zz).sum())
+        h = 1e-3
+        j_plus = float(close_with(((1 + h) * zz.detach())).detach())
+        j_minus = float(close_with(((1 - h) * zz.detach())).detach())
+        d_fd = (j_plus - j_minus) / (2 * h)
+        self.assertAlmostEqual(d_auto, 0.0, delta=1e-2,
+                               msg="window analytic radial derivative "
+                                   "must vanish")
+        self.assertAlmostEqual(d_fd, 0.0, delta=1e-2,
+                               msg="window finite-difference radial "
+                                   "derivative must vanish")
 
 
 if __name__ == "__main__":

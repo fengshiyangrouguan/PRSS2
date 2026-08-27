@@ -168,11 +168,6 @@ class JodieCutBuilder:
         stats_rows = stats.setdefault("valid_rows", {})
         stats_overlap = stats.setdefault("overlap_groups", {})
         stats_outcome = stats.setdefault("outcome_use", {})
-        stats_align = stats.setdefault("aligned_probes", 0)
-        stats_unalign = stats.setdefault("unaligned_probes", 0)
-        stats_self = stats.setdefault("self_steps_skipped", 0)
-        stats_depth = stats.setdefault("depth_terminated", 0)
-        stats_rootrec = stats.setdefault("root_records_used", 0)
         for oid in trace.postorder():
             occ = trace.occurrences[oid]
             node = int(occ.metadata.get("node", -1))
@@ -186,13 +181,21 @@ class JodieCutBuilder:
                 stats_kind.get((occ.tau, kind), 0) + 1
             cut_key = (occ_to_tree[oid], int(oid), str(occ.tau))
             probes, walk = self._walk_up(oid, parent_of, trace, root_cons)
-            stats_align += walk["aligned"]
-            stats_unalign += walk["unaligned"]
-            stats_self += walk["self_steps"]
+            if walk["aligned"]:
+                stats["aligned_probes"] = \
+                    stats.get("aligned_probes", 0) + walk["aligned"]
+            if walk["unaligned"]:
+                stats["unaligned_probes"] = \
+                    stats.get("unaligned_probes", 0) + walk["unaligned"]
+            if walk["self_steps"]:
+                stats["self_steps_skipped"] = \
+                    stats.get("self_steps_skipped", 0) + walk["self_steps"]
             if walk["hit_root"]:
-                stats_rootrec += 1
+                stats["root_records_used"] = \
+                    stats.get("root_records_used", 0) + 1
             if walk["terminated_by_depth"]:
-                stats_depth += 1
+                stats["depth_terminated"] = \
+                    stats.get("depth_terminated", 0) + 1
             rows = []
             for h, (rec, path) in enumerate(probes, start=1):
                 r = self._record(occ, cut_key, h, time, rec, path)

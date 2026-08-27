@@ -137,6 +137,7 @@ def main():
 
     stats = {}
     pooled_rows = []
+    pool_counts = {}
     n_batches_seen = 0
     num_batch = math.ceil(len(train.sources) / args.bs)
     max_batches = args.max_batches or num_batch
@@ -165,9 +166,16 @@ def main():
                 for row in range(size)}
             rows = cut_builder.build(trace, root_events=root_events,
                                      batch_seed=k, stats=stats)
+            # Stratified pool: postorder emits leaf rows first, so a plain
+            # first-N pool would be flooded by layer0 and never see the
+            # upper interfaces.  Each tau gets pool_rows / n_taus quota.
             for r in rows:
+                tau_quota = max(1, args.pool_rows // max(1, len(taus)))
+                if pool_counts.get(r.tau, 0) >= tau_quota:
+                    continue
                 if len(pooled_rows) < args.pool_rows:
                     pooled_rows.append(r)
+                    pool_counts[r.tau] = pool_counts.get(r.tau, 0) + 1
             n_batches_seen += 1
             if n_batches_seen % 20 == 0:
                 print("batch {} / {} (rows so far {})".format(

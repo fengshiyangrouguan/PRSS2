@@ -226,12 +226,17 @@ class JodieTGNAdapter(HostAdapter):
                             src, dst = self._endpoints.get(
                                 int(edge_idxs_np[row, j]), (-1, -1))
                             carrier = int(np_neighbors[row, j])
+                            # JODIE labels belong to the interaction's
+                            # DESTINATION (item state).  The label owner
+                            # is therefore always dst; the carrier is the
+                            # probe's node, so alignment holds only when
+                            # the carrier is the destination itself.
                             if src == carrier:
                                 cons.update({"endpoint_role": 0,
                                              "label_owner": int(dst)})
                             elif dst == carrier:
                                 cons.update({"endpoint_role": 1,
-                                             "label_owner": int(src)})
+                                             "label_owner": int(dst)})
                             else:
                                 cons.update({"endpoint_role": -1,
                                              "label_owner": -1})

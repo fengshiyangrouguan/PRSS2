@@ -365,8 +365,9 @@ def dedup_cut_rows(rows: List, fixed_maps):
         zs.append(r.z)
         ps.append(fixed_maps.pv(r.context, r.outcome))
         weights.append(float(r.weight))
-    return (row_ids, cut_ids, tree_ids, torch.stack(zs), torch.stack(ps),
-            torch.tensor(weights, dtype=torch.float64))
+    zs_t = torch.stack(zs)
+    return (row_ids, cut_ids, tree_ids, zs_t, torch.stack(ps),
+            torch.tensor(weights, dtype=torch.float64, device=zs_t.device))
 
 
 class KFMomentWindow:

@@ -114,10 +114,12 @@ class JodieNodeClassificationLoop:
         if self.rpbe_on and rpbe_cfg.kf_taus is not None:
             kf_dims = {t: d for t, d in rpbe_cfg.state_dims.items()
                        if t in rpbe_cfg.kf_taus}
+        # autoclose=False: the Moment-Adjoint loop closes the windows
+        # itself (close_replay after the pass-1 shadow run).
         self.kf_window = (KFMomentWindow(
             kf_dims, min_ratio=rpbe_cfg.kf_min_ratio,
             min_abs=rpbe_cfg.kf_min_abs, eps=rpbe_cfg.ridge_eps,
-            fixed_maps=fixed_maps)
+            fixed_maps=fixed_maps, autoclose=False)
             if self.rpbe_on else None)
 
     def _clip_all_groups(self):

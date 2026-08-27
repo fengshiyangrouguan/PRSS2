@@ -228,7 +228,7 @@ class KFMomentWindow:
             # Shuffled score: permute the SAMPLE pairing of P (column
             # permutations are trace-invariant and would prove nothing).
             perm = torch.randperm(int(m), generator=torch.Generator(
-                device=cpp.device).manual_seed(int(m * 7919) % (2 ** 31)))
+                device="cpu").manual_seed(int(m * 7919) % (2 ** 31)))
             zc = z_all - z_all.mean(0, keepdim=True)
             pc = p_all[perm] - p_all[perm].mean(0, keepdim=True)
             czp_shuffled = zc.t() @ pc / m

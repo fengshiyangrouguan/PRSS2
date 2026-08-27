@@ -25,18 +25,31 @@ def _ridge(eps: float, sigma: torch.Tensor, jitter: float = 1e-12) -> torch.Tens
     return rel + jitter
 
 
-def _cholesky_retry(mat: torch.Tensor, tries: int = 3) -> torch.Tensor:
-    """Cholesky with escalating absolute jitter (a constant Z/P would make
-    the relative ridge vanish; the jitter keeps the factorization alive)."""
+def _cholesky_retry(mat: torch.Tensor, tries: int = 8) -> torch.Tensor:
+    """Cholesky with escalating jitter, then a relative diagonal floor.
+
+    The caller's ridge scales with trace/dim, so a covariance that is merely
+    NEAR-singular — z directions whose variance collapsed over training (the
+    last Cholesky pivot goes ~0) — can still fail through the escalations,
+    which stay absolute.  The final floor adds ``(rel * 1e-2 + 1e-6) * I``:
+    by Weyl, the smallest eigenvalue of the result is at least ``1e-6``, so
+    the factorization cannot fail and a near-singular window close can never
+    crash training (the crashed run loses hours; a slightly inflated score
+    is the correct degradation).
+    """
+    n = mat.shape[0]
+    rel = float(torch.trace(mat).detach().clamp(min=0.0)) / n
     jitter = 1e-12
     for _ in range(tries):
         try:
             return torch.linalg.cholesky(mat)
         except RuntimeError:
-            n = mat.shape[0]
-            mat = mat + jitter * torch.eye(n, dtype=mat.dtype, device=mat.device)
+            mat = mat + (jitter + rel * 1e-8) * torch.eye(
+                n, dtype=mat.dtype, device=mat.device)
             jitter *= 10.0
-    return torch.linalg.cholesky(mat)
+    floor = rel * 1e-2 + 1e-6
+    return torch.linalg.cholesky(
+        mat + floor * torch.eye(n, dtype=mat.dtype, device=mat.device))
 
 
 def kf_score_fixed(z_c: torch.Tensor, p_c: torch.Tensor,

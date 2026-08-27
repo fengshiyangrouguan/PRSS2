@@ -307,6 +307,39 @@ class TestKFMomentWindow(unittest.TestCase):
         self.assertAlmostEqual(j, 0.0, places=6)
         self.assertTrue(np.isfinite(j))
 
+    def test_near_singular_covariance_does_not_crash(self):
+        # Regression for the cloud crash: after ~18 epochs some z direction
+        # collapses, making the 172x172 C_ZZ non-positive-definite at the
+        # LAST Cholesky pivot.  The window close must degrade (finite score)
+        # instead of killing training.
+        r, m, n = 172, 256, 420
+        g = torch.Generator().manual_seed(123)
+        signal = torch.randn(n, 4, generator=g)          # shared low-rank core
+        z = torch.cat([signal, torch.randn(n, r - 4, generator=g)], dim=1)
+        # Collapse the FINAL coordinate: variance -> machine zero.  This is
+        # exactly the leading-minor-of-order-171 failure shape.
+        z[:, -1] = z[:, -1] * 0.0 + 1e-13 * torch.randn(n, generator=g)
+        p = torch.randn(n, m, generator=g)
+        w = KFMomentWindow({"t": r}, min_ratio=1.0, min_abs=64,
+                           fixed_maps=None)
+        class _Stub:
+            def pv(self, ctx, y):
+                return p[ctx["counterpart"] % n]
+        w.fixed_maps = _Stub()
+        rows = []
+        for i in range(n):
+            rows.append(CutRecord(
+                tree_id=0, cut_id=i, occurrence_id=i, tau="t",
+                node=i, time=float(i), z=z[i],
+                context={"delta_t": 0.0, "counterpart": i, "role": 0,
+                         "query_type": 0}, outcome=0.0))
+        closed, diag, gated = w.add(rows)
+        self.assertIn("t", closed)
+        j = float(closed["t"].detach())
+        self.assertTrue(np.isfinite(j), "near-singular C_ZZ must not crash")
+        self.assertGreaterEqual(j, -1e-6)
+        self.assertLessEqual(j, r + 1e-3)
+
 
 if __name__ == "__main__":
     unittest.main()

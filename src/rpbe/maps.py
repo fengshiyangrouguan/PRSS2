@@ -42,9 +42,18 @@ class FixedMaps(nn.Module):
         # Rows: [0, bins) counterpart hash; bins+0/1 -> role; bins+2/3 -> query.
         self.register_buffer("categorical_c", _fixed_binary(
             (self.num_counter_bins + 4, self.d_c), seed + 1), persistent=True)
-        # Future y in {0, 1}: two fixed d_f-dim signatures.
+        # Future y in {0, 1}: two fixed d_f-dim signatures.  Both rows are
+        # nonzero +-1 signatures, so phi_Y(0) != 0 (a zero signature would
+        # kill every negative-label row's tensor product).
         self.register_buffer("future_table", _fixed_binary(
             (2, self.d_f), seed + 2), persistent=True)
+        # Horizon index (1 -> row 0, 2 -> row 1); invalid values raise.
+        self.register_buffer("horizon_table", _fixed_binary(
+            (2, self.d_c), seed + 6), persistent=True)
+        # PathSketch: fixed per-step signatures for the upward-walk
+        # structure.  rel 0 = SELF recursion step, rel 1 = neighbor edge.
+        self.register_buffer("path_rel_table", _fixed_binary(
+            (2, self.d_c), seed + 7), persistent=True)
         # RFF for the scaled delta_t: cos(W x + b).
         self.register_buffer("rff_w", torch.randn(
             (1, self.d_c), generator=torch.Generator().manual_seed(seed + 3)),
@@ -77,8 +86,23 @@ class FixedMaps(nn.Module):
         self._sketch_full_dim = full_dim
 
     # ------------------------------------------------------------- primitives
+    def _path_vector(self, path, dtype, device) -> torch.Tensor:
+        """Fixed PathSketch of the upward walk: sum over steps of
+        ``cos(dt/scale W + b) + rel_signature``.  Empty path -> zeros."""
+        out = torch.zeros((1, self.d_c), dtype=dtype, device=device)
+        for rel, dt in path:
+            if int(rel) not in (0, 1):
+                raise ValueError("path relation must be 0 or 1, got {}"
+                                 .format(rel))
+            d = torch.tensor(float(dt) / self._delta_t_scale,
+                             dtype=dtype, device=device).reshape(1, 1)
+            out = out + torch.cos(d @ self.rff_w + self.rff_b) \
+                + self.path_rel_table[int(rel)].to(dtype)
+        return out
+
     def context_vector(self, context) -> torch.Tensor:
-        """phi_C(c) for one row: {delta_t, counterpart, role, query_type}."""
+        """phi_C(c) for one row: {delta_t, counterpart, role, query_type,
+        horizon, path}."""
         delta = float(context["delta_t"]) / self._delta_t_scale
         delta_t = torch.tensor(delta, dtype=self.rff_w.dtype,
                                device=self.rff_w.device).reshape(1, 1)
@@ -86,10 +110,16 @@ class FixedMaps(nn.Module):
         partner = int(context["counterpart"]) % self.num_counter_bins
         role = int(context["role"]) % 2
         query = int(context["query_type"]) % 2
+        h = int(context["horizon"])
+        if h not in (1, 2):
+            raise ValueError("horizon must be 1 or 2, got {}".format(h))
         cat = (self.categorical_c[partner]
                + self.categorical_c[self.num_counter_bins + role]
-               + self.categorical_c[self.num_counter_bins + 2 + query])
-        return rff + cat.to(rff.dtype)  # [1, d_c]
+               + self.categorical_c[self.num_counter_bins + 2 + query]
+               + self.horizon_table[h - 1])
+        path_vec = self._path_vector(context.get("path", []),
+                                     self.rff_w.dtype, self.rff_w.device)
+        return rff + cat.to(rff.dtype) + path_vec  # [1, d_c]
 
     def future_vector(self, outcome: float) -> torch.Tensor:
         """phi_Y(y) for one row; y in {0, 1}."""
@@ -140,10 +170,17 @@ class FixedMaps(nn.Module):
             queries = torch.tensor([int(c["query_type"]) % 2
                                     for c in contexts],
                                    dtype=torch.long, device=dev)
+            horizons = torch.tensor(
+                [self._check_horizon(int(c["horizon"])) for c in contexts],
+                dtype=torch.long, device=dev)
             cat = (self.categorical_c[partners]
                    + self.categorical_c[self.num_counter_bins + roles]
-                   + self.categorical_c[self.num_counter_bins + 2 + queries])
-            c_vec = rff + cat.to(rff.dtype)                          # [N, d_c]
+                   + self.categorical_c[self.num_counter_bins + 2 + queries]
+                   + self.horizon_table[horizons - 1])
+            path_vec = torch.stack(
+                [self._path_vector(c.get("path", []), self.rff_w.dtype, dev)[0]
+                 for c in contexts], dim=0)                          # [N, d_c]
+            c_vec = rff + cat.to(rff.dtype) + path_vec               # [N, d_c]
             y_idx = torch.tensor([1 if float(y) > 0.5 else 0
                                   for y in outcomes],
                                  dtype=torch.long, device=dev)
@@ -164,6 +201,12 @@ class FixedMaps(nn.Module):
                 flat[row_idx] * self.sketch_signs.repeat(n))
             return out
 
+    @staticmethod
+    def _check_horizon(h: int) -> int:
+        if h not in (1, 2):
+            raise ValueError("horizon must be 1 or 2, got {}".format(h))
+        return h
+
     # ------------------------------------------------------------------ audit
     def isolation_fingerprint(self) -> dict:
         """Seed/version + FULL byte hash of every frozen buffer and of the
@@ -173,7 +216,8 @@ class FixedMaps(nn.Module):
         h.update(str(self._sketch_full_dim).encode())
         h.update(str(self._delta_t_scale).encode())
         for name in ("categorical_c", "future_table", "rff_w", "rff_b",
-                     "sketch_indices", "sketch_signs"):
+                     "sketch_indices", "sketch_signs",
+                     "horizon_table", "path_rel_table"):
             buf = getattr(self, name)
             h.update(buf.detach().cpu().reshape(-1).contiguous()
                      .numpy().tobytes())

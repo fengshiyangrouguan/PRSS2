@@ -17,7 +17,7 @@ def make_cfg(seed=0, **kw):
 
 def base_context(**kw):
     ctx = {"delta_t": 12345.0, "counterpart": 77, "role": 0,
-           "query_type": 1}
+           "query_type": 1, "horizon": 1, "path": []}
     ctx.update(kw)
     return ctx
 
@@ -73,10 +73,37 @@ class TestPsiBehavior(unittest.TestCase):
         p2 = self.maps.psi(base_context(counterpart=78), 1.0)
         p3 = self.maps.psi(base_context(delta_t=99999.0), 1.0)
         p4 = self.maps.psi(base_context(query_type=0), 1.0)
+        p5 = self.maps.psi(base_context(horizon=2), 1.0)
+        p6 = self.maps.psi(base_context(path=[(1, 500.0)]), 1.0)
+        p7 = self.maps.psi(base_context(path=[(1, 500.0), (0, 200.0)]), 1.0)
         self.assertFalse(torch.equal(p0, p1), "y must change the sketch")
         self.assertFalse(torch.equal(p1, p2), "counterpart must change it")
         self.assertFalse(torch.equal(p1, p3), "delta_t must change it")
         self.assertFalse(torch.equal(p1, p4), "query_type must change it")
+        self.assertFalse(torch.equal(p1, p5), "horizon must change it")
+        self.assertFalse(torch.equal(p1, p6), "path must change it")
+        self.assertFalse(torch.equal(p6, p7), "path length must change it")
+
+    def test_invalid_horizon_raises(self):
+        with self.assertRaises(ValueError):
+            self.maps.context_vector(base_context(horizon=0))
+        with self.assertRaises(ValueError):
+            self.maps.context_vector(base_context(horizon=3))
+        with self.assertRaises(ValueError):
+            self.maps.pv_batch([base_context(horizon=3)], [1.0])
+
+    def test_invalid_path_relation_raises(self):
+        with self.assertRaises(ValueError):
+            self.maps.context_vector(base_context(path=[(2, 100.0)]))
+
+    def test_future_signatures_nonzero(self):
+        # phi_Y(0) != 0: a zero signature would kill every negative-label
+        # row's tensor product (p = chi(C) (x) phi_Y(y)).
+        f0 = self.maps.future_vector(0.0)
+        f1 = self.maps.future_vector(1.0)
+        self.assertGreater(f0.abs().sum().item(), 0.0)
+        self.assertGreater(f1.abs().sum().item(), 0.0)
+        self.assertFalse(torch.equal(f0, f1))
 
     def test_no_gradient(self):
         out = self.maps.psi(base_context(), 0.0)

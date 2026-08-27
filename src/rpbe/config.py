@@ -8,7 +8,7 @@ else configures the fixed measurement and the Ky Fan training term.
 """
 
 from dataclasses import dataclass, field
-from typing import Dict, Mapping
+from typing import Dict, List, Mapping, Optional
 
 
 @dataclass
@@ -24,8 +24,13 @@ class RPBConfig:
     ridge_eps: float = 1e-4              # relative ridge (x tr(Sigma)/dim)
     delta_t_scale: float = 1e6           # fixed scale for continuous delta_t RFF
     cuts_per_tau: int = 32              # depth-balanced cuts per interface/batch
-    kf_min_ratio: float = 2.0            # window: unique trees >= ratio * d_tau
-    kf_min_abs: int = 1024               # gate: effective tree count >= this floor
+    kf_min_ratio: float = 2.0            # window: unique cuts >= ratio * d_tau
+    kf_min_abs: int = 1024               # gate: effective cut count >= this floor
+    kf_taus: Optional[List[str]] = None  # taus entering the KF windows;
+                                         # None = all state_dims. The root
+                                         # interface (no upward walk) is
+                                         # excluded EXPLICITLY here, not by
+                                         # "never accumulating" warnings.
     rpbe_seed: int = 0                   # fixed-measurement seed (independent of host)
 
     def __post_init__(self):
@@ -46,6 +51,11 @@ class RPBConfig:
             raise ValueError("kf_min_ratio > 0 and kf_min_abs >= 2")
         if self.cuts_per_tau < 1:
             raise ValueError("cuts_per_tau must be >= 1")
+        if self.kf_taus is not None:
+            bad = set(self.kf_taus) - set(self.state_dims)
+            if bad:
+                raise ValueError("kf_taus not in state_dims: {}".format(
+                    sorted(bad)))
 
     def alpha(self, tau: str) -> float:
         return float(self.alphas.get(tau, 1.0))
@@ -65,5 +75,6 @@ class RPBConfig:
             "cuts_per_tau": self.cuts_per_tau,
             "kf_min_ratio": self.kf_min_ratio,
             "kf_min_abs": self.kf_min_abs,
+            "kf_taus": list(self.kf_taus) if self.kf_taus is not None else None,
             "rpbe_seed": self.rpbe_seed,
         }

@@ -1,21 +1,22 @@
 """Cut-builder factory for the JODIE line.
 
-Builds the node-grouped, time-sorted FutureIndex over the *full* stream (with
-split flags) and wraps it in a :class:`rpbe.records.JodieCutBuilder` for one
-training stage: LINK (stage 1, self-supervised pretraining) or NODE_CLASS
-(stage 2, node classification).
+Builds the explicit ``idx -> endpoints`` / ``idx -> label`` tables over the
+*full* stream (no indexing-convention assumptions) and wraps them in a
+:class:`rpbe.records.JodieCutBuilder` for one training stage: LINK (stage 1,
+self-supervised pretraining) or NODE_CLASS (stage 2, node classification).
+The same tables feed the adapter's consumption-record stamping.
 """
 
-from rpbe.records import FutureIndex, JodieCutBuilder
+from rpbe.records import build_edge_tables, JodieCutBuilder
 
 
 def build_cut_builder(dataset, *, stage: str, cfg, seed: int = 0,
-                      delta_t_scale: float = 1e6) -> JodieCutBuilder:
-    full = dataset.full
-    index = FutureIndex(full.sources, full.destinations, full.timestamps,
-                        full.labels, val_time=dataset.val_time,
-                        test_time=dataset.test_time)
+                      delta_t_scale: float = 1e6,
+                      tables=None) -> JodieCutBuilder:
+    if tables is None:
+        endpoints, labels, _ = build_edge_tables(dataset)
+        tables = (endpoints, labels)
     cfg.delta_t_scale = float(delta_t_scale) if delta_t_scale > 0 else 1.0
-    return JodieCutBuilder(index, stage=stage,
+    return JodieCutBuilder(tables, stage=stage,
                            cuts_per_tau=getattr(cfg, "cuts_per_tau", 32),
                            seed=int(seed))

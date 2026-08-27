@@ -9,7 +9,7 @@ from rpbe.compressor import RecursiveCompressor
 from rpbe.config import RPBConfig
 from rpbe.data.jodie import JodieData
 from rpbe.maps import FixedMaps
-from rpbe.records import FutureIndex, JodieCutBuilder, NODE_CLASS
+from rpbe.records import JodieCutBuilder, NODE_CLASS
 from rpbe.training.jodie_loop import (JodieNodeClassificationLoop,
                                       metric_bundle, select_trace_rows)
 
@@ -128,12 +128,17 @@ class TestLoopSmoke(unittest.TestCase):
             adapter = install_adapter(tgn)
             adapter.compressor = compressor
             fixed_maps = FixedMaps(cfg).to(self.device)
-            idx = FutureIndex(
-                self.train.sources, self.train.destinations,
-                self.train.timestamps, self.train.labels,
-                val_time=float(np.quantile(self.stream_times, 0.70)),
-                test_time=float(np.quantile(self.stream_times, 0.85)))
-            cut_builder = JodieCutBuilder(idx, stage=NODE_CLASS, seed=0)
+            endpoints = {int(e): (int(s), int(d))
+                         for s, d, e in zip(self.train.sources,
+                                            self.train.destinations,
+                                            self.train.edge_idxs)}
+            labels_tbl = {int(e): float(y)
+                          for e, y in zip(self.train.edge_idxs,
+                                          self.train.labels)}
+            adapter.edge_tables = (endpoints, labels_tbl)
+            adapter._endpoints = endpoints
+            cut_builder = JodieCutBuilder((endpoints, labels_tbl),
+                                          stage=NODE_CLASS, seed=0)
         seen = set()
         main_params = [p for p in main_params
                        if not (id(p) in seen or seen.add(id(p)))]

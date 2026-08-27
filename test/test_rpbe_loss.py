@@ -204,12 +204,16 @@ def make_cut_rows(n_cuts, r, m, rows_per_cut=1, offset=0):
         z = torch.randn(r)
         for k in range(rows_per_cut):
             rows.append(CutRecord(
-                tree_id=offset + c, cut_id=offset + c,
+                tree_id=offset + c,
                 occurrence_id=offset + c,
-                tau="t", node=offset + c, time=float(offset + c), z=z,
+                tau="t", horizon=k + 1, node=offset + c,
+                time=float(offset + c), z=z,
                 context={"delta_t": float(c * 7 + k), "counterpart": c + k,
-                         "role": 0, "query_type": 0},
-                outcome=float(k == 0)))
+                         "role": 0, "query_type": 0,
+                         "horizon": k + 1, "path": []},
+                outcome=float(k == 0),
+                outcome_id=("edge", offset + c),
+                weight=1.0 / rows_per_cut))
     return rows
 
 
@@ -279,11 +283,11 @@ class TestKFMomentWindow(unittest.TestCase):
             rows = []
             for i in range(n):
                 rows.append(CutRecord(
-                    tree_id=i, cut_id=i, occurrence_id=i, tau="t",
+                    tree_id=i, occurrence_id=i, tau="t", horizon=1,
                     node=i, time=float(i), z=z[i],
                     context={"delta_t": 0.0, "counterpart": i, "role": 0,
-                             "query_type": 0},
-                    outcome=0.0))
+                             "query_type": 0, "horizon": 1, "path": []},
+                    outcome=0.0, outcome_id=("edge", i)))
             closed, diag, gated = w.add(rows)
             self.assertIn("t", closed)
             js.append(float(closed["t"].detach()))
@@ -298,10 +302,11 @@ class TestKFMomentWindow(unittest.TestCase):
                            fixed_maps=_FakeMaps(16))
         n = 20
         rows = [CutRecord(
-            tree_id=i, cut_id=i, occurrence_id=i, tau="t",
+            tree_id=i, occurrence_id=i, tau="t", horizon=1,
             node=i, time=float(i), z=torch.ones(4),
             context={"delta_t": 0.0, "counterpart": i, "role": 0,
-                     "query_type": 0}, outcome=0.0)
+                     "query_type": 0, "horizon": 1, "path": []}, outcome=0.0,
+                     outcome_id=("edge", i))
             for i in range(n)]
         closed, diag, gated = w.add(rows)
         self.assertIn("t", closed)
@@ -327,10 +332,11 @@ class TestKFMomentWindow(unittest.TestCase):
         rows = []
         for i in range(n):
             rows.append(CutRecord(
-                tree_id=i, cut_id=i, occurrence_id=i, tau="t",
+                tree_id=i, occurrence_id=i, tau="t", horizon=1,
                 node=i, time=float(i), z=z[i],
                 context={"delta_t": 0.0, "counterpart": i, "role": 0,
-                         "query_type": 0}, outcome=0.0))
+                         "query_type": 0, "horizon": 1, "path": []}, outcome=0.0,
+                outcome_id=("edge", i)))
         closed, diag, gated = w.add(rows)
         self.assertIn("t", closed)
         j = float(closed["t"].detach())
@@ -361,10 +367,11 @@ class TestKFMomentWindow(unittest.TestCase):
         rows = []
         for i in range(n):
             rows.append(CutRecord(
-                tree_id=i, cut_id=i, occurrence_id=i, tau="t",
+                tree_id=i, occurrence_id=i, tau="t", horizon=1,
                 node=i, time=float(i), z=z[i],
                 context={"delta_t": 0.0, "counterpart": i, "role": 0,
-                         "query_type": 0}, outcome=0.0))
+                         "query_type": 0, "horizon": 1, "path": []}, outcome=0.0,
+                outcome_id=("edge", i)))
         closed, diag, gated = w.add(rows)
         self.assertIn("t", closed)
         j = float(closed["t"].detach())
@@ -423,7 +430,7 @@ class TestReviewRegression(unittest.TestCase):
                            fixed_maps=maps)
         closed, diag, gated = w.add(rows)
         self.assertIn("t", closed)
-        keys, tids, zs, ps = dedup_cut_rows(rows, maps)
+        row_ids, cut_ids, tids, zs, ps, weights = dedup_cut_rows(rows, maps)
         zc = (zs.double() - zs.double().mean(0, keepdim=True))
         pc = (ps.double() - ps.double().mean(0, keepdim=True))
         czz, cpp, czp, _ = _covs(zc, pc, float(zc.shape[0] - 1))
@@ -438,16 +445,23 @@ class TestReviewRegression(unittest.TestCase):
         # same denominator — a mismatch silently corrupts the score.
         n, r, mdim = 200, 8, 64
         rows = make_cut_rows(n, r, mdim)
-        keys, tids, zs, ps = dedup_cut_rows(rows, _FakeMaps(mdim))
+        row_ids, cut_ids, tids, zs, ps, weights = dedup_cut_rows(
+            rows, _FakeMaps(mdim))
         self.assertEqual(zs.shape[0], ps.shape[0],
                          "Z and P rows must match after dedup")
-        self.assertEqual(len(keys), zs.shape[0])
+        self.assertEqual(len(row_ids), zs.shape[0])
+        self.assertEqual(len(cut_ids), zs.shape[0])
         self.assertEqual(len(tids), zs.shape[0])
-        # A cut with several rows_per_cut still contributes ONE row pair.
+        self.assertEqual(len(weights), zs.shape[0])
+        # Several horizons per cut: rows stay SEPARATE (no p averaging —
+        # averaging would create p1*p2^T cross terms and change Cov(P));
+        # cut_ids collapse to one unique id per cut.
         dup = make_cut_rows(n, r, mdim, rows_per_cut=3)
-        k2, t2, z2, p2 = dedup_cut_rows(dup, _FakeMaps(mdim))
-        self.assertEqual(z2.shape[0], n)
-        self.assertEqual(p2.shape[0], n)
+        k2, c2, t2, z2, p2, w2 = dedup_cut_rows(dup, _FakeMaps(mdim))
+        self.assertEqual(z2.shape[0], 3 * n, "rows stay separate")
+        self.assertEqual(p2.shape[0], 3 * n)
+        self.assertEqual(len(set(c2)), n, "cut_ids collapse per cut")
+        self.assertEqual(len(set(k2)), 3 * n, "row_ids stay distinct")
         # The close path asserts the invariant itself.
         w = KFMomentWindow({"t": r}, min_ratio=1.0, min_abs=64,
                            fixed_maps=_FakeMaps(mdim))
@@ -472,10 +486,11 @@ class TestReviewRegression(unittest.TestCase):
                 return p[ctx["counterpart"] % n]
         w.fixed_maps = _Stub()
         rows = [CutRecord(
-            tree_id=i, cut_id=i, occurrence_id=i, tau="t",
+            tree_id=i, occurrence_id=i, tau="t", horizon=1,
             node=i, time=float(i), z=z[i],
             context={"delta_t": 0.0, "counterpart": i, "role": 0,
-                     "query_type": 0}, outcome=0.0)
+                     "query_type": 0, "horizon": 1, "path": []}, outcome=0.0,
+                     outcome_id=("edge", i))
             for i in range(n)]
         closed, diag, gated = w.add(rows)
         self.assertIn("t", closed)
@@ -503,10 +518,11 @@ class TestReviewRegression(unittest.TestCase):
             w = KFMomentWindow({"t": r}, min_ratio=1.0, min_abs=64,
                                fixed_maps=_Stub())
             rows = [CutRecord(
-                tree_id=i, cut_id=i, occurrence_id=i, tau="t",
+                tree_id=i, occurrence_id=i, tau="t", horizon=1,
                 node=i, time=float(i), z=zs[i],
                 context={"delta_t": 0.0, "counterpart": i, "role": 0,
-                         "query_type": 0}, outcome=0.0)
+                         "query_type": 0, "horizon": 1, "path": []}, outcome=0.0,
+                     outcome_id=("edge", i))
                 for i in range(n)]
             closed, _, _ = w.add(rows)
             return closed["t"]

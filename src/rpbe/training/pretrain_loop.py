@@ -49,8 +49,14 @@ class TGNPretrainLoop:
         self.trace_roots = int(trace_roots)
         self.rpbe_on = bool(adapter is not None and cut_builder is not None
                             and fixed_maps is not None and rpbe_cfg is not None)
+        # KF windows cover the kf_taus whitelist only (root interface has
+        # no upward walk and is excluded explicitly).
+        kf_dims = rpbe_cfg.state_dims
+        if self.rpbe_on and rpbe_cfg.kf_taus is not None:
+            kf_dims = {t: d for t, d in rpbe_cfg.state_dims.items()
+                       if t in rpbe_cfg.kf_taus}
         self.kf_window = (KFMomentWindow(
-            rpbe_cfg.state_dims, min_ratio=rpbe_cfg.kf_min_ratio,
+            kf_dims, min_ratio=rpbe_cfg.kf_min_ratio,
             min_abs=rpbe_cfg.kf_min_abs, eps=rpbe_cfg.ridge_eps,
             fixed_maps=fixed_maps)
             if self.rpbe_on else None)
@@ -124,7 +130,18 @@ class TGNPretrainLoop:
                         else window_link + link_loss
                     loss = link_loss
                     if trace_rows and self.adapter.trace is not None:
+                        # Link-stage root task record: the traced event is
+                        # a REAL observed interaction (y=1 by construction
+                        # — fabricated negatives belong to the link TASK
+                        # loss only and never enter the Ky Fan moments).
+                        root_events = {
+                            int(row): {"dst": int(dests[row]),
+                                       "label": 1.0,
+                                       "time": float(times[row]),
+                                       "event_idx": int(edge_idxs[row])}
+                            for row in trace_rows}
                         cuts = self.cut_builder.build(self.adapter.trace,
+                                                      root_events=root_events,
                                                       batch_seed=global_step)
                         if not cuts:
                             self.monitor.alert("warning", "kf_no_cuts",

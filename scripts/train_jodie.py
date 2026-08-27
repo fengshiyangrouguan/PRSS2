@@ -46,7 +46,7 @@ from rpbe.hosts.jodie_tgn import JodieTGNAdapter, TAU_TEMPLATE
 from rpbe.hosts.official_tgn import MLP, TGN, get_neighbor_finder
 from rpbe.maps import FixedMaps
 from rpbe.monitoring import MonitorWriter
-from rpbe.records import NODE_CLASS
+from rpbe.records import NODE_CLASS, build_edge_tables
 from rpbe.training.checkpoint import CheckpointManager
 from rpbe.training.jodie_loop import JodieNodeClassificationLoop
 
@@ -236,6 +236,8 @@ def build_components(args, device, dataset):
         host_dim = int(tgn.embedding_dimension)
         taus = [TAU_TEMPLATE.format(l) for l in range(args.n_layer + 1)]
         delta_scale = float(np.median(np.diff(np.sort(full.timestamps)))) or 1.0
+        # The root interface (highest layer) has no upward walk and is
+        # excluded from the KF windows EXPLICITLY (kf_taus whitelist).
         rpbe_cfg = RPBConfig(
             state_dims={tau: host_dim for tau in taus},
             own_dims={tau: host_dim for tau in taus},
@@ -244,16 +246,22 @@ def build_components(args, device, dataset):
             delta_t_scale=delta_scale,
             cuts_per_tau=args.kf_cuts_per_tau, kf_min_ratio=args.kf_min_ratio,
             kf_min_abs=args.kf_min_abs,
+            kf_taus=list(taus[:-1]),
             rpbe_seed=args.rpbe_seed)
         compressor = RecursiveCompressor(rpbe_cfg).to(device)
+        # Explicit edge tables: consumption-record stamping (adapter) and
+        # probe Y lookup (cut builder) share ONE source of truth.
+        endpoints, labels_tbl, edge_table_stats = build_edge_tables(dataset)
         adapter = JodieTGNAdapter(tgn.embedding_module, compressor,
-                                  n_neighbors=args.n_degree)
+                                  n_neighbors=args.n_degree,
+                                  edge_tables=(endpoints, labels_tbl))
         # Swap AFTER pretrained-key validation and freezing.
         tgn.embedding_module = adapter
         fixed_maps = FixedMaps(rpbe_cfg).to(device)
         cut_builder = build_cut_builder(dataset, stage=NODE_CLASS, cfg=rpbe_cfg,
                                         seed=args.rpbe_seed,
-                                        delta_t_scale=delta_scale)
+                                        delta_t_scale=delta_scale,
+                                        tables=(endpoints, labels_tbl))
         # Carry the stage-1 compressor over when the checkpoint provides one
         # (--stage1-rpbe product); otherwise Gamma starts from scratch here.
         if pretrained_payload is not None and isinstance(pretrained_payload, dict):

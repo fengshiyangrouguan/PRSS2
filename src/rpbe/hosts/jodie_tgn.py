@@ -38,7 +38,8 @@ class JodieTGNAdapter(HostAdapter):
     """Wraps the official ``GraphAttentionEmbedding``; ``TGN.compute_temporal_embeddings``
     keeps its exact call surface (``compute_embedding`` with numpy arrays)."""
 
-    def __init__(self, host_embedding, compressor=None, n_neighbors: int = 10):
+    def __init__(self, host_embedding, compressor=None, n_neighbors: int = 10,
+                 edge_tables=None):
         super().__init__()
         if not hasattr(host_embedding, "aggregate"):
             raise ValueError(
@@ -47,6 +48,11 @@ class JodieTGNAdapter(HostAdapter):
             raise ValueError("RPBE requires a host time_encoder")
         self.host = host_embedding
         self.compressor = compressor
+        # ``edge_tables`` = (idx -> (src, dst), idx -> label) from
+        # ``records.build_edge_tables``; used ONLY to stamp each neighbor
+        # occurrence's consumption record (endpoint_role / label_owner).
+        # None (tests / no-data paths) just skips the stamping.
+        self._endpoints = dict(edge_tables[0]) if edge_tables is not None else None
         self.n_neighbors = int(n_neighbors)
         if self.n_neighbors <= 0:
             raise ValueError(
@@ -195,12 +201,41 @@ class JodieTGNAdapter(HostAdapter):
                     children.append(sid)
                     relations.append(0)
                     deltas.append(0.0)
+                    # SELF recursion step: no interaction of its own; the
+                    # cut walker skips it upward (path keeps the step).
+                    self.trace.occurrences[sid].metadata.setdefault(
+                        "consumption", {"kind": "self"})
                 for j in range(n_neighbors):
                     nid = int(neighbor_ids[row, j])
                     if nid >= 0 and int(np_neighbors[row, j]) != 0:
                         children.append(nid)
                         relations.append(1)
                         deltas.append(float(edge_deltas_np[row, j]))
+                        # Consumption record of the neighbor occurrence: the
+                        # real historical interaction through which the
+                        # parent consumed its state.  ``edge_idx`` is the
+                        # 1-based graph_df.idx carried by the neighbor
+                        # finder; endpoints/label owner come from the
+                        # explicit tables (no indexing convention assumed).
+                        child_occ = self.trace.occurrences[nid]
+                        cons = {"kind": "edge",
+                                "edge_idx": int(edge_idxs_np[row, j]),
+                                "edge_time": float(edge_times[row, j]),
+                                "counterpart": int(source_nodes[row])}
+                        if self._endpoints is not None:
+                            src, dst = self._endpoints.get(
+                                int(edge_idxs_np[row, j]), (-1, -1))
+                            carrier = int(np_neighbors[row, j])
+                            if src == carrier:
+                                cons.update({"endpoint_role": 0,
+                                             "label_owner": int(dst)})
+                            elif dst == carrier:
+                                cons.update({"endpoint_role": 1,
+                                             "label_owner": int(src)})
+                            else:
+                                cons.update({"endpoint_role": -1,
+                                             "label_owner": -1})
+                        child_occ.metadata["consumption"] = cons
                 ids[row] = self._new_occurrence(
                     tau, z[row], children, relations, deltas,
                     node=int(source_nodes[row]),

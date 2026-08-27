@@ -28,13 +28,21 @@ from typing import Dict, List, Tuple
 import torch
 
 
-def _covs(zc: torch.Tensor, pc: torch.Tensor, den: float):
+def _covs(zc: torch.Tensor, pc: torch.Tensor, den: float,
+          w: torch.Tensor = None):
     """Covariances from CENTERED float64 rows, explicitly symmetrized.
 
-    Returns ``(czz, cpp, czp, sym_err)`` where ``sym_err`` is the
-    asymmetry of ``czz`` measured BEFORE symmetrization — a moment-algebra
-    bug shows up there as a large value.
+    With ``w`` (detached float64 weights) the centered rows are weighted
+    (``zc * sqrt(w)``), so the result is the weighted covariance with
+    effective degrees of freedom ``den`` supplied by the caller.  Returns
+    ``(czz, cpp, czp, sym_err)`` where ``sym_err`` is the asymmetry of
+    ``czz`` measured BEFORE symmetrization — a moment-algebra bug shows up
+    there as a large value.
     """
+    if w is not None:
+        wc = w.reshape(-1, 1).to(zc.dtype)
+        zc = zc * wc.sqrt()
+        pc = pc * wc.sqrt()
     czz = zc.t() @ zc / den
     cpp = pc.t() @ pc / den
     czp = zc.t() @ pc / den
@@ -190,28 +198,29 @@ def score_rows_by_type(rows: List, state_dims: Dict[str, int]) -> Dict[str, list
 
 
 def dedup_cut_rows(rows: List, fixed_maps):
-    """One row per unique cut: z appears once, P rows of one cut are averaged.
+    """Row-wise projection of CutRecords (NO averaging across horizons).
 
-    Returns ``(keys, tree_ids, zs, ps)`` where ``keys`` are
-    ``(node, time, tau)`` triples — the cross-batch identity of a cut
-    (``cut_id`` is only unique within one trace) — and ``tree_ids`` the
-    identity of the trace each cut came from (independent samples for the
-    window gate are counted per TREE, not per cut: several cuts of one
-    trace share the same history and are not independent).
+    One row per (cut, horizon) pair: horizons of one cut are mixed by
+    WEIGHT (``w_{v,h} = w_v / |H_v|``), never by averaging the p vectors —
+    averaging would create p1*p2^T cross terms and change Cov(P) and the
+    Ky Fan objective.  Returns ``(row_ids, cut_ids, tree_ids, zs, ps,
+    weights)``:
+
+    * ``row_ids``  — (tree, occurrence, tau, horizon): window row dedupe
+    * ``cut_ids``  — (tree, occurrence, tau): unique-cut gate counting
+    * ``tree_ids`` — trace identity (window gate counts per TREE: several
+      cuts of one trace share the same history and are not independent)
     """
-    by_cut: Dict[int, list] = {}
+    row_ids, cut_ids, tree_ids, zs, ps, weights = [], [], [], [], [], []
     for r in rows:
-        by_cut.setdefault(int(r.cut_id), []).append(r)
-    keys, tree_ids, zs, ps = [], [], [], []
-    for _, cut_rows in by_cut.items():
-        r0 = cut_rows[0]
-        keys.append((int(r0.node), float(r0.time), str(r0.tau)))
-        tree_ids.append(int(r0.tree_id))
-        zs.append(r0.z)
-        p_rows = [fixed_maps.pv(r.context, r.outcome) for r in cut_rows]
-        ps.append(torch.stack(p_rows).mean(dim=0) if len(p_rows) > 1
-                  else p_rows[0])
-    return keys, tree_ids, torch.stack(zs), torch.stack(ps)
+        row_ids.append(r.row_id)
+        cut_ids.append(r.cut_id)
+        tree_ids.append(int(r.tree_id))
+        zs.append(r.z)
+        ps.append(fixed_maps.pv(r.context, r.outcome))
+        weights.append(float(r.weight))
+    return (row_ids, cut_ids, tree_ids, torch.stack(zs), torch.stack(ps),
+            torch.tensor(weights, dtype=torch.float64))
 
 
 class KFMomentWindow:
@@ -271,30 +280,37 @@ class KFMomentWindow:
         for tau, tau_rows in by_tau.items():
             if self.fixed_maps is None:
                 raise ValueError("KFMomentWindow requires fixed_maps")
-            keys, tree_ids, zs, ps = dedup_cut_rows(tau_rows, self.fixed_maps)
+            row_ids, cut_ids, tree_ids, zs, ps, weights = dedup_cut_rows(
+                tau_rows, self.fixed_maps)
             win = self._windows.get(tau)
             if win is None:
-                win = {"zs_list": [], "ps_list": [], "seen": set(),
-                       "seen_trees": set(), "tree_count": 0}
+                win = {"zs_list": [], "ps_list": [], "weights_list": [],
+                       "row_seen": set(), "cut_seen": set(),
+                       "cut_ids_list": [], "tree_seen": set()}
                 self._windows[tau] = win
-            # Cross-batch dedupe on the cut's (node, as-of time, tau)
-            # identity: cut_id repeats across traces, the triple does not
-            # (one cut = one node state at one moment at one interface).
-            fresh = [i for i, key in enumerate(keys)
-                     if key not in win["seen"]]
+            # Cross-batch dedupe on row_id (cut + horizon).  cut_id is
+            # globally unique (adapter-wide occurrence counter), so a
+            # repeated row is a true duplicate; distinct horizons of one
+            # cut are DIFFERENT rows and both stay.
+            fresh = [i for i, rid in enumerate(row_ids)
+                     if rid not in win["row_seen"]]
             if not fresh:
                 gated.append(tau)
                 continue
             zs = zs[fresh]
             ps = ps[fresh]
-            win["seen"].update(keys[i] for i in fresh)
-            win["seen_trees"].update(tree_ids[i] for i in fresh)
-            win["tree_count"] = len(win["seen_trees"])
+            weights = weights[fresh]
+            for i in fresh:
+                win["row_seen"].add(row_ids[i])
+                win["cut_seen"].add(cut_ids[i])
+                win["tree_seen"].add(tree_ids[i])
+                win["cut_ids_list"].append(cut_ids[i])
             # Graph-connected rows (float32); the close stacks them once
             # and casts to float64.  P is already gradient-free.
             win["zs_list"].append(zs.float())
             win["ps_list"].append(ps.float())
-            if win["tree_count"] < self._threshold(tau):
+            win["weights_list"].append(weights)
+            if len(win["cut_seen"]) < self._threshold(tau):
                 gated.append(tau)
         # ALL non-empty windows close together: the z graphs of different
         # taus share the same per-batch forward graph, so an asynchronous
@@ -302,8 +318,8 @@ class KFMomentWindow:
         # window length is therefore set by the slowest (root) interface —
         # which is exactly the interface the depth-balancing exists for.
         nonempty = [tau for tau, win in self._windows.items()
-                    if win is not None and win["tree_count"] > 0]
-        if nonempty and all(self._windows[tau]["tree_count"]
+                    if win is not None and len(win["cut_seen"]) > 0]
+        if nonempty and all(len(self._windows[tau]["cut_seen"])
                             >= self._threshold(tau) for tau in nonempty):
             for tau in nonempty:
                 win = self._windows[tau]
@@ -313,16 +329,35 @@ class KFMomentWindow:
         return closed, diagnostics, gated
 
     def _close(self, win: dict):
-        """Close one window: stack, center in float64, score, diagnose."""
+        """Close one window: weighted float64 centering, score, diagnose.
+
+        Row weights ``w_{v,h}`` enter the moments; the effective degrees of
+        freedom use the CLUSTER-level second weight moment (rows of one cut
+        share the same z, so their summed weight is the cut's weight):
+        ``D = W - W2_cut/W`` with ``W2_cut = sum_v (sum_h w_{v,h})^2``.
+        """
         z_all = torch.cat(win["zs_list"], dim=0).double()   # graph-connected
         p_all = torch.cat(win["ps_list"], dim=0).double()   # constant
-        assert z_all.shape[0] == p_all.shape[0], \
-            "Z and P must come from the same rows/mask ({} vs {})".format(
-                z_all.shape[0], p_all.shape[0])
-        m = float(z_all.shape[0])
-        zc = z_all - z_all.mean(0, keepdim=True)
-        pc = p_all - p_all.mean(0, keepdim=True)
-        czz, cpp, czp, sym_err = _covs(zc, pc, m - 1.0)
+        w = torch.cat(win["weights_list"], dim=0).double()  # detached rows
+        assert z_all.shape[0] == p_all.shape[0] == w.shape[0], \
+            "Z/P/weights must share rows ({} vs {} vs {})".format(
+                z_all.shape[0], p_all.shape[0], w.shape[0])
+        wsum_by_cut: Dict[tuple, float] = {}
+        for cid, wv in zip(win["cut_ids_list"], w.tolist()):
+            wsum_by_cut[cid] = wsum_by_cut.get(cid, 0.0) + wv
+        W = float(w.sum())
+        W2_cut = float(sum(v * v for v in wsum_by_cut.values()))
+        D = W - W2_cut / W
+        if not (W > 0.0 and D > 0.0):
+            diag = {"failed": "nonpositive_weight", "W": W, "D_cut": D,
+                    "M_unique": int(len(win["cut_seen"])),
+                    "M_unique_trees": int(len(win["tree_seen"]))}
+            return (z_all.sum() * 0.0).float(), diag
+        mu_z = (z_all * w[:, None]).sum(0, keepdim=True) / W
+        mu_p = (p_all * w[:, None]).sum(0, keepdim=True) / W
+        zc = z_all - mu_z
+        pc = p_all - mu_p
+        czz, cpp, czp, sym_err = _covs(zc, pc, D, w=w)
         j, score_diag = _score_from_covs(czz, czp, cpp, self.eps)
         if score_diag["failed"] is not None:
             if self.strict:
@@ -336,17 +371,31 @@ class KFMomentWindow:
         with torch.no_grad():
             z_all = torch.cat([z.detach() for z in win["zs_list"]], dim=0)
             p_all = torch.cat(win["ps_list"], dim=0)
-            m = float(z_all.shape[0])
+            w = torch.cat(win["weights_list"], dim=0)
+            m_rows = float(z_all.shape[0])
+            W = float(w.sum())
+            wsum_by_cut: Dict[tuple, float] = {}
+            for cid, wv in zip(win["cut_ids_list"], w.tolist()):
+                wsum_by_cut[cid] = wsum_by_cut.get(cid, 0.0) + wv
+            W2_cut = float(sum(v * v for v in wsum_by_cut.values()))
+            D = W - W2_cut / W
             # Shuffled score: permute the SAMPLE pairing of P (column
-            # permutations are trace-invariant and would prove nothing).
-            perm = torch.randperm(int(m), generator=torch.Generator(
-                device="cpu").manual_seed(int(m * 7919) % (2 ** 31)))
-            zc = (z_all - z_all.mean(0, keepdim=True)).double()
-            pc = (p_all[perm] - p_all[perm].mean(0, keepdim=True)).double()
-            czzs, cpps, czps, _ = _covs(zc, pc, m - 1.0)
+            # permutations are trace-invariant and would prove nothing);
+            # weights travel with their rows.
+            perm = torch.randperm(int(m_rows), generator=torch.Generator(
+                device="cpu").manual_seed(int(m_rows * 7919) % (2 ** 31)))
+            wc = w.reshape(-1, 1)
+            mu_z = (z_all * wc).sum(0, keepdim=True) / W
+            mu_p = (p_all[perm] * wc[perm]).sum(0, keepdim=True) / W
+            zc = (z_all - mu_z).double()
+            pc = (p_all[perm] - mu_p).double()
+            czzs, cpps, czps, _ = _covs(zc, pc, D, w=w[perm])
             j_shuffled, _ = _score_from_covs(czzs, czps, cpps, self.eps)
-            d = {"M_unique": int(m),
-                 "M_unique_trees": int(win["tree_count"]),
+            d = {"M_unique": int(len(win["cut_seen"])),
+                 "M_rows": int(m_rows),
+                 "M_unique_trees": int(len(win["tree_seen"])),
+                 "w_eff_cut": (W * W / W2_cut) if W2_cut > 0.0
+                 else float("nan"),
                  "J_shuffled": (float(j_shuffled) if j_shuffled is not None
                                 else float("nan")),
                  "J_real_minus_shuffled":
@@ -363,7 +412,7 @@ class KFMomentWindow:
 
     def window_m(self, tau: str) -> int:
         win = self._windows.get(tau)
-        return int(win["tree_count"]) if win is not None else 0
+        return int(len(win["cut_seen"])) if win is not None else 0
 
     def reset(self):
         """Discard all open windows (used at epoch drain: the accumulated

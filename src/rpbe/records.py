@@ -207,23 +207,37 @@ class JodieCutBuilder:
                 stats_outcome[r.outcome_id] = \
                     stats_outcome.get(r.outcome_id, 0) + 1
             if rows:
-                w = 1.0 / len(rows)      # horizon mixing: w_{v,h} = w_v/|H_v|
-                for r in rows:
-                    r.weight = w
                 per_tau_cuts.setdefault(occ.tau, []).append((cut_key, rows))
 
+        # Tree equal weights (doc section 4): every tree contributes total
+        # weight 1, counted over its PRE-CAP cuts across all interfaces —
+        # a leaf flood cannot starve the root layers.
+        tree_cut_counts: Dict[int, int] = {}
+        for cut_rows in per_tau_cuts.values():
+            for cut_key, _ in cut_rows:
+                tree_cut_counts[cut_key[0]] = \
+                    tree_cut_counts.get(cut_key[0], 0) + 1
+        w_tree = {t: 1.0 / float(n) for t, n in tree_cut_counts.items()}
+
         # Depth-balanced sampling BY CUT: a sampled cut keeps ALL its
-        # horizon rows (sampling-probability correction arrives together
-        # with tree equal weights, task 3).
+        # horizon rows.  When the cap samples, the surviving rows are
+        # up-weighted by n_total / n_sampled (sampling-probability
+        # correction): total weight is conserved per tau.
         out = []
         for tau, cut_rows in per_tau_cuts.items():
             if len(cut_rows) <= self.cuts_per_tau:
                 picks = cut_rows
+                w_sample = 1.0
             else:
                 idx = rng.choice(len(cut_rows), size=self.cuts_per_tau,
                                  replace=False)
                 picks = [cut_rows[i] for i in sorted(idx)]
-            for _, rows in picks:
+                w_sample = float(len(cut_rows)) / float(self.cuts_per_tau)
+            for cut_key, rows in picks:
+                w_h = 1.0 / len(rows)   # horizon mixing: w_{v,h} = w_v/|H_v|
+                w = w_tree[cut_key[0]] * w_sample * w_h
+                for r in rows:
+                    r.weight = w
                 out.extend(rows)
         return out
 

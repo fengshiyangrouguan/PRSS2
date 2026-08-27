@@ -59,6 +59,10 @@ def parse_args():
                    help="audit one batch every K (funnel estimates)")
     p.add_argument("--pool-rows", type=int, default=4096,
                    help="rows collected for the pooled-vs-separate score")
+    p.add_argument("--warmup-batches", type=int, default=20,
+                   help="batches skipped before pooling (memory warmup: "
+                        "wikipedia node features are all-zero, so early z "
+                        "rows are degenerate)")
     p.add_argument("--output", default="outputs/audit/cut_funnel.json")
     return p.parse_args()
 
@@ -169,13 +173,17 @@ def main():
             # Stratified pool: postorder emits leaf rows first, so a plain
             # first-N pool would be flooded by layer0 and never see the
             # upper interfaces.  Each tau gets pool_rows / n_taus quota.
-            for r in rows:
-                tau_quota = max(1, args.pool_rows // max(1, len(taus)))
-                if pool_counts.get(r.tau, 0) >= tau_quota:
-                    continue
-                if len(pooled_rows) < args.pool_rows:
-                    pooled_rows.append(r)
-                    pool_counts[r.tau] = pool_counts.get(r.tau, 0) + 1
+            # Pooling starts AFTER the warmup (memory is zero-initialized
+            # and wikipedia node features are all-zero, so the first
+            # batches carry degenerate z rows).
+            if n_batches_seen > args.warmup_batches:
+                for r in rows:
+                    tau_quota = max(1, args.pool_rows // max(1, len(taus)))
+                    if pool_counts.get(r.tau, 0) >= tau_quota:
+                        continue
+                    if len(pooled_rows) < args.pool_rows:
+                        pooled_rows.append(r)
+                        pool_counts[r.tau] = pool_counts.get(r.tau, 0) + 1
             n_batches_seen += 1
             if n_batches_seen % 20 == 0:
                 print("batch {} / {} (rows so far {})".format(

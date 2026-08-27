@@ -192,14 +192,44 @@ class TestIdentitiesAndWeights(unittest.TestCase):
         self.assertEqual(leaf_h1.cut_id, leaf_h2.cut_id)
         self.assertNotEqual(leaf_h1.row_id, leaf_h2.row_id)
 
-    def test_horizon_weights_sum_one_per_cut(self):
+    def test_tree_equal_weight_and_horizon_split(self):
+        # One tree with 3 cuts (layer0/1/2): w_tree = 1/3.  Within a cut
+        # the horizons split evenly; the whole TREE sums to weight 1.
         _, _, rows = build_rows()
         for cut_rows in (rows_of_cut(rows, 0, "tjo:layer0"),
-                         rows_of_cut(rows, 1, "tjo:layer1"),
-                         rows_of_cut(rows, 2, "tjo:layer2")):
-            self.assertAlmostEqual(sum(r.weight for r in cut_rows), 1.0)
-        for r in rows_of_cut(rows, 0, "tjo:layer0"):
-            self.assertAlmostEqual(r.weight, 0.5)
+                         rows_of_cut(rows, 1, "tjo:layer1")):
+            self.assertAlmostEqual(sum(r.weight for r in cut_rows), 1.0 / 3.0)
+            for r in cut_rows:
+                self.assertAlmostEqual(r.weight, 1.0 / 6.0)
+        r2 = rows_of_cut(rows, 2, "tjo:layer2")[0]
+        self.assertAlmostEqual(r2.weight, 1.0 / 3.0)
+        self.assertAlmostEqual(sum(r.weight for r in rows), 1.0,
+                               msg="tree equal weight: total weight 1")
+
+    def test_tree_equal_weight_across_uneven_trees(self):
+        # Tree 2 has no root event (row 1 missing): its layer2 walk dies
+        # at the top, so it keeps only 2 cuts (layer0, layer1) and gets
+        # w_tree2 = 1/2 vs tree 1's 3 cuts (w_tree1 = 1/3).  Each tree
+        # still sums to exactly 1.
+        _, _, rows = build_rows(n_trees=2,
+                                root_events={0: make_root_events(1)[0]})
+        tree1 = [r for r in rows if r.tree_id == 0]
+        tree2 = [r for r in rows if r.tree_id == 1]
+        self.assertEqual(len(tree2), 3)
+        self.assertAlmostEqual(sum(r.weight for r in tree1), 1.0)
+        self.assertAlmostEqual(sum(r.weight for r in tree2), 1.0)
+        # Tree 2's per-cut weight is larger (fewer cuts share its 1.0).
+        self.assertGreater(tree2[0].weight,
+                           rows_of_cut(tree1, 0, "tjo:layer0")[0].weight)
+
+    def test_sampling_correction_conserves_total_weight(self):
+        # cuts_per_tau=1 over 2 trees: each tau samples 1 of 2 cuts and
+        # up-weights it by 2, so the summed weight per tau equals what the
+        # unsampled population would contribute (2 trees x 1/3 each).
+        _, _, rows = build_rows(n_trees=2, cuts_per_tau=1, seed=3)
+        for tau in ("tjo:layer0", "tjo:layer1", "tjo:layer2"):
+            tau_rows = [r for r in rows if r.tau == tau]
+            self.assertAlmostEqual(sum(r.weight for r in tau_rows), 2.0 / 3.0)
 
     def test_same_node_time_across_trees_is_not_dropped(self):
         # Two identical trees: the same (node, time, tau) overlap does NOT

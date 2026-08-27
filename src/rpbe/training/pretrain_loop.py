@@ -137,7 +137,12 @@ class TGNPretrainLoop:
                         if occ is None:
                             continue
                         z = occ.state.z
-                        loss = loss + self.lambda_kf * (g * z.float()).sum()
+                        # SEVENTH REVIEW: objective is L_link - lambda *
+                        # alpha_tau * J (MAXIMIZE J); g = grad_z J enters
+                        # with a MINUS sign, per-tau alpha included.
+                        loss = loss - self.lambda_kf \
+                            * self.rpbe_cfg.alpha(tau) \
+                            * (g * z.float()).sum()
             loss.backward()
             if self.tgn.use_memory:
                 self.tgn.memory.detach_memory()
@@ -159,8 +164,10 @@ class TGNPretrainLoop:
         kf_sum = {}
         kf_count_tau = {}
         kf_count = 0
+        last_bound = {}
         skipped_types = set()
         n_steps = 0
+        n_batches = 0
         window_batches = []
         window_shadow = None
         for k in range(0, num_batch, self.backprop_every):
@@ -274,7 +281,13 @@ class TGNPretrainLoop:
                         "main_total": link_sum / K + kf_v,
                     }, global_step)
                     n_steps += 1
+                    for tau in kf_detail:
+                        m_u = int(diag[tau]["M_unique"])
+                        last_bound[tau] = int(min(
+                            self.rpbe_cfg.state_dims[tau],
+                            max(1, m_u - 1)))
                 global_step += 1
+                n_batches += 1
 
             if not self.rpbe_on:
                 self.optimizer.zero_grad(set_to_none=True)
@@ -306,23 +319,32 @@ class TGNPretrainLoop:
         kf_out = None
         if kf_count and self.rpbe_cfg is not None:
             # Per-tau denominators: own closed-window counts; J_frac uses
-            # the saturation-aware bound min(d_tau, M_window-1).
+            # the saturation-aware bound min(d_tau, M_window-1) recorded
+            # AT CLOSE TIME (window_m() would return 0 after the drain
+            # reset — seventh review).
             j_frac = {}
             for tau, v in kf_sum.items():
-                m_u = self.kf_window.window_m(tau)
-                bound = min(self.rpbe_cfg.state_dims[tau], max(1, m_u - 1))
+                bound = last_bound.get(tau, 1)
                 j_frac[tau] = (v / kf_count_tau.get(tau, 1)) / bound
             kf_out = {
                 "J": {tau: v / kf_count_tau.get(tau, 1)
                       for tau, v in kf_sum.items()},
                 "J_frac": j_frac,
                 "skipped_types": sorted(skipped_types),
-                "kf_loss": total_kf / max(n_steps, 1),
+                "kf_score": total_kf / max(n_batches, 1),
+                "kf_loss": -self.lambda_kf * total_kf / max(n_batches, 1),
+                "closed_windows": kf_count,
+                "p_cache_hits": getattr(self.fixed_maps, "_p_cache_hits", 0),
+                "p_cache_misses": getattr(self.fixed_maps,
+                                          "_p_cache_misses", 0),
             }
-        return {"train_link_loss": total_link / max(n_steps, 1),
-                "train_kf_loss": total_kf / max(n_steps, 1),
+        return {"train_link_loss": total_link / max(n_batches, 1),
+                "train_kf_score": total_kf / max(n_batches, 1),
+                "train_kf_loss": -self.lambda_kf * total_kf
+                / max(n_batches, 1),
                 "kf": kf_out,
-                "n_steps": n_steps, "global_step": global_step}
+                "n_steps": n_steps, "n_batches": n_batches,
+                "global_step": global_step}
 
     # --------------------------------------------------------------- evaluation
     @torch.no_grad()

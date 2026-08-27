@@ -602,6 +602,124 @@ class TestMomentAdjointReplay(unittest.TestCase):
             "({})".format(float((paramA - paramC).abs().max())))
 
 
+class TestSeventhReviewFixes(unittest.TestCase):
+    """Seventh review: KF sign, horizon duplication, alpha scaling."""
+
+    def _multi_horizon_rows(self, n_cuts, r, mdim, horizons, z, p, w):
+        # One cut with several horizon rows sharing z; weights 1/|H|.
+        rows = []
+        for c in range(n_cuts):
+            for h in horizons:
+                rows.append(CutRecord(
+                    tree_id=c, occurrence_id=c, tau="t", horizon=h,
+                    node=c, time=float(c), z=z[c],
+                    context={"delta_t": float(c * 7 + h), "counterpart": c,
+                             "role": 0, "query_type": 0, "horizon": h,
+                             "path": []},
+                    outcome=float(h == 1), outcome_id=("edge", c),
+                    weight=float(w[c]) / len(horizons)))
+        return rows
+
+    def _stub(self, p):
+        class _Stub:
+            def pv(self, ctx, y):
+                return p[ctx["counterpart"] % p.shape[0]]
+        return _Stub()
+
+    def _latent_surrogate(self, z, plan):
+        return sum((g * z[occ_id].float()).sum()
+                   for (occ_id, g) in plan["t"]["by_batch"][0])
+
+    def test_multi_horizon_replay_gradient_matches_direct(self):
+        # 1/2/3 horizon cuts: the merged per-cut gradient must be replayed
+        # ONCE (seventh review) — direct and latent gradients must agree
+        # exactly for every horizon multiplicity.
+        for horizons in ((1,), (1, 2), (1, 2, 3)):
+            n, r, mdim = 60, 8, 12
+            g = torch.Generator().manual_seed(11)
+            z = torch.randn(n, r, generator=g).requires_grad_(True)
+            p = torch.randn(n, mdim, generator=g)
+            w = torch.rand(n, generator=g) + 0.5
+            rows = self._multi_horizon_rows(n, r, mdim, horizons, z, p, w)
+            wA = KFMomentWindow({"t": r}, min_ratio=1.0, min_abs=2,
+                                fixed_maps=self._stub(p))
+            jA = wA.add(rows)[0]["t"]
+            jA.backward()
+            gradA = z.grad.clone()
+            z.grad = None
+            wC = KFMomentWindow({"t": r}, min_ratio=1.0, min_abs=2,
+                                fixed_maps=self._stub(p), autoclose=False)
+            wC.add([CutRecord(
+                tree_id=r2.tree_id, occurrence_id=r2.occurrence_id,
+                tau=r2.tau, horizon=r2.horizon, node=r2.node,
+                time=r2.time, z=r2.z.detach(), context=r2.context,
+                outcome=r2.outcome, outcome_id=r2.outcome_id,
+                weight=r2.weight) for r2 in rows])
+            closedC, planC, diagC = wC.close_replay()
+            self.assertAlmostEqual(float(closedC["t"]), float(jA.detach()),
+                                   places=5)
+            # Each cut must appear EXACTLY ONCE in the replay plan.
+            emitted = [occ for (occ, _g) in planC["t"]["by_batch"][0]]
+            self.assertEqual(len(emitted), n,
+                             "horizons={}: merged gradient must be "
+                             "replayed once per cut".format(horizons))
+            surr = self._latent_surrogate(z, planC)
+            surr.backward()
+            gradC = z.grad.clone()
+            self.assertTrue(
+                torch.allclose(gradA, gradC, atol=1e-6, rtol=1e-5),
+                "horizons={}: latent gradient mismatch vs direct "
+                "({})".format(horizons,
+                              float((gradA - gradC).abs().max())))
+
+    def test_kf_only_optimizer_step_raises_j(self):
+        # The objective maximizes J: one optimizer step on -J must RAISE
+        # the score (this fails if the replay sign is flipped).
+        n, r, mdim = 400, 6, 12
+        g = torch.Generator().manual_seed(31)
+        z = torch.randn(n, r, generator=g).requires_grad_(True)
+        p = torch.randn(n, mdim, generator=g)
+        j_before = float(kf_score(z, p, eps=1e-4))
+        opt = torch.optim.Adam([z], lr=0.1)
+        opt.zero_grad()
+        (-kf_score(z, p, eps=1e-4)).backward()
+        opt.step()
+        j_after = float(kf_score(z.detach(), p, eps=1e-4))
+        self.assertGreater(j_after, j_before,
+                           "one KF ascent step must raise J "
+                           "({:.4f} -> {:.4f})".format(j_before, j_after))
+
+    def test_alpha_scaling_direct_matches_latent(self):
+        # A per-tau alpha enters the objective linearly: alpha * grad_J
+        # must equal the latent replay scaled by the same alpha.
+        n, r, mdim = 80, 8, 12
+        g = torch.Generator().manual_seed(41)
+        z = torch.randn(n, r, generator=g).requires_grad_(True)
+        p = torch.randn(n, mdim, generator=g)
+        w = torch.rand(n, generator=g) + 0.5
+        rows = self._multi_horizon_rows(n, r, mdim, (1, 2), z, p, w)
+        wA = KFMomentWindow({"t": r}, min_ratio=1.0, min_abs=2,
+                            fixed_maps=self._stub(p))
+        alpha = 0.37
+        jA = wA.add(rows)[0]["t"]
+        (alpha * jA).backward()
+        gradA = z.grad.clone()
+        z.grad = None
+        wC = KFMomentWindow({"t": r}, min_ratio=1.0, min_abs=2,
+                            fixed_maps=self._stub(p), autoclose=False)
+        wC.add([CutRecord(
+            tree_id=r2.tree_id, occurrence_id=r2.occurrence_id,
+            tau=r2.tau, horizon=r2.horizon, node=r2.node,
+            time=r2.time, z=r2.z.detach(), context=r2.context,
+            outcome=r2.outcome, outcome_id=r2.outcome_id,
+            weight=r2.weight) for r2 in rows])
+        _, planC, _ = wC.close_replay()
+        (alpha * self._latent_surrogate(z, planC)).backward()
+        gradC = z.grad.clone()
+        self.assertTrue(torch.allclose(gradA, gradC, atol=1e-6, rtol=1e-5),
+                        "alpha-scaled latent gradient must match direct")
+
+
 class TestReviewRegression(unittest.TestCase):
     """Regression tests from the cloud-crash review (2026-08-27).
 

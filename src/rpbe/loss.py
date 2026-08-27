@@ -677,12 +677,20 @@ class KFMomentWindow:
                 cpp = r["M2_pp"] / r["D"]
                 czp = r["M2_zp"] / r["D"]
                 # Slice the merged per-cut gradients back into per-batch
-                # lists aligned with the pass-2 replay order.
+                # lists aligned with the pass-2 replay order.  ONE entry
+                # per cut: the horizon rows of a cut share cut_id, so the
+                # merged gradient must be emitted ONCE (emitting it per
+                # row would replay it 2-3 times and distort the KF weight
+                # by depth — seventh review).
                 by_batch = []
                 pos = 0
                 for cnt in win["batch_cut_counts"]:
                     batch_rows = []
+                    emitted = set()
                     for cid in win["cut_ids_list"][pos:pos + cnt]:
+                        if cid in emitted:
+                            continue
+                        emitted.add(cid)
                         g = g_by_cut.get(cid)
                         if g is not None:
                             batch_rows.append((cid[1], g.float()))

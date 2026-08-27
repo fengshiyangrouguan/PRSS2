@@ -45,6 +45,12 @@ class FixedMaps(nn.Module):
         # not move during pass 2.
         self._pv_calls = 0
         self._pv_batch_calls = 0
+        # Cache effectiveness counters (seventh review): the batch-level
+        # key depends on the sampled cut set, which changes with the
+        # growing global_step seed — hit/miss reporting tells us whether
+        # the cache actually pays off across epochs.
+        self._p_cache_hits = 0
+        self._p_cache_misses = 0
         # Frozen at construction: later cfg mutations must not change the
         # measurement (the fingerprint covers this value).
         self._delta_t_scale = float(cfg.delta_t_scale)
@@ -188,7 +194,9 @@ class FixedMaps(nn.Module):
         self._pv_batch_calls += 1
         hit = self._p_cache.get(key)
         if hit is not None:
+            self._p_cache_hits += 1
             return hit.to(dev, dtype=self.rff_w.dtype)
+        self._p_cache_misses += 1
         with torch.no_grad():
             deltas = torch.tensor(
                 [float(c["delta_t"]) for c in contexts],

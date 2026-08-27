@@ -255,7 +255,13 @@ class JodieNodeClassificationLoop:
                                 gr.detach().norm() for gr in kf_grads
                                 if gr is not None))
                             kf_gn_measured = True
-                        loss = loss + self.lambda_kf * (g * z.float()).sum()
+                        # SEVENTH REVIEW: the objective is L_link - lambda
+                        # * alpha_tau * J_tau (MAXIMIZE J).  g = grad_z J
+                        # points UP the score, so the surrogate enters the
+                        # loss with a MINUS sign and the per-tau alpha.
+                        loss = loss - self.lambda_kf \
+                            * self.rpbe_cfg.alpha(tau) \
+                            * (g * z.float()).sum()
             loss.backward()
             # Upstream truncation invariant: detach the memory graph when
             # the host can carry gradients.
@@ -294,6 +300,7 @@ class JodieNodeClassificationLoop:
         kf_sum = {}
         kf_count_tau = {}
         kf_count = 0
+        last_bound = {}
         kf_gn_total = 0.0
         skipped_types = set()
         train_probs, train_labels = [], []
@@ -392,6 +399,8 @@ class JodieNodeClassificationLoop:
                     m_u = int(diag[tau]["M_unique"])
                     dims[tau] = int(min(self.rpbe_cfg.state_dims[tau],
                                         max(1, m_u - 1)))
+                for tau in kf_detail:
+                    last_bound[tau] = dims[tau]
                 self.monitor.validate_kf(kf_detail, dims, global_step)
                 for tau, jv in kf_detail.items():
                     if diag[tau].get("failed"):
@@ -444,28 +453,33 @@ class JodieNodeClassificationLoop:
         if kf_count and self.rpbe_cfg is not None:
             # Per-tau denominators: each tau averages over its own closed
             # windows; J_frac uses the saturation-aware bound
-            # min(d_tau, M_window-1) of the LAST closed window.
+            # min(d_tau, M_window-1) recorded AT CLOSE TIME (window_m()
+            # returns 0 after the drain reset — seventh review).
             j_frac = {}
             for tau, v in kf_sum.items():
-                m_u = self.kf_window.window_m(tau)
-                bound = min(self.rpbe_cfg.state_dims[tau], max(1, m_u - 1))
+                bound = last_bound.get(tau, 1)
                 j_frac[tau] = (v / kf_count_tau.get(tau, 1)) / bound
             kf_out = {
                 "J": {tau: v / kf_count_tau.get(tau, 1)
                       for tau, v in kf_sum.items()},
                 "J_frac": j_frac,
                 "skipped_types": sorted(skipped_types),
-                "kf_loss": total_kf / max(n_batches, 1),
+                "kf_score": total_kf / max(n_batches, 1),
+                "kf_loss": -self.lambda_kf * total_kf / max(n_batches, 1),
                 # Sum of the pass-2 VJP surrogates: a nonzero value means
                 # the KF term carried a real gradient source into the
                 # replay backward (the "task=0 -> adapter still updates"
                 # audit in one number).
                 "kf_grad_norm_mean": kf_gn_total / max(kf_count, 1),
+                "p_cache_hits": getattr(self.fixed_maps, "_p_cache_hits", 0),
+                "p_cache_misses": getattr(self.fixed_maps,
+                                          "_p_cache_misses", 0),
                 "closed_windows": kf_count,
             }
         return {
             "train_task_loss": total_task / max(n_batches, 1),
-            "train_kf_loss": total_kf / max(n_batches, 1),
+            "train_kf_score": total_kf / max(n_batches, 1),
+            "train_kf_loss": -self.lambda_kf * total_kf / max(n_batches, 1),
             "kf": kf_out,
             "train": train_metrics,
             "n_batches": n_batches,

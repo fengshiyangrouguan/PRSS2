@@ -79,8 +79,12 @@ class TGNPretrainLoop:
         kf_count = 0
         skipped_types = set()
         n_steps = 0
+        # RPBE on: the window replaces the official backprop_every rhythm —
+        # backward fires only when the KF window closes (the window's J
+        # depends on z graphs across batches, which a per-batch backward
+        # would already have freed).  Vanilla keeps the upstream rhythm.
+        window_link = None
         for k in range(0, num_batch, self.backprop_every):
-            self.optimizer.zero_grad(set_to_none=True)
             loss = 0.0
             for j in range(self.backprop_every):
                 batch_idx = k + j
@@ -113,46 +117,100 @@ class TGNPretrainLoop:
                     pos_prob.squeeze(), torch.ones(size, device=self.device))
                     + F.binary_cross_entropy(
                         neg_prob.squeeze(), torch.zeros(size, device=self.device)))
-                loss = loss + link_loss
 
-                if self.rpbe_on and trace_rows and self.adapter.trace is not None:
-                    cuts = self.cut_builder.build(self.adapter.trace,
-                                                  batch_seed=global_step)
-                    if not cuts:
-                        self.monitor.alert("warning", "kf_no_cuts",
-                                           "batch produced no valid cuts",
-                                           step=global_step)
-                    else:
-                        closed, diag, gated = self.kf_window.add(cuts)
-                        skipped_types.update(gated)
-                        if gated:
-                            self.monitor.alert(
-                                "warning", "kf_gated_tau",
-                                "still accumulating: {}".format(sorted(gated)),
-                                step=global_step)
-                        if closed:
-                            kf_term = kf_loss(closed, self.rpbe_cfg.alphas)
-                            total_kf += float(kf_term.detach())
-                            kf_detail = {tau: float(j.detach())
-                                         for tau, j in closed.items()}
-                            for tau, jv in kf_detail.items():
-                                kf_sum[tau] = kf_sum.get(tau, 0.0) + jv
-                                kf_count_tau[tau] = kf_count_tau.get(tau, 0) + 1
-                            kf_count += 1
-                            dims = {}
-                            for tau in kf_detail:
-                                m_u = int(diag[tau]["M_unique"])
-                                dims[tau] = int(min(
-                                    self.rpbe_cfg.state_dims[tau],
-                                    max(1, m_u - 1)))
-                            self.monitor.validate_kf(kf_detail, dims,
-                                                     global_step)
-                            loss = loss + self.lambda_kf * kf_term
+                kf_closed = {}
+                if self.rpbe_on:
+                    window_link = link_loss if window_link is None \
+                        else window_link + link_loss
+                    loss = link_loss
+                    if trace_rows and self.adapter.trace is not None:
+                        cuts = self.cut_builder.build(self.adapter.trace,
+                                                      batch_seed=global_step)
+                        if not cuts:
+                            self.monitor.alert("warning", "kf_no_cuts",
+                                               "batch produced no valid cuts",
+                                               step=global_step)
+                        else:
+                            closed, diag, gated = self.kf_window.add(cuts)
+                            skipped_types.update(gated)
+                            if gated:
+                                self.monitor.alert(
+                                    "warning", "kf_gated_tau",
+                                    "still accumulating: {}".format(
+                                        sorted(gated)), step=global_step)
+                            if closed:
+                                kf_closed = closed
+                                kf_term = kf_loss(closed,
+                                                  self.rpbe_cfg.alphas)
+                                total_kf += float(kf_term.detach())
+                                kf_detail = {tau: float(j.detach())
+                                             for tau, j in closed.items()}
+                                for tau, jv in kf_detail.items():
+                                    kf_sum[tau] = kf_sum.get(tau, 0.0) + jv
+                                    kf_count_tau[tau] = \
+                                        kf_count_tau.get(tau, 0) + 1
+                                kf_count += 1
+                                dims = {}
+                                for tau in kf_detail:
+                                    m_u = int(diag[tau]["M_unique"])
+                                    dims[tau] = int(min(
+                                        self.rpbe_cfg.state_dims[tau],
+                                        max(1, m_u - 1)))
+                                self.monitor.validate_kf(kf_detail, dims,
+                                                         global_step)
+                                # ONE backward for the whole window.
+                                total = window_link + self.lambda_kf * kf_term
+                                self.optimizer.zero_grad(set_to_none=True)
+                                total.backward()
+                                if self.grad_clip > 0:
+                                    params = [
+                                        p for g in self.optimizer.param_groups
+                                        for p in g["params"]
+                                        if p.grad is not None]
+                                    if params:
+                                        torch.nn.utils.clip_grad_norm_(
+                                            params, max_norm=self.grad_clip,
+                                            error_if_nonfinite=True)
+                                self.optimizer.step()
+                                window_link = None
+                                n_steps += 1
+                else:
+                    loss = loss + link_loss
 
                 total_link += float(link_loss.detach())
                 global_step += 1
-            loss = loss / self.backprop_every
-            loss.backward()
+
+            if not self.rpbe_on:
+                self.optimizer.zero_grad(set_to_none=True)
+                loss = loss / self.backprop_every
+                loss.backward()
+                if self.grad_clip > 0:
+                    params = [p for g in self.optimizer.param_groups
+                              for p in g["params"] if p.grad is not None]
+                    if params:
+                        torch.nn.utils.clip_grad_norm_(
+                            params, max_norm=self.grad_clip,
+                            error_if_nonfinite=True)
+                self.optimizer.step()
+                n_steps += 1
+            self.monitor.validate_losses({
+                "link": float(total_link) / max(global_step, 1),
+                "kf": total_kf / max(global_step, 1),
+                "main_total": float((loss if not self.rpbe_on
+                                     else (window_link.detach()
+                                           if window_link is not None
+                                           else 0.0))),
+            }, global_step)
+            if self.tgn.use_memory:
+                self.tgn.memory.detach_memory()
+
+        # Drain a partial window with a task-only step.
+        if self.rpbe_on and window_link is not None:
+            self.monitor.alert("warning", "kf_window_unclosed",
+                               "epoch ended with an unclosed KF window; "
+                               "task-only step", step=global_step)
+            self.optimizer.zero_grad(set_to_none=True)
+            window_link.backward()
             if self.grad_clip > 0:
                 params = [p for g in self.optimizer.param_groups
                           for p in g["params"] if p.grad is not None]
@@ -161,13 +219,6 @@ class TGNPretrainLoop:
                         params, max_norm=self.grad_clip,
                         error_if_nonfinite=True)
             self.optimizer.step()
-            self.monitor.validate_losses({
-                "link": float(total_link) / max(global_step, 1),
-                "kf": total_kf / max(global_step, 1),
-                "main_total": float(loss.detach()),
-            }, global_step)
-            if self.tgn.use_memory:
-                self.tgn.memory.detach_memory()
             n_steps += 1
         kf_out = None
         if kf_count and self.rpbe_cfg is not None:

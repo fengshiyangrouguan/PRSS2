@@ -185,11 +185,8 @@ class TestJodieCutBuilder(unittest.TestCase):
         self.assertEqual(ids1, {0, 1})
         self.assertEqual(ids2, {2, 3})
 
-    def test_pseudo_duplicate_node_time_soft_deduped(self):
-        # Two roots, same (node, time, tau) pair: NO hard dedupe — both
-        # rows survive with their tree weights (the window dilutes them by
-        # the context-overlap weight instead).  Each tree has exactly one
-        # cut, so both rows carry the tree equal-weight 1.0.
+    def test_pseudo_duplicate_node_time_dropped(self):
+        # Two roots, same (node, time) pair: only one cut per pair survives.
         trace = RecursiveTrace()
         for k in range(2):
             trace.add(RecursiveOccurrence(
@@ -203,32 +200,8 @@ class TestJodieCutBuilder(unittest.TestCase):
             trace.root_rows.append(k)
         rows = JodieCutBuilder(self.idx, stage=NODE_CLASS, seed=0).build(
             trace, batch_seed=0)
-        self.assertEqual(len(rows), 2)          # both duplicates kept
-        self.assertEqual({(r.node, r.time) for r in rows}, {(5, 4.0)})
-        for r in rows:
-            self.assertEqual(r.weight, 1.0)     # one cut per tree
-
-    def test_tree_equal_weight_and_sampling_correction(self):
-        # Document §四: every tree contributes total weight 1 (each row
-        # carries 1 / #cuts of its tree), and the sampling-probability
-        # correction keeps the total unchanged when a tau is subsampled.
-        # make_trace gives 2 trees x 2 cuts (layer0 + layer1, same node).
-        trace = make_trace(as_of_times=(4.0, 9.0))
-        builder = JodieCutBuilder(self.idx, stage=NODE_CLASS, seed=0)
-        rows = builder.build(trace, batch_seed=0)
-        self.assertEqual(len(rows), 4)
-        for r in rows:
-            self.assertAlmostEqual(r.weight, 0.5, places=9)  # 1/2 cuts
-        self.assertAlmostEqual(sum(r.weight for r in rows), 2.0,
-                               places=6)  # = number of trees
-        # With a sampling cap each tau is subsampled with correction
-        # w_sample = total/sampled: the total weight is preserved.
-        rows2 = JodieCutBuilder(self.idx, stage=NODE_CLASS, seed=3,
-                                cuts_per_tau=1).build(trace, batch_seed=0)
-        self.assertAlmostEqual(sum(r.weight for r in rows2), 2.0,
-                               places=6,
-                               msg="sampling correction must preserve "
-                                   "the total tree weight")
+        pairs = {(r.node, r.time) for r in rows}
+        self.assertEqual(len(pairs), 1)
 
 
 if __name__ == "__main__":

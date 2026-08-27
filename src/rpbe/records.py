@@ -33,10 +33,6 @@ class CutRecord:
     context: Dict[str, Any]  # raw C: delta_t, counterpart id, role, query_type
     outcome: float          # raw Y: 0/1 for both stages
     valid: bool = True
-    weight: float = 1.0     # document §四: tree equal-weight x sampling
-                            # correction (set by the builder; the
-                            # context-overlap correction is applied at the
-                            # window close)
 
     def to(self, device):
         self.z = self.z.to(device)
@@ -147,27 +143,26 @@ class JodieCutBuilder:
                 stack.extend(trace.occurrences[oid].children)
         self._tree_counter += len(trace.roots)
 
-        # Document §四: every occurrence is a cut candidate.  The three
-        # filters are (i) a real node id, (ii) a real future continuation,
-        # (iii) the future inside the train region — censored cuts emit
-        # NOTHING (never a y=0 row).  There is NO hard dedupe on
-        # (node, time, tau): duplicates across trees stay, and the window
-        # dilutes them with the context-overlap weight (soft dedupe).
+        seen_pairs = set()
         per_tau_candidates: Dict[str, list] = {}
-        tree_cut_counts: Dict[int, int] = {}
         for oid in trace.postorder():
             occ = trace.occurrences[oid]
             node = int(occ.metadata.get("node", -1))
             time = float(occ.metadata.get("time", -1.0))
             if node < 0:
                 continue
+            # Pseudo-replication guard: the same (node, as-of time) pair at
+            # the SAME interface may appear in several trees of one batch;
+            # keep a single cut for it (different taus are different cuts).
+            pair = (node, time, occ.tau)
+            if pair in seen_pairs:
+                continue
+            seen_pairs.add(pair)
             hit = self.future_index.query(node, time)
             if hit is None:
                 continue
             if not hit["valid"]:
                 continue  # censored: never becomes a y=0 row
-            tree_id = occ_to_tree.get(occ.occurrence_id, 0)
-            tree_cut_counts[tree_id] = tree_cut_counts.get(tree_id, 0) + 1
             base_ctx = {
                 "delta_t": float(hit["time"] - time),
                 "counterpart": int(hit["counterpart"]),
@@ -179,37 +174,26 @@ class JodieCutBuilder:
             # and never enter the KF moments (they are not observed futures).
             per_tau_candidates.setdefault(
                 occ.tau, []).append(
-                (occ, tree_id, base_ctx, float(hit["outcome"])))
+                self._record(occ, occ_to_tree, base_ctx,
+                             outcome=float(hit["outcome"])))
 
-        # Depth balancing by WEIGHT, not by dropping (document §四: every
-        # tree equal weight; sampling-probability correction).  Each row of
-        # a tree carries ``1 / (# cuts of its tree)``, so every tree's
-        # total window weight is 1 regardless of how many cuts it has (the
-        # leaf flood no longer starves the root layer).  When a tau has
-        # more candidates than ``cuts_per_tau`` they are subsampled with
-        # ``w_sample = total / sampled``, which keeps each tree's expected
-        # total weight unchanged.
-        w_tree = {t: 1.0 / n for t, n in tree_cut_counts.items()}
+        # Depth-balanced sampling: every interface contributes the same
+        # number of cuts per batch (uniform over the interface's real
+        # occurrences), so the root layer is not starved by the leaf flood.
         rows = []
         for tau, cands in per_tau_candidates.items():
             if len(cands) <= self.cuts_per_tau:
-                chosen = cands
-                w_sample = 1.0
+                rows.extend(cands)
             else:
                 idx = rng.choice(len(cands), size=self.cuts_per_tau,
                                  replace=False)
-                chosen = [cands[i] for i in sorted(idx)]
-                w_sample = float(len(cands)) / self.cuts_per_tau
-            for occ, tree_id, ctx, outcome in chosen:
-                rows.append(self._record(
-                    occ, tree_id, ctx, outcome,
-                    weight=w_tree[tree_id] * w_sample))
+                rows.extend(cands[i] for i in sorted(idx))
         return rows
 
-    def _record(self, occ, tree_id: int, context: Dict[str, Any],
-                outcome: float, *, weight: float) -> CutRecord:
+    def _record(self, occ, occ_to_tree: Dict[int, int],
+                context: Dict[str, Any], outcome: float) -> CutRecord:
         return CutRecord(
-            tree_id=tree_id,
+            tree_id=occ_to_tree.get(occ.occurrence_id, 0),
             cut_id=int(occ.occurrence_id),
             occurrence_id=int(occ.occurrence_id),
             tau=str(occ.tau),
@@ -218,5 +202,4 @@ class JodieCutBuilder:
             z=occ.state.z,
             context=context,
             outcome=outcome,
-            valid=True,
-            weight=weight)
+            valid=True)

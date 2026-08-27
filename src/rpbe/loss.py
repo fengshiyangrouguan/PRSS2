@@ -204,20 +204,27 @@ class KFMomentWindow:
             win["ps_list"].append(ps.detach())
             if win["m"] < self._threshold(tau):
                 gated.append(tau)
-                continue
-            # Window closes: covariances from the moments (full gradient via
-            # every z-carrying moment).
-            m = float(win["m"])
-            zbar = win["sz"] / m
-            pbar = win["sp"] / m
-            czz = win["szz"] / m - torch.outer(zbar, zbar)
-            czp = win["szp"] / m - torch.outer(zbar, pbar)
-            cpp = win["spp"] / m - torch.outer(pbar, pbar)
-            j = _j_from_covs(czz, czp, cpp, self.eps, zs)
-            closed[tau] = j
-            diagnostics[tau] = self._diagnostics(win, czz, cpp)
-            # Reset the window for the next accumulation cycle.
-            self._windows.pop(tau)
+        # ALL non-empty windows close together: the z graphs of different
+        # taus share the same per-batch forward graph, so an asynchronous
+        # close would backward through an already-consumed graph.  The
+        # window length is therefore set by the slowest (root) interface —
+        # which is exactly the interface the depth-balancing exists for.
+        nonempty = [tau for tau, win in self._windows.items()
+                    if win is not None and win["m"] > 0]
+        if nonempty and all(self._windows[tau]["m"] >= self._threshold(tau)
+                            for tau in nonempty):
+            for tau in nonempty:
+                win = self._windows[tau]
+                m = float(win["m"])
+                zbar = win["sz"] / m
+                pbar = win["sp"] / m
+                czz = win["szz"] / m - torch.outer(zbar, zbar)
+                czp = win["szp"] / m - torch.outer(zbar, pbar)
+                cpp = win["spp"] / m - torch.outer(pbar, pbar)
+                closed[tau] = _j_from_covs(czz, czp, cpp, self.eps, zs)
+                diagnostics[tau] = self._diagnostics(win, czz, cpp)
+            for tau in nonempty:
+                self._windows.pop(tau)
         return closed, diagnostics, gated
 
     def _diagnostics(self, win, czz, cpp) -> dict:

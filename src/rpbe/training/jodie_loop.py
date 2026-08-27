@@ -200,6 +200,7 @@ class JodieNodeClassificationLoop:
         K = float(len(window_batches))
         self.optimizer.zero_grad(set_to_none=True)
         task_sum = 0.0
+        surr_sum = 0.0
         for (sources, dests, times, edge_idxs, labels_np, trace_rows,
              step) in window_batches:
             labels_t = torch.from_numpy(labels_np).float().to(self.device)
@@ -227,8 +228,10 @@ class JodieNodeClassificationLoop:
                     tau_rows = [c for c in cuts if c.tau == tau]
                     _, _, _, zs, ps, weights = dedup_cut_rows(
                         tau_rows, self.fixed_maps)
-                    loss = loss + self.lambda_kf * kf_vjp_batch(
-                        zs, ps, weights, r["mu_z"], r["mu_p"], adj)
+                    vjp = kf_vjp_batch(zs, ps, weights,
+                                       r["mu_z"], r["mu_p"], adj)
+                    surr_sum += float(vjp.detach())
+                    loss = loss + self.lambda_kf * vjp
             loss.backward()
             # Upstream truncation invariant: detach the memory graph when
             # the host can carry gradients.
@@ -236,7 +239,7 @@ class JodieNodeClassificationLoop:
                 self.tgn.memory.detach_memory()
         self._clip_all_groups()
         self.optimizer.step()
-        return kf_v, kf_detail, diag, task_sum, K
+        return kf_v, kf_detail, diag, task_sum, surr_sum, K
 
     def train_epoch(self, epoch: int, global_step: int, train: object) -> Dict:
         """One supervised epoch over the chronological train stream.
@@ -258,6 +261,7 @@ class JodieNodeClassificationLoop:
         kf_sum = {}
         kf_count_tau = {}
         kf_count = 0
+        kf_surr_sum = 0.0
         skipped_types = set()
         train_probs, train_labels = [], []
         window_batches = []          # macro-window batch snapshots
@@ -338,12 +342,14 @@ class JodieNodeClassificationLoop:
             train_labels.append(labels_np)
 
             if self.rpbe_on and self.kf_window.window_ready():
-                kf_v, kf_detail, diag, task_sum, K = self._close_and_replay(
-                    window_batches, window_shadow, task_only=False)
+                (kf_v, kf_detail, diag, task_sum, surr_sum, K) = \
+                    self._close_and_replay(
+                        window_batches, window_shadow, task_only=False)
                 window_batches = []
                 window_shadow = None
                 total_task += task_sum
                 total_kf += kf_v
+                kf_surr_sum = kf_surr_sum + surr_sum
                 for tau, jv in kf_detail.items():
                     kf_sum[tau] = kf_sum.get(tau, 0.0) + jv
                     kf_count_tau[tau] = kf_count_tau.get(tau, 0) + 1
@@ -378,7 +384,7 @@ class JodieNodeClassificationLoop:
             self.monitor.alert("warning", "kf_window_unclosed",
                                "epoch ended with an unclosed KF window; "
                                "task-only replay step", step=global_step)
-            _, _, _, task_sum, _ = self._close_and_replay(
+            _, _, _, task_sum, _, _ = self._close_and_replay(
                 window_batches, window_shadow, task_only=True)
             total_task += task_sum
             self.kf_window.reset()
@@ -402,6 +408,12 @@ class JodieNodeClassificationLoop:
                 "J_frac": j_frac,
                 "skipped_types": sorted(skipped_types),
                 "kf_loss": total_kf / max(n_batches, 1),
+                # Sum of the pass-2 VJP surrogates: a nonzero value means
+                # the KF term carried a real gradient source into the
+                # replay backward (the "task=0 -> adapter still updates"
+                # audit in one number).
+                "surr_mean": kf_surr_sum / max(kf_count, 1),
+                "closed_windows": kf_count,
             }
         return {
             "train_task_loss": total_task / max(n_batches, 1),

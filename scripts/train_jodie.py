@@ -95,6 +95,10 @@ def parse_args():
     p.add_argument("--trace-roots", type=int, default=32)
     p.add_argument("--trace-mode", default="positive_first",
                    choices=["positive_first", "evenly_spaced", "off"])
+    p.add_argument("--train-eval-auc", action="store_true",
+                   help="epoch-end fixed-checkpoint train evaluation "
+                        "(the online concatenated metric is renamed "
+                        "online_auc)")
     # Diagnostics.
     p.add_argument("--no-early-stop", action="store_true")
     # Monitoring / resume / smoke caps.
@@ -329,7 +333,8 @@ def main():
         adapter=components["adapter"], cut_builder=components["cut_builder"],
         fixed_maps=components["fixed_maps"], rpbe_cfg=components["rpbe_cfg"],
         trace_roots=args.trace_roots,
-        trace_mode=args.trace_mode)
+        trace_mode=args.trace_mode,
+        train_eval_auc=args.train_eval_auc)
 
     save_json(out / "config.json", {
         "data": args.data,
@@ -400,16 +405,16 @@ def main():
             f.write(json.dumps(row, allow_nan=True) + "\n")
         monitor.write_epoch(row)
         print(f"epoch={epoch} "
-              f"train_auc={train_row['train']['auc']:.5f} "
-              f"train_ap={train_row['train']['ap']:.5f} "
+              f"online_train_auc={train_row['train']['online_auc']:.5f} "
+              f"online_train_ap={train_row['train']['online_ap']:.5f} "
               f"val_auc={val_row['auc']:.5f} val_ap={val_row['ap']:.5f} "
               f"val_nll={val_row['nll']:.5f} val_pos={val_row['positives']} "
               f"sec={row['epoch_seconds']:.1f}", flush=True)
         if tb_writer is not None:
-            tb_writer.add_scalar("epoch/train_auc",
-                                 train_row["train"]["auc"], epoch)
-            tb_writer.add_scalar("epoch/train_ap",
-                                 train_row["train"]["ap"], epoch)
+            tb_writer.add_scalar("epoch/online_train_auc",
+                                 train_row["train"]["online_auc"], epoch)
+            tb_writer.add_scalar("epoch/online_train_ap",
+                                 train_row["train"]["online_ap"], epoch)
             tb_writer.add_scalar("epoch/val_auc", val_row["auc"], epoch)
             tb_writer.add_scalar("epoch/val_ap", val_row["ap"], epoch)
             tb_writer.add_scalar("epoch/train_task_loss",

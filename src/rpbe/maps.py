@@ -40,6 +40,11 @@ class FixedMaps(nn.Module):
         # 0 to disable.
         self.p_cache_max_entries = int(p_cache_max_entries)
         self._p_cache = {}
+        # Call counters for the pass-2 audit (sixth review): the replay
+        # pass must do ZERO measurement work; the loop asserts these do
+        # not move during pass 2.
+        self._pv_calls = 0
+        self._pv_batch_calls = 0
         # Frozen at construction: later cfg mutations must not change the
         # measurement (the fingerprint covers this value).
         self._delta_t_scale = float(cfg.delta_t_scale)
@@ -135,6 +140,7 @@ class FixedMaps(nn.Module):
 
     def psi(self, context, outcome: float) -> torch.Tensor:
         """sketch([1; phi_C] (x) phi_Y) -> [m]; no gradient."""
+        self._pv_calls += 1
         with torch.no_grad():
             c = self.context_vector(context)               # [1, d_c]
             f = self.future_vector(outcome)                # [d_f]
@@ -179,6 +185,7 @@ class FixedMaps(nn.Module):
                            for rel, dt in c.get("path", [])),
                      float(y))
                     for c, y in zip(contexts, outcomes))
+        self._pv_batch_calls += 1
         hit = self._p_cache.get(key)
         if hit is not None:
             return hit.to(dev, dtype=self.rff_w.dtype)

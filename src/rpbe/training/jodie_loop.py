@@ -84,7 +84,8 @@ class JodieNodeClassificationLoop:
                  grad_clip, monitor, seed, finetune_host=False,
                  selection_metric="auc", adapter=None, cut_builder=None,
                  fixed_maps=None, rpbe_cfg=None,
-                 trace_roots=8, trace_mode="positive_first"):
+                 trace_roots=8, trace_mode="positive_first",
+                 train_eval_auc=False):
         self.tgn = tgn
         self.decoder = decoder
         self.optimizer = optimizer
@@ -105,6 +106,7 @@ class JodieNodeClassificationLoop:
         self.lambda_kf = float(rpbe_cfg.lambda_kf) if rpbe_cfg is not None else 0.0
         self.trace_roots = int(trace_roots)
         self.trace_mode = trace_mode
+        self.train_eval_auc = bool(train_eval_auc)
         self.rpbe_on = bool(adapter is not None and cut_builder is not None
                             and fixed_maps is not None and rpbe_cfg is not None)
         # KF windows cover the kf_taus whitelist only: the root interface
@@ -205,6 +207,13 @@ class JodieNodeClassificationLoop:
                                  for tau, j in closed.items()))
                 kf_detail = dict(closed)
         self._restore_replay_state(window_shadow)
+        # Pass-2 audit counters (sixth review): the replay pass must do
+        # ZERO RPBE measurement work — no p projection, no re-walk, no
+        # moment rebuild.  These asserts turn the structural guarantee
+        # into a runtime regression check.
+        pre_pv = getattr(self.fixed_maps, "_pv_calls", 0) \
+            + getattr(self.fixed_maps, "_pv_batch_calls", 0)
+        pre_build = getattr(self.cut_builder, "_build_calls", 0)
         K = float(len(window_batches))
         self.optimizer.zero_grad(set_to_none=True)
         task_sum = 0.0
@@ -254,6 +263,15 @@ class JodieNodeClassificationLoop:
                 self.tgn.memory.detach_memory()
         self._clip_all_groups()
         self.optimizer.step()
+        post_pv = getattr(self.fixed_maps, "_pv_calls", 0) \
+            + getattr(self.fixed_maps, "_pv_batch_calls", 0)
+        post_build = getattr(self.cut_builder, "_build_calls", 0)
+        assert post_pv == pre_pv, \
+            "pass 2 must do ZERO measurement work (pv calls {} -> {})" \
+            .format(pre_pv, post_pv)
+        assert post_build == pre_build, \
+            "pass 2 must not re-walk (build calls {} -> {})" \
+            .format(pre_build, post_build)
         return kf_v, kf_detail, diag, task_sum, kf_gn_sum, K
 
     def train_epoch(self, epoch: int, global_step: int, train: object) -> Dict:
@@ -407,6 +425,21 @@ class JodieNodeClassificationLoop:
 
         train_metrics = metric_bundle(np.concatenate(train_labels),
                                       np.concatenate(train_probs))
+        # The concatenated epoch predictions come from CONTINUOUSLY CHANGING
+        # parameters (batch 1 used epoch-start weights, batch N epoch-end
+        # weights) — an ONLINE metric, not a fixed-checkpoint evaluation
+        # (sixth review).  Renamed honestly; the optional fixed-checkpoint
+        # counterpart (train_eval_auc) is appended when requested.
+        train_metrics["online_auc"] = train_metrics.pop("auc")
+        train_metrics["online_ap"] = train_metrics.pop("ap")
+        if self.train_eval_auc:
+            backup = self.tgn.memory.backup_memory() \
+                if self.tgn.use_memory else None
+            te_row = self.evaluate_split(train, reset=True)
+            if backup is not None:
+                self.tgn.memory.restore_memory(backup)
+            train_metrics["eval_auc"] = te_row["auc"]
+            train_metrics["eval_ap"] = te_row["ap"]
         kf_out = None
         if kf_count and self.rpbe_cfg is not None:
             # Per-tau denominators: each tau averages over its own closed

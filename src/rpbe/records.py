@@ -130,6 +130,9 @@ class JodieCutBuilder:
         self.cuts_per_tau = int(cuts_per_tau)
         self.seed = int(seed)
         self._tree_counter = 0
+        # Pass-2 audit counter (sixth review): the replay pass must not
+        # re-walk; the loop asserts this does not move during pass 2.
+        self._build_calls = 0
 
     def build(self, trace, root_events=None, batch_seed: int = 0,
               stats=None):
@@ -146,6 +149,7 @@ class JodieCutBuilder:
         """
         if trace is None or not trace.roots:
             return []
+        self._build_calls += 1
         if stats is None:
             stats = {}
         rng = np.random.RandomState((self.seed * 1000003) ^ int(batch_seed))

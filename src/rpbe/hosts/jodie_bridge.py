@@ -14,8 +14,9 @@ def build_cut_builder(dataset, *, stage: str, cfg, seed: int = 0,
                       delta_t_scale: float = 1e6,
                       tables=None) -> JodieCutBuilder:
     if tables is None:
-        endpoints, labels, _ = build_edge_tables(dataset)
-        tables = (endpoints, labels)
+        (endpoints, labels, users, pages,
+         _) = build_edge_tables(dataset)
+        tables = (endpoints, labels, users, pages)
     cfg.delta_t_scale = float(delta_t_scale) if delta_t_scale > 0 else 1.0
     return JodieCutBuilder(tables, stage=stage,
                            cuts_per_tau=getattr(cfg, "cuts_per_tau", 32),

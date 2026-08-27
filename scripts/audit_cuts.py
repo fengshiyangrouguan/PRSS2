@@ -117,10 +117,12 @@ def main():
         dataset.val_time), flush=True)
 
     tgn = build_host(dataset, args, device)
-    endpoints, labels_tbl, table_stats = build_edge_tables(dataset)
+    (endpoints, labels_tbl, user_nodes, page_nodes,
+     table_stats) = build_edge_tables(dataset)
+    edge_tables = (endpoints, labels_tbl, user_nodes, page_nodes)
     adapter = JodieTGNAdapter(tgn.embedding_module, compressor=None,
                               n_neighbors=args.n_degree,
-                              edge_tables=(endpoints, labels_tbl))
+                              edge_tables=edge_tables)
     tgn.embedding_module = adapter
 
     taus = [TAU_TEMPLATE.format(l) for l in range(args.n_layer + 1)]
@@ -135,7 +137,7 @@ def main():
         cuts_per_tau=10 ** 9,
         kf_min_abs=10 ** 9)
     maps = FixedMaps(cfg).to(device)
-    cut_builder = JodieCutBuilder((endpoints, labels_tbl),
+    cut_builder = JodieCutBuilder(edge_tables,
                                   stage=NODE_CLASS, seed=args.seed,
                                   cuts_per_tau=10 ** 9)
 
@@ -258,10 +260,22 @@ def main():
     root_outcomes = {str(k): v for k, v in outcome_use.items()
                      if k[0] == "root"}
 
+    structure = {
+        "cut_node_type_by_tau": {str(k): v
+                                 for k, v in stats.get("cut_node_type",
+                                                       {}).items()},
+        "owner_position_by_tau": {str(k): v
+                                  for k, v in stats.get("owner_position",
+                                                        {}).items()},
+        "parent_child_same_type": stats.get("parent_child_same_type", 0),
+        "bipartite_alternation_ok": stats.get("parent_child_same_type", 0) == 0,
+    }
+
     report = {
         "args": vars(args),
         "n_batches_seen": n_batches_seen,
         "edge_table": table_stats,
+        "structure": structure,
         "funnel": {
             "raw_occurrences_by_tau": raw,
             "consumption_kind_by_tau": kind_by_tau,

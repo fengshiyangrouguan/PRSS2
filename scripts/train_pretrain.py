@@ -185,16 +185,18 @@ def main():
         compressor = RecursiveCompressor(rpbe_cfg).to(device)
         # Explicit edge tables: consumption-record stamping (adapter) and
         # probe Y lookup (cut builder) share ONE source of truth.
-        endpoints, labels_tbl, edge_table_stats = build_edge_tables(dataset)
+        (endpoints, labels_tbl, user_nodes, page_nodes,
+         edge_table_stats) = build_edge_tables(dataset)
+        edge_tables = (endpoints, labels_tbl, user_nodes, page_nodes)
         adapter = JodieTGNAdapter(tgn.embedding_module, compressor,
                                   n_neighbors=args.n_degree,
-                                  edge_tables=(endpoints, labels_tbl))
+                                  edge_tables=edge_tables)
         tgn.embedding_module = adapter
         fixed_maps = FixedMaps(rpbe_cfg).to(device)
         cut_builder = build_cut_builder(dataset, stage=LINK, cfg=rpbe_cfg,
                                         seed=args.rpbe_seed,
                                         delta_t_scale=delta_scale,
-                                        tables=(endpoints, labels_tbl))
+                                        tables=edge_tables)
 
     main_params = [p for p in tgn.parameters() if p.requires_grad]
     if compressor is not None:

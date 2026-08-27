@@ -135,10 +135,14 @@ class TestLoopSmoke(unittest.TestCase):
             labels_tbl = {int(e): float(y)
                           for e, y in zip(self.train.edge_idxs,
                                           self.train.labels)}
-            adapter.edge_tables = (endpoints, labels_tbl)
+            users = set(int(x) for x in self.train.sources)
+            pages = set(int(x) for x in self.train.destinations)
+            adapter.edge_tables = (endpoints, labels_tbl, users, pages)
             adapter._endpoints = endpoints
-            cut_builder = JodieCutBuilder((endpoints, labels_tbl),
-                                          stage=NODE_CLASS, seed=0)
+            adapter._user_nodes = users
+            cut_builder = JodieCutBuilder(
+                (endpoints, labels_tbl, users, pages),
+                stage=NODE_CLASS, seed=0)
         seen = set()
         main_params = [p for p in main_params
                        if not (id(p) in seen or seen.add(id(p)))]

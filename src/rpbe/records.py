@@ -70,23 +70,39 @@ def build_edge_tables(dataset):
     NOT assume (no ``labels[edge_idx]`` indexing anywhere): the maps are
     built from the data itself.  Conflicts (one idx shared by different
     endpoints or labels) are counted for the audit.
+
+    JODIE semantics (fifth review): the label is the USER's state change
+    (``state_label``), so ``label_owner_node`` is ALWAYS the source node —
+    never inferred from whatever the carrier happens to be.  Wikipedia is
+    bipartite (users edit pages), so the builder also returns the user /
+    page node sets for the structural audit.
     """
     endpoints: Dict[int, Tuple[int, int]] = {}
     labels: Dict[int, float] = {}
     endpoint_conflicts = 0
     label_conflicts = 0
+    user_nodes = set()
+    page_nodes = set()
     for idx, s, d, y in zip(dataset.full.edge_idxs, dataset.full.sources,
                             dataset.full.destinations, dataset.full.labels):
         i = int(idx)
         pair = (int(s), int(d))
+        user_nodes.add(int(s))
+        page_nodes.add(int(d))
         if i in endpoints and endpoints[i] != pair:
             endpoint_conflicts += 1
         endpoints[i] = pair
         if i in labels and labels[i] != float(y):
             label_conflicts += 1
         labels[i] = float(y)
-    return endpoints, labels, {"endpoint_conflicts": endpoint_conflicts,
-                               "label_conflicts": label_conflicts}
+    # Bipartite structure: a node is either a user or a page, never both
+    # (the audit measured overlap 0 on wikipedia; the assert pins it).
+    assert not (user_nodes & page_nodes), \
+        "JODIE graph must be bipartite; {} nodes appear on both sides" \
+        .format(len(user_nodes & page_nodes))
+    return (endpoints, labels, user_nodes, page_nodes,
+            {"endpoint_conflicts": endpoint_conflicts,
+             "label_conflicts": label_conflicts})
 
 
 class JodieCutBuilder:
@@ -101,7 +117,8 @@ class JodieCutBuilder:
                  cuts_per_tau: int = 32, seed: int = 0):
         if stage not in (LINK, NODE_CLASS):
             raise ValueError("unknown stage {}".format(stage))
-        self.endpoints, self.labels = edge_tables
+        (self.endpoints, self.labels,
+         self.user_nodes, self.page_nodes) = edge_tables
         self.stage = stage
         self.cuts_per_tau = int(cuts_per_tau)
         self.seed = int(seed)
@@ -168,6 +185,8 @@ class JodieCutBuilder:
         stats_rows = stats.setdefault("valid_rows", {})
         stats_overlap = stats.setdefault("overlap_groups", {})
         stats_outcome = stats.setdefault("outcome_use", {})
+        stats_ctype = stats.setdefault("cut_node_type", {})
+        stats_orole = stats.setdefault("owner_position", {})
         for oid in trace.postorder():
             occ = trace.occurrences[oid]
             node = int(occ.metadata.get("node", -1))
@@ -175,6 +194,22 @@ class JodieCutBuilder:
             if node < 0:
                 continue
             stats_raw[occ.tau] = stats_raw.get(occ.tau, 0) + 1
+            # Structural audit (fifth review, spec E): bipartite types
+            # must alternate with depth — a parent-child pair of the same
+            # type is a collector bug, counted and asserted here.
+            is_user = node in self.user_nodes
+            ctype = "user" if is_user else ("page" if node in self.page_nodes
+                                            else "unknown")
+            stats_ctype[(occ.tau, ctype)] = \
+                stats_ctype.get((occ.tau, ctype), 0) + 1
+            par = parent_of.get(oid)
+            if par is not None:
+                pnode = int(trace.occurrences[par].metadata.get("node", -1))
+                if pnode >= 0:
+                    p_user = pnode in self.user_nodes
+                    if p_user == is_user:
+                        stats["parent_child_same_type"] = \
+                            stats.get("parent_child_same_type", 0) + 1
             cons = occ.metadata.get("consumption")
             kind = cons.get("kind") if isinstance(cons, dict) else "none"
             stats_kind[(occ.tau, kind)] = \
@@ -206,6 +241,8 @@ class JodieCutBuilder:
                     stats_overlap.get(r.overlap_id, 0) + 1
                 stats_outcome[r.outcome_id] = \
                     stats_outcome.get(r.outcome_id, 0) + 1
+                stats_orole[(occ.tau, int(r.context["role"]))] = \
+                    stats_orole.get((occ.tau, int(r.context["role"])), 0) + 1
             if rows:
                 per_tau_cuts.setdefault(occ.tau, []).append((cut_key, rows))
 
@@ -287,10 +324,21 @@ class JodieCutBuilder:
     def _probe_of(self, anc, trace, root_cons):
         """The usable probe record of one ancestor, plus its kind.
 
-        Kinds: ``root`` (task record), ``aligned`` (historical edge whose
-        label belongs to the ancestor's node), ``unaligned`` (historical
-        edge, label belongs elsewhere — skipped), ``self`` (SELF step or
-        no record — skipped).  Only root/aligned yield a record.
+        Alignment rule (fifth review): the label belongs to the
+        interaction's SOURCE user (JODIE ``state_label``), never to
+        "whoever the carrier is".  A probe is valid when its edge's label
+        owner lies ON the continuation path — which is automatic for a
+        historical edge, whose owner is one of its two endpoints (the
+        cut-side node or the consumer-side parent).  ``role`` encodes the
+        owner POSITION: 0 = owner is the cut-side node, 1 = owner is the
+        consumer side.  ``carrier == label_owner`` is NOT a gate (it is a
+        descriptive statistic): a page's history affecting a user's state
+        is exactly the cross-node signal we keep.
+
+        Kinds: ``root`` (task record; the label belongs to the traced
+        source user, the cut-side node itself — role 0), ``aligned``
+        (usable historical edge), ``self`` (SELF step, missing record, or
+        owner off the path — skipped).
         """
         a_occ = trace.occurrences[anc]
         if anc in root_cons:
@@ -299,22 +347,27 @@ class JodieCutBuilder:
                      "outcome_id": rec["outcome_id"],
                      "counterpart": rec["counterpart"],
                      "edge_time": rec["edge_time"],
-                     "role": rec["role"]}, "root")
+                     "role": 0}, "root")
         cons = a_occ.metadata.get("consumption")
         if not isinstance(cons, dict) or cons.get("kind") != "edge":
             return None, "self"
         e_idx = int(cons["edge_idx"])
+        if e_idx not in self.labels:
+            return None, "self"
         owner = int(cons.get("label_owner", -1))
         node = int(a_occ.metadata.get("node", -1))
-        if owner != node:
-            return None, "unaligned"
-        if e_idx not in self.labels:
-            return None, "unaligned"
+        counterpart = int(cons.get("counterpart", -1))
+        if owner == node:
+            role = 0      # CUT_SIDE: label belongs to the cut-side node
+        elif owner == counterpart:
+            role = 1      # CONSUMER_SIDE: label belongs to the parent
+        else:
+            return None, "self"   # owner off the path: data anomaly
         return ({"outcome": float(self.labels[e_idx]),
                  "outcome_id": ("edge", e_idx),
-                 "counterpart": int(cons.get("counterpart", -1)),
+                 "counterpart": counterpart,
                  "edge_time": float(cons.get("edge_time", 0.0)),
-                 "role": int(cons.get("endpoint_role", 1))}, "aligned")
+                 "role": role}, "aligned")
 
     def _record(self, occ, cut_key, horizon: int, as_of: float, rec, path):
         return CutRecord(

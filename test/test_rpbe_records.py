@@ -27,24 +27,34 @@ def make_occurrence(oid, tau, node, children, relations, deltas, consumption):
 
 
 def make_trace(n_trees=1, mutate=None):
-    """Four-layer tree(s): leaf(layer0,n10) -> mid1(layer1,n20) ->
-    mid2(layer2,n30) -> root(layer3,n40), all at as-of time 100.
+    """Four-layer tree(s), bipartite types alternating with depth (fifth
+    review, structural audit E):
+
+        root(layer3, node 40, USER) -> mid2(layer2, node 30, PAGE)
+            -> mid1(layer1, node 20, USER) -> leaf(layer0, node 10, PAGE)
 
     Consumption edges carry DIFFERENT labels so the shifted-horizon
-    off-by-one is pinned: leaf's edge idx 11 (label 0.0), mid1's 22
-    (1.0), mid2's 33 (0.0); the root task record label is 1.0.
+    off-by-one is pinned; the label owner is always the edge's SOURCE
+    user (JODIE ``state_label`` semantics):
+
+    * leaf(page 10) consumed by mid1(user 20): edge (20 -> 10), owner 20
+      (consumer side, role 1)
+    * mid1(user 20) consumed by mid2(page 30): edge (20 -> 30), owner 20
+      (cut side, role 0)
+    * mid2(page 30) consumed by root(user 40): edge (40 -> 30), owner 40
+      (consumer side, role 1)
     """
     trace = RecursiveTrace()
     for t in range(n_trees):
         base = t * 10
         leaf_cons = {"kind": "edge", "edge_idx": 11 + base, "edge_time": 90.0,
-                     "endpoint_role": 1, "label_owner": 10 + base,
+                     "endpoint_role": 1, "label_owner": 20 + base,
                      "counterpart": 20 + base}
         mid1_cons = {"kind": "edge", "edge_idx": 22 + base, "edge_time": 80.0,
-                     "endpoint_role": 1, "label_owner": 20 + base,
+                     "endpoint_role": 0, "label_owner": 20 + base,
                      "counterpart": 30 + base}
         mid2_cons = {"kind": "edge", "edge_idx": 33 + base, "edge_time": 70.0,
-                     "endpoint_role": 1, "label_owner": 30 + base,
+                     "endpoint_role": 1, "label_owner": 40 + base,
                      "counterpart": 40 + base}
         if mutate is not None:
             leaf_cons, mid1_cons, mid2_cons = mutate(
@@ -69,14 +79,20 @@ def make_trace(n_trees=1, mutate=None):
     return trace
 
 
-def make_labels(n_trees=1):
-    d = {}
+def make_edge_tables(n_trees=1):
+    """(endpoints, labels, users, pages) for the synthetic bipartite graph."""
+    endpoints, labels, users, pages = {}, {}, set(), set()
     for t in range(n_trees):
         base = t * 10
-        d[11 + base] = 0.0   # leaf's own consumption edge
-        d[22 + base] = 1.0   # mid1's edge
-        d[33 + base] = 0.0   # mid2's edge
-    return d
+        endpoints[11 + base] = (20 + base, 10 + base)   # user -> page
+        endpoints[22 + base] = (20 + base, 30 + base)
+        endpoints[33 + base] = (40 + base, 30 + base)
+        labels[11 + base] = 0.0
+        labels[22 + base] = 1.0
+        labels[33 + base] = 0.0
+        users.update({20 + base, 40 + base})
+        pages.update({10 + base, 30 + base})
+    return endpoints, labels, users, pages
 
 
 def make_root_events(n_trees=1):
@@ -85,14 +101,12 @@ def make_root_events(n_trees=1):
 
 
 def build_rows(n_trees=1, stage=NODE_CLASS, cuts_per_tau=32, seed=0,
-               mutate=None, root_events=None, labels=None):
+               mutate=None, root_events=None):
     trace = make_trace(n_trees=n_trees, mutate=mutate)
-    if labels is None:
-        labels = make_labels(n_trees=n_trees)
     if root_events is None:
         root_events = make_root_events(n_trees=n_trees)
-    b = JodieCutBuilder(({}, labels), stage=stage, cuts_per_tau=cuts_per_tau,
-                        seed=seed)
+    b = JodieCutBuilder(make_edge_tables(n_trees=n_trees), stage=stage,
+                        cuts_per_tau=cuts_per_tau, seed=seed)
     return trace, b, b.build(trace, root_events=root_events, batch_seed=0)
 
 
@@ -147,11 +161,32 @@ class TestShiftedHorizonWalk(unittest.TestCase):
         self.assertEqual(cut[1].context["path"], [(1, 20.0), (1, 30.0)])
 
 
-class TestAlignmentAndSelfSkip(unittest.TestCase):
-    def test_unaligned_edge_probe_skipped_upward(self):
-        # mid1's label belongs to node 99, not to mid1's node (20): the
-        # probe is unusable; the walk skips to mid2's edge.  The skipped
-        # step stays in the path.
+class TestOwnerPositionAndSelfSkip(unittest.TestCase):
+    def test_owner_position_encoding(self):
+        # Fifth-review rule: the label owner is the edge's SOURCE user.
+        # role encodes WHERE on the continuation path the owner sits:
+        #   0 = CUT_SIDE (owner is the ancestor node itself)
+        #   1 = CONSUMER_SIDE (owner is the parent that consumed it)
+        # leaf h1 = mid1's edge (20->30, owner 20 == mid1) -> role 0
+        # leaf h2 = mid2's edge (40->30, owner 40 == root)  -> role 1
+        # mid1 h1 = mid2's edge -> role 1; mid1 h2 = root record (label
+        # belongs to the traced source user = the cut-side node) -> role 0
+        _, _, rows = build_rows()
+        leaf = sorted(rows_of_cut(rows, 0, "tjo:layer0"),
+                      key=lambda r: r.horizon)
+        self.assertEqual(leaf[0].context["role"], 0, "leaf h1: CUT_SIDE")
+        self.assertEqual(leaf[1].context["role"], 1, "leaf h2: CONSUMER_SIDE")
+        mid1 = sorted(rows_of_cut(rows, 1, "tjo:layer1"),
+                      key=lambda r: r.horizon)
+        self.assertEqual(mid1[0].context["role"], 1, "mid1 h1: CONSUMER_SIDE")
+        self.assertEqual(mid1[1].context["role"], 0, "mid1 h2: root CUT_SIDE")
+        mid2 = rows_of_cut(rows, 2, "tjo:layer2")[0]
+        self.assertEqual(mid2.context["role"], 0, "mid2 h1: root CUT_SIDE")
+
+    def test_owner_off_path_skipped(self):
+        # A label owner that lies on NEITHER endpoint of the recorded
+        # continuation edge is a data anomaly: the probe is skipped and
+        # the walk moves upward (the step stays in the path).
         def mutate(t, l, m1, m2):
             m1["label_owner"] = 99
             return l, m1, m2
@@ -160,7 +195,7 @@ class TestAlignmentAndSelfSkip(unittest.TestCase):
                      key=lambda r: r.horizon)
         self.assertEqual(len(cut), 2)
         self.assertEqual(cut[0].outcome_id, ("edge", 33),
-                         "unaligned mid1 must be skipped")
+                         "off-path owner must skip mid1")
         self.assertEqual(cut[0].context["path"], [(1, 10.0), (1, 20.0)])
         self.assertEqual(cut[1].outcome_id, ("root", 999))
 
@@ -248,17 +283,17 @@ class TestIdentitiesAndWeights(unittest.TestCase):
     def test_shared_node_overlap_keeps_all_rows(self):
         # Same (node, time, tau) in two trees: both rows survive.
         trace = make_trace(n_trees=2, mutate=lambda t, l, m1, m2: (
-            dict(l, label_owner=10, edge_idx=11, counterpart=20),
+            dict(l, label_owner=20, edge_idx=11, counterpart=20),
             dict(m1, label_owner=20, edge_idx=22, counterpart=30),
-            dict(m2, label_owner=30, edge_idx=33, counterpart=40)))
+            dict(m2, label_owner=40, edge_idx=33, counterpart=40)))
         # Rebuild with nodes pinned across trees: overwrite metadata nodes
         # so both trees share node ids 10/20/30/40 (mutate already pinned
         # the label owners to the same ids, keeping the probes aligned).
         node_pin = {0: 10, 1: 20, 2: 30, 3: 40}
         for oid, occ in trace.occurrences.items():
             occ.metadata["node"] = node_pin[int(occ.metadata["layer"])]
-        labels = {11: 0.0, 22: 1.0, 33: 0.0}
-        b = JodieCutBuilder(({}, labels), stage=NODE_CLASS, seed=0)
+        b = JodieCutBuilder(make_edge_tables(n_trees=1), stage=NODE_CLASS,
+                            seed=0)
         rows = b.build(trace, root_events=make_root_events(2), batch_seed=0)
         self.assertEqual(len(rows), 10)
         overlap_ids = {r.overlap_id for r in rows}
@@ -267,7 +302,8 @@ class TestIdentitiesAndWeights(unittest.TestCase):
 
     def test_tree_ids_global_across_batches(self):
         trace = make_trace()
-        b = JodieCutBuilder(({}, make_labels()), stage=NODE_CLASS, seed=0)
+        b = JodieCutBuilder(make_edge_tables(n_trees=1), stage=NODE_CLASS,
+                            seed=0)
         r1 = b.build(trace, root_events=make_root_events(1), batch_seed=0)
         t2 = make_trace()
         r2 = b.build(t2, root_events=make_root_events(1), batch_seed=1)
@@ -294,7 +330,8 @@ class TestCapAndErrors(unittest.TestCase):
         trace.occurrences[3].children.append(0)
         trace.occurrences[3].child_relations.append(1)
         trace.occurrences[3].child_delta_t.append(5.0)
-        b = JodieCutBuilder(({}, make_labels()), stage=NODE_CLASS, seed=0)
+        b = JodieCutBuilder(make_edge_tables(n_trees=1), stage=NODE_CLASS,
+                            seed=0)
         with self.assertRaises(ValueError):
             b.build(trace, root_events=make_root_events(), batch_seed=0)
 
@@ -324,12 +361,25 @@ class TestEdgeTables(unittest.TestCase):
             sources=np.array([1, 5, 2]),
             destinations=np.array([9, 9, 8]),
             labels=np.array([1.0, 1.0, 0.0])))
-        endpoints, labels, stats = build_edge_tables(data)
+        endpoints, labels, users, pages, stats = build_edge_tables(data)
         self.assertEqual(endpoints[3], (5, 9))          # last write wins
         self.assertEqual(labels[3], 1.0)
         self.assertEqual(labels[4], 0.0)
+        self.assertEqual(users, {1, 5, 2})              # label owner = user
+        self.assertEqual(pages, {9, 8})
         self.assertEqual(stats["endpoint_conflicts"], 1)
         self.assertEqual(stats["label_conflicts"], 0)
+
+    def test_bipartite_assert_rejects_overlap(self):
+        from types import SimpleNamespace
+        import numpy as np
+        data = SimpleNamespace(full=SimpleNamespace(
+            edge_idxs=np.array([1]),
+            sources=np.array([7]),
+            destinations=np.array([7]),      # node on both sides
+            labels=np.array([1.0])))
+        with self.assertRaises(AssertionError):
+            build_edge_tables(data)
 
 
 if __name__ == "__main__":

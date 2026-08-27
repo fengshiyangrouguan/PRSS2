@@ -48,11 +48,16 @@ class JodieTGNAdapter(HostAdapter):
             raise ValueError("RPBE requires a host time_encoder")
         self.host = host_embedding
         self.compressor = compressor
-        # ``edge_tables`` = (idx -> (src, dst), idx -> label) from
-        # ``records.build_edge_tables``; used ONLY to stamp each neighbor
-        # occurrence's consumption record (endpoint_role / label_owner).
-        # None (tests / no-data paths) just skips the stamping.
-        self._endpoints = dict(edge_tables[0]) if edge_tables is not None else None
+        # ``edge_tables`` = (idx -> (src, dst), idx -> label, user set,
+        # page set) from ``records.build_edge_tables``; used ONLY to stamp
+        # each neighbor occurrence's consumption record.  None (tests /
+        # no-data paths) just skips the stamping.
+        if edge_tables is not None:
+            self._endpoints = dict(edge_tables[0])
+            self._user_nodes = set(edge_tables[2])
+        else:
+            self._endpoints = None
+            self._user_nodes = None
         self.n_neighbors = int(n_neighbors)
         if self.n_neighbors <= 0:
             raise ValueError(
@@ -114,6 +119,22 @@ class JodieTGNAdapter(HostAdapter):
         if int(n_neighbors) != self.n_neighbors:
             raise ValueError("adapter fixed n_neighbors {} but got {}".format(
                 self.n_neighbors, n_neighbors))
+        # Trace scope (fifth review): the official TGN concatenates
+        # [source, destination, negative] roots and calls
+        # compute_embedding ONCE (model/tgn.py:148).  The node-
+        # classification protocol trains on task-source roots only:
+        # traced rows must live in the first third.  POS_DST shadow audit
+        # and NEG exclusion are future work; this assert makes the current
+        # scope explicit instead of an accidental artifact of row indexing.
+        if self._trace_top_rows:
+            if len(source_nodes) % 3 != 0:
+                raise ValueError(
+                    "concatenated [src, dst, neg] roots expected, got {}"
+                    .format(len(source_nodes)))
+            B = len(source_nodes) // 3
+            assert max(self._trace_top_rows) < B, \
+                "trace scope: only task-source roots (rows < {}) may be " \
+                "traced".format(B)
         active = np.zeros(len(source_nodes), dtype=bool)
         for row in self._trace_top_rows:
             if 0 <= row < len(active):
@@ -226,17 +247,23 @@ class JodieTGNAdapter(HostAdapter):
                             src, dst = self._endpoints.get(
                                 int(edge_idxs_np[row, j]), (-1, -1))
                             carrier = int(np_neighbors[row, j])
-                            # JODIE labels belong to the interaction's
-                            # DESTINATION (item state).  The label owner
-                            # is therefore always dst; the carrier is the
-                            # probe's node, so alignment holds only when
-                            # the carrier is the destination itself.
+                            # JODIE semantics (fifth review): the label is
+                            # the SOURCE user's state change.  The owner is
+                            # ALWAYS src — never inferred from whatever the
+                            # carrier happens to be.  endpoint_role only
+                            # describes the carrier's side (0=source,
+                            # 1=destination); the probe's validity comes
+                            # from the owner lying on the continuation
+                            # path, which a historical edge always does.
+                            if self._user_nodes is not None:
+                                assert src in self._user_nodes, \
+                                    "label owner (source) must be a user"
                             if src == carrier:
                                 cons.update({"endpoint_role": 0,
-                                             "label_owner": int(dst)})
+                                             "label_owner": int(src)})
                             elif dst == carrier:
                                 cons.update({"endpoint_role": 1,
-                                             "label_owner": int(dst)})
+                                             "label_owner": int(src)})
                             else:
                                 cons.update({"endpoint_role": -1,
                                              "label_owner": -1})

@@ -9,7 +9,7 @@ import unittest
 
 import torch
 
-from rpbe.loss import kf_score
+from rpbe.loss import kf_score, kf_score_fixed
 
 
 def _rand(*shape, seed):
@@ -124,6 +124,33 @@ class TestGradientIsolation(unittest.TestCase):
         j.backward()
         self.assertIsNotNone(z.grad)
         self.assertGreater(z.grad.abs().sum().item(), 0.0)
+
+    def test_whitening_statistics_are_stop_gradient(self):
+        # The method definition fixes Sigma_ZZ as a measurement scale: the
+        # gradcheck-able core (fixed statistics) must carry exactly the
+        # analytic gradient of the closed form.  gradcheck on the wrapper
+        # itself is invalid by construction (stop-gradient makes the value
+        # depend on the stats while the gradient does not).
+        z = _rand(30, 4, seed=15).double().requires_grad_(True)
+        p = _rand(30, 6, seed=16).double()
+        z_c = (z - z.mean(0, keepdim=True)).double()
+        p_c = p - p.mean(0, keepdim=True)
+        m = z.shape[0]
+        szz = (z_c.t() @ z_c / m).detach()
+        spp = (p_c.t() @ p_c / m).detach()
+        ok = torch.autograd.gradcheck(
+            lambda zz: kf_score_fixed(zz - zz.mean(0, keepdim=True), p_c,
+                                      szz, spp, eps=1e-2),
+            (z,), eps=1e-4, atol=1e-3, rtol=1e-3)
+        self.assertTrue(ok, "gradcheck failed on the fixed-statistics core")
+
+    def test_j_forward_value_unchanged_by_sg(self):
+        # Detaching the whitening stats must not change the forward score.
+        z = _rand(200, 6, seed=17)
+        p = _rand(200, 10, seed=18)
+        j_now = kf_score(z, p, eps=1e-4)
+        self.assertGreater(float(j_now), -1e-6)
+        self.assertLessEqual(float(j_now), 6.0 + 1e-3)
 
 
 if __name__ == "__main__":

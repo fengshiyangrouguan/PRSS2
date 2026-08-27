@@ -105,6 +105,69 @@ def _matrix_diag(name: str, x: torch.Tensor) -> dict:
             "{}_cond".format(name): emax / max(emin, 1e-30)}
 
 
+def kf_adjoint(wf_result: dict, eps: float, strict: bool = False):
+    """A = grad of the Ky Fan score w.r.t. the window statistics.
+
+    The Moment-Adjoint Replay bridge: the Welford result (pass 1, detached)
+    becomes small-matrix leaves; the score graph is replayed on them and
+    one backward yields the cotangents ``A_zz, A_zp, A_pp`` (d J / d M2_*).
+    Pass 2 then replays each batch with
+
+        surrogate_b = <A_zz, M2_zz_b> + <A_zp, M2_zp_b> + <A_pp, M2_pp_b>
+
+    (batched moments centered with the SAME global detached means), which
+    is the exact first-order gradient at the current parameters — the
+    statistics span and the autograd graph span are fully decoupled.
+
+    ``W``/``W2_cut``/``D`` carry no model gradient under FIXED weights and
+    are deliberately NOT part of the adjoint (they only fix the numeric
+    value of A).  Returns ``(j_float, adjoints, score_diag)``; a failed
+    close returns ``(None, None, diag)`` (or raises in strict mode).
+    """
+    D = float(wf_result["D"])
+    W = float(wf_result["W"])
+    if not (W > 0.0 and D > 0.0):
+        diag = {"failed": "nonpositive_weight", "W": W, "D_cut": D}
+        if strict:
+            raise RuntimeError("kf_adjoint: {}".format(diag))
+        return None, None, diag
+    czz = wf_result["M2_zz"].clone().requires_grad_(True)
+    cpp = wf_result["M2_pp"].clone().requires_grad_(True)
+    czp = wf_result["M2_zp"].clone().requires_grad_(True)
+    # _score_from_covs signature is (czz, czp, cpp, eps).
+    j, score_diag = _score_from_covs(czz / D, czp / D, cpp / D, eps)
+    if score_diag["failed"] is not None:
+        if strict:
+            raise RuntimeError("kf_adjoint close failed: {}".format(score_diag))
+        return None, None, score_diag
+    j.backward()
+    adjoints = {"M2_zz": czz.grad.detach(),
+                "M2_pp": cpp.grad.detach(),
+                "M2_zp": czp.grad.detach()}
+    return float(j.detach()), adjoints, score_diag
+
+
+def kf_vjp_batch(z_b: torch.Tensor, p_b: torch.Tensor, w_b: torch.Tensor,
+                 mu_z: torch.Tensor, mu_p: torch.Tensor,
+                 adjoints: dict) -> torch.Tensor:
+    """Pass-2 surrogate for one batch: <A, S_b(theta)>.
+
+    ``z_b`` carries gradient; ``p_b``, ``w_b``, ``mu_z``, ``mu_p`` and the
+    adjoints are all detached constants.  The batched moments are centered
+    with the SAME global detached means, so the per-batch terms add up to
+    the exact gradient of the whole-window score.
+    """
+    zc = z_b.double() - mu_z
+    pc = p_b.double() - mu_p
+    sw = w_b.double().sqrt().reshape(-1, 1)
+    mzz_b = (zc * sw).t() @ (zc * sw)
+    mzp_b = (zc * sw).t() @ (pc * sw)
+    mpp_b = (pc * sw).t() @ (pc * sw)
+    return ((adjoints["M2_zz"] * mzz_b).sum()
+            + (adjoints["M2_zp"] * mzp_b).sum()
+            + (adjoints["M2_pp"] * mpp_b).sum())
+
+
 def _joint_min_eig(czz, czp, cpp) -> float:
     """Smallest eigenvalue of the joint [[Czz, Czp],[Czp^T, Cpp]] matrix.
 
@@ -333,13 +396,16 @@ class KFMomentWindow:
 
     def __init__(self, state_dims: Dict[str, int], *, min_ratio: float = 2.0,
                  min_abs: int = 64, eps: float = 1e-4, fixed_maps=None,
-                 strict: bool = False):
+                 strict: bool = False, autoclose: bool = True):
         self.state_dims = dict(state_dims)
         self.min_ratio = float(min_ratio)
         self.min_abs = int(min_abs)
         self.eps = float(eps)
         self.fixed_maps = fixed_maps
         self.strict = bool(strict)
+        # autoclose=False (replay mode): ``add`` only accumulates; the
+        # loop decides when to call ``close_replay``.
+        self.autoclose = bool(autoclose)
         self._windows: Dict[str, dict] = {}
 
     def _threshold(self, tau: str) -> float:
@@ -402,8 +468,9 @@ class KFMomentWindow:
         # which is exactly the interface the depth-balancing exists for.
         nonempty = [tau for tau, win in self._windows.items()
                     if win is not None and len(win["cut_seen"]) > 0]
-        if nonempty and all(len(self._windows[tau]["cut_seen"])
-                            >= self._threshold(tau) for tau in nonempty):
+        if self.autoclose and nonempty and all(
+                len(self._windows[tau]["cut_seen"])
+                >= self._threshold(tau) for tau in nonempty):
             for tau in nonempty:
                 win = self._windows[tau]
                 closed[tau], diagnostics[tau] = self._close(win)
@@ -496,6 +563,60 @@ class KFMomentWindow:
     def window_m(self, tau: str) -> int:
         win = self._windows.get(tau)
         return int(len(win["cut_seen"])) if win is not None else 0
+
+    # ---------------------------------------------------------- replay close
+    def close_replay(self):
+        """Moment-Adjoint close (pass-1 -> pass-2 bridge).
+
+        Accumulates the stored (detached) rows through WeightedWelford,
+        derives the small-matrix adjoints ``A = grad_S F(S)`` and returns
+        ``(closed, adjoints, diagnostics)`` where ``closed[tau]`` is the
+        REAL window score ``F(S_W)`` (the number to log — never the
+        surrogate), and ``adjoints[tau] = (adj, wf_result)`` feeds the
+        pass-2 replay.  All nonempty windows close together (same shared-
+        graph argument as the direct path).
+        """
+        closed: Dict[str, float] = {}
+        adjoints: Dict[str, tuple] = {}
+        diagnostics: Dict[str, dict] = {}
+        nonempty = [tau for tau, win in self._windows.items()
+                    if win is not None and len(win["cut_seen"]) > 0]
+        for tau in nonempty:
+            win = self._windows[tau]
+            z_all = torch.cat(win["zs_list"], dim=0)
+            p_all = torch.cat(win["ps_list"], dim=0)
+            w = torch.cat(win["weights_list"], dim=0)
+            wf = WeightedWelford(int(z_all.shape[1]), int(p_all.shape[1]))
+            wf.add(z_all, p_all, w, win["cut_ids_list"])
+            r = wf.result()
+            j, adj, score_diag = kf_adjoint(r, self.eps, self.strict)
+            if j is None:
+                closed[tau] = 0.0
+                adjoints[tau] = None
+                diagnostics[tau] = {"failed": score_diag["failed"],
+                                    "W": r["W"], "D_cut": r["D"],
+                                    "M_unique": int(len(win["cut_seen"])),
+                                    "M_unique_trees": int(len(win["tree_seen"]))}
+            else:
+                czz = r["M2_zz"] / r["D"]
+                cpp = r["M2_pp"] / r["D"]
+                czp = r["M2_zp"] / r["D"]
+                closed[tau] = float(j)
+                adjoints[tau] = (adj, r)
+                diagnostics[tau] = self._diagnostics(
+                    win, czz, czp, cpp, torch.tensor(j, dtype=torch.float64),
+                    0.0, score_diag)
+        for tau in nonempty:
+            self._windows.pop(tau)
+        return closed, adjoints, diagnostics
+
+    def window_ready(self) -> bool:
+        """All nonempty windows have reached their unique-cut threshold."""
+        nonempty = [tau for tau, win in self._windows.items()
+                    if win is not None and len(win["cut_seen"]) > 0]
+        return bool(nonempty) and all(
+            len(self._windows[tau]["cut_seen"]) >= self._threshold(tau)
+            for tau in nonempty)
 
     def reset(self):
         """Discard all open windows (used at epoch drain: the accumulated

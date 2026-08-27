@@ -21,7 +21,8 @@ import torch
 import torch.nn.functional as F
 from sklearn.metrics import average_precision_score, roc_auc_score
 
-from rpbe.loss import KFMomentWindow, kf_loss
+from rpbe.loss import (KFMomentWindow, dedup_cut_rows, kf_vjp_batch,
+                       kf_loss)
 from rpbe.training.isolation import assert_clean, rpbe_fingerprint
 
 EPS = 1e-7
@@ -144,8 +145,108 @@ class JodieNodeClassificationLoop:
                 self.n_neighbors)
 
     # ----------------------------------------------------------------- training
+    def _backup_replay_state(self):
+        """Shadow state at macro-window start: memory triple + all RNGs."""
+        mem = self.tgn.memory.backup_memory() if self.tgn.use_memory else None
+        return (mem, {"torch": torch.get_rng_state(),
+                      "cuda": torch.cuda.get_rng_state_all()
+                      if torch.cuda.is_available() else None,
+                      "numpy": np.random.get_state()})
+
+    def _restore_replay_state(self, shadow):
+        """Restore the shadow state before the pass-2 replay."""
+        mem, rngs = shadow
+        if self.tgn.use_memory and mem is not None:
+            self.tgn.memory.restore_memory(mem)
+        torch.set_rng_state(rngs["torch"])
+        if rngs["cuda"] is not None:
+            torch.cuda.set_rng_state_all(rngs["cuda"])
+        np.random.set_state(rngs["numpy"])
+
+    @staticmethod
+    def _root_events(trace_rows, dests, labels_np, times, edge_idxs):
+        """Root task records: the tree-level supervisor at the end of the
+        upward walk (dst + natural label of the traced event; event_idx =
+        the 1-based graph_df.idx)."""
+        return {int(row): {"dst": int(dests[row]),
+                           "label": float(labels_np[row]),
+                           "time": float(times[row]),
+                           "event_idx": int(edge_idxs[row])}
+                for row in trace_rows}
+
+    def _close_and_replay(self, window_batches, window_shadow, task_only):
+        """Pass-1 -> pass-2 bridge.
+
+        Closes the moment windows into small-matrix adjoints (``task_only``
+        skips the KF part — the epoch-end drain), restores the shadow
+        state, replays every batch WITH gradients: task loss / K plus the
+        per-tau KF VJP surrogate, one immediate backward per batch (graph
+        freed), ``detach_memory`` after each, ONE optimizer step at the
+        end.  Returns ``(kf_v, kf_detail, diag, task_sum, K)``.
+        """
+        kf_v = 0.0
+        kf_detail = {}
+        diag = {}
+        adjoints = {}
+        if not task_only:
+            closed, adjoints, diag = self.kf_window.close_replay()
+            if closed:
+                kf_v = float(sum(self.rpbe_cfg.alpha(tau) * j
+                                 for tau, j in closed.items()))
+                kf_detail = dict(closed)
+        self._restore_replay_state(window_shadow)
+        K = float(len(window_batches))
+        self.optimizer.zero_grad(set_to_none=True)
+        task_sum = 0.0
+        for (sources, dests, times, edge_idxs, labels_np, trace_rows,
+             step) in window_batches:
+            labels_t = torch.from_numpy(labels_np).float().to(self.device)
+            if trace_rows:
+                self.adapter.set_trace_source_rows(trace_rows)
+            src_emb, _, _ = self._full_official_embedding_call(
+                sources, dests, times, edge_idxs, grad_enabled=True)
+            logits = self.decoder(src_emb)
+            pred = logits.sigmoid()
+            task_loss = F.binary_cross_entropy(pred, labels_t)
+            task_sum += float(task_loss.detach())
+            loss = task_loss / K
+            if not task_only and adjoints and trace_rows \
+                    and self.adapter.trace is not None:
+                root_events = self._root_events(
+                    trace_rows, dests, labels_np, times, edge_idxs)
+                cuts = self.cut_builder.build(
+                    self.adapter.trace, root_events=root_events,
+                    batch_seed=step)
+                for tau in set(c.tau for c in cuts):
+                    entry = adjoints.get(tau)
+                    if entry is None:
+                        continue
+                    adj, r = entry
+                    tau_rows = [c for c in cuts if c.tau == tau]
+                    _, _, _, zs, ps, weights = dedup_cut_rows(
+                        tau_rows, self.fixed_maps)
+                    loss = loss + self.lambda_kf * kf_vjp_batch(
+                        zs, ps, weights, r["mu_z"], r["mu_p"], adj)
+            loss.backward()
+            # Upstream truncation invariant: detach the memory graph when
+            # the host can carry gradients.
+            if self.tgn.use_memory and (self.finetune_host or self.rpbe_on):
+                self.tgn.memory.detach_memory()
+        self._clip_all_groups()
+        self.optimizer.step()
+        return kf_v, kf_detail, diag, task_sum, K
+
     def train_epoch(self, epoch: int, global_step: int, train: object) -> Dict:
-        """One supervised epoch over the chronological train stream."""
+        """One supervised epoch over the chronological train stream.
+
+        RPBE on: Moment-Adjoint Replay.  Pass 1 (no_grad) runs every batch
+        of the macro-window, feeding detached rows into the KF moment
+        windows (the REAL score is logged when they close).  The window's
+        shadow state is restored and pass 2 replays the same batches with
+        gradients — task loss / K plus the KF VJP surrogate — one
+        immediate backward per batch, one optimizer.step per macro-window.
+        Vanilla keeps the upstream per-batch step.
+        """
         self.reset_memory()
         self.tgn.train(self.finetune_host)
         self.decoder.train()
@@ -157,10 +258,8 @@ class JodieNodeClassificationLoop:
         kf_count = 0
         skipped_types = set()
         train_probs, train_labels = [], []
-        # Windowed accumulation (RPBE on): the task loss and the KF moments
-        # accumulate over microbatches; ONE backward fires when a tau window
-        # closes.  Vanilla keeps the upstream per-batch step.
-        window_task = None
+        window_batches = []          # macro-window batch snapshots
+        window_shadow = None         # (memory backup, rng states)
         num_batch = math.ceil(len(train.sources) / self.batch_size)
         for k in range(num_batch):
             s, e = k * self.batch_size, min(len(train.sources),
@@ -181,122 +280,107 @@ class JodieNodeClassificationLoop:
                     self.trace_mode)
                 self.adapter.set_trace_source_rows(trace_rows)
 
-            src_emb, _, _ = self._full_official_embedding_call(
-                sources, dests, times, edge_idxs,
-                grad_enabled=(self.finetune_host or self.rpbe_on))
-            logits = self.decoder(src_emb)
-            pred = logits.sigmoid()
-            # Upstream node-classification objective exactly: sigmoid + BCE.
-            # (BCEWithLogits would be numerically stabler, but the protocol
-            # stays byte-compatible with the upstream baseline.)
-            task_loss = F.binary_cross_entropy(pred, labels_t)
-
             kf_v = 0.0
-            kf_detail = {}
             if self.rpbe_on:
-                window_task = task_loss if window_task is None \
-                    else window_task + task_loss
-                if trace_rows and self.adapter.trace is not None:
-                    # Root task records: the tree-level supervisor at the
-                    # end of the upward walk (dst + natural label of the
-                    # traced event; event_idx = the 1-based graph_df.idx).
-                    root_events = {
-                        int(row): {"dst": int(dests[row]),
-                                   "label": float(labels_np[row]),
-                                   "time": float(times[row]),
-                                   "event_idx": int(edge_idxs[row])}
-                        for row in trace_rows}
-                    cuts = self.cut_builder.build(self.adapter.trace,
-                                                  root_events=root_events,
-                                                  batch_seed=global_step)
-                    if not cuts:
-                        self.monitor.alert("warning", "kf_no_cuts",
-                                           "batch produced no valid cuts",
-                                           step=global_step)
-                    else:
-                        closed, diag, gated = self.kf_window.add(cuts)
-                        skipped_types.update(gated)
-                        if gated:
+                # ---------------- pass 1: statistics only (no graph kept)
+                if not window_batches:
+                    window_shadow = self._backup_replay_state()
+                with torch.no_grad():
+                    src_emb, _, _ = self._full_official_embedding_call(
+                        sources, dests, times, edge_idxs, grad_enabled=False)
+                    logits = self.decoder(src_emb)
+                    pred = logits.sigmoid()
+                    if trace_rows and self.adapter.trace is not None:
+                        root_events = self._root_events(
+                            trace_rows, dests, labels_np, times, edge_idxs)
+                        cuts = self.cut_builder.build(
+                            self.adapter.trace, root_events=root_events,
+                            batch_seed=global_step)
+                        if not cuts:
                             self.monitor.alert(
-                                "warning", "kf_gated_tau",
-                                "still accumulating: {}".format(sorted(gated)),
+                                "warning", "kf_no_cuts",
+                                "batch produced no valid cuts",
                                 step=global_step)
-                        if closed:
-                            kf_term = kf_loss(closed, self.rpbe_cfg.alphas)
-                            kf_v = float(kf_term.detach())
-                            kf_detail = {tau: float(j.detach())
-                                         for tau, j in closed.items()}
-                            for tau, jv in kf_detail.items():
-                                kf_sum[tau] = kf_sum.get(tau, 0.0) + jv
-                                kf_count_tau[tau] = kf_count_tau.get(tau, 0) + 1
-                            kf_count += 1
-                            dims = {}
-                            for tau in kf_detail:
-                                m_u = int(diag[tau]["M_unique"])
-                                dims[tau] = int(min(
-                                    self.rpbe_cfg.state_dims[tau],
-                                    max(1, m_u - 1)))
-                            self.monitor.validate_kf(kf_detail, dims,
-                                                     global_step)
-                            for tau, jv in kf_detail.items():
-                                if diag[tau].get("failed"):
-                                    self.monitor.alert(
-                                        "warning", "kf_window_failed",
-                                        f"{tau} {diag[tau]['failed']} "
-                                        f"scale_z={diag[tau].get('scale_z', float('nan')):.3e} "
-                                        f"scale_p={diag[tau].get('scale_p', float('nan')):.3e} "
-                                        f"M={diag[tau]['M_unique_trees']}",
-                                        step=global_step, interface=tau)
-                            # ONE backward for the whole window.
-                            total = window_task + self.lambda_kf * kf_term
-                            self.optimizer.zero_grad(set_to_none=True)
-                            total.backward()
-                            self._clip_all_groups()
-                            self.optimizer.step()
-                            window_task = None
-                main_loss = task_loss
+                        else:
+                            _, _, gated = self.kf_window.add(cuts)
+                            skipped_types.update(gated)
+                            if gated:
+                                self.monitor.alert(
+                                    "warning", "kf_gated_tau",
+                                    "still accumulating: {}"
+                                    .format(sorted(gated)),
+                                    step=global_step)
+                window_batches.append(
+                    (sources, dests, times, edge_idxs, labels_np,
+                     trace_rows, global_step))
             else:
-                main_loss = task_loss
+                src_emb, _, _ = self._full_official_embedding_call(
+                    sources, dests, times, edge_idxs,
+                    grad_enabled=self.finetune_host)
+                logits = self.decoder(src_emb)
+                pred = logits.sigmoid()
+                task_loss = F.binary_cross_entropy(pred, labels_t)
                 self.monitor.validate_losses({
                     "task": float(task_loss.detach()),
                     "kf": 0.0,
                     "main_total": float(task_loss.detach()),
                 }, global_step)
-                main_loss.backward()
+                task_loss.backward()
                 self._clip_all_groups()
                 self.optimizer.step()
-
-            if self.rpbe_on:
-                self.monitor.validate_losses({
-                    "task": float(task_loss.detach()),
-                    "kf": kf_v,
-                    "main_total": float(task_loss.detach() + kf_v),
-                }, global_step)
-
-            # Upstream truncation invariant: detach the memory graph when the
-            # host can carry gradients.
-            if self.tgn.use_memory and (self.finetune_host or self.rpbe_on):
-                self.tgn.memory.detach_memory()
+                if self.tgn.use_memory and self.finetune_host:
+                    self.tgn.memory.detach_memory()
+                total_task += float(task_loss.detach())
 
             train_probs.append(pred.detach().cpu().numpy())
             train_labels.append(labels_np)
-            total_task += float(task_loss.detach())
-            total_kf += kf_v
+
+            if self.rpbe_on and self.kf_window.window_ready():
+                kf_v, kf_detail, diag, task_sum, K = self._close_and_replay(
+                    window_batches, window_shadow, task_only=False)
+                window_batches = []
+                window_shadow = None
+                total_task += task_sum
+                total_kf += kf_v
+                for tau, jv in kf_detail.items():
+                    kf_sum[tau] = kf_sum.get(tau, 0.0) + jv
+                    kf_count_tau[tau] = kf_count_tau.get(tau, 0) + 1
+                kf_count += 1
+                dims = {}
+                for tau in kf_detail:
+                    m_u = int(diag[tau]["M_unique"])
+                    dims[tau] = int(min(self.rpbe_cfg.state_dims[tau],
+                                        max(1, m_u - 1)))
+                self.monitor.validate_kf(kf_detail, dims, global_step)
+                for tau, jv in kf_detail.items():
+                    if diag[tau].get("failed"):
+                        self.monitor.alert(
+                            "warning", "kf_window_failed",
+                            f"{tau} {diag[tau]['failed']} "
+                            f"scale_z={diag[tau].get('scale_z', float('nan')):.3e} "
+                            f"scale_p={diag[tau].get('scale_p', float('nan')):.3e} "
+                            f"M={diag[tau]['M_unique_trees']}",
+                            step=global_step, interface=tau)
+                self.monitor.validate_losses({
+                    "task": task_sum / K,
+                    "kf": kf_v,
+                    "main_total": task_sum / K + kf_v,
+                }, global_step)
+
             n_batches += 1
             global_step += 1
 
-        # Drain a partial window with a task-only step (kf needs more cuts).
-        # The unfinished window's moments reference z graphs that this
-        # backward consumes, so the window MUST be discarded.
-        if self.rpbe_on and window_task is not None:
+        # Epoch-end drain: the unfinished macro-window replays task-only
+        # (no KF — the moments never closed).
+        if self.rpbe_on and window_batches:
             self.monitor.alert("warning", "kf_window_unclosed",
                                "epoch ended with an unclosed KF window; "
-                               "task-only step", step=global_step)
+                               "task-only replay step", step=global_step)
+            _, _, _, task_sum, _ = self._close_and_replay(
+                window_batches, window_shadow, task_only=True)
+            total_task += task_sum
             self.kf_window.reset()
-            self.optimizer.zero_grad(set_to_none=True)
-            window_task.backward()
-            self._clip_all_groups()
-            self.optimizer.step()
+            window_batches = []
 
         train_metrics = metric_bundle(np.concatenate(train_labels),
                                       np.concatenate(train_probs))

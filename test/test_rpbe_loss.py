@@ -11,8 +11,8 @@ import numpy as np
 import torch
 
 from rpbe.loss import (KFMomentWindow, WeightedWelford, _covs,
-                       _score_from_covs, dedup_cut_rows, kf_score,
-                       kf_score_fixed)
+                       _score_from_covs, dedup_cut_rows, kf_adjoint,
+                       kf_score, kf_score_fixed, kf_vjp_batch)
 from rpbe.records import CutRecord
 
 
@@ -482,6 +482,154 @@ class TestWeightedWelford(unittest.TestCase):
         self.assertTrue(torch.allclose(rs["mu_z"], ro["mu_z"], atol=1e-10))
         self.assertTrue(torch.allclose(rs["M2_zz"], ro["M2_zz"], atol=1e-8))
         self.assertTrue(torch.allclose(rs["M2_zp"], ro["M2_zp"], atol=1e-8))
+
+
+class TestMomentAdjointReplay(unittest.TestCase):
+    """The Moment-Adjoint bridge: the replay surrogate's gradient must be
+    the EXACT first-order gradient of the direct whole-window score — at
+    the same parameters, same rows, same weights (the task-6 A/B contract,
+    verified locally on z-gradients)."""
+
+    def _rows(self, z, p, w):
+        n = z.shape[0]
+        return [CutRecord(
+            tree_id=i, occurrence_id=i, tau="t", horizon=1,
+            node=i, time=float(i), z=z[i],
+            context={"delta_t": 0.0, "counterpart": i, "role": 0,
+                     "query_type": 0, "horizon": 1, "path": []},
+            outcome=0.0, outcome_id=("edge", i), weight=float(w[i]))
+            for i in range(n)]
+
+    def _stub(self, p):
+        class _Stub:
+            def pv(self, ctx, y):
+                return p[ctx["counterpart"] % p.shape[0]]
+        return _Stub()
+
+    def test_surrogate_gradient_equals_direct_window_gradient(self):
+        n, r, mdim = 90, 8, 12
+        g = torch.Generator().manual_seed(11)
+        z = torch.randn(n, r, generator=g).requires_grad_(True)
+        p = torch.randn(n, mdim, generator=g)
+        w = torch.rand(n, generator=g) + 0.5
+        rows = self._rows(z, p, w)
+
+        # Path A (direct): the old whole-window close, one backward.
+        wA = KFMomentWindow({"t": r}, min_ratio=1.0, min_abs=2,
+                            fixed_maps=self._stub(p))
+        closedA, diagA, _ = wA.add(rows)
+        jA = closedA["t"]
+        self.assertIsNotNone(jA.grad_fn)
+        jA.backward()
+        gradA = z.grad.clone()
+        z.grad = None
+
+        # Path B (replay): pass-1 detached accumulation, small-matrix
+        # adjoint, then the per-batch surrogate on the SAME z graph.
+        wB = KFMomentWindow({"t": r}, min_ratio=1.0, min_abs=2,
+                            fixed_maps=self._stub(p), autoclose=False)
+        wB.add([CutRecord(
+            tree_id=r2.tree_id, occurrence_id=r2.occurrence_id,
+            tau=r2.tau, horizon=1, node=r2.node, time=r2.time,
+            z=r2.z.detach(), context=r2.context, outcome=r2.outcome,
+            outcome_id=r2.outcome_id, weight=r2.weight) for r2 in rows])
+        closedB, adjoints, diagB = wB.close_replay()
+        self.assertAlmostEqual(float(closedB["t"]), float(jA.detach()),
+                               places=5,
+                               msg="replay score must equal direct score")
+        adj, r = adjoints["t"]
+        zc = z.double()
+        pc = p.double()
+        wd = w.double()
+        mu_z = (zc * wd[:, None]).sum(0, keepdim=True) / wd.sum()
+        mu_p = (pc * wd[:, None]).sum(0, keepdim=True) / wd.sum()
+        surr = kf_vjp_batch(z, p, w, mu_z[0], mu_p[0], adj)
+        surr.backward()
+        gradB = z.grad.clone()
+
+        self.assertTrue(torch.allclose(gradA, gradB, atol=1e-6, rtol=1e-5),
+                        "replay gradient must equal direct gradient "
+                        "(max diff {})".format(float((gradA - gradB).abs().max())))
+
+    def test_surrogate_gradient_matches_mlp_parameter_gradient(self):
+        # The same contract with z produced by a small deterministic MLP:
+        # replay vs direct on PARAMETER gradients, not just z-gradients.
+        n, r, mdim, hdim = 60, 8, 12, 16
+        g = torch.Generator().manual_seed(21)
+        x = torch.randn(n, 10, generator=g)
+        p = torch.randn(n, mdim, generator=g)
+        w = torch.rand(n, generator=g) + 0.5
+        torch.manual_seed(7)
+        lin = torch.nn.Linear(10, r)
+        torch.nn.init.xavier_normal_(lin.weight, generator=g)
+
+        def make_rows(z, detach):
+            return [CutRecord(
+                tree_id=i, occurrence_id=i, tau="t", horizon=1,
+                node=i, time=float(i),
+                z=z[i].detach() if detach else z[i],
+                context={"delta_t": 0.0, "counterpart": i, "role": 0,
+                         "query_type": 0, "horizon": 1, "path": []},
+                outcome=0.0, outcome_id=("edge", i), weight=float(w[i]))
+                for i in range(n)]
+
+        z = lin(x)
+        wA = KFMomentWindow({"t": r}, min_ratio=1.0, min_abs=2,
+                            fixed_maps=self._stub(p))
+        jA = wA.add(make_rows(z, detach=False))[0]["t"]
+        jA.backward()
+        gradA = lin.weight.grad.clone()
+        lin.zero_grad()
+
+        z = lin(x)
+        wB = KFMomentWindow({"t": r}, min_ratio=1.0, min_abs=2,
+                            fixed_maps=self._stub(p), autoclose=False)
+        wB.add(make_rows(z, detach=True))
+        _, adjoints, _ = wB.close_replay()
+        adj, r = adjoints["t"]
+        zc = z.detach().double()
+        pc = p.double()
+        wd = w.double()
+        mu_z = (zc * wd[:, None]).sum(0, keepdim=True) / wd.sum()
+        mu_p = (pc * wd[:, None]).sum(0, keepdim=True) / wd.sum()
+        surr = kf_vjp_batch(z, p, w, mu_z[0], mu_p[0], adj)
+        surr.backward()
+        gradB = lin.weight.grad.clone()
+
+        self.assertTrue(torch.allclose(gradA, gradB, atol=1e-6, rtol=1e-5),
+                        "MLP parameter gradient mismatch "
+                        "(max {})".format(float((gradA - gradB).abs().max())))
+
+    def test_adjoint_matches_finite_difference(self):
+        # The small-matrix adjoint itself: dJ/dM2 vs numerical jitter.
+        n, r, mdim = 80, 5, 6
+        g = torch.Generator().manual_seed(31)
+        z = torch.randn(n, r, generator=g)
+        p = torch.randn(n, mdim, generator=g)
+        w = torch.rand(n, generator=g) + 0.5
+        wf = WeightedWelford(r, mdim)
+        wf.add(z, p, w, [(i, i, "t", 1) for i in range(n)])
+        res = wf.result()
+        j, adj, diag = kf_adjoint(res, eps=1e-4)
+        self.assertIsNone(diag["failed"])
+        D = res["D"]
+        for (i, k) in [(0, 0), (0, 2), (3, 1)]:
+            eps_fd = 1e-6
+            r_plus = wf.result()
+            r_minus = wf.result()
+            # Symmetric jitter: J responds to both entries, so the finite
+            # difference equals adj[i,k] + adj[k,i] (the adjoint is taken
+            # on the symmetric M2 leaf BEFORE any /D rescaling).
+            r_plus["M2_zz"][i, k] += eps_fd
+            r_plus["M2_zz"][k, i] += eps_fd
+            r_minus["M2_zz"][i, k] -= eps_fd
+            r_minus["M2_zz"][k, i] -= eps_fd
+            jp, _, _ = kf_adjoint(r_plus, eps=1e-4)
+            jm, _, _ = kf_adjoint(r_minus, eps=1e-4)
+            fd = (jp - jm) / (2 * eps_fd)
+            analytic = float(adj["M2_zz"][i, k] + adj["M2_zz"][k, i])
+            self.assertAlmostEqual(fd, analytic, places=4,
+                                   msg="dJ/dM2[{}][{}] mismatch".format(i, k))
 
 
 class TestReviewRegression(unittest.TestCase):

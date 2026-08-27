@@ -107,15 +107,23 @@ class JodieCutBuilder:
         self.seed = int(seed)
         self._tree_counter = 0
 
-    def build(self, trace, root_events=None, batch_seed: int = 0):
+    def build(self, trace, root_events=None, batch_seed: int = 0,
+              stats=None):
         """One call per batch; ``batch_seed`` keeps sampling deterministic.
 
         ``root_events`` maps ``trace.root_rows`` entries to the real task
         event: ``{"dst", "label", "time", "event_idx"}`` — the root task
         record is the tree-level supervisor reached at the end of the walk.
+
+        ``stats`` (optional dict, audit path) accumulates the cut funnel:
+        raw occurrence counts per tau, consumption kind coverage, probe
+        alignment, skipped steps, valid rows, overlap groups and outcome
+        reuse.  All counters are dicts/counts the caller can aggregate.
         """
         if trace is None or not trace.roots:
             return []
+        if stats is None:
+            stats = {}
         rng = np.random.RandomState((self.seed * 1000003) ^ int(batch_seed))
         # Map occurrence -> its GLOBAL tree id (a per-builder counter, so
         # tree-level statistics stay meaningful across batches).
@@ -155,17 +163,46 @@ class JodieCutBuilder:
                     "role": 1}
 
         per_tau_cuts: Dict[str, List[Tuple[tuple, List[CutRecord]]]] = {}
+        stats_raw = stats.setdefault("raw_occurrences", {})
+        stats_kind = stats.setdefault("consumption_kind", {})
+        stats_rows = stats.setdefault("valid_rows", {})
+        stats_overlap = stats.setdefault("overlap_groups", {})
+        stats_outcome = stats.setdefault("outcome_use", {})
+        stats_align = stats.setdefault("aligned_probes", 0)
+        stats_unalign = stats.setdefault("unaligned_probes", 0)
+        stats_self = stats.setdefault("self_steps_skipped", 0)
+        stats_depth = stats.setdefault("depth_terminated", 0)
+        stats_rootrec = stats.setdefault("root_records_used", 0)
         for oid in trace.postorder():
             occ = trace.occurrences[oid]
             node = int(occ.metadata.get("node", -1))
             time = float(occ.metadata.get("time", -1.0))
             if node < 0:
                 continue
+            stats_raw[occ.tau] = stats_raw.get(occ.tau, 0) + 1
+            cons = occ.metadata.get("consumption")
+            kind = cons.get("kind") if isinstance(cons, dict) else "none"
+            stats_kind[(occ.tau, kind)] = \
+                stats_kind.get((occ.tau, kind), 0) + 1
             cut_key = (occ_to_tree[oid], int(oid), str(occ.tau))
-            probes = self._walk_up(oid, parent_of, trace, root_cons)
+            probes, walk = self._walk_up(oid, parent_of, trace, root_cons)
+            stats_align += walk["aligned"]
+            stats_unalign += walk["unaligned"]
+            stats_self += walk["self_steps"]
+            if walk["hit_root"]:
+                stats_rootrec += 1
+            if walk["terminated_by_depth"]:
+                stats_depth += 1
             rows = []
             for h, (rec, path) in enumerate(probes, start=1):
-                rows.append(self._record(occ, cut_key, h, time, rec, path))
+                r = self._record(occ, cut_key, h, time, rec, path)
+                rows.append(r)
+                stats_rows[(occ.tau, h)] = \
+                    stats_rows.get((occ.tau, h), 0) + 1
+                stats_overlap[r.overlap_id] = \
+                    stats_overlap.get(r.overlap_id, 0) + 1
+                stats_outcome[r.outcome_id] = \
+                    stats_outcome.get(r.outcome_id, 0) + 1
             if rows:
                 w = 1.0 / len(rows)      # horizon mixing: w_{v,h} = w_v/|H_v|
                 for r in rows:
@@ -195,9 +232,15 @@ class JodieCutBuilder:
         recursion step (no interaction of its own) or a historical edge
         whose label does not belong to the ancestor's node (unaligned).
         Skipped steps stay in ``path`` so C keeps the walk structure.
+
+        Returns ``(probes, walk)`` where ``walk`` carries the audit counts
+        (aligned/unaligned probes inspected, SELF steps skipped, whether
+        the root record was reached, whether the walk ran out of tree).
         """
         probes = []
         path: List[tuple] = []
+        walk = {"aligned": 0, "unaligned": 0, "self_steps": 0,
+                "hit_root": False, "terminated_by_depth": False}
         anc = parent_of.get(oid)
         while anc is not None and len(probes) < 2:
             a_occ = trace.occurrences[anc]
@@ -207,37 +250,54 @@ class JodieCutBuilder:
             dt = float(a_occ.child_delta_t[i]) \
                 if i < len(a_occ.child_delta_t) else 0.0
             path.append((rel, dt))
-            rec = self._probe_of(anc, trace, root_cons)
+            rec, kind = self._probe_of(anc, trace, root_cons)
+            if kind == "aligned":
+                walk["aligned"] += 1
+            elif kind == "unaligned":
+                walk["unaligned"] += 1
+            elif kind == "self":
+                walk["self_steps"] += 1
+            elif kind == "root":
+                walk["aligned"] += 1
+                walk["hit_root"] = True
             if rec is not None:
                 probes.append((rec, list(path)))
             oid, anc = anc, parent_of.get(anc)
-        return probes
+        if len(probes) < 2:
+            walk["terminated_by_depth"] = True
+        return probes, walk
 
     def _probe_of(self, anc, trace, root_cons):
-        """The usable probe record of one ancestor, or None (skip it)."""
+        """The usable probe record of one ancestor, plus its kind.
+
+        Kinds: ``root`` (task record), ``aligned`` (historical edge whose
+        label belongs to the ancestor's node), ``unaligned`` (historical
+        edge, label belongs elsewhere — skipped), ``self`` (SELF step or
+        no record — skipped).  Only root/aligned yield a record.
+        """
         a_occ = trace.occurrences[anc]
         if anc in root_cons:
             rec = root_cons[anc]
-            return {"outcome": rec["outcome"],
-                    "outcome_id": rec["outcome_id"],
-                    "counterpart": rec["counterpart"],
-                    "edge_time": rec["edge_time"],
-                    "role": rec["role"]}
+            return ({"outcome": rec["outcome"],
+                     "outcome_id": rec["outcome_id"],
+                     "counterpart": rec["counterpart"],
+                     "edge_time": rec["edge_time"],
+                     "role": rec["role"]}, "root")
         cons = a_occ.metadata.get("consumption")
         if not isinstance(cons, dict) or cons.get("kind") != "edge":
-            return None
+            return None, "self"
         e_idx = int(cons["edge_idx"])
         owner = int(cons.get("label_owner", -1))
         node = int(a_occ.metadata.get("node", -1))
         if owner != node:
-            return None   # unaligned historical edge: not a usable probe
+            return None, "unaligned"
         if e_idx not in self.labels:
-            return None
-        return {"outcome": float(self.labels[e_idx]),
-                "outcome_id": ("edge", e_idx),
-                "counterpart": int(cons.get("counterpart", -1)),
-                "edge_time": float(cons.get("edge_time", 0.0)),
-                "role": int(cons.get("endpoint_role", 1))}
+            return None, "unaligned"
+        return ({"outcome": float(self.labels[e_idx]),
+                 "outcome_id": ("edge", e_idx),
+                 "counterpart": int(cons.get("counterpart", -1)),
+                 "edge_time": float(cons.get("edge_time", 0.0)),
+                 "role": int(cons.get("endpoint_role", 1))}, "aligned")
 
     def _record(self, occ, cut_key, horizon: int, as_of: float, rec, path):
         return CutRecord(

@@ -80,6 +80,20 @@ class TestFutureIndex(unittest.TestCase):
         hit = self.idx.query(6, 26.0)
         self.assertFalse(hit["valid"])
 
+    def test_dual_role_indexing(self):
+        # Node 10 only appears as a destination (of node 1 at t=1): its next
+        # event must be found with role=1 and counterpart = the source.
+        hit = self.idx.query(10, 0.0)
+        self.assertTrue(hit["valid"])
+        self.assertEqual(hit["role"], 1)
+        self.assertEqual(hit["counterpart"], 1)
+
+    def test_neg_pool_is_train_region_only(self):
+        # Destination 19 appears only at t=40 (test region) -> excluded.
+        self.assertNotIn(19, self.idx.neg_pool.tolist())
+        # Destination 11 appears at t=5 (train) -> included.
+        self.assertIn(11, self.idx.neg_pool.tolist())
+
 
 class TestJodieCutBuilder(unittest.TestCase):
     def setUp(self):
@@ -159,6 +173,49 @@ class TestJodieCutBuilder(unittest.TestCase):
         b1 = [(r.context["counterpart"], r.outcome) for r in b.build(trace, batch_seed=12)]
         self.assertEqual(a1, a2)
         self.assertNotEqual(a1, b1)
+
+    def test_negative_never_equals_positive_counterpart(self):
+        trace = make_trace(as_of_times=(4.0, 9.0))
+        rows = JodieCutBuilder(self.idx, stage=LINK, neg_per_cut=3,
+                               seed=7).build(trace, batch_seed=0)
+        by_cut = {}
+        for r in rows:
+            by_cut.setdefault(r.cut_id, []).append(r)
+        for cut_id, cut_rows in by_cut.items():
+            pos = next(r for r in cut_rows if r.outcome == 1.0)
+            for n in cut_rows:
+                if n.outcome == 0.0:
+                    self.assertNotEqual(n.context["counterpart"],
+                                        pos.context["counterpart"])
+
+    def test_tree_ids_are_global_across_batches(self):
+        b = JodieCutBuilder(self.idx, stage=NODE_CLASS, seed=0)
+        t1 = make_trace(as_of_times=(4.0, 9.0))
+        t2 = make_trace(as_of_times=(4.0, 9.0))
+        r1 = b.build(t1, batch_seed=0)
+        r2 = b.build(t2, batch_seed=1)
+        ids1 = {r.tree_id for r in r1}
+        ids2 = {r.tree_id for r in r2}
+        self.assertEqual(ids1, {0, 1})
+        self.assertEqual(ids2, {2, 3})
+
+    def test_pseudo_duplicate_node_time_dropped(self):
+        # Two roots, same (node, time) pair: only one cut per pair survives.
+        trace = RecursiveTrace()
+        for k in range(2):
+            trace.add(RecursiveOccurrence(
+                occurrence_id=k, tau="tjo:layer1",
+                state=OccurrenceState(tau="tjo:layer1", z=torch.randn(4)),
+                children=[],
+                child_relations=[], child_delta_t=[],
+                metadata={"layer": 1, "node": 5, "time": 4.0,
+                          "own_raw": torch.randn(4)}))
+            trace.roots.append(k)
+            trace.root_rows.append(k)
+        rows = JodieCutBuilder(self.idx, stage=NODE_CLASS, seed=0).build(
+            trace, batch_seed=0)
+        pairs = {(r.node, r.time) for r in rows}
+        self.assertEqual(len(pairs), 1)
 
 
 if __name__ == "__main__":

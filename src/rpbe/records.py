@@ -53,16 +53,24 @@ class FutureIndex:
                  val_time: float, test_time: float):
         self.val_time = float(val_time)
         self.test_time = float(test_time)
-        self.unique_destinations = np.unique(np.asarray(destinations))
+        # Both roles are indexed: a node's future continuation includes the
+        # interactions it initiates (role 0) and the ones it receives
+        # (role 1) — the role is part of the context C.
         per_node: Dict[int, List] = {}
         for u, dst, t, y in zip(sources, destinations, timestamps, labels):
             per_node.setdefault(int(u), []).append(
-                (float(t), int(dst), float(y)))
+                (float(t), int(dst), float(y), 0))
+            per_node.setdefault(int(dst), []).append(
+                (float(t), int(u), float(y), 1))
         self._events: Dict[int, np.ndarray] = {}
         for u, events in per_node.items():
-            arr = np.asarray(events, dtype=np.float64)  # [n, 3]: time, dst, y
+            arr = np.asarray(events, dtype=np.float64)  # [n,4]: t,other,y,role
             arr = arr[np.argsort(arr[:, 0])]
             self._events[u] = arr
+        # Stage-1 negative pool: train-region destinations only (no val/test
+        # support leakage).
+        ts = np.asarray(timestamps)
+        self.neg_pool = np.unique(np.asarray(destinations)[ts <= self.val_time])
 
     def _split_of(self, t: float) -> str:
         if t <= self.val_time:
@@ -72,11 +80,12 @@ class FutureIndex:
         return "test"
 
     def query(self, node: int, t: float) -> Optional[dict]:
-        """First source-event of ``node`` after time ``t``.
+        """First event of ``node`` (either role) after time ``t``.
 
-        Returns ``{"time", "counterpart", "outcome", "valid"}``; ``None`` when
-        the node has no future event at all, ``valid=False`` when the next
-        event lies in val/test (censored — its content must not be read).
+        Returns ``{"time", "counterpart", "outcome", "role", "valid"}``;
+        ``None`` when the node has no future event at all, ``valid=False``
+        when the next event lies in val/test (censored — its content must not
+        be read).
         """
         events = self._events.get(int(node))
         if events is None:
@@ -88,9 +97,10 @@ class FutureIndex:
         split = self._split_of(float(nxt[0]))
         if split != "train":
             return {"time": float(nxt[0]), "counterpart": None,
-                    "outcome": None, "valid": False}
+                    "outcome": None, "role": None, "valid": False}
         return {"time": float(nxt[0]), "counterpart": int(nxt[1]),
-                "outcome": float(nxt[2]), "valid": True}
+                "outcome": float(nxt[2]), "role": int(nxt[3]),
+                "valid": True}
 
 
 class JodieCutBuilder:
@@ -110,6 +120,7 @@ class JodieCutBuilder:
         self.stage = stage
         self.neg_per_cut = int(neg_per_cut)
         self.seed = int(seed)
+        self._tree_counter = 0
 
     def build(self, trace, batch_seed: int = 0) -> List[CutRecord]:
         """One call per batch; ``batch_seed`` keeps negative sampling
@@ -117,10 +128,11 @@ class JodieCutBuilder:
         if trace is None or not trace.roots:
             return []
         rng = np.random.RandomState((self.seed * 1000003) ^ int(batch_seed))
-        # Map occurrence -> its root row for tree_id: walk each root's own
-        # subtree (occurrences are never shared between roots).
+        # Map occurrence -> its GLOBAL tree id (a per-builder counter, so
+        # tree-level cross-fitting stays meaningful across batches).
         occ_to_tree = {}
-        for tree_id, root in enumerate(trace.roots):
+        for local_tree_id, root in enumerate(trace.roots):
+            tree_id = self._tree_counter + local_tree_id
             stack = [root]
             while stack:
                 oid = stack.pop()
@@ -128,6 +140,9 @@ class JodieCutBuilder:
                     continue
                 occ_to_tree[oid] = tree_id
                 stack.extend(trace.occurrences[oid].children)
+        self._tree_counter += len(trace.roots)
+
+        seen_pairs = set()
         rows: List[CutRecord] = []
         for oid in trace.postorder():
             occ = trace.occurrences[oid]
@@ -135,6 +150,13 @@ class JodieCutBuilder:
             time = float(occ.metadata.get("time", -1.0))
             if node < 0:
                 continue
+            # Pseudo-replication guard: the same (node, as-of time) pair at
+            # the SAME interface may appear in several trees of one batch;
+            # keep a single cut for it (different taus are different cuts).
+            pair = (node, time, occ.tau)
+            if pair in seen_pairs:
+                continue
+            seen_pairs.add(pair)
             hit = self.future_index.query(node, time)
             if hit is None:
                 continue
@@ -143,7 +165,7 @@ class JodieCutBuilder:
             base_ctx = {
                 "delta_t": float(hit["time"] - time),
                 "counterpart": int(hit["counterpart"]),
-                "role": 0,                      # source
+                "role": int(hit["role"]),       # 0 source / 1 destination
                 "query_type": 0 if self.stage == LINK else 1,
             }
             if self.stage == NODE_CLASS:
@@ -153,11 +175,14 @@ class JodieCutBuilder:
                 # Positive: the real next interaction happened (y=1).
                 rows.append(self._record(occ, occ_to_tree, dict(base_ctx),
                                          outcome=1.0))
-                # Negatives: random counterpart candidates that did not
-                # necessarily interact (y=0, a valid observed negative under
-                # the query).  Sampling from the destination side only.
+                # Negatives: train-region destination candidates, drawn
+                # without replacement; a candidate equal to the positive
+                # counterpart is resampled (a pair cannot be y=1 and y=0 at
+                # the same cut).
                 for _ in range(self.neg_per_cut):
-                    cand = int(rng.choice(self.future_index.unique_destinations))
+                    cand = int(rng.choice(self.future_index.neg_pool))
+                    while cand == int(hit["counterpart"]):
+                        cand = int(rng.choice(self.future_index.neg_pool))
                     ctx = dict(base_ctx)
                     ctx["counterpart"] = cand
                     rows.append(self._record(occ, occ_to_tree, ctx, outcome=0.0))

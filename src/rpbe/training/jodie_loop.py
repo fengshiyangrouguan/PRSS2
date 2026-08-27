@@ -356,7 +356,7 @@ class JodieNodeClassificationLoop:
             train_labels.append(labels_np)
 
             if self.rpbe_on and self.kf_window.window_ready():
-                (kf_v, kf_detail, diag, task_sum, surr_sum, K) = \
+                (kf_v, kf_detail, diag, task_sum, surr_sum, kf_gn_sum, K) = \
                     self._close_and_replay(
                         window_batches, window_shadow, task_only=False)
                 window_batches = []

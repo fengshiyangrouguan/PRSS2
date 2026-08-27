@@ -250,6 +250,12 @@ class KFMomentWindow:
         win = self._windows.get(tau)
         return int(win["m"]) if win is not None else 0
 
+    def reset(self):
+        """Discard all open windows (used at epoch drain: the accumulated
+        moments' z graphs are consumed by the task-only backward, so the
+        unfinished window cannot survive into the next epoch)."""
+        self._windows.clear()
+
 
 def _j_from_covs(czz, czp, cpp, eps, zs_for_zero):
     """J = tr[(C_ZZ+e)^-1 C_ZP (C_PP+e)^-1 C_PZ], constant-safe.

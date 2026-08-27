@@ -260,10 +260,13 @@ class JodieNodeClassificationLoop:
             global_step += 1
 
         # Drain a partial window with a task-only step (kf needs more cuts).
+        # The unfinished window's moments reference z graphs that this
+        # backward consumes, so the window MUST be discarded.
         if self.rpbe_on and window_task is not None:
             self.monitor.alert("warning", "kf_window_unclosed",
                                "epoch ended with an unclosed KF window; "
                                "task-only step", step=global_step)
+            self.kf_window.reset()
             self.optimizer.zero_grad(set_to_none=True)
             window_task.backward()
             self._clip_all_groups()

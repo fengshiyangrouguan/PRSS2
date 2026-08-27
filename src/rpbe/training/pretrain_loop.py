@@ -204,11 +204,14 @@ class TGNPretrainLoop:
             if self.tgn.use_memory:
                 self.tgn.memory.detach_memory()
 
-        # Drain a partial window with a task-only step.
+        # Drain a partial window with a task-only step.  The unfinished
+        # window's moments reference z graphs that this backward consumes,
+        # so the window MUST be discarded — it cannot span epochs.
         if self.rpbe_on and window_link is not None:
             self.monitor.alert("warning", "kf_window_unclosed",
                                "epoch ended with an unclosed KF window; "
                                "task-only step", step=global_step)
+            self.kf_window.reset()
             self.optimizer.zero_grad(set_to_none=True)
             window_link.backward()
             if self.grad_clip > 0:

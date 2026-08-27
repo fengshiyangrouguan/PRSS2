@@ -299,6 +299,15 @@ class WeightedWelford:
         assert n == p.shape[0] == w.shape[0] == len(cut_ids_b), \
             "row mismatch: z {} p {} w {} ids {}".format(
                 n, p.shape[0], w.shape[0], len(cut_ids_b))
+        # Lazy device placement: the accumulator is created CPU-side and
+        # follows the first batch's device (weights arrive on z's device
+        # via dedup_cut_rows).
+        if self.mu_z.device != z.device:
+            self.mu_z = self.mu_z.to(z.device)
+            self.mu_p = self.mu_p.to(z.device)
+            self.M2_zz = self.M2_zz.to(z.device)
+            self.M2_pp = self.M2_pp.to(z.device)
+            self.M2_zp = self.M2_zp.to(z.device)
         W_b = float(w.sum())
         if W_b <= 0.0 or n == 0:
             return

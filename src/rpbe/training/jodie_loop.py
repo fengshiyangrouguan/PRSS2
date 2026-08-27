@@ -112,7 +112,7 @@ class JodieNodeClassificationLoop:
         # KF windows cover the kf_taus whitelist only: the root interface
         # has no upward walk and is excluded EXPLICITLY (no "still
         # accumulating" warnings from a tau that can never close).
-        kf_dims = rpbe_cfg.state_dims
+        kf_dims = rpbe_cfg.state_dims if rpbe_cfg is not None else {}
         if self.rpbe_on and rpbe_cfg.kf_taus is not None:
             kf_dims = {t: d for t, d in rpbe_cfg.state_dims.items()
                        if t in rpbe_cfg.kf_taus}

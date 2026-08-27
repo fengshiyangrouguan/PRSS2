@@ -52,7 +52,7 @@ class TGNPretrainLoop:
                             and fixed_maps is not None and rpbe_cfg is not None)
         # KF windows cover the kf_taus whitelist only (root interface has
         # no upward walk and is excluded explicitly).
-        kf_dims = rpbe_cfg.state_dims
+        kf_dims = rpbe_cfg.state_dims if rpbe_cfg is not None else {}
         if self.rpbe_on and rpbe_cfg.kf_taus is not None:
             kf_dims = {t: d for t, d in rpbe_cfg.state_dims.items()
                        if t in rpbe_cfg.kf_taus}
@@ -95,13 +95,15 @@ class TGNPretrainLoop:
         np.random.set_state(rngs["numpy"])
 
     def _close_and_replay(self, window_batches, window_shadow, task_only):
-        """Pass-1 -> pass-2 bridge (same contract as the stage-2 loop)."""
+        """Pass-1 -> pass-2 bridge (latent-adjoint form, same contract as
+        the stage-2 loop): pass 2 = forward + <sg(g), z> dot products
+        only — no p, no moments, no re-walk."""
         kf_v = 0.0
         kf_detail = {}
         diag = {}
-        adjoints = {}
+        replay_plan = {}
         if not task_only:
-            closed, adjoints, diag = self.kf_window.close_replay()
+            closed, replay_plan, diag = self.kf_window.close_replay()
             if closed:
                 kf_v = float(sum(self.rpbe_cfg.alpha(tau) * j
                                  for tau, j in closed.items()))
@@ -110,8 +112,8 @@ class TGNPretrainLoop:
         K = float(len(window_batches))
         self.optimizer.zero_grad(set_to_none=True)
         link_sum = 0.0
-        for (sources, dests, times, edge_idxs, negatives, trace_rows,
-             step) in window_batches:
+        for bi, (sources, dests, times, edge_idxs, negatives, trace_rows,
+                 step) in enumerate(window_batches):
             size = len(sources)
             if trace_rows:
                 self.adapter.set_trace_source_rows(trace_rows)
@@ -125,30 +127,17 @@ class TGNPretrainLoop:
                     torch.zeros(size, device=self.device)))
             link_sum += float(link_loss.detach())
             loss = link_loss / K
-            if not task_only and adjoints and trace_rows \
+            if not task_only and replay_plan and trace_rows \
                     and self.adapter.trace is not None:
-                # Link-stage root task record: the traced event is a REAL
-                # observed interaction (y=1 by construction — fabricated
-                # negatives belong to the link TASK loss only).
-                root_events = {
-                    int(row): {"counterpart": int(dests[row]), "label": 1.0,
-                               "time": float(times[row]),
-                               "event_idx": int(edge_idxs[row]),
-                               "role": 0}
-                    for row in trace_rows}
-                cuts = self.cut_builder.build(
-                    self.adapter.trace, root_events=root_events,
-                    batch_seed=step)
-                for tau in set(c.tau for c in cuts):
-                    entry = adjoints.get(tau)
-                    if entry is None:
+                for tau, plan in replay_plan.items():
+                    if bi >= len(plan["by_batch"]):
                         continue
-                    adj, r = entry
-                    tau_rows = [c for c in cuts if c.tau == tau]
-                    _, _, _, zs, ps, weights = dedup_cut_rows(
-                        tau_rows, self.fixed_maps)
-                    loss = loss + self.lambda_kf * kf_vjp_batch(
-                        zs, ps, weights, r["mu_z"], r["mu_p"], adj)
+                    for (occ_id, g) in plan["by_batch"][bi]:
+                        occ = self.adapter.trace.occurrences.get(occ_id)
+                        if occ is None:
+                            continue
+                        z = occ.state.z
+                        loss = loss + self.lambda_kf * (g * z.float()).sum()
             loss.backward()
             if self.tgn.use_memory:
                 self.tgn.memory.detach_memory()

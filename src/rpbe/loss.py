@@ -26,12 +26,14 @@ def _ridge(eps: float, sigma: torch.Tensor) -> torch.Tensor:
 def kf_score_fixed(z_c: torch.Tensor, p_c: torch.Tensor,
                    szz: torch.Tensor, spp: torch.Tensor,
                    eps: float = 1e-4) -> torch.Tensor:
-    """J with all whitening statistics held constant.
+    """J with all whitening statistics held constant (a true fixed scale).
 
     ``z_c`` carries gradient (the only gradient path is the cross term
-    ``S_ZP = z_c^T p_c / M``); ``szz``/``spp``/``p_c`` are fixed measurement
-    scales.  This is the gradcheck-able core; ``kf_score`` wraps it with
-    stop-gradient batch statistics.
+    ``S_ZP = z_c^T p_c / M``).  This core serves two purposes: (a) the
+    gradcheck target, and (b) a future fixed-reference-scale variant, which
+    must precompute ``szz``/``spp`` once from a frozen calibration model
+    and add an explicit covariance constraint — it is NOT what ``kf_score``
+    currently uses.
     """
     m = z_c.shape[0]
     szp = z_c.t() @ p_c / m
@@ -47,20 +49,27 @@ def kf_score_fixed(z_c: torch.Tensor, p_c: torch.Tensor,
 def kf_score(Z: torch.Tensor, P: torch.Tensor, eps: float = 1e-4) -> torch.Tensor:
     """J_tau for one type.  ``Z``: [M, r] (gradient flows); ``P``: [M, m] (detached).
 
-    Whitening statistics are STOP-GRADIENT measurement scales per the method
-    definition (``z_w = Sigma_ZZ^{-1/2}(q - E q)`` with population statistics):
-    the gradient may only flow through the centered cross path
-    ``Sigma_ZP = Z_c^T P_c / M``.  Letting the batch ``Sigma_ZZ`` carry
-    gradient would give theta a spurious channel to inflate J by shrinking
-    its own covariance instead of learning better cross-correlations.
+    This is the STANDARD normalized Ky Fan / CCA score: ``C_zz`` is the
+    normalization term of the current ``q_theta`` and therefore theta-dependent
+    — its gradient is a *necessary* part of the objective (shrinking Z shrinks
+    the cross-covariance too; the two effects cancel exactly, giving the
+    scale invariance ``<grad_Z J, Z> = 0``).  Stop-gradding the batch ``C_zz``
+    would be a half-gradient (forward changes, backward pretends not), whose
+    radial derivative is ``2J`` instead of 0 — it is NOT the gradient of any
+    objective.  The P-side statistics carry no gradient because P is a fixed
+    measurement (``psi`` runs under no_grad).
+
+    ``kf_score_fixed`` below is the core for a genuinely fixed reference
+    scale (precomputed once from a frozen calibration model + an explicit
+    scale constraint), which this implementation does NOT use.
     """
     if Z.shape[0] < 2:
         raise ValueError("kf_score needs at least 2 rows")
-    z = Z - Z.mean(dim=0, keepdim=True).detach()
-    p = P - P.mean(dim=0, keepdim=True).detach()
+    z = Z - Z.mean(dim=0, keepdim=True)
+    p = P - P.mean(dim=0, keepdim=True)           # P constant -> no grad anyway
     m = z.shape[0]
-    szz = (z.t() @ z / m).detach()                # measurement scale (fixed)
-    spp = (p.t() @ p / m).detach()                # P is constant anyway
+    szz = z.t() @ z / m                           # normalization term: full grad
+    spp = p.t() @ p / m
     return kf_score_fixed(z, p, szz, spp, eps=eps)
 
 

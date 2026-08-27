@@ -125,12 +125,32 @@ class TestGradientIsolation(unittest.TestCase):
         self.assertIsNotNone(z.grad)
         self.assertGreater(z.grad.abs().sum().item(), 0.0)
 
-    def test_whitening_statistics_are_stop_gradient(self):
-        # The method definition fixes Sigma_ZZ as a measurement scale: the
-        # gradcheck-able core (fixed statistics) must carry exactly the
-        # analytic gradient of the closed form.  gradcheck on the wrapper
-        # itself is invalid by construction (stop-gradient makes the value
-        # depend on the stats while the gradient does not).
+    def test_full_gradient_has_zero_radial_derivative(self):
+        # Scale invariance of the normalized score: with the full gradient
+        # (C_zz as a theta-dependent normalization term), both the analytic
+        # radial derivative <grad_Z J, Z> and the finite-difference
+        # (J((1+h)Z) - J((1-h)Z)) / 2h must be ~0.  A stop-grad wrapper
+        # would give fd ~ 0 but auto ~ 2J — the exact signature of the
+        # half-gradient bug.
+        z = _rand(200, 6, seed=15).requires_grad_(True)
+        p = _rand(200, 10, seed=16)
+        j = kf_score(z, p, eps=1e-6)
+        grad = torch.autograd.grad(j, z)[0]
+        d_auto = float((grad * z).sum())
+        h = 1e-3
+        j_plus = float(kf_score((1 + h) * z.detach(), p, eps=1e-6))
+        j_minus = float(kf_score((1 - h) * z.detach(), p, eps=1e-6))
+        d_fd = (j_plus - j_minus) / (2 * h)
+        self.assertAlmostEqual(d_auto, 0.0, delta=1e-2,
+                               msg="radial derivative of the analytic "
+                                   "gradient must vanish")
+        self.assertAlmostEqual(d_fd, 0.0, delta=1e-2,
+                               msg="finite-difference radial derivative "
+                                   "must vanish")
+
+    def test_fixed_statistics_core_gradchecks(self):
+        # The fixed-scale core (for a future frozen-reference variant) must
+        # carry exactly the analytic gradient of its closed form.
         z = _rand(30, 4, seed=15).double().requires_grad_(True)
         p = _rand(30, 6, seed=16).double()
         z_c = (z - z.mean(0, keepdim=True)).double()

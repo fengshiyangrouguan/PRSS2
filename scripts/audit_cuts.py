@@ -63,6 +63,12 @@ def parse_args():
                    help="batches skipped before pooling (memory warmup: "
                         "wikipedia node features are all-zero, so early z "
                         "rows are degenerate)")
+    p.add_argument("--scope", default="task_src",
+                   choices=["task_src", "pos_dst"],
+                   help="task_src = trace source roots [0,B) (training "
+                        "population); pos_dst = shadow-audit the "
+                        "destination roots [B,2B) — statistics only, "
+                        "never enters any loss")
     p.add_argument("--output", default="outputs/audit/cut_funnel.json")
     return p.parse_args()
 
@@ -161,15 +167,33 @@ def main():
             size = len(sources)
             # Audit builds trees for EVERY row of the batch (training
             # traces a subset; the funnel must see the full population).
-            adapter.set_trace_source_rows(list(range(size)))
+            # TASK_SRC roots live at rows [0, size); POS_DST shadow roots
+            # at [size, 2*size) (the concatenated official call).
+            if args.scope == "task_src":
+                adapter.set_trace_source_rows(list(range(size)))
+                root_events = {
+                    row: {"counterpart": int(dests[row]),
+                          "label": float(labels_np[row]),
+                          "time": float(times[row]),
+                          "event_idx": int(edge_idxs[row]),
+                          "role": 0}
+                    for row in range(size)}
+            else:  # pos_dst shadow audit
+                adapter.set_trace_source_rows(
+                    [size + row for row in range(size)])
+                # The task label belongs to the event's SOURCE user, so
+                # for a destination-rooted tree the owner is on the
+                # consumer side (role 1) and the counterpart is the src.
+                root_events = {
+                    size + row: {"counterpart": int(sources[row]),
+                                 "label": float(labels_np[row]),
+                                 "time": float(times[row]),
+                                 "event_idx": int(edge_idxs[row]),
+                                 "role": 1}
+                    for row in range(size)}
             tgn.compute_temporal_embeddings(
                 sources, dests, dests, times, edge_idxs, args.n_degree)
             trace = adapter.trace
-            root_events = {
-                row: {"dst": int(dests[row]), "label": float(labels_np[row]),
-                      "time": float(times[row]),
-                      "event_idx": int(edge_idxs[row])}
-                for row in range(size)}
             rows = cut_builder.build(trace, root_events=root_events,
                                      batch_seed=k, stats=stats)
             # Stratified pool: postorder emits leaf rows first, so a plain

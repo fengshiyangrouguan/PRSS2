@@ -29,6 +29,13 @@ import torch
 LINK = "link"
 NODE_CLASS = "node_class"
 
+# Horizon weights (method_delta.md: omega_1 = omega_2 = 1/4, omega_star =
+# 1/2): the star horizon (root task result) dominates the joint test.
+# Within a cut the surviving horizons are renormalized so the cut's total
+# horizon weight is 1 (tree equal weights then act on cuts).
+HORIZON_OMEGA = (0.25, 0.25, 0.5)
+MAX_HORIZONS = 3
+
 
 @dataclass
 class CutRecord:
@@ -172,12 +179,18 @@ class JodieCutBuilder:
         for row, oid in zip(trace.root_rows, trace.roots):
             ev = (root_events or {}).get(int(row))
             if ev is not None:
+                # ``role`` encodes the owner position of the task label:
+                # 0 for TASK_SRC roots (the label belongs to the traced
+                # source user = the cut-side node itself) and 1 for
+                # POS_DST shadow roots (the owner is the event's source,
+                # the consumer side).  ``counterpart`` is the OTHER
+                # endpoint in both cases.
                 root_cons[oid] = {
                     "outcome": float(ev["label"]),
                     "outcome_id": ("root", int(ev["event_idx"])),
-                    "counterpart": int(ev["dst"]),
+                    "counterpart": int(ev["counterpart"]),
                     "edge_time": float(ev["time"]),
-                    "role": 1}
+                    "role": int(ev.get("role", 0))}
 
         per_tau_cuts: Dict[str, List[Tuple[tuple, List[CutRecord]]]] = {}
         stats_raw = stats.setdefault("raw_occurrences", {})
@@ -279,10 +292,15 @@ class JodieCutBuilder:
                 picks = [cut_rows[i] for i in sorted(idx)]
                 w_sample = float(len(cut_rows)) / float(self.cuts_per_tau)
             for cut_key, rows in picks:
-                w_h = 1.0 / len(rows)   # horizon mixing: w_{v,h} = w_v/|H_v|
-                w = w_tree[cut_key[0]] * w_sample * w_h
+                # Horizon mixing with the document weights: omega_h =
+                # (1/4, 1/4, 1/2), renormalized over the SURVIVING
+                # horizons of this cut (missing horizons are masked, the
+                # cut's total horizon weight stays 1 for tree equal
+                # weights).
+                omega_sum = sum(HORIZON_OMEGA[:len(rows)])
+                w = w_tree[cut_key[0]] * w_sample
                 for r in rows:
-                    r.weight = w
+                    r.weight = w * HORIZON_OMEGA[r.horizon - 1] / omega_sum
                 out.extend(rows)
         return out
 
@@ -304,7 +322,7 @@ class JodieCutBuilder:
         walk = {"aligned": 0, "unaligned": 0, "self_steps": 0,
                 "hit_root": False, "terminated_by_depth": False}
         anc = parent_of.get(oid)
-        while anc is not None and len(probes) < 2:
+        while anc is not None and len(probes) < MAX_HORIZONS:
             a_occ = trace.occurrences[anc]
             i = a_occ.children.index(oid)
             rel = int(a_occ.child_relations[i]) \
@@ -325,7 +343,7 @@ class JodieCutBuilder:
             if rec is not None:
                 probes.append((rec, list(path)))
             oid, anc = anc, parent_of.get(anc)
-        if len(probes) < 2:
+        if len(probes) < MAX_HORIZONS:
             walk["terminated_by_depth"] = True
         return probes, walk
 
@@ -355,7 +373,7 @@ class JodieCutBuilder:
                      "outcome_id": rec["outcome_id"],
                      "counterpart": rec["counterpart"],
                      "edge_time": rec["edge_time"],
-                     "role": 0}, "root")
+                     "role": int(rec["role"])}, "root")
         cons = a_occ.metadata.get("consumption")
         if not isinstance(cons, dict) or cons.get("kind") != "edge":
             return None, "self"

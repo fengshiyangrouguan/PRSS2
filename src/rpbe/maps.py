@@ -53,9 +53,10 @@ class FixedMaps(nn.Module):
         # kill every negative-label row's tensor product).
         self.register_buffer("future_table", _fixed_binary(
             (2, self.d_f), seed + 2), persistent=True)
-        # Horizon index (1 -> row 0, 2 -> row 1); invalid values raise.
+        # Horizon index (1 -> row 0, 2 -> row 1, 3 -> row 2 for the star
+        # horizon); invalid values raise.
         self.register_buffer("horizon_table", _fixed_binary(
-            (2, self.d_c), seed + 6), persistent=True)
+            (3, self.d_c), seed + 6), persistent=True)
         # PathSketch: fixed per-step signatures for the upward-walk
         # structure.  rel 0 = SELF recursion step, rel 1 = neighbor edge.
         self.register_buffer("path_rel_table", _fixed_binary(
@@ -117,8 +118,8 @@ class FixedMaps(nn.Module):
         role = int(context["role"]) % 2
         query = int(context["query_type"]) % 2
         h = int(context["horizon"])
-        if h not in (1, 2):
-            raise ValueError("horizon must be 1 or 2, got {}".format(h))
+        if h not in (1, 2, 3):
+            raise ValueError("horizon must be 1, 2 or 3, got {}".format(h))
         cat = (self.categorical_c[partner]
                + self.categorical_c[self.num_counter_bins + role]
                + self.categorical_c[self.num_counter_bins + 2 + query]
@@ -232,8 +233,8 @@ class FixedMaps(nn.Module):
 
     @staticmethod
     def _check_horizon(h: int) -> int:
-        if h not in (1, 2):
-            raise ValueError("horizon must be 1 or 2, got {}".format(h))
+        if h not in (1, 2, 3):
+            raise ValueError("horizon must be 1, 2 or 3, got {}".format(h))
         return h
 
     # ------------------------------------------------------------------ audit

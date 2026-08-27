@@ -122,19 +122,21 @@ class JodieTGNAdapter(HostAdapter):
         # Trace scope (fifth review): the official TGN concatenates
         # [source, destination, negative] roots and calls
         # compute_embedding ONCE (model/tgn.py:148).  The node-
-        # classification protocol trains on task-source roots only:
-        # traced rows must live in the first third.  POS_DST shadow audit
-        # and NEG exclusion are future work; this assert makes the current
-        # scope explicit instead of an accidental artifact of row indexing.
+        # classification protocol trains on task-source roots ([0, B))
+        # only; the POS_DST shadow audit may additionally trace rows
+        # [B, 2B) but they never enter the training loss (the audit script
+        # runs them separately with --scope pos_dst).  NEG_PLACEHOLDER
+        # rows [2B, 3B) must NEVER be traced.
         if self._trace_top_rows:
             if len(source_nodes) % 3 != 0:
                 raise ValueError(
                     "concatenated [src, dst, neg] roots expected, got {}"
                     .format(len(source_nodes)))
             B = len(source_nodes) // 3
-            assert max(self._trace_top_rows) < B, \
-                "trace scope: only task-source roots (rows < {}) may be " \
-                "traced".format(B)
+            assert max(self._trace_top_rows) < 2 * B, \
+                "trace scope: only task-source roots (rows < {}) and " \
+                "pos-dst shadow roots (rows < {}) may be traced".format(
+                    B, 2 * B)
         active = np.zeros(len(source_nodes), dtype=bool)
         for row in self._trace_top_rows:
             if 0 <= row < len(active):

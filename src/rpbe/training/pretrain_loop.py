@@ -131,9 +131,10 @@ class TGNPretrainLoop:
                 # observed interaction (y=1 by construction — fabricated
                 # negatives belong to the link TASK loss only).
                 root_events = {
-                    int(row): {"dst": int(dests[row]), "label": 1.0,
+                    int(row): {"counterpart": int(dests[row]), "label": 1.0,
                                "time": float(times[row]),
-                               "event_idx": int(edge_idxs[row])}
+                               "event_idx": int(edge_idxs[row]),
+                               "role": 0}
                     for row in trace_rows}
                 cuts = self.cut_builder.build(
                     self.adapter.trace, root_events=root_events,
@@ -208,10 +209,11 @@ class TGNPretrainLoop:
                                 self.n_neighbors)
                         if trace_rows and self.adapter.trace is not None:
                             root_events = {
-                                int(row): {"dst": int(dests[row]),
+                                int(row): {"counterpart": int(dests[row]),
                                            "label": 1.0,
                                            "time": float(times[row]),
-                                           "event_idx": int(edge_idxs[row])}
+                                           "event_idx": int(edge_idxs[row]),
+                                           "role": 0}
                                 for row in trace_rows}
                             cuts = self.cut_builder.build(
                                 self.adapter.trace,

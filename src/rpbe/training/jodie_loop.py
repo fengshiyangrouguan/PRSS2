@@ -167,13 +167,16 @@ class JodieNodeClassificationLoop:
 
     @staticmethod
     def _root_events(trace_rows, dests, labels_np, times, edge_idxs):
-        """Root task records: the tree-level supervisor at the end of the
-        upward walk (dst + natural label of the traced event; event_idx =
-        the 1-based graph_df.idx)."""
-        return {int(row): {"dst": int(dests[row]),
+        """Root task records (TASK_SRC scope): the tree-level supervisor
+        at the end of the upward walk — the natural label of the traced
+        event belongs to the source user, so the counterpart (the other
+        endpoint) is the destination and role=0 (owner on the cut side).
+        ``event_idx`` = the 1-based graph_df.idx."""
+        return {int(row): {"counterpart": int(dests[row]),
                            "label": float(labels_np[row]),
                            "time": float(times[row]),
-                           "event_idx": int(edge_idxs[row])}
+                           "event_idx": int(edge_idxs[row]),
+                           "role": 0}
                 for row in trace_rows}
 
     def _close_and_replay(self, window_batches, window_shadow, task_only):

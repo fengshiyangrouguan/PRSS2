@@ -96,8 +96,8 @@ def make_edge_tables(n_trees=1):
 
 
 def make_root_events(n_trees=1):
-    return {t: {"dst": 50 + t, "label": 1.0, "time": 100.0,
-                "event_idx": 999 + t} for t in range(n_trees)}
+    return {t: {"counterpart": 50 + t, "label": 1.0, "time": 100.0,
+                "event_idx": 999 + t, "role": 0} for t in range(n_trees)}
 
 
 def build_rows(n_trees=1, stage=NODE_CLASS, cuts_per_tau=32, seed=0,
@@ -121,24 +121,28 @@ class TestShiftedHorizonWalk(unittest.TestCase):
         _, _, rows = build_rows()
         cut = sorted(rows_of_cut(rows, 0, "tjo:layer0"),
                      key=lambda r: r.horizon)
-        self.assertEqual(len(cut), 2)
+        self.assertEqual(len(cut), 3)
         self.assertEqual(cut[0].horizon, 1)
         self.assertEqual(cut[0].outcome, 1.0, "leaf h1 must read mid1's edge")
         self.assertEqual(cut[0].outcome_id, ("edge", 22))
         self.assertEqual(cut[1].horizon, 2)
         self.assertEqual(cut[1].outcome, 0.0, "leaf h2 must read mid2's edge")
         self.assertEqual(cut[1].outcome_id, ("edge", 33))
+        self.assertEqual(cut[2].horizon, 3, "h3 is the star horizon")
+        self.assertEqual(cut[2].outcome, 1.0, "leaf h3 = root task label")
+        self.assertEqual(cut[2].outcome_id, ("root", 999))
 
     def test_per_layer_row_matrix(self):
-        # layer0: 2 rows (h1 mid1 edge, h2 mid2 edge); layer1: 2 rows
-        # (h1 mid2 edge, h2 root record); layer2: 1 row (h1 root record);
-        # layer3 (root): no upward walk -> 0 rows.  Total 5.
+        # layer0: 3 rows (h1 mid1 edge, h2 mid2 edge, h3 STAR = root
+        # record); layer1: 2 rows (h1 mid2 edge, h2 root record);
+        # layer2: 1 row (h1 root record); layer3 (root): no upward
+        # walk -> 0 rows.  Total 6.
         _, _, rows = build_rows()
-        self.assertEqual(len(rows_of_cut(rows, 0, "tjo:layer0")), 2)
+        self.assertEqual(len(rows_of_cut(rows, 0, "tjo:layer0")), 3)
         self.assertEqual(len(rows_of_cut(rows, 1, "tjo:layer1")), 2)
         self.assertEqual(len(rows_of_cut(rows, 2, "tjo:layer2")), 1)
         self.assertEqual(len(rows_of_cut(rows, 3, "tjo:layer3")), 0)
-        self.assertEqual(len(rows), 5)
+        self.assertEqual(len(rows), 6)
 
     def test_root_record_reached_by_layer2_h1(self):
         _, _, rows = build_rows()
@@ -176,6 +180,9 @@ class TestOwnerPositionAndSelfSkip(unittest.TestCase):
                       key=lambda r: r.horizon)
         self.assertEqual(leaf[0].context["role"], 0, "leaf h1: CUT_SIDE")
         self.assertEqual(leaf[1].context["role"], 1, "leaf h2: CONSUMER_SIDE")
+        self.assertEqual(leaf[2].context["role"], 0,
+                         "leaf h3 (star): root record, owner = traced "
+                         "source user = cut-side")
         mid1 = sorted(rows_of_cut(rows, 1, "tjo:layer1"),
                       key=lambda r: r.horizon)
         self.assertEqual(mid1[0].context["role"], 1, "mid1 h1: CONSUMER_SIDE")
@@ -228,14 +235,19 @@ class TestIdentitiesAndWeights(unittest.TestCase):
         self.assertNotEqual(leaf_h1.row_id, leaf_h2.row_id)
 
     def test_tree_equal_weight_and_horizon_split(self):
-        # One tree with 3 cuts (layer0/1/2): w_tree = 1/3.  Within a cut
-        # the horizons split evenly; the whole TREE sums to weight 1.
+        # One tree with 3 cuts: w_tree = 1/3.  Horizon weights follow
+        # omega = (1/4, 1/4, 1/2) renormalized over surviving horizons:
+        # layer0 (h1,h2,star) -> (1/12, 1/12, 1/6); layer1 (h1,h2) ->
+        # (1/6, 1/6); layer2 (h1) -> 1/3.  Whole TREE sums to 1.
         _, _, rows = build_rows()
-        for cut_rows in (rows_of_cut(rows, 0, "tjo:layer0"),
-                         rows_of_cut(rows, 1, "tjo:layer1")):
-            self.assertAlmostEqual(sum(r.weight for r in cut_rows), 1.0 / 3.0)
-            for r in cut_rows:
-                self.assertAlmostEqual(r.weight, 1.0 / 6.0)
+        l0 = sorted(rows_of_cut(rows, 0, "tjo:layer0"),
+                    key=lambda r: r.horizon)
+        self.assertAlmostEqual(l0[0].weight, 1.0 / 12.0)
+        self.assertAlmostEqual(l0[1].weight, 1.0 / 12.0)
+        self.assertAlmostEqual(l0[2].weight, 1.0 / 6.0,
+                               msg="star horizon carries omega=1/2")
+        for r in rows_of_cut(rows, 1, "tjo:layer1"):
+            self.assertAlmostEqual(r.weight, 1.0 / 6.0)
         r2 = rows_of_cut(rows, 2, "tjo:layer2")[0]
         self.assertAlmostEqual(r2.weight, 1.0 / 3.0)
         self.assertAlmostEqual(sum(r.weight for r in rows), 1.0,
@@ -271,9 +283,9 @@ class TestIdentitiesAndWeights(unittest.TestCase):
         # delete rows (overlap_id is a correlation grouping, never a
         # delete key) — both trees contribute their full rows.
         _, _, rows = build_rows(n_trees=2)
-        self.assertEqual(len(rows), 10)
-        self.assertEqual(len(rows_of_cut(rows, 0, "tjo:layer0")), 2)
-        self.assertEqual(len(rows_of_cut(rows, 10, "tjo:layer0")), 2)
+        self.assertEqual(len(rows), 12)
+        self.assertEqual(len(rows_of_cut(rows, 0, "tjo:layer0")), 3)
+        self.assertEqual(len(rows_of_cut(rows, 10, "tjo:layer0")), 3)
         # Nodes are offset per tree (10/20/30/40 vs 20/30/40/50), so the
         # overlap ids are all distinct here; with shared nodes they would
         # repeat and still keep every row (the overlap is a group key).
@@ -295,7 +307,7 @@ class TestIdentitiesAndWeights(unittest.TestCase):
         b = JodieCutBuilder(make_edge_tables(n_trees=1), stage=NODE_CLASS,
                             seed=0)
         rows = b.build(trace, root_events=make_root_events(2), batch_seed=0)
-        self.assertEqual(len(rows), 10)
+        self.assertEqual(len(rows), 12)
         overlap_ids = {r.overlap_id for r in rows}
         self.assertEqual(len(overlap_ids), 3, "shared nodes collapse the "
                          "overlap grouping only, not the rows")
@@ -317,11 +329,11 @@ class TestCapAndErrors(unittest.TestCase):
         # cut keeps BOTH its horizon rows.
         _, _, rows = build_rows(n_trees=2, cuts_per_tau=1, seed=3)
         layer0 = [r for r in rows if r.tau == "tjo:layer0"]
-        self.assertEqual(len(layer0), 2)
+        self.assertEqual(len(layer0), 3)
         oids = {r.occurrence_id for r in layer0}
         self.assertEqual(len(oids), 1, "cap must sample by cut")
-        self.assertEqual(len({r.horizon for r in layer0}), 2,
-                         "a sampled cut keeps all horizons")
+        self.assertEqual(len({r.horizon for r in layer0}), 3,
+                         "a sampled cut keeps all horizons (incl. star)")
 
     def test_parent_map_asserts_single_parent(self):
         trace = make_trace()

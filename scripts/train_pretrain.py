@@ -73,7 +73,9 @@ def parse_args():
     p.add_argument("--kf-lambda", type=float, default=1.0)
     p.add_argument("--rpbe-width", type=int, default=128)
     p.add_argument("--sketch-dim", type=int, default=64)
-    p.add_argument("--kf-cuts-per-tau", type=int, default=32)
+    p.add_argument("--kf-cuts-per-tau", type=int, default=1024,
+                   help="per-tau per-batch sampling cap (sampling-probability "
+                        "corrected)")
     p.add_argument("--kf-min-ratio", type=float, default=2.0)
     p.add_argument("--kf-min-abs", type=int, default=1024)
     p.add_argument("--ridge-eps", type=float, default=1e-4)

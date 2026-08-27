@@ -27,6 +27,9 @@ class _FakeMonitor:
             assert np.isfinite(j), (tau, j)
             assert 0.0 <= j <= dims[tau] + 1e-4, (tau, j, dims[tau])
 
+    def alert(self, severity, code, message, **meta):
+        pass  # warnings are not errors in the smoke test
+
 
 class TestSelectTraceRows(unittest.TestCase):
     def test_positives_first_uses_all_positives(self):

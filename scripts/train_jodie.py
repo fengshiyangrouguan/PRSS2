@@ -67,7 +67,8 @@ def parse_args():
     p.add_argument("--n-epoch", type=int, default=10)
     p.add_argument("--n-layer", type=int, default=2)
     p.add_argument("--lr", type=float, default=3e-4)
-    p.add_argument("--patience", type=int, default=3)
+    p.add_argument("--patience", type=int, default=10,
+                   help="val 曲线抖动大，早停阈值放宽（10 epoch 内基本不早停）")
     p.add_argument("--drop-out", type=float, default=0.1)
     p.add_argument("--message-dim", type=int, default=100)
     p.add_argument("--memory-dim", type=int, default=172)

@@ -202,6 +202,7 @@ class JodieNodeClassificationLoop:
         task_sum = 0.0
         surr_sum = 0.0
         kf_gn_sum = 0.0
+        kf_gn_measured = False
         for (sources, dests, times, edge_idxs, labels_np, trace_rows,
              step) in window_batches:
             labels_t = torch.from_numpy(labels_np).float().to(self.device)
@@ -237,13 +238,19 @@ class JodieNodeClassificationLoop:
                     # direct measurement.  (surr_sum itself is ~0 by the
                     # score's z-scale invariance — the radial inner
                     # product <A, S> vanishes — so it is NOT the right
-                    # nonzero-gradient probe.)
-                    kf_params = list(self.adapter.compressor.parameters())
-                    kf_grads = torch.autograd.grad(
-                        vjp, kf_params, retain_graph=True, allow_unused=True)
-                    kf_gn_sum += float(sum(
-                        g.detach().norm() for g in kf_grads
-                        if g is not None))
+                    # nonzero-gradient probe.)  Measured ONCE per window
+                    # (the first vjp) to keep the extra autograd pass out
+                    # of the per-batch cost.
+                    if not kf_gn_measured:
+                        kf_params = list(
+                            self.adapter.compressor.parameters())
+                        kf_grads = torch.autograd.grad(
+                            vjp, kf_params, retain_graph=True,
+                            allow_unused=True)
+                        kf_gn_sum += float(sum(
+                            g.detach().norm() for g in kf_grads
+                            if g is not None))
+                        kf_gn_measured = True
                     loss = loss + self.lambda_kf * vjp
             loss.backward()
             # Upstream truncation invariant: detach the memory graph when

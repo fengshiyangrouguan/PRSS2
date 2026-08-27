@@ -366,16 +366,24 @@ def dedup_cut_rows(rows: List, fixed_maps):
     * ``tree_ids`` — trace identity (window gate counts per TREE: several
       cuts of one trace share the same history and are not independent)
     """
-    row_ids, cut_ids, tree_ids, zs, ps, weights = [], [], [], [], [], []
+    row_ids, cut_ids, tree_ids, zs, weights = [], [], [], [], []
     for r in rows:
         row_ids.append(r.row_id)
         cut_ids.append(r.cut_id)
         tree_ids.append(int(r.tree_id))
         zs.append(r.z)
-        ps.append(fixed_maps.pv(r.context, r.outcome))
         weights.append(float(r.weight))
     zs_t = torch.stack(zs)
-    return (row_ids, cut_ids, tree_ids, zs_t, torch.stack(ps),
+    # Vectorized P projection: the per-row ``pv`` call is a Python-loop
+    # small-operator storm (~0.25 ms/row); ``pv_batch`` computes all rows
+    # in one pass (~0.01 ms/row).  Test stubs only implement ``pv``.
+    if hasattr(fixed_maps, "pv_batch"):
+        ps_t = fixed_maps.pv_batch([r.context for r in rows],
+                                   [r.outcome for r in rows])
+    else:
+        ps_t = torch.stack([fixed_maps.pv(r.context, r.outcome)
+                            for r in rows])
+    return (row_ids, cut_ids, tree_ids, zs_t, ps_t,
             torch.tensor(weights, dtype=torch.float64, device=zs_t.device))
 
 

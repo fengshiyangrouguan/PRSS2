@@ -10,8 +10,9 @@ import unittest
 import numpy as np
 import torch
 
-from rpbe.loss import (KFMomentWindow, _covs, _score_from_covs, dedup_cut_rows,
-                       kf_score, kf_score_fixed)
+from rpbe.loss import (KFMomentWindow, WeightedWelford, _covs,
+                       _score_from_covs, dedup_cut_rows, kf_score,
+                       kf_score_fixed)
 from rpbe.records import CutRecord
 
 
@@ -378,6 +379,109 @@ class TestKFMomentWindow(unittest.TestCase):
         self.assertTrue(np.isfinite(j), "near-singular C_ZZ must not crash")
         self.assertGreaterEqual(j, -1e-6)
         self.assertLessEqual(j, r + 1e-3)
+
+
+class TestWeightedWelford(unittest.TestCase):
+    """The pass-1 accumulator of the Moment-Adjoint Replay must reproduce
+    the direct float64 stack-center covariances exactly (the numerical
+    contract of d80d65f), merge batches via the Chan correction, and keep
+    the cluster degrees of freedom D = W - W2_cut/W."""
+
+    def _batches(self, sizes=(40, 60, 25), dim_z=6, dim_p=10, seed=3):
+        g = torch.Generator().manual_seed(seed)
+        zs = [torch.randn(n, dim_z, generator=g) for n in sizes]
+        ps = [torch.randn(n, dim_p, generator=g) for n in sizes]
+        ws = [torch.rand(n, generator=g) + 0.5 for n in sizes]
+        cut_ids = [[(i, i, "t", 1) for i in range(n)] for n in sizes]
+        return zs, ps, ws, cut_ids
+
+    def test_matches_direct_stack_centering(self):
+        zs, ps, ws, cut_ids = self._batches()
+        wf = WeightedWelford(6, 10)
+        for z, p, w, cids in zip(zs, ps, ws, cut_ids):
+            wf.add(z, p, w, cids)
+        r = wf.result()
+        z_all = torch.cat(zs).double()
+        p_all = torch.cat(ps).double()
+        w_all = torch.cat(ws).double()
+        W = w_all.sum()
+        mu_z = (z_all * w_all[:, None]).sum(0) / W
+        mu_p = (p_all * w_all[:, None]).sum(0) / W
+        zc = z_all - mu_z
+        pc = p_all - mu_p
+        sw = w_all.sqrt()[:, None]
+        mzz = (zc * sw).t() @ (zc * sw)
+        mpp = (pc * sw).t() @ (pc * sw)
+        mzp = (zc * sw).t() @ (pc * sw)
+        self.assertAlmostEqual(r["W"], float(W), places=12)
+        self.assertTrue(torch.allclose(r["mu_z"], mu_z, atol=1e-10))
+        self.assertTrue(torch.allclose(r["mu_p"], mu_p, atol=1e-10))
+        self.assertTrue(torch.allclose(r["M2_zz"], mzz, atol=1e-8))
+        self.assertTrue(torch.allclose(r["M2_pp"], mpp, atol=1e-8))
+        self.assertTrue(torch.allclose(r["M2_zp"], mzp, atol=1e-8))
+
+    def test_large_dc_offset_stays_stable(self):
+        # z with a 1e4 DC offset (added in float64, the accumulator's
+        # domain): the centered M2 must match the offset-free run exactly
+        # — no raw-moment cancellation (the d80d65f contract).  A float32
+        # offset would quantize the low bits before the accumulator even
+        # sees the data, which is not the accumulator's concern.
+        zs, ps, ws, cut_ids = self._batches()
+        wf0 = WeightedWelford(6, 10)
+        wf1 = WeightedWelford(6, 10)
+        for z, p, w, cids in zip(zs, ps, ws, cut_ids):
+            wf0.add(z, p, w, cids)
+            wf1.add(z.double() + 1e4, p, w, cids)
+        r0, r1 = wf0.result(), wf1.result()
+        self.assertTrue(torch.allclose(r0["M2_zz"], r1["M2_zz"], atol=1e-6))
+        self.assertTrue(torch.allclose(r0["M2_zp"], r1["M2_zp"], atol=1e-6))
+
+    def test_uniform_weights_degrade_to_n_minus_one(self):
+        # All-ones weights, one row per cut: D = n - 1 (the pre-weighting
+        # denominator contract).
+        zs, ps, _, cut_ids = self._batches()
+        n = sum(len(z) for z in zs)
+        wf = WeightedWelford(6, 10)
+        for z, p, cids in zip(zs, ps, cut_ids):
+            wf.add(z, p, torch.ones(len(z)), cids)
+        r = wf.result()
+        self.assertAlmostEqual(r["W"], float(n), places=10)
+        self.assertAlmostEqual(r["W2_cut"], float(n), places=10)
+        self.assertAlmostEqual(r["D"], float(n - 1), places=10)
+
+    def test_cluster_w2_two_horizon_cut(self):
+        # One cut with two horizon rows (0.5 + 0.5): the cluster W2 sums
+        # the cut's rows first (1.0 per cut), so D = W - W2/W with W=n —
+        # horizon splitting does NOT fake extra independent samples.
+        zs, ps, _, cut_ids = self._batches(sizes=(80,))
+        n = len(zs[0])
+        wf = WeightedWelford(6, 10)
+        w = torch.full((n,), 0.5)
+        cids = [(i, i, "t", 1) for i in range(n)]
+        wf.add(zs[0], ps[0], w, cids)
+        r = wf.result()
+        # W = n*0.5; W2_cut = n*0.25; D = W - W2_cut/W = n/2 - 1/2
+        # (a single row with w=1 gives W=n, W2=n, D=n-1 — the horizon
+        # split scales everything by 1/2 and does NOT add fake samples).
+        self.assertAlmostEqual(r["W"], float(n) * 0.5, places=10)
+        self.assertAlmostEqual(r["W2_cut"], float(n) * 0.25, places=10)
+        self.assertAlmostEqual(r["D"], float(n) * 0.5 - 0.5, places=10)
+
+    def test_chan_merge_across_batches_equals_one_pass(self):
+        # The cross-batch merge must be order-invariant: two batches added
+        # separately equal the same rows added in one call.
+        zs, ps, ws, cut_ids = self._batches(sizes=(50, 30))
+        wf_sep = WeightedWelford(6, 10)
+        for z, p, w, cids in zip(zs, ps, ws, cut_ids):
+            wf_sep.add(z, p, w, cids)
+        wf_one = WeightedWelford(6, 10)
+        wf_one.add(torch.cat(zs), torch.cat(ps), torch.cat(ws),
+                   cut_ids[0] + cut_ids[1])
+        rs, ro = wf_sep.result(), wf_one.result()
+        self.assertAlmostEqual(rs["W"], ro["W"], places=12)
+        self.assertTrue(torch.allclose(rs["mu_z"], ro["mu_z"], atol=1e-10))
+        self.assertTrue(torch.allclose(rs["M2_zz"], ro["M2_zz"], atol=1e-8))
+        self.assertTrue(torch.allclose(rs["M2_zp"], ro["M2_zp"], atol=1e-8))
 
 
 class TestReviewRegression(unittest.TestCase):

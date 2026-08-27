@@ -197,6 +197,89 @@ def score_rows_by_type(rows: List, state_dims: Dict[str, int]) -> Dict[str, list
     return by_tau
 
 
+class WeightedWelford:
+    """FP64 weighted ONLINE central moments (Chan et al. merge form).
+
+    The pass-1 accumulator of the Moment-Adjoint Replay: one no_grad pass
+    merges every batch's weighted centered moments into the whole-window
+    statistics ``W, W2_cut, mu_z, mu_p, M2_zz, M2_pp, M2_zp`` in float64,
+    from which the global mean mu_hat and the cluster degrees of freedom
+    ``D = W - W2_cut/W`` come out (``W2_cut = sum_v (sum_h w_{v,h})^2``,
+    rows of one cut share z so the cut's weight is its rows' sum).
+
+    The merge keeps the direct-centering numerical contract: batch means
+    and M2 are computed on CENTERED rows, and the cross-batch merge adds
+    the Chan correction term ``d d^T W W_b/(W+W_b)`` — raw-moment
+    cancellation (``E[zz^T] - E[z]E[z]^T``) never appears.
+    """
+
+    def __init__(self, dim_z: int, dim_p: int):
+        self.dim_z = int(dim_z)
+        self.dim_p = int(dim_p)
+        self.W = 0.0
+        self.W2_cut = 0.0
+        self.mu_z = torch.zeros(self.dim_z, dtype=torch.float64)
+        self.mu_p = torch.zeros(self.dim_p, dtype=torch.float64)
+        self.M2_zz = torch.zeros(self.dim_z, self.dim_z, dtype=torch.float64)
+        self.M2_pp = torch.zeros(self.dim_p, self.dim_p, dtype=torch.float64)
+        self.M2_zp = torch.zeros(self.dim_z, self.dim_p, dtype=torch.float64)
+        self.n_batches = 0
+
+    def add(self, z_b: torch.Tensor, p_b: torch.Tensor,
+            w_b: torch.Tensor, cut_ids_b: List[tuple]):
+        """Merge one batch: ``z_b`` [n, dim_z] (detached), ``p_b`` [n, dim_p]
+        (constant), ``w_b`` [n] weights, ``cut_ids_b`` per row."""
+        z = z_b.detach().double()
+        p = p_b.detach().double()
+        w = w_b.detach().double().reshape(-1)
+        n = z.shape[0]
+        assert n == p.shape[0] == w.shape[0] == len(cut_ids_b), \
+            "row mismatch: z {} p {} w {} ids {}".format(
+                n, p.shape[0], w.shape[0], len(cut_ids_b))
+        W_b = float(w.sum())
+        if W_b <= 0.0 or n == 0:
+            return
+        # Batch-internal weighted mean and centered M2 (direct centering).
+        wc = w[:, None]
+        mz = (z * wc).sum(0, keepdim=True) / W_b
+        mp = (p * wc).sum(0, keepdim=True) / W_b
+        zc = z - mz
+        pc = p - mp
+        sw = w.sqrt()[:, None]
+        M2_zz_b = (zc * sw).t() @ (zc * sw)
+        M2_pp_b = (pc * sw).t() @ (pc * sw)
+        M2_zp_b = (zc * sw).t() @ (pc * sw)
+        # Cluster W2: rows of one cut share z; its weight is the row sum.
+        wsum = {}
+        for cid, wv in zip(cut_ids_b, w.tolist()):
+            wsum[cid] = wsum.get(cid, 0.0) + wv
+        W2_b = float(sum(v * v for v in wsum.values()))
+        # Chan merge into the running statistics.
+        W_new = self.W + W_b
+        dz = mz - self.mu_z                      # [1, dim_z]
+        dp = mp - self.mu_p
+        gain = self.W * W_b / W_new
+        self.M2_zz = self.M2_zz + M2_zz_b + gain * (dz.t() @ dz)
+        self.M2_pp = self.M2_pp + M2_pp_b + gain * (dp.t() @ dp)
+        self.M2_zp = self.M2_zp + M2_zp_b + gain * (dz.t() @ dp)
+        self.mu_z = self.mu_z + (W_b / W_new) * dz[0]
+        self.mu_p = self.mu_p + (W_b / W_new) * dp[0]
+        self.W = float(W_new)
+        self.W2_cut += W2_b
+        self.n_batches += 1
+
+    def result(self) -> dict:
+        """(W, W2_cut, D, mu_z, mu_p, M2_zz, M2_pp, M2_zp) — detached FP64."""
+        D = self.W - self.W2_cut / self.W if self.W > 0.0 else 0.0
+        return {"W": float(self.W), "W2_cut": float(self.W2_cut),
+                "D": float(D),
+                "mu_z": self.mu_z.clone(),
+                "mu_p": self.mu_p.clone(),
+                "M2_zz": self.M2_zz.clone(),
+                "M2_pp": self.M2_pp.clone(),
+                "M2_zp": self.M2_zp.clone()}
+
+
 def dedup_cut_rows(rows: List, fixed_maps):
     """Row-wise projection of CutRecords (NO averaging across horizons).
 

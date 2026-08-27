@@ -307,6 +307,36 @@ class TestKFMomentWindow(unittest.TestCase):
         self.assertAlmostEqual(j, 0.0, places=6)
         self.assertTrue(np.isfinite(j))
 
+    def test_collapsed_z_scale_does_not_break_the_bound(self):
+        # Regression for the second cloud crash: z collapsing to ~1e-10
+        # scale made the absolute ridge jitter (1e-12) dominate, blowing
+        # J up past dim (J=245.09 vs dim=172 -> monitor invariant raise).
+        # The scale-following ridge must keep J within [0, dim].
+        r, m, n = 172, 256, 420
+        g = torch.Generator().manual_seed(456)
+        z = 1e-10 * torch.randn(n, r, generator=g)     # collapsed scale
+        p = torch.randn(n, m, generator=g)
+        w = KFMomentWindow({"t": r}, min_ratio=1.0, min_abs=64,
+                           fixed_maps=None)
+        class _Stub:
+            def pv(self, ctx, y):
+                return p[ctx["counterpart"] % n]
+        w.fixed_maps = _Stub()
+        rows = []
+        for i in range(n):
+            rows.append(CutRecord(
+                tree_id=0, cut_id=i, occurrence_id=i, tau="t",
+                node=i, time=float(i), z=z[i],
+                context={"delta_t": 0.0, "counterpart": i, "role": 0,
+                         "query_type": 0}, outcome=0.0))
+        closed, diag, gated = w.add(rows)
+        self.assertIn("t", closed)
+        j = float(closed["t"].detach())
+        self.assertTrue(np.isfinite(j))
+        self.assertGreaterEqual(j, -1e-6)
+        self.assertLessEqual(j, r + 1e-3,
+                             "collapsed-scale J must stay within the bound")
+
     def test_near_singular_covariance_does_not_crash(self):
         # Regression for the cloud crash: after ~18 epochs some z direction
         # collapses, making the 172x172 C_ZZ non-positive-definite at the

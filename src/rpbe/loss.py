@@ -20,9 +20,21 @@ from typing import Dict, List, Tuple
 import torch
 
 
-def _ridge(eps: float, sigma: torch.Tensor, jitter: float = 1e-12) -> torch.Tensor:
-    rel = eps * torch.trace(sigma).clamp(min=0.0) / sigma.shape[0]
-    return rel + jitter
+def _ridge(eps: float, sigma: torch.Tensor, jitter: float = 1e-6) -> torch.Tensor:
+    """Ridge that tracks the z scale: ``(eps + jitter) * trace/dim`` plus a
+    tiny absolute floor.
+
+    The OLD absolute jitter (1e-12) broke down when z collapsed: with
+    ``C_ZZ ~ a*I`` and ``a -> 0`` the relative part ``eps*trace/dim ~ 1e-14``
+    fell below the absolute jitter, ridge ~ 1e-12 dominated, and
+    ``(C_ZZ+ridge)^-1 ~ 1e12`` made ``J ~ a/1e-12`` explode past ``dim``
+    (cloud crash ``kf_score_out_of_bounds tjo:layer0 J=245.09 dim=172``).
+    A scale-following ridge restores the scale invariance of the score.
+    The 1e-14 floor only matters for trace ~ 0, which ``_j_from_covs``
+    already intercepts via the allclose check.
+    """
+    rel = (eps + jitter) * torch.trace(sigma).clamp(min=0.0) / sigma.shape[0]
+    return rel + 1e-14
 
 
 def _cholesky_retry(mat: torch.Tensor, tries: int = 8) -> torch.Tensor:

@@ -77,6 +77,8 @@ N = 12
 wins = 0
 window_batches = []
 shadow = None
+from rpbe.hosts.official_tgn import MLP
+decoder = MLP(dim=172, drop=0.1).to(device)
 acc('start')
 if VANILLA:
     # Official rhythm: ONE forward (no trace, no adapter hook) + task BCE
@@ -92,9 +94,10 @@ if VANILLA:
         opt.zero_grad(set_to_none=True)
         emb, _, _ = tgn.compute_temporal_embeddings(
             srcs, dsts, dsts, tms, eis, ND)
+        logits = decoder(emb)
         acc('vanilla_fwd')
         loss = torch.nn.functional.binary_cross_entropy(
-            emb.sigmoid(),
+            logits.sigmoid(),
             torch.from_numpy(lbs).float().to(device))
         loss.backward()
         acc('vanilla_backward')
@@ -103,57 +106,78 @@ if VANILLA:
         acc('vanilla_step')
     acc('end')
 else:
-    for k in range(N):
-        s, e = k * BS, min(len(train.sources), (k + 1) * BS)
-        srcs = train.sources[s:e]
-        dsts = train.destinations[s:e]
-        tms = train.timestamps[s:e]
-        eis = train.edge_idxs[s:e]
-        lbs = train.labels[s:e]
-        trace_rows = select_trace_rows(lbs, 32, 0, k, 'positive_first')
-        adapter.set_trace_source_rows(trace_rows)
-        with torch.no_grad():
-            tgn.compute_temporal_embeddings(srcs, dsts, dsts, tms, eis, ND)
-        acc('pass1_fwd')
-        revs = {int(r): {'dst': int(dsts[r]), 'label': float(lbs[r]),
-                         'time': float(tms[r]), 'event_idx': int(eis[r])}
-                for r in trace_rows}
-        cuts = builder.build(adapter.trace, root_events=revs, batch_seed=k)
-        acc('build_cuts')
-        window.add(cuts)
-        acc('window_add')
-        window_batches.append((srcs, dsts, tms, eis, lbs, trace_rows, k))
-        if shadow is None:
-            shadow = tgn.memory.backup_memory()
-        if window.window_ready():
-            closed, replay_plan, diag = window.close_replay()
-            acc('close_replay')
-            tgn.memory.restore_memory(shadow)
-            opt.zero_grad(set_to_none=True)
-            for bi, (src2, dst2, t2, e2, l2, tr2, step2) in \
-                    enumerate(window_batches):
-                adapter.set_trace_source_rows(tr2)
-                emb, _, _ = tgn.compute_temporal_embeddings(
-                    src2, dst2, dst2, t2, e2, ND)
-                acc('pass2_fwd')
-                loss = emb.sum() * 0.0
-                for tau, plan in replay_plan.items():
-                    if bi >= len(plan["by_batch"]):
-                        continue
-                    for (occ_id, g) in plan["by_batch"][bi]:
-                        z = adapter.trace.occurrences[occ_id].state.z
-                        loss = loss + (g * z.float()).sum()
-                acc('pass2_surrogate')
-                loss.backward()
-                acc('backward')
-                tgn.memory.detach_memory()
-            opt.step()
-            acc('optimizer_step')
-            window_batches = []
-            shadow = None
-            wins += 1
-    acc('end')
-    print('closed windows:', wins, 'of', N, 'batches')
+    # RPBE rounds: round 1 warms the fixed-measurement p cache (epoch 1
+    # cost); round 2 measures the epoch-2+ speed with cache hits.
+    def run_rpbe_round(measure):
+        global _last, wins, shadow, window_batches
+        _last = None
+        wins = 0
+        window_batches = []
+        shadow = None
+        window.reset()
+        tgn.memory.__init_memory__()   # epoch-start reset (real loop does this)
+        if measure:
+            times.clear()
+            acc('start')
+        for k in range(N):
+            s, e = k * BS, min(len(train.sources), (k + 1) * BS)
+            srcs = train.sources[s:e]
+            dsts = train.destinations[s:e]
+            tms = train.timestamps[s:e]
+            eis = train.edge_idxs[s:e]
+            lbs = train.labels[s:e]
+            trace_rows = select_trace_rows(lbs, 32, 0, k, 'positive_first')
+            adapter.set_trace_source_rows(trace_rows)
+            with torch.no_grad():
+                tgn.compute_temporal_embeddings(
+                    srcs, dsts, dsts, tms, eis, ND)
+            acc('pass1_fwd')
+            revs = {int(r): {'dst': int(dsts[r]), 'label': float(lbs[r]),
+                             'time': float(tms[r]),
+                             'event_idx': int(eis[r])} for r in trace_rows}
+            cuts = builder.build(adapter.trace, root_events=revs,
+                                 batch_seed=k)
+            acc('build_cuts')
+            window.add(cuts)
+            acc('window_add')
+            window_batches.append(
+                (srcs, dsts, tms, eis, lbs, trace_rows, k))
+            if shadow is None:
+                shadow = tgn.memory.backup_memory()
+            if window.window_ready():
+                closed, replay_plan, diag = window.close_replay()
+                acc('close_replay')
+                tgn.memory.restore_memory(shadow)
+                opt.zero_grad(set_to_none=True)
+                for bi, (src2, dst2, t2, e2, l2, tr2, step2) in \
+                        enumerate(window_batches):
+                    adapter.set_trace_source_rows(tr2)
+                    emb, _, _ = tgn.compute_temporal_embeddings(
+                        src2, dst2, dst2, t2, e2, ND)
+                    acc('pass2_fwd')
+                    loss = emb.sum() * 0.0
+                    for tau, plan in replay_plan.items():
+                        if bi >= len(plan["by_batch"]):
+                            continue
+                        for (occ_id, g) in plan["by_batch"][bi]:
+                            z = adapter.trace.occurrences[occ_id].state.z
+                            loss = loss + (g * z.float()).sum()
+                    acc('pass2_surrogate')
+                    loss.backward()
+                    acc('backward')
+                    tgn.memory.detach_memory()
+                opt.step()
+                acc('optimizer_step')
+                window_batches = []
+                shadow = None
+                wins += 1
+        if measure:
+            acc('end')
+            print('closed windows:', wins, 'of', N, 'batches')
+        return wins
+
+    run_rpbe_round(measure=False)   # warm the p cache
+    run_rpbe_round(measure=True)    # epoch-2+ speed
 total = sum(times.values())
 for kk, v in sorted(times.items(), key=lambda x: -x[1]):
     print('{:<16} {:7.2f}s  {:5.1f}%  ({:6.1f} ms/batch)'.format(

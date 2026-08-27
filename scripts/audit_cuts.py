@@ -267,8 +267,11 @@ def main():
         "owner_position_by_tau": {str(k): v
                                   for k, v in stats.get("owner_position",
                                                         {}).items()},
-        "parent_child_same_type": stats.get("parent_child_same_type", 0),
-        "bipartite_alternation_ok": stats.get("parent_child_same_type", 0) == 0,
+        # SELF recursion chains are same-type by construction; a NEIGHBOR
+        # edge joining same-type nodes is the real alternation violation.
+        "self_chain_same_type": stats.get("self_chain_same_type", 0),
+        "neighbor_same_type": stats.get("neighbor_same_type", 0),
+        "bipartite_alternation_ok": stats.get("neighbor_same_type", 0) == 0,
     }
 
     report = {

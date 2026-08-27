@@ -195,8 +195,11 @@ class JodieCutBuilder:
                 continue
             stats_raw[occ.tau] = stats_raw.get(occ.tau, 0) + 1
             # Structural audit (fifth review, spec E): bipartite types
-            # must alternate with depth — a parent-child pair of the same
-            # type is a collector bug, counted and asserted here.
+            # must alternate with depth ALONG NEIGHBOR edges.  The SELF
+            # recursion chain (relation 0) recurses on the SAME node and
+            # is same-type by construction — a neighbor edge (relation 1)
+            # joining two same-type nodes is a collector bug, counted and
+            # asserted separately.
             is_user = node in self.user_nodes
             ctype = "user" if is_user else ("page" if node in self.page_nodes
                                             else "unknown")
@@ -208,8 +211,13 @@ class JodieCutBuilder:
                 if pnode >= 0:
                     p_user = pnode in self.user_nodes
                     if p_user == is_user:
-                        stats["parent_child_same_type"] = \
-                            stats.get("parent_child_same_type", 0) + 1
+                        p_occ = trace.occurrences[par]
+                        i = p_occ.children.index(oid)
+                        rel = int(p_occ.child_relations[i]) \
+                            if i < len(p_occ.child_relations) else 0
+                        key = ("neighbor_same_type" if rel == 1
+                               else "self_chain_same_type")
+                        stats[key] = stats.get(key, 0) + 1
             cons = occ.metadata.get("consumption")
             kind = cons.get("kind") if isinstance(cons, dict) else "none"
             stats_kind[(occ.tau, kind)] = \

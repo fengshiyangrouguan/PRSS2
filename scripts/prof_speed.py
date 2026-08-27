@@ -14,6 +14,7 @@ random.seed(0); np.random.seed(0); torch.manual_seed(0)
 BS = int(sys.argv[1]) if len(sys.argv) > 1 else 100
 NL = int(sys.argv[2]) if len(sys.argv) > 2 else 2
 ND = int(sys.argv[3]) if len(sys.argv) > 3 else 10
+VANILLA = (len(sys.argv) > 4 and sys.argv[4] == "vanilla")
 
 from rpbe.data.jodie import JodieDataset
 from rpbe.hosts.official_tgn import TGN, get_neighbor_finder
@@ -77,57 +78,82 @@ wins = 0
 window_batches = []
 shadow = None
 acc('start')
-for k in range(N):
-    s, e = k * BS, min(len(train.sources), (k + 1) * BS)
-    srcs = train.sources[s:e]
-    dsts = train.destinations[s:e]
-    tms = train.timestamps[s:e]
-    eis = train.edge_idxs[s:e]
-    lbs = train.labels[s:e]
-    trace_rows = select_trace_rows(lbs, 32, 0, k, 'positive_first')
-    adapter.set_trace_source_rows(trace_rows)
-    with torch.no_grad():
-        tgn.compute_temporal_embeddings(srcs, dsts, dsts, tms, eis, ND)
-    acc('pass1_fwd')
-    revs = {int(r): {'dst': int(dsts[r]), 'label': float(lbs[r]),
-                     'time': float(tms[r]), 'event_idx': int(eis[r])}
-            for r in trace_rows}
-    cuts = builder.build(adapter.trace, root_events=revs, batch_seed=k)
-    acc('build_cuts')
-    window.add(cuts)
-    acc('window_add')
-    window_batches.append((srcs, dsts, tms, eis, lbs, trace_rows, k))
-    if shadow is None:
-        shadow = tgn.memory.backup_memory()
-    if window.window_ready():
-        closed, replay_plan, diag = window.close_replay()
-        acc('close_replay')
-        tgn.memory.restore_memory(shadow)
+if VANILLA:
+    # Official rhythm: ONE forward (no trace, no adapter hook) + task BCE
+    # + ONE backward + step per batch.  The adapter is still installed but
+    # traces nothing (empty trace set), so the host path is untouched.
+    for k in range(N):
+        s, e = k * BS, min(len(train.sources), (k + 1) * BS)
+        srcs = train.sources[s:e]
+        dsts = train.destinations[s:e]
+        tms = train.timestamps[s:e]
+        eis = train.edge_idxs[s:e]
+        lbs = train.labels[s:e]
         opt.zero_grad(set_to_none=True)
-        for bi, (src2, dst2, t2, e2, l2, tr2, step2) in \
-                enumerate(window_batches):
-            adapter.set_trace_source_rows(tr2)
-            emb, _, _ = tgn.compute_temporal_embeddings(
-                src2, dst2, dst2, t2, e2, ND)
-            acc('pass2_fwd')
-            loss = emb.sum() * 0.0
-            for tau, plan in replay_plan.items():
-                if bi >= len(plan["by_batch"]):
-                    continue
-                for (occ_id, g) in plan["by_batch"][bi]:
-                    z = adapter.trace.occurrences[occ_id].state.z
-                    loss = loss + (g * z.float()).sum()
-            acc('pass2_surrogate')
-            loss.backward()
-            acc('backward')
-            tgn.memory.detach_memory()
+        emb, _, _ = tgn.compute_temporal_embeddings(
+            srcs, dsts, dsts, tms, eis, ND)
+        acc('vanilla_fwd')
+        loss = torch.nn.functional.binary_cross_entropy(
+            emb.sigmoid(),
+            torch.from_numpy(lbs).float().to(device))
+        loss.backward()
+        acc('vanilla_backward')
+        tgn.memory.detach_memory()
         opt.step()
-        acc('optimizer_step')
-        window_batches = []
-        shadow = None
-        wins += 1
-acc('end')
-print('closed windows:', wins, 'of', N, 'batches')
+        acc('vanilla_step')
+    acc('end')
+else:
+    for k in range(N):
+        s, e = k * BS, min(len(train.sources), (k + 1) * BS)
+        srcs = train.sources[s:e]
+        dsts = train.destinations[s:e]
+        tms = train.timestamps[s:e]
+        eis = train.edge_idxs[s:e]
+        lbs = train.labels[s:e]
+        trace_rows = select_trace_rows(lbs, 32, 0, k, 'positive_first')
+        adapter.set_trace_source_rows(trace_rows)
+        with torch.no_grad():
+            tgn.compute_temporal_embeddings(srcs, dsts, dsts, tms, eis, ND)
+        acc('pass1_fwd')
+        revs = {int(r): {'dst': int(dsts[r]), 'label': float(lbs[r]),
+                         'time': float(tms[r]), 'event_idx': int(eis[r])}
+                for r in trace_rows}
+        cuts = builder.build(adapter.trace, root_events=revs, batch_seed=k)
+        acc('build_cuts')
+        window.add(cuts)
+        acc('window_add')
+        window_batches.append((srcs, dsts, tms, eis, lbs, trace_rows, k))
+        if shadow is None:
+            shadow = tgn.memory.backup_memory()
+        if window.window_ready():
+            closed, replay_plan, diag = window.close_replay()
+            acc('close_replay')
+            tgn.memory.restore_memory(shadow)
+            opt.zero_grad(set_to_none=True)
+            for bi, (src2, dst2, t2, e2, l2, tr2, step2) in \
+                    enumerate(window_batches):
+                adapter.set_trace_source_rows(tr2)
+                emb, _, _ = tgn.compute_temporal_embeddings(
+                    src2, dst2, dst2, t2, e2, ND)
+                acc('pass2_fwd')
+                loss = emb.sum() * 0.0
+                for tau, plan in replay_plan.items():
+                    if bi >= len(plan["by_batch"]):
+                        continue
+                    for (occ_id, g) in plan["by_batch"][bi]:
+                        z = adapter.trace.occurrences[occ_id].state.z
+                        loss = loss + (g * z.float()).sum()
+                acc('pass2_surrogate')
+                loss.backward()
+                acc('backward')
+                tgn.memory.detach_memory()
+            opt.step()
+            acc('optimizer_step')
+            window_batches = []
+            shadow = None
+            wins += 1
+    acc('end')
+    print('closed windows:', wins, 'of', N, 'batches')
 total = sum(times.values())
 for kk, v in sorted(times.items(), key=lambda x: -x[1]):
     print('{:<16} {:7.2f}s  {:5.1f}%  ({:6.1f} ms/batch)'.format(

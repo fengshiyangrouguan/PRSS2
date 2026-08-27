@@ -27,13 +27,19 @@ def _fixed_binary(shape, seed, device=None, dtype=None):
 class FixedMaps(nn.Module):
     """phi_C, phi_Y and the sparse CountSketch of their tensor product."""
 
-    def __init__(self, cfg, *, num_counter_bins: int = 4096):
+    def __init__(self, cfg, *, num_counter_bins: int = 4096,
+                 p_cache_max_entries: int = 4096):
         super().__init__()
         self.cfg = cfg
         self.d_c = int(cfg.d_c)
         self.d_f = int(cfg.d_f)
         self.m = int(cfg.m)
         self.num_counter_bins = int(num_counter_bins)
+        # Fixed-measurement batch cache (see pv_batch docstring).  4096
+        # batches x ~2300 rows x 64 floats x 4B ~ 2.4GB worst case; set
+        # 0 to disable.
+        self.p_cache_max_entries = int(p_cache_max_entries)
+        self._p_cache = {}
         # Frozen at construction: later cfg mutations must not change the
         # measurement (the fingerprint covers this value).
         self._delta_t_scale = float(cfg.delta_t_scale)
@@ -150,12 +156,31 @@ class FixedMaps(nn.Module):
         ``contexts`` is a list of context dicts, ``outcomes`` a float list;
         the per-row small-operator storm of ``pv`` is avoided by batching the
         RFF pass, the categorical gathers and a single index_add.
+
+        Fixed-measurement cache (sixth review, step 4): psi is a FIXED map
+        and the sampling/tree structure is deterministic, so the same
+        batch of (context, outcome) rows recurs every epoch.  The batch is
+        keyed by its full row-semantic tuple; hits skip the CountSketch
+        scatter entirely (the measured ~210 ms/batch hotspot).  The cache
+        holds CPU float32 copies and is bounded (oldest-eviction by
+        dict order); a map/seed change produces different keys by
+        construction, so no version stamping is needed.
         """
         n = len(contexts)
         if n == 0:
             return torch.zeros((0, self.m), dtype=self.rff_w.dtype,
                                device=self.rff_w.device)
         dev = self.rff_w.device
+        key = tuple((int(c["horizon"]), float(c["delta_t"]),
+                     int(c["counterpart"]), int(c["role"]),
+                     int(c["query_type"]),
+                     tuple((int(rel), float(dt))
+                           for rel, dt in c.get("path", [])),
+                     float(y))
+                    for c, y in zip(contexts, outcomes))
+        hit = self._p_cache.get(key)
+        if hit is not None:
+            return hit.to(dev, dtype=self.rff_w.dtype)
         with torch.no_grad():
             deltas = torch.tensor(
                 [float(c["delta_t"]) for c in contexts],
@@ -199,6 +224,10 @@ class FixedMaps(nn.Module):
             out.view(-1).index_add_(
                 0, col_idx,
                 flat[row_idx] * self.sketch_signs.repeat(n))
+            if self.p_cache_max_entries > 0:
+                while len(self._p_cache) >= self.p_cache_max_entries:
+                    self._p_cache.pop(next(iter(self._p_cache)))
+                self._p_cache[key] = out.detach().float().cpu()
             return out
 
     @staticmethod

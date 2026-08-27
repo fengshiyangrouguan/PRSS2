@@ -129,6 +129,36 @@ class TestPsiBehavior(unittest.TestCase):
             self.assertTrue(torch.equal(batch[i], self.maps.psi(c, y)),
                             "pv_batch row {} diverges from pv".format(i))
 
+    def test_p_cache_hits_are_bit_identical(self):
+        # The fixed-measurement cache must return BIT-IDENTICAL rows: the
+        # cached float32 copy goes straight back to the device, no
+        # recomputation, no floating-point drift.
+        contexts = [base_context(counterpart=i, delta_t=1000.0 * (i + 1),
+                                 role=i % 2, query_type=i % 2,
+                                 path=[(i % 2, 500.0)])
+                    for i in range(8)]
+        outcomes = [0.0, 1.0] * 4
+        first = self.maps.pv_batch(contexts, outcomes)
+        self.assertGreater(len(self.maps._p_cache), 0)
+        second = self.maps.pv_batch(contexts, outcomes)   # cache hit
+        self.assertTrue(torch.equal(first, second),
+                        "cached pv_batch must be bit-identical")
+        # A different batch must NOT collide with the cached key.
+        other = [dict(c, counterpart=c["counterpart"] + 1)
+                 for c in contexts]
+        third = self.maps.pv_batch(other, outcomes)
+        self.assertFalse(torch.equal(first, third))
+
+    def test_p_cache_disabled_matches_enabled(self):
+        cfg = make_cfg(seed=1)
+        a = FixedMaps(cfg, p_cache_max_entries=0)
+        b = FixedMaps(cfg, p_cache_max_entries=8)
+        contexts = [base_context(counterpart=i, delta_t=700.0 * i)
+                    for i in range(5)]
+        outcomes = [0.0, 1.0, 0.0, 1.0, 0.0]
+        self.assertTrue(torch.equal(a.pv_batch(contexts, outcomes),
+                                    b.pv_batch(contexts, outcomes)))
+
 
 if __name__ == "__main__":
     unittest.main()

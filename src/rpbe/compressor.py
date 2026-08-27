@@ -26,20 +26,20 @@ class RecursiveCompressor(nn.Module):
         agg_dims = dict(agg_dims) if agg_dims is not None else dict(cfg.own_dims)
         self.adapters = nn.ModuleDict({
             tau: nn.Linear(int(cfg.own_dims[tau]), D)
-            for tau in cfg.interfaces})
+            for tau in cfg.state_dims})
         self.agg_adapters = nn.ModuleDict({
             tau: nn.Linear(int(agg_dims[tau]), D)
-            for tau in cfg.interfaces})
+            for tau in cfg.state_dims})
         self.heads = nn.ModuleDict({
             tau: nn.Linear(D, int(r_tau))
-            for tau, r_tau in cfg.interfaces.items()})
+            for tau, r_tau in cfg.state_dims.items()})
         # Shared core: [A(o); A_agg(aggregate)] -> D, with residual.
         self.core = nn.Sequential(
             nn.Linear(2 * D, D), activation(), nn.Linear(D, D))
 
     def compress(self, *, tau: str, own_input: torch.Tensor,
                  aggregate_output: torch.Tensor) -> torch.Tensor:
-        """One interface call: [N, d_o] x [N, d_agg] -> [N, r_tau].
+        """One interface call: [N, d_o] x [N, d_agg] -> [N, d_tau].
 
         ``aggregate_output`` is the host aggregate result (layer 0 has no
         children: the host passes its raw state in both slots).
@@ -50,4 +50,4 @@ class RecursiveCompressor(nn.Module):
         return self.heads[tau](h)
 
     def interface_dims(self) -> dict:
-        return dict(self.cfg.interfaces)
+        return dict(self.cfg.state_dims)

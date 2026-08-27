@@ -10,7 +10,7 @@ from rpbe.maps import FixedMaps
 
 def make_cfg(seed=0, **kw):
     return RPBConfig(
-        interfaces={"tjo:layer0": 8, "tjo:layer1": 8, "tjo:layer2": 8},
+        state_dims={"tjo:layer0": 8, "tjo:layer1": 8, "tjo:layer2": 8},
         own_dims={"tjo:layer0": 8, "tjo:layer1": 8, "tjo:layer2": 8},
         d_c=32, d_f=32, m=256, rpbe_seed=seed, **kw)
 

@@ -21,7 +21,7 @@ import torch
 import torch.nn.functional as F
 from sklearn.metrics import average_precision_score, roc_auc_score
 
-from rpbe.loss import KyFanTracker, kf_loss
+from rpbe.loss import KFMomentWindow, kf_loss
 from rpbe.training.isolation import assert_clean, rpbe_fingerprint
 
 EPS = 1e-7
@@ -106,11 +106,21 @@ class JodieNodeClassificationLoop:
         self.trace_mode = trace_mode
         self.rpbe_on = bool(adapter is not None and cut_builder is not None
                             and fixed_maps is not None and rpbe_cfg is not None)
-        self.kf_tracker = (KyFanTracker(
-            rpbe_cfg.interfaces, ema_rho=rpbe_cfg.kf_ema_rho,
-            min_ratio=rpbe_cfg.kf_min_ratio, min_abs=rpbe_cfg.kf_min_abs,
-            eps=rpbe_cfg.ridge_eps, fixed_maps=fixed_maps)
+        self.kf_window = (KFMomentWindow(
+            rpbe_cfg.state_dims, min_ratio=rpbe_cfg.kf_min_ratio,
+            min_abs=rpbe_cfg.kf_min_abs, eps=rpbe_cfg.ridge_eps,
+            fixed_maps=fixed_maps)
             if self.rpbe_on else None)
+
+    def _clip_all_groups(self):
+        """Gradient clipping across EVERY optimizer parameter group."""
+        if self.grad_clip <= 0:
+            return
+        params = [p for g in self.optimizer.param_groups
+                  for p in g["params"] if p.grad is not None]
+        if params:
+            torch.nn.utils.clip_grad_norm_(params, max_norm=self.grad_clip,
+                                           error_if_nonfinite=True)
 
     # ------------------------------------------------------------- stream state
     def reset_memory(self):
@@ -140,6 +150,10 @@ class JodieNodeClassificationLoop:
         kf_count = 0
         skipped_types = set()
         train_probs, train_labels = [], []
+        # Windowed accumulation (RPBE on): the task loss and the KF moments
+        # accumulate over microbatches; ONE backward fires when a tau window
+        # closes.  Vanilla keeps the upstream per-batch step.
+        window_task = None
         num_batch = math.ceil(len(train.sources) / self.batch_size)
         for k in range(num_batch):
             s, e = k * self.batch_size, min(len(train.sources),
@@ -150,7 +164,8 @@ class JodieNodeClassificationLoop:
             edge_idxs = train.edge_idxs[s:e]
             labels_np = train.labels[s:e]
             labels_t = torch.from_numpy(labels_np).float().to(self.device)
-            self.optimizer.zero_grad(set_to_none=True)
+            if not self.rpbe_on:
+                self.optimizer.zero_grad(set_to_none=True)
 
             trace_rows = []
             if self.adapter is not None:
@@ -171,60 +186,66 @@ class JodieNodeClassificationLoop:
 
             kf_v = 0.0
             kf_detail = {}
-            if self.rpbe_on and trace_rows and self.adapter.trace is not None:
-                cuts = self.cut_builder.build(self.adapter.trace,
-                                              batch_seed=global_step)
-                if not cuts:
-                    # Monitoring hole fix: a batch with no valid cuts must be
-                    # visible, not silent.
-                    self.monitor.alert("warning", "kf_no_cuts",
-                                       "batch produced no valid cuts",
-                                       step=global_step)
-                    main_loss = task_loss
-                else:
-                    scores, skipped = self.kf_tracker.update(cuts)
-                    skipped_types.update(skipped)
-                    if skipped:
-                        self.monitor.alert(
-                            "warning", "kf_gated_tau",
-                            "gated below min unique cuts: {}"
-                            .format(sorted(skipped)), step=global_step)
-                    if scores:
-                        kf_term = kf_loss(scores, self.rpbe_cfg.alphas)
-                        kf_v = float(kf_term.detach())
-                        kf_detail = {tau: float(j.detach())
-                                     for tau, j in scores.items()}
-                        for tau, jv in kf_detail.items():
-                            kf_sum[tau] = kf_sum.get(tau, 0.0) + jv
-                            kf_count_tau[tau] = kf_count_tau.get(tau, 0) + 1
-                        kf_count += 1
-                        # J bound is min(r, n-1) with the EFFECTIVE sample
-                        # size, not the P sketch dim.
-                        dims = {}
-                        for tau in kf_detail:
-                            n_eff = self.kf_tracker.effective_n(tau)
-                            dims[tau] = int(min(self.rpbe_cfg.interfaces[tau],
-                                                max(1, n_eff - 1)))
-                        self.monitor.validate_kf(kf_detail, dims, global_step)
-                        main_loss = task_loss + self.lambda_kf * kf_term
+            if self.rpbe_on:
+                window_task = task_loss if window_task is None \
+                    else window_task + task_loss
+                if trace_rows and self.adapter.trace is not None:
+                    cuts = self.cut_builder.build(self.adapter.trace,
+                                                  batch_seed=global_step)
+                    if not cuts:
+                        self.monitor.alert("warning", "kf_no_cuts",
+                                           "batch produced no valid cuts",
+                                           step=global_step)
                     else:
-                        main_loss = task_loss
+                        closed, diag, gated = self.kf_window.add(cuts)
+                        skipped_types.update(gated)
+                        if gated:
+                            self.monitor.alert(
+                                "warning", "kf_gated_tau",
+                                "still accumulating: {}".format(sorted(gated)),
+                                step=global_step)
+                        if closed:
+                            kf_term = kf_loss(closed, self.rpbe_cfg.alphas)
+                            kf_v = float(kf_term.detach())
+                            kf_detail = {tau: float(j.detach())
+                                         for tau, j in closed.items()}
+                            for tau, jv in kf_detail.items():
+                                kf_sum[tau] = kf_sum.get(tau, 0.0) + jv
+                                kf_count_tau[tau] = kf_count_tau.get(tau, 0) + 1
+                            kf_count += 1
+                            dims = {}
+                            for tau in kf_detail:
+                                m_u = int(diag[tau]["M_unique"])
+                                dims[tau] = int(min(
+                                    self.rpbe_cfg.state_dims[tau],
+                                    max(1, m_u - 1)))
+                            self.monitor.validate_kf(kf_detail, dims,
+                                                     global_step)
+                            # ONE backward for the whole window.
+                            total = window_task + self.lambda_kf * kf_term
+                            self.optimizer.zero_grad(set_to_none=True)
+                            total.backward()
+                            self._clip_all_groups()
+                            self.optimizer.step()
+                            window_task = None
+                main_loss = task_loss
             else:
                 main_loss = task_loss
+                self.monitor.validate_losses({
+                    "task": float(task_loss.detach()),
+                    "kf": 0.0,
+                    "main_total": float(task_loss.detach()),
+                }, global_step)
+                main_loss.backward()
+                self._clip_all_groups()
+                self.optimizer.step()
 
-            self.monitor.validate_losses({
-                "task": float(task_loss.detach()),
-                "kf": kf_v,
-                "main_total": float(main_loss.detach()),
-            }, global_step)
-
-            main_loss.backward()
-            if self.grad_clip > 0:
-                torch.nn.utils.clip_grad_norm_(
-                    [p for p in self.optimizer.param_groups[0]["params"]
-                     if p.grad is not None], max_norm=self.grad_clip,
-                    error_if_nonfinite=True)
-            self.optimizer.step()
+            if self.rpbe_on:
+                self.monitor.validate_losses({
+                    "task": float(task_loss.detach()),
+                    "kf": kf_v,
+                    "main_total": float(task_loss.detach() + kf_v),
+                }, global_step)
 
             # Upstream truncation invariant: detach the memory graph when the
             # host can carry gradients.
@@ -238,17 +259,27 @@ class JodieNodeClassificationLoop:
             n_batches += 1
             global_step += 1
 
+        # Drain a partial window with a task-only step (kf needs more cuts).
+        if self.rpbe_on and window_task is not None:
+            self.monitor.alert("warning", "kf_window_unclosed",
+                               "epoch ended with an unclosed KF window; "
+                               "task-only step", step=global_step)
+            self.optimizer.zero_grad(set_to_none=True)
+            window_task.backward()
+            self._clip_all_groups()
+            self.optimizer.step()
+
         train_metrics = metric_bundle(np.concatenate(train_labels),
                                       np.concatenate(train_probs))
         kf_out = None
         if kf_count and self.rpbe_cfg is not None:
-            # Per-tau denominators: each tau averages over its own scored
-            # batches, and J_frac uses the saturation-aware bound
-            # min(r_tau, n_eff-1), not the sketch dim m.
+            # Per-tau denominators: each tau averages over its own closed
+            # windows; J_frac uses the saturation-aware bound
+            # min(d_tau, M_window-1) of the LAST closed window.
             j_frac = {}
             for tau, v in kf_sum.items():
-                n_eff = self.kf_tracker.effective_n(tau)
-                bound = min(self.rpbe_cfg.interfaces[tau], max(1, n_eff - 1))
+                m_u = self.kf_window.window_m(tau)
+                bound = min(self.rpbe_cfg.state_dims[tau], max(1, m_u - 1))
                 j_frac[tau] = (v / kf_count_tau.get(tau, 1)) / bound
             kf_out = {
                 "J": {tau: v / kf_count_tau.get(tau, 1)

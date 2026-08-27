@@ -34,6 +34,9 @@ class FixedMaps(nn.Module):
         self.d_f = int(cfg.d_f)
         self.m = int(cfg.m)
         self.num_counter_bins = int(num_counter_bins)
+        # Frozen at construction: later cfg mutations must not change the
+        # measurement (the fingerprint covers this value).
+        self._delta_t_scale = float(cfg.delta_t_scale)
         seed = int(cfg.rpbe_seed)
 
         # Rows: [0, bins) counterpart hash; bins+0/1 -> role; bins+2/3 -> query.
@@ -76,7 +79,7 @@ class FixedMaps(nn.Module):
     # ------------------------------------------------------------- primitives
     def context_vector(self, context) -> torch.Tensor:
         """phi_C(c) for one row: {delta_t, counterpart, role, query_type}."""
-        delta = float(context["delta_t"]) / float(self.cfg.delta_t_scale)
+        delta = float(context["delta_t"]) / self._delta_t_scale
         delta_t = torch.tensor(delta, dtype=self.rff_w.dtype,
                                device=self.rff_w.device).reshape(1, 1)
         rff = torch.cos(delta_t @ self.rff_w + self.rff_b)  # [1, d_c]
@@ -168,12 +171,12 @@ class FixedMaps(nn.Module):
         h = hashlib.sha256()
         h.update(str(self.cfg.rpbe_seed).encode())
         h.update(str(self._sketch_full_dim).encode())
-        h.update(str(float(self.cfg.delta_t_scale)).encode())
+        h.update(str(self._delta_t_scale).encode())
         for name in ("categorical_c", "future_table", "rff_w", "rff_b",
                      "sketch_indices", "sketch_signs"):
             buf = getattr(self, name)
             h.update(buf.detach().cpu().reshape(-1).contiguous()
                      .numpy().tobytes())
         return {"seed": int(self.cfg.rpbe_seed),
-                "delta_t_scale": float(self.cfg.delta_t_scale),
+                "delta_t_scale": self._delta_t_scale,
                 "sha256": h.hexdigest()}

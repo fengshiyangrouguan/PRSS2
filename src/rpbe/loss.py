@@ -97,11 +97,11 @@ def kf_loss(scores: Dict[str, torch.Tensor], alphas: Dict[str, float]) -> torch.
     return -sum(float(alphas.get(tau, 1.0)) * j for tau, j in scores.items())
 
 
-def score_rows_by_type(rows: List, interfaces: Dict[str, int]) -> Dict[str, list]:
+def score_rows_by_type(rows: List, state_dims: Dict[str, int]) -> Dict[str, list]:
     """Split CutRecord rows into per-tau (z list, p list) pairs."""
     by_tau = {}
     for r in rows:
-        if r.tau not in interfaces:
+        if r.tau not in state_dims:
             continue
         by_tau.setdefault(r.tau, []).append(r)
     return by_tau
@@ -110,105 +110,155 @@ def score_rows_by_type(rows: List, interfaces: Dict[str, int]) -> Dict[str, list
 def dedup_cut_rows(rows: List, fixed_maps):
     """One row per unique cut: z appears once, P rows of one cut are averaged.
 
-    Stage-1 link cuts repeat the same z across 1 positive + k negative rows;
-    counting those rows as independent samples gives the small-sample CCA
-    saturation (rank(Z_c) is bounded by the number of UNIQUE cuts, not by the
-    row count).  Averaging the P rows of a cut is the corresponding
-    context-balancing weight.
+    Returns ``(keys, zs, ps)`` where ``keys`` are ``(node, time, tau)``
+    triples — the cross-batch identity of a cut (``cut_id`` is only unique
+    within one trace).  The link stage no longer fabricates negative rows
+    (each cut carries ONE real future continuation), so the dedup is a
+    defensive layer for any residual repetition.
     """
     by_cut: Dict[int, list] = {}
     for r in rows:
         by_cut.setdefault(int(r.cut_id), []).append(r)
-    zs, ps = [], []
+    keys, zs, ps = [], [], []
     for _, cut_rows in by_cut.items():
-        zs.append(cut_rows[0].z)
+        r0 = cut_rows[0]
+        keys.append((int(r0.node), float(r0.time), str(r0.tau)))
+        zs.append(r0.z)
         p_rows = [fixed_maps.pv(r.context, r.outcome) for r in cut_rows]
         ps.append(torch.stack(p_rows).mean(dim=0) if len(p_rows) > 1
                   else p_rows[0])
-    return torch.stack(zs), torch.stack(ps)
+    return keys, torch.stack(zs), torch.stack(ps)
 
 
-class KyFanTracker:
-    """Running (EMA) per-tau statistics for the Ky Fan score.
+class KFMomentWindow:
+    """Cross-microbatch moment accumulation for the Ky Fan score.
 
-    The score is computed over UNIQUE cuts accumulated across batches — the
-    batch-level stochastic approximation of the population statistics
-    ``E[z z^T]`` etc.  The EMA history is detached (constant measurement
-    history); the CURRENT batch's covariance contributions carry the full
-    gradient, which preserves the scale invariance ``<grad_z J, z> = 0``
-    within each step.  A tau only produces a score (and therefore a training
-    signal) once its effective unique-cut count exceeds the threshold
-    ``max(min_ratio * r_tau, min_abs)``: below that, in-batch canonical
-    correlations saturate on independent noise (J -> min(r, M-1)), so the
-    term is gated out instead of feeding noise gradients.
+    Per tau, accumulate (M, sum z, sum p, sum zz^T, sum pp^T, sum zp^T) over
+    temporal microbatches.  All z-carrying quantities stay graph-connected;
+    the window closes when M — counted in UNIQUE cut ids seen IN THIS WINDOW —
+    reaches ``max(min_ratio * d_tau, min_abs)``.  Only then J_tau is computed
+    (once) from the window moments, and the caller performs ONE backward for
+    the accumulated task loss plus the Ky Fan term.  The window then resets.
 
-    ``update`` returns ``(scores, skipped)``; ``skipped`` lists taus that
-    received data but did not meet the gate this step, so callers can alert.
+    This is not a second trainer or a calibration pass: it is just a Ky Fan
+    minibatch large enough that the small-sample CCA saturation (fake full
+    score on independent noise) cannot occur.
     """
 
-    def __init__(self, interfaces: Dict[str, int], *, ema_rho: float = 0.05,
-                 min_ratio: float = 2.0, min_abs: int = 64, eps: float = 1e-4,
-                 fixed_maps=None):
-        self.interfaces = dict(interfaces)
-        self.ema_rho = float(ema_rho)
+    def __init__(self, state_dims: Dict[str, int], *, min_ratio: float = 2.0,
+                 min_abs: int = 64, eps: float = 1e-4, fixed_maps=None):
+        self.state_dims = dict(state_dims)
         self.min_ratio = float(min_ratio)
         self.min_abs = int(min_abs)
         self.eps = float(eps)
         self.fixed_maps = fixed_maps
-        self._state: Dict[str, Tuple[torch.Tensor, ...]] = {}
+        self._windows: Dict[str, dict] = {}
 
     def _threshold(self, tau: str) -> float:
-        return max(self.min_ratio * int(self.interfaces[tau]),
+        return max(self.min_ratio * int(self.state_dims[tau]),
                    float(self.min_abs))
 
-    def update(self, rows: List):
-        """``rows``: this batch's CutRecord rows (any tau)."""
-        by_tau = score_rows_by_type(rows, self.interfaces)
-        scores: Dict[str, torch.Tensor] = {}
-        skipped: List[str] = []
+    def add(self, rows: List):
+        """Accumulate a batch of CutRecord rows.
+
+        Returns ``(closed, diagnostics, gated)``:
+        ``closed`` = {tau: J} for windows that closed this step (graph-
+        connected J, one per tau); ``diagnostics`` = per-tau {M, J_shuffled,
+        cond_zz, cond_pp} (detached); ``gated`` = taus still accumulating.
+        """
+        by_tau = score_rows_by_type(rows, self.state_dims)
+        closed: Dict[str, torch.Tensor] = {}
+        diagnostics: Dict[str, dict] = {}
+        gated: List[str] = []
         for tau, tau_rows in by_tau.items():
             if self.fixed_maps is None:
-                raise ValueError("KyFanTracker requires fixed_maps")
-            zs, ps = dedup_cut_rows(tau_rows, self.fixed_maps)
-            m_u = int(zs.shape[0])
-            if m_u < 2:
-                skipped.append(tau)
+                raise ValueError("KFMomentWindow requires fixed_maps")
+            keys, zs, ps = dedup_cut_rows(tau_rows, self.fixed_maps)
+            win = self._windows.get(tau)
+            if win is None:
+                win = {"m": 0, "sz": None, "sp": None, "szz": None,
+                       "spp": None, "szp": None, "seen": set(),
+                       "zs_list": [], "ps_list": []}
+                self._windows[tau] = win
+            # Cross-batch dedupe on the cut's (node, as-of time, tau)
+            # identity: cut_id repeats across traces, the triple does not
+            # (one cut = one node state at one moment at one interface).
+            fresh = [i for i, key in enumerate(keys)
+                     if key not in win["seen"]]
+            if not fresh:
+                gated.append(tau)
                 continue
-            mu_z = zs.mean(dim=0)
-            mu_p = ps.mean(dim=0)
-            czz = zs.t() @ zs / m_u - torch.outer(mu_z, mu_z)   # grad via zs
-            czp = zs.t() @ ps / m_u - torch.outer(mu_z, mu_p)   # grad via zs
-            cpp = ps.t() @ ps / m_u - torch.outer(mu_p, mu_p)   # P constant
-            st = self._state.get(tau)
-            if st is None:
-                n, a, b, d = float(m_u), czz, czp, cpp
-            else:
-                n0, a, b, d = st   # history is detached (constant history)
-                rho = self.ema_rho
-                # n is a CUMULATIVE unique-cut count (the gate asks "have we
-                # ever seen enough unique cuts"), while the covariances are
-                # EMA-smoothed.  An EMA'd n would converge to the batch size
-                # and gate out any tau whose per-batch count sits below the
-                # threshold forever (e.g. the root layer).
-                n = n0 + float(m_u)
-                a = rho * czz + (1 - rho) * a
-                b = rho * czp + (1 - rho) * b
-                d = rho * cpp + (1 - rho) * d
-            # Store detached so the graph never spans batches.
-            self._state[tau] = (n, a.detach(), b.detach(), d.detach())
-            if n < self._threshold(tau):
-                skipped.append(tau)
+            zs = zs[fresh]
+            ps = ps[fresh]
+            win["seen"].update(keys[i] for i in fresh)
+            zs = zs.float()                       # never AMP fp16 moments
+            ps = ps.float()
+            win["m"] += len(fresh)
+            win["sz"] = zs.sum(0) if win["sz"] is None else win["sz"] + zs.sum(0)
+            win["sp"] = ps.sum(0) if win["sp"] is None else win["sp"] + ps.sum(0)
+            win["szz"] = zs.t() @ zs if win["szz"] is None else win["szz"] + zs.t() @ zs
+            win["spp"] = ps.t() @ ps if win["spp"] is None else win["spp"] + ps.t() @ ps
+            win["szp"] = zs.t() @ ps if win["szp"] is None else win["szp"] + zs.t() @ ps
+            # Detached row copies for the shuffled diagnostic only.
+            win["zs_list"].append(zs.detach())
+            win["ps_list"].append(ps.detach())
+            if win["m"] < self._threshold(tau):
+                gated.append(tau)
                 continue
-            r = int(self.interfaces[tau])
-            lz = _cholesky_retry(a + _ridge(self.eps, a) * torch.eye(
-                r, dtype=a.dtype, device=a.device))
-            lp = _cholesky_retry(d + _ridge(self.eps, d) * torch.eye(
-                d.shape[0], dtype=d.dtype, device=d.device))
-            w = torch.cholesky_solve(b, lz)           # [r, m] = (A+e)^-1 B
-            s = torch.cholesky_solve(b.t(), lp)       # [m, r] = (D+e)^-1 B^T
-            scores[tau] = (w * s.t()).sum()
-        return scores, skipped
+            # Window closes: covariances from the moments (full gradient via
+            # every z-carrying moment).
+            m = float(win["m"])
+            zbar = win["sz"] / m
+            pbar = win["sp"] / m
+            czz = win["szz"] / m - torch.outer(zbar, zbar)
+            czp = win["szp"] / m - torch.outer(zbar, pbar)
+            cpp = win["spp"] / m - torch.outer(pbar, pbar)
+            j = _j_from_covs(czz, czp, cpp, self.eps, zs)
+            closed[tau] = j
+            diagnostics[tau] = self._diagnostics(win, czz, cpp)
+            # Reset the window for the next accumulation cycle.
+            self._windows.pop(tau)
+        return closed, diagnostics, gated
 
-    def effective_n(self, tau: str) -> float:
-        st = self._state.get(tau)
-        return float(st[0]) if st is not None else 0.0
+    def _diagnostics(self, win, czz, cpp) -> dict:
+        with torch.no_grad():
+            z_all = torch.cat(win["zs_list"], dim=0)   # [M, d] detached
+            p_all = torch.cat(win["ps_list"], dim=0)   # [M, m] detached
+            m = float(z_all.shape[0])
+            # Shuffled score: permute the SAMPLE pairing of P (column
+            # permutations are trace-invariant and would prove nothing).
+            perm = torch.randperm(int(m), generator=torch.Generator(
+                device=cpp.device).manual_seed(int(m * 7919) % (2 ** 31)))
+            zc = z_all - z_all.mean(0, keepdim=True)
+            pc = p_all[perm] - p_all[perm].mean(0, keepdim=True)
+            czp_shuffled = zc.t() @ pc / m
+            j_shuffled = _j_from_covs(czz.detach(), czp_shuffled,
+                                      cpp.detach(), self.eps, None)
+            cond_zz = float(torch.linalg.cond(czz.detach()))
+            cond_pp = float(torch.linalg.cond(cpp.detach()))
+        return {"M_unique": int(m), "J_shuffled": float(j_shuffled),
+                "cond_zz": cond_zz, "cond_pp": cond_pp}
+
+    def window_m(self, tau: str) -> int:
+        win = self._windows.get(tau)
+        return int(win["m"]) if win is not None else 0
+
+
+def _j_from_covs(czz, czp, cpp, eps, zs_for_zero):
+    """J = tr[(C_ZZ+e)^-1 C_ZP (C_PP+e)^-1 C_PZ], constant-safe.
+
+    A constant Z makes C_ZZ zero; return a differentiable zero instead of
+    letting a vanishing ridge feed Cholesky.
+    """
+    if torch.allclose(czz, torch.zeros_like(czz), atol=1e-12) \
+            or torch.allclose(cpp, torch.zeros_like(cpp), atol=1e-12):
+        # Differentiable zero: keeps the graph connected without a score.
+        return czp.sum() * 0.0
+    r = czz.shape[0]
+    lz = _cholesky_retry(czz + _ridge(eps, czz) * torch.eye(
+        r, dtype=czz.dtype, device=czz.device))
+    lp = _cholesky_retry(cpp + _ridge(eps, cpp) * torch.eye(
+        cpp.shape[0], dtype=cpp.dtype, device=cpp.device))
+    w = torch.cholesky_solve(czp, lz)
+    s = torch.cholesky_solve(czp.t(), lp)
+    return (w * s.t()).sum()

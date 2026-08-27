@@ -30,7 +30,7 @@ def make_trace(root_rows=(0, 2), as_of_times=(10.0, 12.0)):
             child_delta_t=[0.0] * len(children),
             metadata={"layer": int(tau.split(":")[1][len("layer"):]),
                       "node": node, "time": time,
-                      "own_raw": torch.randn(4)}))
+}))
         return oid
 
     for i, (row, t) in enumerate(zip(root_rows, as_of_times)):
@@ -117,23 +117,32 @@ class TestJodieCutBuilder(unittest.TestCase):
             self.assertIn("counterpart", r.context)
             self.assertTrue(r.valid)
 
-    def test_stage1_positive_plus_negatives(self):
+    def test_stage1_one_real_continuation_per_cut(self):
+        # Ky Fan measurement uses REAL futures only: exactly one row per
+        # cut, no fabricated negatives (those belong to the link TASK loss).
         trace = make_trace(as_of_times=(4.0, 9.0))
-        rows = JodieCutBuilder(self.idx, stage=LINK, neg_per_cut=3,
-                               seed=7).build(trace, batch_seed=0)
-        # Four cuts x (1 pos + 3 neg).
-        self.assertEqual(len(rows), 4 * 4)
-        self.assertEqual(sum(1 for r in rows if r.outcome == 1.0), 4)
-        self.assertEqual(sum(1 for r in rows if r.outcome == 0.0), 12)
+        rows = JodieCutBuilder(self.idx, stage=LINK, seed=7).build(
+            trace, batch_seed=0)
+        self.assertEqual(len(rows), 4)  # 2 cuts per tree x 2 trees, 1 row each
         for r in rows:
             self.assertEqual(r.context["query_type"], 0)
-        # z repeats across the rows of one cut (same tensor object).
-        pos = next(r for r in rows if r.cut_id == 0 and r.outcome == 1.0)
-        negs = [r for r in rows if r.cut_id == 0 and r.outcome == 0.0]
-        self.assertEqual(len(negs), 3)
-        for n in negs:
-            self.assertTrue(torch.equal(n.z, pos.z))
-            self.assertNotEqual(n.context["counterpart"], pos.context["counterpart"])
+            self.assertIn(r.outcome, (0.0, 1.0))  # the observed event label
+            self.assertNotIn("is_positive", r.context)
+        # Node 5 (t=4) next event has label 0.0; node 6 (t=9) next 1.0.
+        by_cut = {r.cut_id: r for r in rows}
+        self.assertEqual(by_cut[0].outcome, 0.0)
+        self.assertEqual(by_cut[3].outcome, 1.0)
+
+    def test_depth_balanced_sampling_caps_per_tau(self):
+        # Root layers produce fewer real cuts than leaf layers; with a cap
+        # every interface contributes at most cuts_per_tau rows.
+        trace = make_trace(as_of_times=(4.0, 9.0))
+        rows = JodieCutBuilder(self.idx, stage=NODE_CLASS, cuts_per_tau=1,
+                               seed=3).build(trace, batch_seed=0)
+        from collections import Counter
+        counts = Counter(r.tau for r in rows)
+        for tau, n in counts.items():
+            self.assertLessEqual(n, 1)
 
     def test_censored_cuts_never_become_y0_rows(self):
         # Node 5 from t=4 is valid (next 15.0); use a node whose next event is
@@ -146,7 +155,7 @@ class TestJodieCutBuilder(unittest.TestCase):
             children=[],
             child_relations=[], child_delta_t=[],
             metadata={"layer": 1, "node": 4, "time": 12.0,
-                      "own_raw": torch.randn(4)}))
+}))
         trace.roots.append(0)
         trace.root_rows.append(0)
         rows = JodieCutBuilder(self.idx, stage=NODE_CLASS, seed=0).build(
@@ -155,8 +164,8 @@ class TestJodieCutBuilder(unittest.TestCase):
 
     def test_forbidden_fields_absent_from_context(self):
         trace = make_trace(as_of_times=(4.0,))
-        rows = JodieCutBuilder(self.idx, stage=LINK, neg_per_cut=1,
-                               seed=1).build(trace, batch_seed=0)
+        rows = JodieCutBuilder(self.idx, stage=LINK, seed=1).build(
+            trace, batch_seed=0)
         for r in rows:
             for bad in ("outcome", "y", "label", "valid", "is_positive"):
                 self.assertNotIn(bad, r.context)
@@ -164,29 +173,6 @@ class TestJodieCutBuilder(unittest.TestCase):
             self.assertIn("counterpart", r.context)
             self.assertIn("role", r.context)
             self.assertIn("query_type", r.context)
-
-    def test_negatives_deterministic_per_batch_seed(self):
-        trace = make_trace(as_of_times=(4.0, 9.0))
-        b = JodieCutBuilder(self.idx, stage=LINK, neg_per_cut=2, seed=3)
-        a1 = [(r.context["counterpart"], r.outcome) for r in b.build(trace, batch_seed=11)]
-        a2 = [(r.context["counterpart"], r.outcome) for r in b.build(trace, batch_seed=11)]
-        b1 = [(r.context["counterpart"], r.outcome) for r in b.build(trace, batch_seed=12)]
-        self.assertEqual(a1, a2)
-        self.assertNotEqual(a1, b1)
-
-    def test_negative_never_equals_positive_counterpart(self):
-        trace = make_trace(as_of_times=(4.0, 9.0))
-        rows = JodieCutBuilder(self.idx, stage=LINK, neg_per_cut=3,
-                               seed=7).build(trace, batch_seed=0)
-        by_cut = {}
-        for r in rows:
-            by_cut.setdefault(r.cut_id, []).append(r)
-        for cut_id, cut_rows in by_cut.items():
-            pos = next(r for r in cut_rows if r.outcome == 1.0)
-            for n in cut_rows:
-                if n.outcome == 0.0:
-                    self.assertNotEqual(n.context["counterpart"],
-                                        pos.context["counterpart"])
 
     def test_tree_ids_are_global_across_batches(self):
         b = JodieCutBuilder(self.idx, stage=NODE_CLASS, seed=0)
@@ -209,7 +195,7 @@ class TestJodieCutBuilder(unittest.TestCase):
                 children=[],
                 child_relations=[], child_delta_t=[],
                 metadata={"layer": 1, "node": 5, "time": 4.0,
-                          "own_raw": torch.randn(4)}))
+    }))
             trace.roots.append(k)
             trace.root_rows.append(k)
         rows = JodieCutBuilder(self.idx, stage=NODE_CLASS, seed=0).build(

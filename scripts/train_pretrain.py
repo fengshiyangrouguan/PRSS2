@@ -73,8 +73,7 @@ def parse_args():
     p.add_argument("--kf-lambda", type=float, default=1.0)
     p.add_argument("--rpbe-width", type=int, default=128)
     p.add_argument("--sketch-dim", type=int, default=256)
-    p.add_argument("--neg-per-cut", type=int, default=4)
-    p.add_argument("--kf-ema-rho", type=float, default=0.05)
+    p.add_argument("--kf-cuts-per-tau", type=int, default=32)
     p.add_argument("--kf-min-ratio", type=float, default=2.0)
     p.add_argument("--kf-min-abs", type=int, default=64)
     p.add_argument("--ridge-eps", type=float, default=1e-4)
@@ -170,12 +169,12 @@ def main():
         taus = [TAU_TEMPLATE.format(l) for l in range(args.n_layer + 1)]
         delta_scale = float(np.median(np.diff(np.sort(full.timestamps)))) or 1.0
         rpbe_cfg = RPBConfig(
-            interfaces={tau: host_dim for tau in taus},
+            state_dims={tau: host_dim for tau in taus},
             own_dims={tau: host_dim for tau in taus},
             width_D=args.rpbe_width, m=args.sketch_dim,
             lambda_kf=args.kf_lambda, ridge_eps=args.ridge_eps,
-            delta_t_scale=delta_scale, neg_per_cut=args.neg_per_cut,
-            kf_ema_rho=args.kf_ema_rho, kf_min_ratio=args.kf_min_ratio,
+            delta_t_scale=delta_scale,
+            cuts_per_tau=args.kf_cuts_per_tau, kf_min_ratio=args.kf_min_ratio,
             kf_min_abs=args.kf_min_abs,
             rpbe_seed=args.rpbe_seed)
         compressor = RecursiveCompressor(rpbe_cfg).to(device)

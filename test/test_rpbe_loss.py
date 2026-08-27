@@ -7,9 +7,10 @@ gradient isolation of the fixed measurement side.
 
 import unittest
 
+import numpy as np
 import torch
 
-from rpbe.loss import KyFanTracker, kf_score, kf_score_fixed
+from rpbe.loss import KFMomentWindow, kf_score, kf_score_fixed
 from rpbe.records import CutRecord
 
 
@@ -196,68 +197,115 @@ class _FakeMaps:
         return torch.randn(self.m, generator=g)
 
 
-def make_cut_rows(n_cuts, r, m, rows_per_cut=1):
+def make_cut_rows(n_cuts, r, m, rows_per_cut=1, offset=0):
     rows = []
     for c in range(n_cuts):
         z = torch.randn(r)
         for k in range(rows_per_cut):
             rows.append(CutRecord(
-                tree_id=0, cut_id=c, occurrence_id=c, tau="t",
-                node=c, time=float(c), z=z,
+                tree_id=0, cut_id=offset + c, occurrence_id=offset + c,
+                tau="t", node=offset + c, time=float(offset + c), z=z,
                 context={"delta_t": float(c * 7 + k), "counterpart": c + k,
                          "role": 0, "query_type": 0},
                 outcome=float(k == 0)))
     return rows
 
 
-class TestKyFanTracker(unittest.TestCase):
-    def test_gate_blocks_small_sample_saturation(self):
-        # The audit counterexample: r=32 with 16 unique cuts per batch would
-        # saturate on independent noise (J -> min(r, M-1)); the gate
-        # (min_ratio*r = 64) must hold the score back.
-        tr = KyFanTracker({"t": 32}, min_ratio=2.0, min_abs=64,
-                          fixed_maps=_FakeMaps(256))
-        scores, skipped = tr.update(make_cut_rows(16, 32, 256))
-        self.assertEqual(scores, {})
-        self.assertIn("t", skipped)
+class TestKFMomentWindow(unittest.TestCase):
+    def test_window_gates_small_sample(self):
+        # d=32 with <64 unique cuts must stay open (no score yet).
+        w = KFMomentWindow({"t": 32}, min_ratio=2.0, min_abs=64,
+                           fixed_maps=_FakeMaps(256))
+        closed, diag, gated = w.add(make_cut_rows(16, 32, 256))
+        self.assertEqual(closed, {})
+        self.assertIn("t", gated)
 
-    def test_score_appears_once_enough_unique_cuts_accumulate(self):
-        tr = KyFanTracker({"t": 8}, ema_rho=0.2, min_ratio=2.0, min_abs=64,
-                          fixed_maps=_FakeMaps(64))
-        scores = {}
-        skipped = []
-        for _ in range(6):
-            s, sk = tr.update(make_cut_rows(60, 8, 64))
-            scores.update(s)
-            skipped.append(sk)
-        self.assertIn("t", scores)
-        n_eff = tr.effective_n("t")
-        self.assertGreaterEqual(n_eff, 64)
+    def test_window_closes_after_enough_unique_cuts(self):
+        w = KFMomentWindow({"t": 8}, min_ratio=2.0, min_abs=64,
+                           fixed_maps=_FakeMaps(64))
+        closed = {}
+        last_diag = {}
+        for k in range(3):
+            c, diag, gated = w.add(
+                make_cut_rows(40, 8, 64, offset=k * 100))
+            closed.update(c)
+            if diag:
+                last_diag = diag
+        self.assertIn("t", closed)
+        self.assertGreaterEqual(last_diag["t"]["M_unique"], 64)
+        self.assertTrue(np.isfinite(float(closed["t"].detach())))
 
     def test_independent_noise_does_not_saturate(self):
-        # With M_unique >> r and independent P, J stays far below its
-        # saturation bound min(r, M-1) — the small-sample false maximum is
-        # gone by construction (gated) and the accumulated score is honest.
-        tr = KyFanTracker({"t": 8}, ema_rho=0.1, min_ratio=2.0, min_abs=64,
-                          fixed_maps=_FakeMaps(64))
-        scores = {}
-        for _ in range(8):
-            s, _ = tr.update(make_cut_rows(50, 8, 64))
-            scores.update(s)
-        j = float(scores["t"].detach())
-        n_eff = tr.effective_n("t")
-        bound = min(8, max(1, int(n_eff) - 1))
-        self.assertLess(j, 0.5 * bound,
-                        "independent noise score {} too close to the "
-                        "saturation bound {}".format(j, bound))
+        # Window far above d: the honest score stays well below the
+        # saturation bound, and the shuffled score is on the same level
+        # (no real correlation to claim).
+        w = KFMomentWindow({"t": 8}, min_ratio=2.0, min_abs=64,
+                           fixed_maps=_FakeMaps(64))
+        closed = {}
+        last_diag = {}
+        for k in range(3):
+            c, d, gated = w.add(make_cut_rows(50, 8, 64, offset=k * 100))
+            closed.update(c)
+            if d:
+                last_diag = d
+        j = float(closed["t"].detach())
+        bound = min(8, last_diag["t"]["M_unique"] - 1)
+        self.assertLess(j, 0.75 * bound)
+        self.assertLessEqual(
+            abs(j - last_diag["t"]["J_shuffled"]) / max(bound, 1), 0.2,
+            "independent-noise J and shuffled J must agree")
 
-    def test_dedup_weights_unique_cuts(self):
-        # 5 rows per cut (1 pos + 4 neg) must count as ONE unique sample:
-        # the effective n accumulates per unique cut.
-        tr = KyFanTracker({"t": 4}, min_ratio=1.0, min_abs=2,
-                          fixed_maps=_FakeMaps(16))
-        tr.update(make_cut_rows(20, 4, 16, rows_per_cut=5))
-        self.assertAlmostEqual(tr.effective_n("t"), 20.0, places=1)
+    def test_correlated_zp_beats_shuffled(self):
+        # Z and P sharing a low-rank signal must score clearly above the
+        # shuffled baseline.  Single-window estimates are noisy, so average
+        # over three independent windows.
+        n, r, m, sdim = 400, 8, 64, 6
+        js, jsh = [], []
+        for rep in range(3):
+            g = torch.Generator().manual_seed(42 + rep)
+            signal = torch.randn(n, sdim, generator=g)
+            z = torch.cat([signal, torch.randn(n, r - sdim, generator=g)],
+                          dim=1)
+            p = torch.cat([signal, torch.randn(n, m - sdim, generator=g)],
+                          dim=1)
+            w = KFMomentWindow({"t": r}, min_ratio=2.0, min_abs=64,
+                               fixed_maps=None)
+            class _Stub:
+                def pv(self, ctx, y):
+                    return p[ctx["counterpart"] % n]
+            w.fixed_maps = _Stub()
+            rows = []
+            for i in range(n):
+                rows.append(CutRecord(
+                    tree_id=0, cut_id=i, occurrence_id=i, tau="t",
+                    node=i, time=float(i), z=z[i],
+                    context={"delta_t": 0.0, "counterpart": i, "role": 0,
+                             "query_type": 0},
+                    outcome=0.0))
+            closed, diag, gated = w.add(rows)
+            self.assertIn("t", closed)
+            js.append(float(closed["t"].detach()))
+            jsh.append(diag["t"]["J_shuffled"])
+        self.assertGreater(sum(js) / 3, sum(jsh) / 3 + 1.0,
+                           "correlated score must beat shuffled "
+                           "({:.2f} vs {:.2f})".format(sum(js) / 3,
+                                                       sum(jsh) / 3))
+
+    def test_constant_z_returns_zero_not_crash(self):
+        w = KFMomentWindow({"t": 4}, min_ratio=1.0, min_abs=4,
+                           fixed_maps=_FakeMaps(16))
+        n = 20
+        rows = [CutRecord(
+            tree_id=0, cut_id=i, occurrence_id=i, tau="t",
+            node=i, time=float(i), z=torch.ones(4),
+            context={"delta_t": 0.0, "counterpart": i, "role": 0,
+                     "query_type": 0}, outcome=0.0)
+            for i in range(n)]
+        closed, diag, gated = w.add(rows)
+        self.assertIn("t", closed)
+        j = float(closed["t"].detach())
+        self.assertAlmostEqual(j, 0.0, places=6)
+        self.assertTrue(np.isfinite(j))
 
 
 if __name__ == "__main__":

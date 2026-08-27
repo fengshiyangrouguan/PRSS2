@@ -138,10 +138,10 @@ class TestTraceStructure(unittest.TestCase):
             if rel == 0:
                 self.assertEqual(delta, 0.0)
 
-    def test_metadata_contract_node_time_own_raw(self):
-        """Every occurrence carries node / as-of time / own_raw, and the
-        as-of time is the query timestamp for the whole tree (the official
-        recursion reuses the query timestamp for neighbors)."""
+    def test_metadata_contract_node_time(self):
+        """Every occurrence carries node / as-of time, and the as-of time is
+        the query timestamp for the whole tree (the official recursion
+        reuses the query timestamp for neighbors)."""
         sources, destinations, timestamps, edge_idxs, labels = self.stream
         self.adapter.set_trace_source_rows([0, 1])
         forward_batch(self.tgn, sources, destinations, timestamps, edge_idxs)
@@ -149,14 +149,8 @@ class TestTraceStructure(unittest.TestCase):
         for occ in trace.occurrences.values():
             self.assertIn("node", occ.metadata)
             self.assertIn("time", occ.metadata)
-            self.assertIn("own_raw", occ.metadata)
             self.assertGreaterEqual(occ.metadata["node"], 0)
             self.assertIn("layer", occ.metadata)
-            own = occ.metadata["own_raw"]
-            self.assertEqual(tuple(own.shape), (8,))  # host_dim of the tiny host
-            self.assertTrue(torch.isfinite(own).all())
-            # Note: synthetic node_features are all-zero, so own_raw sums to
-            # zero — only shape/finiteness is contractually guaranteed here.
         # as-of time == query timestamp of the traced row, for every node.
         for root_id, row in zip(trace.roots, trace.root_rows):
             t_root = float(timestamps[row])

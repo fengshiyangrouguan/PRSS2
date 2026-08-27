@@ -16,5 +16,6 @@ def build_cut_builder(dataset, *, stage: str, cfg, seed: int = 0,
                         full.labels, val_time=dataset.val_time,
                         test_time=dataset.test_time)
     cfg.delta_t_scale = float(delta_t_scale) if delta_t_scale > 0 else 1.0
-    return JodieCutBuilder(index, stage=stage, neg_per_cut=cfg.neg_per_cut,
+    return JodieCutBuilder(index, stage=stage,
+                           cuts_per_tau=getattr(cfg, "cuts_per_tau", 32),
                            seed=int(seed))

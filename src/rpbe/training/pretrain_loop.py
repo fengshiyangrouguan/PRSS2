@@ -19,7 +19,7 @@ import torch
 import torch.nn.functional as F
 from sklearn.metrics import average_precision_score, roc_auc_score
 
-from rpbe.loss import KyFanTracker, kf_loss
+from rpbe.loss import KFMomentWindow, kf_loss
 from rpbe.training.isolation import assert_clean, rpbe_fingerprint
 from rpbe.training.jodie_loop import select_trace_rows
 
@@ -49,10 +49,10 @@ class TGNPretrainLoop:
         self.trace_roots = int(trace_roots)
         self.rpbe_on = bool(adapter is not None and cut_builder is not None
                             and fixed_maps is not None and rpbe_cfg is not None)
-        self.kf_tracker = (KyFanTracker(
-            rpbe_cfg.interfaces, ema_rho=rpbe_cfg.kf_ema_rho,
-            min_ratio=rpbe_cfg.kf_min_ratio, min_abs=rpbe_cfg.kf_min_abs,
-            eps=rpbe_cfg.ridge_eps, fixed_maps=fixed_maps)
+        self.kf_window = (KFMomentWindow(
+            rpbe_cfg.state_dims, min_ratio=rpbe_cfg.kf_min_ratio,
+            min_abs=rpbe_cfg.kf_min_abs, eps=rpbe_cfg.ridge_eps,
+            fixed_maps=fixed_maps)
             if self.rpbe_on else None)
 
     # ------------------------------------------------------------- stream state
@@ -123,28 +123,28 @@ class TGNPretrainLoop:
                                            "batch produced no valid cuts",
                                            step=global_step)
                     else:
-                        scores, skipped = self.kf_tracker.update(cuts)
-                        skipped_types.update(skipped)
-                        if skipped:
+                        closed, diag, gated = self.kf_window.add(cuts)
+                        skipped_types.update(gated)
+                        if gated:
                             self.monitor.alert(
                                 "warning", "kf_gated_tau",
-                                "gated below min unique cuts: {}"
-                                .format(sorted(skipped)), step=global_step)
-                        if scores:
-                            kf_term = kf_loss(scores, self.rpbe_cfg.alphas)
+                                "still accumulating: {}".format(sorted(gated)),
+                                step=global_step)
+                        if closed:
+                            kf_term = kf_loss(closed, self.rpbe_cfg.alphas)
                             total_kf += float(kf_term.detach())
                             kf_detail = {tau: float(j.detach())
-                                         for tau, j in scores.items()}
+                                         for tau, j in closed.items()}
                             for tau, jv in kf_detail.items():
                                 kf_sum[tau] = kf_sum.get(tau, 0.0) + jv
                                 kf_count_tau[tau] = kf_count_tau.get(tau, 0) + 1
                             kf_count += 1
                             dims = {}
                             for tau in kf_detail:
-                                n_eff = self.kf_tracker.effective_n(tau)
+                                m_u = int(diag[tau]["M_unique"])
                                 dims[tau] = int(min(
-                                    self.rpbe_cfg.interfaces[tau],
-                                    max(1, n_eff - 1)))
+                                    self.rpbe_cfg.state_dims[tau],
+                                    max(1, m_u - 1)))
                             self.monitor.validate_kf(kf_detail, dims,
                                                      global_step)
                             loss = loss + self.lambda_kf * kf_term
@@ -154,10 +154,12 @@ class TGNPretrainLoop:
             loss = loss / self.backprop_every
             loss.backward()
             if self.grad_clip > 0:
-                torch.nn.utils.clip_grad_norm_(
-                    [p for p in self.optimizer.param_groups[0]["params"]
-                     if p.grad is not None], max_norm=self.grad_clip,
-                    error_if_nonfinite=True)
+                params = [p for g in self.optimizer.param_groups
+                          for p in g["params"] if p.grad is not None]
+                if params:
+                    torch.nn.utils.clip_grad_norm_(
+                        params, max_norm=self.grad_clip,
+                        error_if_nonfinite=True)
             self.optimizer.step()
             self.monitor.validate_losses({
                 "link": float(total_link) / max(global_step, 1),
@@ -169,12 +171,12 @@ class TGNPretrainLoop:
             n_steps += 1
         kf_out = None
         if kf_count and self.rpbe_cfg is not None:
-            # Per-tau denominators: own scored-batch counts, and J_frac uses
-            # the saturation-aware bound min(r_tau, n_eff-1).
+            # Per-tau denominators: own closed-window counts; J_frac uses
+            # the saturation-aware bound min(d_tau, M_window-1).
             j_frac = {}
             for tau, v in kf_sum.items():
-                n_eff = self.kf_tracker.effective_n(tau)
-                bound = min(self.rpbe_cfg.interfaces[tau], max(1, n_eff - 1))
+                m_u = self.kf_window.window_m(tau)
+                bound = min(self.rpbe_cfg.state_dims[tau], max(1, m_u - 1))
                 j_frac[tau] = (v / kf_count_tau.get(tau, 1)) / bound
             kf_out = {
                 "J": {tau: v / kf_count_tau.get(tau, 1)

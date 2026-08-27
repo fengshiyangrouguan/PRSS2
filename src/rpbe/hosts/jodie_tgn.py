@@ -52,6 +52,15 @@ class JodieTGNAdapter(HostAdapter):
             raise ValueError(
                 "RPBE requires n_neighbors > 0 so the host interface width is fixed")
 
+        if compressor is not None:
+            # Host-width contract: d_tau must equal the width the host
+            # attention actually consumes; a mismatch would only surface as
+            # a shape error inside the vendored aggregate.
+            for tau, d_tau in compressor.cfg.state_dims.items():
+                if int(d_tau) != int(host_embedding.embedding_dimension):
+                    raise ValueError(
+                        "state_dims[{}]={} must equal host width {}".format(
+                            tau, d_tau, host_embedding.embedding_dimension))
         self.embedding_dimension = host_embedding.embedding_dimension
         self.device = host_embedding.device
         self.n_layers = host_embedding.n_layers
@@ -143,8 +152,7 @@ class JodieTGNAdapter(HostAdapter):
                     ids[row] = self._new_occurrence(
                         tau, z[row], [], [], [],
                         node=int(source_nodes[row]),
-                        time=float(timestamps[row]),
-                        own_raw=raw_source[row].detach())
+                        time=float(timestamps[row]))
             return z, ids
 
         tau = TAU_TEMPLATE.format(layer)
@@ -196,12 +204,11 @@ class JodieTGNAdapter(HostAdapter):
                 ids[row] = self._new_occurrence(
                     tau, z[row], children, relations, deltas,
                     node=int(source_nodes[row]),
-                    time=float(timestamps[row]),
-                    own_raw=raw_source[row].detach())
+                    time=float(timestamps[row]))
         return z, ids
 
     def _new_occurrence(self, tau, z, children, relations, deltas, *,
-                        node: int, time: float, own_raw):
+                        node: int, time: float):
         oid = self._next_oid
         self._next_oid += 1
         self.trace.add(RecursiveOccurrence(
@@ -211,7 +218,6 @@ class JodieTGNAdapter(HostAdapter):
             child_relations=list(relations),
             child_delta_t=list(deltas),
             metadata={"layer": int(tau.split(":")[1][len("layer"):]),
-                      "node": int(node), "time": float(time),
-                      "own_raw": own_raw},
+                      "node": int(node), "time": float(time)},
         ))
         return oid

@@ -26,7 +26,7 @@ class TestHostIndependence(unittest.TestCase):
 
 class TestRPBConfigValidation(unittest.TestCase):
     def _cfg(self, **kw):
-        base = dict(interfaces={"a": 8, "b": 8}, own_dims={"a": 8, "b": 8})
+        base = dict(state_dims={"a": 8, "b": 8}, own_dims={"a": 8, "b": 8})
         base.update(kw)
         return RPBConfig(**base)
 
@@ -45,7 +45,7 @@ class TestRPBConfigValidation(unittest.TestCase):
 
     def test_nonpositive_r_tau_rejected(self):
         with self.assertRaises(ValueError):
-            self._cfg(interfaces={"a": 0, "b": 8}, own_dims={"a": 8, "b": 8})
+            self._cfg(state_dims={"a": 0, "b": 8}, own_dims={"a": 8, "b": 8})
 
     def test_alpha_defaults_and_overrides(self):
         cfg = self._cfg(alphas={"a": 0.5})

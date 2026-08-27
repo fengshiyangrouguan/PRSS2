@@ -118,7 +118,7 @@ class TestLoopSmoke(unittest.TestCase):
         adapter = cut_builder = fixed_maps = rpbe_cfg = None
         if rpbe:
             cfg = RPBConfig(
-                interfaces={"tjo:layer0": 8, "tjo:layer1": 8, "tjo:layer2": 8},
+                state_dims={"tjo:layer0": 8, "tjo:layer1": 8, "tjo:layer2": 8},
                 own_dims={"tjo:layer0": 8, "tjo:layer1": 8, "tjo:layer2": 8},
                 width_D=16, m=64, kf_min_abs=4, rpbe_seed=0,
                 delta_t_scale=1.0)

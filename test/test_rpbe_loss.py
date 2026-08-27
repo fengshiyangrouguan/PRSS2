@@ -5,6 +5,7 @@ the Ky Fan supremum, whitening invariance, the [0, min(r,m)] bound and the
 gradient isolation of the fixed measurement side.
 """
 
+import dataclasses
 import unittest
 
 import numpy as np
@@ -198,7 +199,7 @@ class _FakeMaps:
         return torch.randn(self.m, generator=g)
 
 
-def make_cut_rows(n_cuts, r, m, rows_per_cut=1, offset=0):
+def make_cut_rows(n_cuts, r, m, rows_per_cut=1, offset=0, weight=1.0):
     rows = []
     for c in range(n_cuts):
         z = torch.randn(r)
@@ -209,7 +210,7 @@ def make_cut_rows(n_cuts, r, m, rows_per_cut=1, offset=0):
                 tau="t", node=offset + c, time=float(offset + c), z=z,
                 context={"delta_t": float(c * 7 + k), "counterpart": c + k,
                          "role": 0, "query_type": 0},
-                outcome=float(k == 0)))
+                outcome=float(k == 0), weight=weight))
     return rows
 
 
@@ -423,7 +424,8 @@ class TestReviewRegression(unittest.TestCase):
                            fixed_maps=maps)
         closed, diag, gated = w.add(rows)
         self.assertIn("t", closed)
-        keys, tids, zs, ps = dedup_cut_rows(rows, maps)
+        keys, tids, zs, ps, weights = dedup_cut_rows(rows, maps)
+        self.assertEqual(zs.shape[0], n)
         zc = (zs.double() - zs.double().mean(0, keepdim=True))
         pc = (ps.double() - ps.double().mean(0, keepdim=True))
         czz, cpp, czp, _ = _covs(zc, pc, float(zc.shape[0] - 1))
@@ -438,16 +440,17 @@ class TestReviewRegression(unittest.TestCase):
         # same denominator — a mismatch silently corrupts the score.
         n, r, mdim = 200, 8, 64
         rows = make_cut_rows(n, r, mdim)
-        keys, tids, zs, ps = dedup_cut_rows(rows, _FakeMaps(mdim))
+        keys, tids, zs, ps, weights = dedup_cut_rows(rows, _FakeMaps(mdim))
         self.assertEqual(zs.shape[0], ps.shape[0],
                          "Z and P rows must match after dedup")
         self.assertEqual(len(keys), zs.shape[0])
         self.assertEqual(len(tids), zs.shape[0])
         # A cut with several rows_per_cut still contributes ONE row pair.
         dup = make_cut_rows(n, r, mdim, rows_per_cut=3)
-        k2, t2, z2, p2 = dedup_cut_rows(dup, _FakeMaps(mdim))
+        k2, t2, z2, p2, w2 = dedup_cut_rows(dup, _FakeMaps(mdim))
         self.assertEqual(z2.shape[0], n)
         self.assertEqual(p2.shape[0], n)
+        self.assertEqual(len(w2), n)
         # The close path asserts the invariant itself.
         w = KFMomentWindow({"t": r}, min_ratio=1.0, min_abs=64,
                            fixed_maps=_FakeMaps(mdim))
@@ -524,6 +527,62 @@ class TestReviewRegression(unittest.TestCase):
         self.assertAlmostEqual(d_fd, 0.0, delta=1e-2,
                                msg="window finite-difference radial "
                                    "derivative must vanish")
+
+    def test_constant_weight_multiplier_is_scale_invariant(self):
+        # A constant weight multiplier (w = 2 on every row) scales all
+        # moments AND the effective denominator by the same factor: J must
+        # be unchanged — the weight enters only through ratios.
+        n, r, mdim = 300, 8, 64
+        base = make_cut_rows(n, r, mdim, offset=900, weight=1.0)
+        rows2 = [dataclasses.replace(rec, weight=2.0) for rec in base]
+        w1 = KFMomentWindow({"t": r}, min_ratio=1.0, min_abs=64,
+                            fixed_maps=_FakeMaps(mdim))
+        w2 = KFMomentWindow({"t": r}, min_ratio=1.0, min_abs=64,
+                            fixed_maps=_FakeMaps(mdim))
+        c1, _, _ = w1.add(base)
+        c2, d2, _ = w2.add(rows2)
+        self.assertIn("t", c1)
+        self.assertIn("t", c2)
+        self.assertAlmostEqual(float(c1["t"].detach()),
+                               float(c2["t"].detach()), places=4,
+                               msg="constant weight multiplier must not "
+                                   "change J")
+        # The effective sample size is scale-free in a constant multiplier.
+        self.assertAlmostEqual(d2["t"]["w_eff"], n, delta=1.0)
+
+    def test_soft_dedupe_equals_hard_dedupe(self):
+        # Document §四 soft dedupe: duplicate (node, time, tau) cuts across
+        # trees are kept and diluted by the context-overlap weight 1/r —
+        # the weighted statistics of r identical rows are EXACTLY those of
+        # the single row (same tree gate: the duplicates share tree ids).
+        n, r, mdim = 150, 8, 64
+        base = make_cut_rows(n, r, mdim, offset=500)
+        dup = []
+        for rec in base:
+            dup.append(rec)
+            # Same (node, time, tau) and same z, but a DIFFERENT cut
+            # (occurrence of another tree): the duplicate survives the
+            # per-cut merge and hits the window's overlap weight.
+            dup.append(dataclasses.replace(
+                rec, cut_id=rec.cut_id + 100000,
+                occurrence_id=rec.occurrence_id + 100000,
+                tree_id=rec.tree_id + 100000))
+        w1 = KFMomentWindow({"t": r}, min_ratio=1.0, min_abs=64,
+                            fixed_maps=_FakeMaps(mdim))
+        w2 = KFMomentWindow({"t": r}, min_ratio=1.0, min_abs=64,
+                            fixed_maps=_FakeMaps(mdim))
+        c1, _, _ = w1.add(base)
+        c2, d2, _ = w2.add(dup)
+        self.assertIn("t", c1)
+        self.assertIn("t", c2)
+        self.assertAlmostEqual(float(c1["t"].detach()),
+                               float(c2["t"].detach()), places=3,
+                               msg="soft-deduped duplicates must score "
+                                   "like the single row")
+        # Two half-weight rows have the same total weight (1) but half the
+        # weight-square of one full row: w_eff = 2n by the formula, with
+        # the STATISTICS identical to the n single rows.
+        self.assertAlmostEqual(d2["t"]["w_eff"], 2.0 * n, delta=1.0)
 
 
 if __name__ == "__main__":

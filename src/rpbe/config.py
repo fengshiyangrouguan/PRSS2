@@ -23,7 +23,9 @@ class RPBConfig:
     alphas: Dict[str, float] = field(default_factory=dict)  # tau -> weight; default 1
     ridge_eps: float = 1e-4              # relative ridge (x tr(Sigma)/dim)
     delta_t_scale: float = 1e6           # fixed scale for continuous delta_t RFF
-    cuts_per_tau: int = 32              # depth-balanced cuts per interface/batch
+    cuts_per_tau: int = 32              # sampling cap per interface/batch (document
+                                        # §四: subsample with probability correction
+                                        # when exceeded — NOT a hard drop)
     kf_min_ratio: float = 2.0            # window: unique trees >= ratio * d_tau
     kf_min_abs: int = 1024               # gate: effective tree count >= this floor
     rpbe_seed: int = 0                   # fixed-measurement seed (independent of host)

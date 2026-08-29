@@ -10,11 +10,13 @@ keeps only the recursive compressor wrapped around the host aggregate.
 
 from rpbe.compressor import RecursiveCompressor
 from rpbe.config import RPBConfig
-from rpbe.loss import kf_loss, kf_score
+from rpbe.loss import KFLaggedWindow, kf_loss, kf_score
 from rpbe.maps import FixedMaps
-from rpbe.records import CutRecord
+from rpbe.records import CutRecord, JodieFutureIndex
+from rpbe.state import CompactCutTrace, CutCandidate
 
-__all__ = ["CutRecord", "FixedMaps", "RPBConfig", "RecursiveCompressor",
-           "kf_loss", "kf_score"]
+__all__ = ["CompactCutTrace", "CutCandidate", "CutRecord", "FixedMaps",
+           "JodieFutureIndex", "KFLaggedWindow", "RPBConfig",
+           "RecursiveCompressor", "kf_loss", "kf_score"]
 
 __version__ = "3.0.0"

@@ -6,6 +6,7 @@ GPU box where the bridge works.
 """
 
 import unittest
+from types import SimpleNamespace
 
 import numpy as np
 import torch
@@ -106,76 +107,26 @@ class TestTraceStructure(unittest.TestCase):
         self.adapter = install_adapter(tgn)
         self.tgn = tgn
 
-    def test_trace_tree_depth_and_roots(self):
+    def test_trace_is_bounded_internal_self_spine(self):
         sources, destinations, timestamps, edge_idxs, labels = self.stream
         self.adapter.set_trace_source_rows([2, 5])
         forward_batch(self.tgn, sources, destinations, timestamps, edge_idxs)
         trace = self.adapter.trace
         self.assertIsNotNone(trace)
         self.assertEqual(trace.root_rows, [2, 5])
-        self.assertEqual(len(trace.roots), 2)
-        # Tree depth = L+1 layers: layer2 root -> layer1 -> layer0.
-        layers = {occ.metadata["layer"] for occ in trace.occurrences.values()}
-        self.assertEqual(layers, {0, 1, 2})
-        for root in trace.roots:
-            occ = trace.occurrences[root]
-            self.assertEqual(occ.tau, "tjo:layer2")
-            # children: 1 source continuation + up to n_neighbors neighbors.
-            self.assertGreaterEqual(len(occ.children), 1)
-            self.assertLessEqual(len(occ.children), 1 + 4)
-            rels = set(occ.child_relations)
-            self.assertLessEqual(rels, {0, 1})
-
-    def test_children_delta_times(self):
-        sources, destinations, timestamps, edge_idxs, labels = self.stream
-        self.adapter.set_trace_source_rows([0])
-        forward_batch(self.tgn, sources, destinations, timestamps, edge_idxs)
-        trace = self.adapter.trace
-        root = trace.occurrences[trace.roots[0]]
-        for cid, rel, delta in zip(root.children, root.child_relations,
-                                   root.child_delta_t):
-            self.assertGreaterEqual(delta, 0.0)
-            if rel == 0:
-                self.assertEqual(delta, 0.0)
-
-    def test_metadata_contract_node_time(self):
-        """Every occurrence carries node / as-of time, and the as-of time is
-        the query timestamp for the whole tree (the official recursion
-        reuses the query timestamp for neighbors)."""
-        sources, destinations, timestamps, edge_idxs, labels = self.stream
-        self.adapter.set_trace_source_rows([0, 1])
-        forward_batch(self.tgn, sources, destinations, timestamps, edge_idxs)
-        trace = self.adapter.trace
-        for occ in trace.occurrences.values():
-            self.assertIn("node", occ.metadata)
-            self.assertIn("time", occ.metadata)
-            self.assertGreaterEqual(occ.metadata["node"], 0)
-            self.assertIn("layer", occ.metadata)
-        # as-of time == query timestamp of the traced row, for every node.
-        for root_id, row in zip(trace.roots, trace.root_rows):
-            t_root = float(timestamps[row])
-            for oid in trace.occurrences:
-                if self._descends_from(trace, oid, root_id):
-                    self.assertEqual(trace.occurrences[oid].metadata["time"],
-                                     t_root)
-
-    @staticmethod
-    def _descends_from(trace, oid, root_id):
-        seen = set()
-
-        def walk(x):
-            if x == oid:
-                return True
-            if x in seen:
-                return False
-            seen.add(x)
-            return any(walk(c) for c in trace.occurrences[x].children)
-
-        return walk(root_id)
+        # L=2 has exactly one internal compressible interface per root.
+        self.assertEqual(len(trace.cuts), 2)
+        self.assertEqual({cut.tau for cut in trace.cuts}, {"tjo:layer1"})
+        self.assertEqual({cut.root_row for cut in trace.cuts}, {2, 5})
+        for cut in trace.cuts:
+            self.assertEqual(cut.node, int(sources[cut.root_row]))
+            self.assertEqual(cut.time, float(timestamps[cut.root_row]))
+            self.assertEqual(cut.path, [(0, 0.0)])
+        self.assertFalse(hasattr(trace, "occurrences"))
+        self.assertFalse(hasattr(trace, "roots"))
 
     def test_trace_records_z_with_grad(self):
-        """OccurrenceState carries z only; with a grad-enabled host forward
-        the traced z is graph-connected."""
+        """The compact candidate's z stays graph-connected."""
         sources, destinations, timestamps, edge_idxs, labels = self.stream
         self.tgn.train()
         for p in self.tgn.parameters():
@@ -186,8 +137,33 @@ class TestTraceStructure(unittest.TestCase):
                 sources[:4], destinations[:4], destinations[:4],
                 timestamps[:4], edge_idxs[:4], 4)
         trace = self.adapter.trace
-        root = trace.occurrences[trace.roots[0]]
-        self.assertTrue(root.state.z.requires_grad)
+        self.assertEqual(len(trace.cuts), 1)
+        self.assertTrue(trace.cuts[0].z.requires_grad)
+
+    def test_gamma_runs_at_internal_layers_only(self):
+        class CountingCompressor(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.cfg = SimpleNamespace(state_dims={
+                    "tjo:layer0": 8,
+                    "tjo:layer1": 8,
+                    "tjo:layer2": 8,
+                })
+                self.calls = []
+
+            def compress(self, *, tau, own_input, aggregate_output):
+                self.calls.append((tau, int(aggregate_output.shape[0])))
+                return aggregate_output
+
+        sources, destinations, timestamps, edge_idxs, labels = self.stream
+        compressor = CountingCompressor()
+        self.adapter.compressor = compressor
+        forward_batch(self.tgn, sources, destinations, timestamps, edge_idxs)
+        self.assertGreater(len(compressor.calls), 0)
+        self.assertEqual({tau for tau, _ in compressor.calls},
+                         {"tjo:layer1"})
+        self.assertNotIn("tjo:layer0", [tau for tau, _ in compressor.calls])
+        self.assertNotIn("tjo:layer2", [tau for tau, _ in compressor.calls])
 
     def test_clear_trace_resets(self):
         sources, destinations, timestamps, edge_idxs, labels = self.stream

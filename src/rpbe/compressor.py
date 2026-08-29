@@ -11,7 +11,9 @@ the child-aggregation token.  Gamma adds the thin stack on top::
     z_v = Q_tau(h_v)                       # output head     -> budget r_tau
 
 ``compress`` is the deployment path: it reads only the node's own input and
-the aggregate of the children's compressed states — never any future.
+the aggregate of the children's compressed states — never any future.  The
+host adapter calls it only for internal aggregated nodes; leaf and task-root
+boundary handling belongs to the adapter.
 """
 
 import torch
@@ -41,8 +43,7 @@ class RecursiveCompressor(nn.Module):
                  aggregate_output: torch.Tensor) -> torch.Tensor:
         """One interface call: [N, d_o] x [N, d_agg] -> [N, d_tau].
 
-        ``aggregate_output`` is the host aggregate result (layer 0 has no
-        children: the host passes its raw state in both slots).
+        ``aggregate_output`` is the host aggregate result of an internal node.
         """
         u = self.adapters[tau](own_input)
         a = self.agg_adapters[tau](aggregate_output.to(u.dtype))

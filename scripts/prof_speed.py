@@ -14,7 +14,7 @@ random.seed(0); np.random.seed(0); torch.manual_seed(0)
 BS = int(sys.argv[1]) if len(sys.argv) > 1 else 100
 NL = int(sys.argv[2]) if len(sys.argv) > 2 else 2
 ND = int(sys.argv[3]) if len(sys.argv) > 3 else 10
-VANILLA = (len(sys.argv) > 4 and sys.argv[4] == "vanilla")
+MODE = sys.argv[4] if len(sys.argv) > 4 else "stage2"
 
 from rpbe.data.jodie import JodieDataset
 from rpbe.hosts.official_tgn import TGN, get_neighbor_finder
@@ -73,14 +73,14 @@ def acc(name):
         times[name] = times.get(name, 0.0) + (now - _last)
     _last = now
 
-N = 12
+N = int(sys.argv[5]) if len(sys.argv) > 5 else 12
 wins = 0
 window_batches = []
 shadow = None
 from rpbe.hosts.official_tgn import MLP
 decoder = MLP(dim=172, drop=0.1).to(device)
 acc('start')
-if VANILLA:
+if MODE == "vanilla":
     # Official rhythm: ONE forward (no trace, no adapter hook) + task BCE
     # + ONE backward + step per batch.  The adapter is still installed but
     # traces nothing (empty trace set), so the host path is untouched.
@@ -105,6 +105,88 @@ if VANILLA:
         opt.step()
         acc('vanilla_step')
     acc('end')
+elif MODE == "pretrain":
+    # Stage-1 rhythm with the replay loop: neg sampling + link BCE, the
+    # same pass1/pass2 structure as the real pretrain loop.
+    from rpbe.hosts.official_tgn import TGN as _T
+    def run_pretrain_round(measure):
+        global _last, wins, shadow, window_batches
+        _last = None
+        wins = 0
+        window_batches = []
+        shadow = None
+        window.reset()
+        tgn.memory.__init_memory__()
+        if measure:
+            times.clear()
+            acc('start')
+        for k in range(N):
+            s, e = k * BS, min(len(train.sources), (k + 1) * BS)
+            srcs = train.sources[s:e]
+            dsts = train.destinations[s:e]
+            tms = train.timestamps[s:e]
+            eis = train.edge_idxs[s:e]
+            size = len(srcs)
+            trace_rows = select_trace_rows(np.zeros(size), 32, 0, k,
+                                           'evenly_spaced')
+            adapter.set_trace_source_rows(trace_rows)
+            with torch.no_grad():
+                negatives = np.random.choice(train.destinations,
+                                             size=size, replace=True)
+                tgn.compute_edge_probabilities(srcs, dsts, negatives,
+                                               tms, eis, ND)
+            acc('pass1_fwd')
+            revs = {int(r): {'counterpart': int(dsts[r]), 'label': 1.0,
+                             'time': float(tms[r]),
+                             'event_idx': int(eis[r]), 'role': 0}
+                    for r in trace_rows}
+            cuts = builder.build(adapter.trace, root_events=revs,
+                                 batch_seed=k)
+            acc('build_cuts')
+            window.add(cuts)
+            acc('window_add')
+            window_batches.append((srcs, dsts, tms, eis, negatives,
+                                   trace_rows, k))
+            if shadow is None:
+                shadow = tgn.memory.backup_memory()
+            if window.window_ready():
+                closed, replay_plan, diag = window.close_replay()
+                acc('close_replay')
+                tgn.memory.restore_memory(shadow)
+                opt.zero_grad(set_to_none=True)
+                for bi, (src2, dst2, t2, e2, neg2, tr2, step2) in                         enumerate(window_batches):
+                    adapter.set_trace_source_rows(tr2)
+                    pp, np_ = tgn.compute_edge_probabilities(
+                        src2, dst2, neg2, t2, e2, ND)
+                    acc('pass2_fwd')
+                    link_loss = (torch.nn.functional.binary_cross_entropy(
+                        pp.squeeze(), torch.ones(len(src2), device=device))
+                        + torch.nn.functional.binary_cross_entropy(
+                            np_.squeeze(), torch.zeros(len(src2),
+                                                       device=device)))
+                    loss = link_loss / float(len(window_batches))
+                    for tau, plan in replay_plan.items():
+                        if bi >= len(plan["by_batch"]):
+                            continue
+                        for (occ_id, g) in plan["by_batch"][bi]:
+                            z = adapter.trace.occurrences[occ_id].state.z
+                            loss = loss + (g * z.float()).sum()
+                    acc('pass2_surrogate')
+                    loss.backward()
+                    acc('backward')
+                    tgn.memory.detach_memory()
+                opt.step()
+                acc('optimizer_step')
+                window_batches = []
+                shadow = None
+                wins += 1
+        if measure:
+            acc('end')
+            print('closed windows:', wins, 'of', N, 'batches')
+        return wins
+
+    run_pretrain_round(measure=False)
+    run_pretrain_round(measure=True)
 else:
     # RPBE rounds: round 1 warms the fixed-measurement p cache (epoch 1
     # cost); round 2 measures the epoch-2+ speed with cache hits.
@@ -132,9 +214,11 @@ else:
                 tgn.compute_temporal_embeddings(
                     srcs, dsts, dsts, tms, eis, ND)
             acc('pass1_fwd')
-            revs = {int(r): {'dst': int(dsts[r]), 'label': float(lbs[r]),
+            revs = {int(r): {'counterpart': int(dsts[r]),
+                             'label': float(lbs[r]),
                              'time': float(tms[r]),
-                             'event_idx': int(eis[r])} for r in trace_rows}
+                             'event_idx': int(eis[r]), 'role': 0}
+                    for r in trace_rows}
             cuts = builder.build(adapter.trace, root_events=revs,
                                  batch_seed=k)
             acc('build_cuts')

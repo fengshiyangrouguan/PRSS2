@@ -92,11 +92,9 @@ class TestPsiBehavior(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.maps.pv_batch([base_context(horizon=4)], [1.0])
 
-    def test_star_horizon_changes_sketch(self):
-        # h=3 (the star horizon) is a valid, distinct measurement slot.
-        p1 = self.maps.psi(base_context(horizon=1), 1.0)
-        p3 = self.maps.psi(base_context(horizon=3), 1.0)
-        self.assertFalse(torch.equal(p1, p3))
+    def test_root_star_horizon_is_rejected(self):
+        with self.assertRaises(ValueError):
+            self.maps.psi(base_context(horizon=3), 1.0)
 
     def test_invalid_path_relation_raises(self):
         with self.assertRaises(ValueError):

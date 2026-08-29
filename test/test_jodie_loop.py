@@ -1,6 +1,7 @@
 """JODIE loop contracts: row selection, metric bundle, tiny end-to-end smoke."""
 
 import unittest
+from pathlib import Path
 
 import numpy as np
 import torch
@@ -9,7 +10,7 @@ from rpbe.compressor import RecursiveCompressor
 from rpbe.config import RPBConfig
 from rpbe.data.jodie import JodieData
 from rpbe.maps import FixedMaps
-from rpbe.records import JodieCutBuilder, NODE_CLASS
+from rpbe.records import JodieCutBuilder, JodieFutureIndex, NODE_CLASS
 from rpbe.training.jodie_loop import (JodieNodeClassificationLoop,
                                       metric_bundle, select_trace_rows)
 
@@ -91,6 +92,18 @@ class TestMetricBundle(unittest.TestCase):
         self.assertEqual(m["ap"], 0.0)
 
 
+class TestOnePassSourceContract(unittest.TestCase):
+    def test_training_code_has_no_shadow_replay_path(self):
+        training = Path(__file__).resolve().parents[1] / "src" / "rpbe" \
+            / "training"
+        text = (training / "jodie_loop.py").read_text(encoding="utf-8") \
+            + (training / "pretrain_loop.py").read_text(encoding="utf-8")
+        for forbidden in ("_close_and_replay", "_backup_replay_state",
+                          "_restore_replay_state", "root_events",
+                          "torch.autograd.grad"):
+            self.assertNotIn(forbidden, text)
+
+
 @REQUIRES_NUMPY_BRIDGE
 class TestLoopSmoke(unittest.TestCase):
     """End-to-end: one train epoch, eval, and replay on tiny data, with and
@@ -128,20 +141,8 @@ class TestLoopSmoke(unittest.TestCase):
             adapter = install_adapter(tgn)
             adapter.compressor = compressor
             fixed_maps = FixedMaps(cfg).to(self.device)
-            endpoints = {int(e): (int(s), int(d))
-                         for s, d, e in zip(self.train.sources,
-                                            self.train.destinations,
-                                            self.train.edge_idxs)}
-            labels_tbl = {int(e): float(y)
-                          for e, y in zip(self.train.edge_idxs,
-                                          self.train.labels)}
-            users = set(int(x) for x in self.train.sources)
-            pages = set(int(x) for x in self.train.destinations)
-            adapter.edge_tables = (endpoints, labels_tbl, users, pages)
-            adapter._endpoints = endpoints
-            adapter._user_nodes = users
             cut_builder = JodieCutBuilder(
-                (endpoints, labels_tbl, users, pages),
+                JodieFutureIndex(self.train),
                 stage=NODE_CLASS, seed=0)
         seen = set()
         main_params = [p for p in main_params

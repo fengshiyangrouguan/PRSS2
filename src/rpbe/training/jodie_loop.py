@@ -200,16 +200,52 @@ class JodieNodeClassificationLoop:
             self.monitor.validate_kf(scores, bounds, step)
         return raw_score, norm_score, scores, auxiliary, set(cold)
 
+    def _close_repr_group(self, group_batch_count: int, global_step: int,
+                          new_ref_j: dict, param_version: int):
+        """Close one macro group: build the next KF reference (KF path),
+        step the representation optimizer, advance the version, commit.
+
+        The commit happens strictly AFTER the optimizer step, so the new
+        reference always lags the updated parameters by exactly one
+        version.  Returns ``(new_param_version, refreshes)``.
+        """
+        refreshes = 0
+        if self.kf_on:
+            diagnostics, refreshed = self.kf_window.close_group()
+            refreshes = len(refreshed)
+            for tau, diag in diagnostics.items():
+                if diag.get("failed"):
+                    self.monitor.alert(
+                        "warning", "kf_reference_failed",
+                        "{} {} scale_z={:.3e} scale_p={:.3e} trees={}".format(
+                            tau, diag["failed"],
+                            diag.get("scale_z", float("nan")),
+                            diag.get("scale_p", float("nan")),
+                            diag["M_unique_trees"]),
+                        step=global_step, interface=tau)
+                if diag.get("score") is not None:
+                    new_ref_j[tau] = diag["score"]
+        for p in self.repr_params:
+            if p.grad is not None:
+                p.grad.div_(float(max(1, group_batch_count)))
+        self._clip(self.repr_params)
+        self.repr_optimizer.step()
+        param_version += 1
+        if self.kf_on:
+            self.kf_window.commit_reference(current_version=param_version)
+        return param_version, refreshes
+
     # ----------------------------------------------------------------- training
     def train_epoch(self, epoch: int, global_step: int, train: object) -> Dict:
         """One chronological epoch.
 
         Macro-group timing (eighth review C): representation parameters
         (host + compressor) are frozen within a macro-group and update once
-        when the KF pending windows close (or, in the task-only fast path,
-        every fixed K batches so both protocols share the same optimizer
-        cadence).  The head updates every batch.  One query, one backward,
-        one head step per batch — no replay, no cross-batch graphs.
+        per FIXED group of ceil(kf_min_abs / trace_roots) batches — the
+        same cadence for the KF path and the lambda=0 task-only fast path
+        (fair ablation, review D).  The head updates every batch.  One
+        query, one backward, one head step per batch — no replay, no
+        cross-batch graphs.
         """
         self.reset_memory()
         if self.kf_window is not None:
@@ -217,8 +253,8 @@ class JodieNodeClassificationLoop:
         self.tgn.train(self.finetune_host)
         self.decoder.train()
 
-        # Fixed group length for the task-only fast path (same cadence as
-        # the KF path: ceil(min_abs / trace_roots) batches).
+        # Fixed group length shared by both component protocols:
+        # ceil(kf_min_abs / trace_roots) batches.
         fixed_group = max(1, math.ceil(
             self.rpbe_cfg.kf_min_abs / max(1, self.trace_roots))) \
             if self.component_on else 1
@@ -228,6 +264,7 @@ class JodieNodeClassificationLoop:
         total_norm = 0.0
         kf_sum = {}
         kf_count_tau = {}
+        new_ref_j = {}
         cold_types = set()
         refreshes = 0
         aux_batches = 0
@@ -317,47 +354,25 @@ class JodieNodeClassificationLoop:
             group_batch_count += 1
             global_step += 1
 
-            # Macro-group close: KF path closes on pending readiness; the
-            # task-only fast path uses the fixed cadence.
-            close_now = False
-            if self.kf_on and self.kf_window.all_pending_ready():
-                close_now = True
-            elif not self.kf_on and self.component_on \
-                    and group_batch_count >= fixed_group:
-                close_now = True
-            if close_now:
-                if self.kf_on:
-                    diagnostics, refreshed = self.kf_window.close_group()
-                    refreshes += len(refreshed)
-                    for tau, diag in diagnostics.items():
-                        if diag.get("failed"):
-                            self.monitor.alert(
-                                "warning", "kf_reference_failed",
-                                "{} {} scale_z={:.3e} scale_p={:.3e} "
-                                "trees={}".format(
-                                    tau, diag["failed"],
-                                    diag.get("scale_z", float("nan")),
-                                    diag.get("scale_p", float("nan")),
-                                    diag["M_unique_trees"]),
-                                step=global_step, interface=tau)
-                for p in self.repr_params:
-                    if p.grad is not None:
-                        p.grad.div_(float(group_batch_count))
-                self._clip(self.repr_params)
-                self.repr_optimizer.step()
-                param_version += 1
-                if self.kf_on:
-                    self.kf_window.commit_reference()
+            # Macro-group close (eighth review C): FIXED cadence shared by
+            # the KF path and the lambda=0 task-only path —
+            # ceil(kf_min_abs / trace_roots) batches — so both protocols
+            # share the same representation-update timing (fair ablation,
+            # review D).  The window's threshold gate lives in
+            # close_group, which discards below-threshold windows.
+            if repr_group_active and group_batch_count >= fixed_group:
+                param_version, refs = self._close_repr_group(
+                    group_batch_count, global_step, new_ref_j, param_version)
+                refreshes += refs
                 repr_group_active = False
 
-        # Epoch drain: update the representation parameters with the
-        # accumulated task gradients of the unfinished group.
+        # Epoch drain: the same close sequence for the unfinished group
+        # (close + commit + one representation step), so the reference
+        # lifecycle never crosses an epoch boundary.
         if repr_group_active:
-            for p in self.repr_params:
-                if p.grad is not None:
-                    p.grad.div_(float(max(1, group_batch_count)))
-            self._clip(self.repr_params)
-            self.repr_optimizer.step()
+            param_version, refs = self._close_repr_group(
+                group_batch_count, global_step, new_ref_j, param_version)
+            refreshes += refs
             self.repr_optimizer.zero_grad(set_to_none=True)
 
         train_metrics = metric_bundle(np.concatenate(train_labels),
@@ -379,10 +394,18 @@ class JodieNodeClassificationLoop:
                      for tau, value in kf_sum.items()}
             kf_out = {
                 "estimator": "one_pass_lagged_moment_adjoint",
+                # J/J_norm are the ACTIVE reference values (honest
+                # monitoring, never the current model's score).
                 "J": means,
                 "J_norm": {tau: value / min(
                     int(self.rpbe_cfg.state_dims[tau]),
                     int(self.fixed_maps.m)) for tau, value in means.items()},
+                # The NEXT reference built at this epoch's group closes
+                # (None where the group was below threshold).
+                "J_new": dict(new_ref_j),
+                "reference_age": {
+                    tau: self.kf_window.reference_age(tau)
+                    for tau in means},
                 "skipped_types": sorted(cold_types),
                 "kf_score": total_raw / max(num_batch, 1),
                 "kf_normalized": total_norm / max(num_batch, 1),

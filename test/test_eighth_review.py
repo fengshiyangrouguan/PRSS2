@@ -24,7 +24,8 @@ import torch
 from rpbe.compressor import RecursiveCompressor
 from rpbe.config import RPBConfig
 from rpbe.data.jodie import JodieData
-from rpbe.loss import KFLaggedWindow
+from rpbe.loss import (KFLaggedWindow, WeightedWelford, kf_adjoint,
+                      kf_vjp_batch, latent_z_adjoint)
 from rpbe.maps import FixedMaps
 from rpbe.records import JodieCutBuilder, JodieFutureIndex, LINK, NODE_CLASS
 from rpbe.state import CompactCutTrace
@@ -48,29 +49,6 @@ class _FakeMonitor:
 
     def alert(self, severity, code, message, **meta):
         pass
-
-
-class _SpyOpt:
-    """Counts optimizer steps; records the grad snapshot at each step."""
-
-    def __init__(self, params):
-        self.param_groups = [{"params": list(params)}]
-        self.steps = 0
-        self.grad_snaps = []
-
-    def zero_grad(self, set_to_none=True):
-        for p in self.param_groups[0]["params"]:
-            if p.grad is not None:
-                if set_to_none:
-                    p.grad = None
-                else:
-                    p.grad.zero_()
-
-    def step(self):
-        self.steps += 1
-        self.grad_snaps.append([
-            None if p.grad is None else float(p.grad.detach().abs().sum())
-            for p in self.param_groups[0]["params"]])
 
 
 def _tiny_loop(rpbe_cfg, adapter, cut_builder, fixed_maps,
@@ -156,6 +134,153 @@ class TestRankNormalization(unittest.TestCase):
         self.assertLessEqual(norm, 1.0)
 
 
+class _SpyOpt:
+    """Counts optimizer steps; records the grad snapshot at each step."""
+
+    def __init__(self, params):
+        self.param_groups = [{"params": list(params)}]
+        self.steps = 0
+        self.grad_snaps = []
+        self.param_snaps_at_zero = []
+        self.param_snaps_at_step = []
+
+    def _snap(self):
+        return [p.detach().clone()
+                for p in self.param_groups[0]["params"]]
+
+    def zero_grad(self, set_to_none=True):
+        self.param_snaps_at_zero.append(self._snap())
+        for p in self.param_groups[0]["params"]:
+            if p.grad is not None:
+                if set_to_none:
+                    p.grad = None
+                else:
+                    p.grad.zero_()
+
+    def step(self):
+        self.steps += 1
+        self.param_snaps_at_step.append(self._snap())
+        self.grad_snaps.append([
+            None if p.grad is None else float(p.grad.detach().abs().sum())
+            for p in self.param_groups[0]["params"]])
+
+
+class TestVJPEquivalence(unittest.TestCase):
+    """Review acceptance 1-4: the moment-adjoint VJP is the exact first
+    derivative of the window score on the SAME data, additive across
+    batches, and the /W_ref scaling does NOT satisfy the equivalence.
+
+    Pure torch: runs on the local box too.
+    """
+
+    def _window(self, n_trees=8, rows_per_cut=4, r=4, m=8):
+        # Cluster weights (rows of one cut share z) make D strictly
+        # smaller than W: D/W = (n-1)/n, which the /W_ref negative test
+        # relies on.
+        rows = make_cut_rows(n_trees, r, m, rows_per_cut=rows_per_cut)
+        zs = torch.stack([row.z for row in rows])
+        ps = torch.stack([_FakeMaps(m).pv(row.context, row.outcome)
+                          for row in rows])
+        w = torch.tensor([row.weight for row in rows], dtype=torch.float64)
+        cut_ids = [(row.tree_id, row.occurrence_id, row.tau)
+                   for row in rows]
+        wf = WeightedWelford(r, m)
+        wf.add(zs, ps, w, cut_ids)
+        return wf.result(), rows, cut_ids
+
+    def _vjp_row_grads(self, rows, adjoints, result):
+        """Per-row gradients of the raw batch VJP <A, M2_batch>."""
+        zs = torch.stack([row.z.clone() for row in rows])
+        ps = torch.stack([_FakeMaps(8).pv(row.context, row.outcome)
+                          for row in rows])
+        w = torch.tensor([row.weight for row in rows], dtype=torch.float64)
+        zl = zs.requires_grad_(True)
+        raw = kf_vjp_batch(zl, ps, w, result["mu_z"], result["mu_p"],
+                           adjoints)
+        raw.backward()
+        return zl.grad.detach()
+
+    def _merge_by_cut(self, rows, row_grads):
+        merged = {}
+        for row, g in zip(rows, row_grads):
+            cid = (row.tree_id, row.occurrence_id, row.tau)
+            merged[cid] = merged.get(cid, 0.0) + g
+        return [merged[cid] for cid in sorted(merged)]
+
+    def test_raw_surrogate_gradient_cosine_matches_direct(self):
+        # Acceptance 1/2: on the SAME window data the raw VJP gradient
+        # and the direct score gradient are collinear (cosine > 0.99999),
+        # so the training direction -grad(-surrogate) points the same way
+        # as grad(J).
+        result, rows, cut_ids = self._window()
+        _, adjoints, _ = kf_adjoint(result, eps=1e-4)
+        g_vjp = self._merge_by_cut(rows, self._vjp_row_grads(
+            rows, adjoints, result))
+        z_rows = torch.stack([row.z for row in rows])
+        p_rows = torch.stack([_FakeMaps(8).pv(row.context, row.outcome)
+                              for row in rows])
+        w = torch.tensor([row.weight for row in rows], dtype=torch.float64)
+        _, g_by_cut, diag = latent_z_adjoint(
+            z_rows, p_rows, w, cut_ids, result["mu_z"], result["mu_p"],
+            result["D"], 1e-4)
+        self.assertIsNone(diag["failed"])
+        g_direct = [g_by_cut[cid] for cid in sorted(g_by_cut)]
+        gv = torch.stack(g_vjp).flatten().double()
+        gd = torch.stack(g_direct).flatten().double()
+        cos = float((gv * gd).sum()
+                    / (gv.norm() * gd.norm()).clamp(min=1e-30))
+        self.assertGreater(cos, 0.99999)
+
+    def test_batch_split_vjp_sums_to_direct_gradient(self):
+        # Acceptance 3: the raw VJP of the whole window equals the sum of
+        # per-batch VJPs, and that sum IS the exact direct gradient of
+        # the window score.  (The score is scale-invariant —
+        # _score_from_covs normalizes by mean(diag) — so the 1/D of the
+        # covariance convention cancels exactly and NO rescaling is the
+        # correct recovery.)
+        result, rows, cut_ids = self._window()
+        _, adjoints, _ = kf_adjoint(result, eps=1e-4)
+        total = None
+        for start in range(0, len(rows), 5):
+            chunk = rows[start:start + 5]
+            g = self._vjp_row_grads(chunk, adjoints, result)
+            total = g if total is None else torch.cat([total, g])
+        g_raw_sum = total  # row order preserved by the loop slicing
+        z_rows = torch.stack([row.z for row in rows])
+        p_rows = torch.stack([_FakeMaps(8).pv(row.context, row.outcome)
+                              for row in rows])
+        w = torch.tensor([row.weight for row in rows], dtype=torch.float64)
+        _, g_by_cut, diag = latent_z_adjoint(
+            z_rows, p_rows, w, cut_ids, result["mu_z"], result["mu_p"],
+            result["D"], 1e-4)
+        self.assertIsNone(diag["failed"])
+        g_direct = self._merge_by_cut(rows, g_raw_sum)
+        ref = [g_by_cut[cid] for cid in sorted(g_by_cut)]
+        for a, b in zip(g_direct, ref):
+            err = float((a.double() - b.double()).norm()
+                        / b.double().norm().clamp(min=1e-30))
+            self.assertLess(err, 1e-5)
+
+    def test_divide_by_wref_breaks_equivalence(self):
+        # Acceptance 4: on the SAME window data (where the equivalence of
+        # acceptance 1-3 holds), the /W_ref convention breaks it — it
+        # shrinks the gradient by 1/W_ref — while the raw VJP remains the
+        # exact direct gradient (the scale-invariant score cancels the
+        # 1/D factor, so no rescaling is the correct recovery).
+        result, rows, _ = self._window()
+        _, adjoints, _ = kf_adjoint(result, eps=1e-4)
+        g_raw = self._vjp_row_grads(rows, adjoints, result)
+        W_ref = result["W"]
+        g_direct_flat = torch.stack(
+            self._merge_by_cut(rows, g_raw)).flatten().double()
+        g_divw = torch.stack(
+            self._merge_by_cut(rows, g_raw / W_ref)).flatten().double()
+        norm = g_direct_flat.norm().clamp(min=1e-30)
+        # /W_ref convention: off by the 1/W_ref constant (7/8 here).
+        err_divw = float((g_divw - g_direct_flat).norm() / norm)
+        self.assertGreater(err_divw, (1.0 - 1.0 / W_ref) * 0.5)
+
+
 class TestReferenceLifecycle(unittest.TestCase):
     """Section B: the lagged reference window lifecycle.
 
@@ -192,6 +317,19 @@ class TestReferenceLifecycle(unittest.TestCase):
                      param_version=0)
         self.assertIsNotNone(window.reference_score("t"))
 
+    def test_window_score_bounded_by_rank(self):
+        # Acceptance 10: the ridge-regularized Ky Fan score stays within
+        # [0, min(d_tau, m)], so the rank-normalized objective J_norm
+        # stays within [0, 1].
+        window = self._window()
+        _feed_window(window, make_cut_rows(24, 4, 8, offset=0),
+                     param_version=0)
+        j = window.reference_score("t")
+        self.assertIsNotNone(j)
+        self.assertGreaterEqual(j, 0.0)
+        self.assertLessEqual(j, 4.0 * (1.0 + 1e-6))
+        self.assertLessEqual(j / 4.0, 1.0)
+
     def test_close_group_builds_next_without_activating(self):
         window = self._window()
         window.begin_group(0, 0)
@@ -206,28 +344,33 @@ class TestReferenceLifecycle(unittest.TestCase):
         self.assertIsNotNone(window.reference_score("t"))
         self.assertEqual(window._reference["t"]["param_version"], 0)
 
-    def test_below_threshold_group_close_keeps_pending(self):
-        # Window accumulation is decoupled from the representation-update
-        # cadence: a group closes below threshold without discarding its
-        # rows — the next group keeps adding to the same window.  The
-        # pending is only reset when a refresh actually happens.
+    def test_below_threshold_group_close_discards_pending(self):
+        # Eighth review C: a reference window must live inside ONE macro
+        # group (the representation parameters are frozen within a group),
+        # so a below-threshold group discards its partial window instead
+        # of carrying rows across parameter versions.
         window = self._window()
         window.begin_group(0, 0)
         window.consume(make_cut_rows(2, 4, 8, rows_per_cut=2))
         self.assertEqual(window.pending_tree_count("t"), 2)
         diagnostics, refreshed = window.close_group()
         self.assertEqual(refreshed, [])
-        self.assertEqual(diagnostics, {})
+        self.assertTrue(diagnostics["t"]["below_threshold"])
+        self.assertEqual(diagnostics["t"]["dropped_trees"], 2)
         self.assertIsNone(window.reference_score("t"))
-        # Next group accumulates on top of the surviving rows.
+        # The discarded rows do NOT survive into the next group.
         window.begin_group(1, 0)
         window.consume(make_cut_rows(2, 4, 8, rows_per_cut=2, offset=50))
+        self.assertEqual(window.pending_tree_count("t"), 2)
+        # A group that reaches the threshold refreshes and activates.
+        window.consume(make_cut_rows(2, 4, 8, rows_per_cut=2, offset=100))
         self.assertEqual(window.pending_tree_count("t"), 4)
         diagnostics, refreshed = window.close_group()
         self.assertEqual(refreshed, ["t"])
         self.assertIsNone(window.reference_score("t"))  # not active yet
-        window.commit_reference()
+        window.commit_reference(current_version=2)
         self.assertIsNotNone(window.reference_score("t"))
+        self.assertEqual(window.reference_age("t"), 1)
         # A refresh resets the pending for the next group.
         self.assertEqual(window.pending_tree_count("t"), 0)
 
@@ -293,6 +436,27 @@ class TestMacroGroupTiming(unittest.TestCase):
         self.assertIn(1.0, divs)
         # Both representation steps actually carried gradients.
         self.assertTrue(any(snap is not None for snap in repr_opt.grad_snaps))
+
+    def test_repr_fingerprint_unchanged_within_group(self):
+        # Acceptance 5: the representation parameters are untouched
+        # between the group's zero_grad and its single step — group 2's
+        # start state equals the state right after step 1, and the step
+        # really moved the parameters.
+        loop, repr_opt, head_opt = self._task_only_loop()
+        loop.train_epoch(0, 0, self.train)  # 3 batches, group length 2
+        snaps_zero = repr_opt.param_snaps_at_zero
+        snaps_step = repr_opt.param_snaps_at_step
+        self.assertEqual(len(snaps_zero), 2)   # group1 start, group2 start
+        self.assertEqual(len(snaps_step), 2)   # group close + epoch drain
+        s0, s1 = snaps_zero
+        step0 = snaps_step[0]
+        # Nothing touched the representation parameters between the two
+        # groups (the batch-3 gradient accumulation does not move params).
+        for a, b in zip(s1, step0):
+            self.assertTrue(torch.equal(a, b))
+        # And the representation step really moved them.
+        for a, b in zip(s0, step0):
+            self.assertFalse(torch.equal(a, b))
 
 
 @REQUIRES_NUMPY_BRIDGE
@@ -407,6 +571,26 @@ class TestFrozenScaleAndLinkRefusal(unittest.TestCase):
 
     Pure torch / python fixtures: runs on the local box too.
     """
+
+    def test_pv_batch_frozen_scale_consistent_with_pv(self):
+        # Acceptance 13 (batch path): pv_batch uses the frozen
+        # construction-time delta_t_scale, and stays consistent with the
+        # per-row pv after external config mutation.
+        cfg = RPBConfig(state_dims={"t": 4}, own_dims={"t": 4}, m=8,
+                        delta_t_scale=10.0)
+        maps = FixedMaps(cfg)
+        contexts = [{"horizon": 1, "delta_t": 500.0 * (k + 1),
+                     "counterpart": k, "role": 0, "query_type": 1,
+                     "endpoint_role": 1, "path": []} for k in range(5)]
+        outcomes = [float(k) for k in range(5)]
+        out1 = maps.pv_batch(contexts, outcomes)
+        for k, ctx in enumerate(contexts):
+            self.assertTrue(torch.equal(out1[k], maps.pv(ctx, outcomes[k])))
+        cfg.delta_t_scale = 999.0  # post-construction mutation
+        out2 = maps.pv_batch(contexts, outcomes)
+        self.assertTrue(torch.equal(out1, out2))
+        for k, ctx in enumerate(contexts):
+            self.assertTrue(torch.equal(out2[k], maps.pv(ctx, outcomes[k])))
 
     def test_pv_batch_frozen_delta_t_scale(self):
         # F1: the P projection freezes delta_t_scale at construction;

@@ -24,7 +24,7 @@ Numerical contract (after the cloud crash review, 2026-08-27):
 """
 
 import math
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import torch
 
@@ -650,17 +650,34 @@ class KFLaggedWindow:
 
     def close_group(self):
         """Build the NEXT reference from pending moments (never the active
-        one).  Returns ``(diagnostics, refreshed)``."""
+        one).  Returns ``(diagnostics, refreshed)``.
+
+        Eighth review C: a window must live inside ONE macro group — the
+        representation parameters are frozen within a group, so rows from
+        older groups would mix parameter versions and break the "single
+        theta_ref" property of the linearization.  A group that closes
+        below threshold DISCARDS its partial window instead of carrying
+        it across versions.
+        """
         diagnostics: Dict[str, dict] = {}
         refreshed: List[str] = []
         for tau, pending in list(self._pending.items()):
             if len(pending["tree_seen"]) < self._threshold(tau):
+                diagnostics[tau] = {
+                    "failed": None,
+                    "below_threshold": True,
+                    "M_unique_trees": len(pending["tree_seen"]),
+                    "threshold": self._threshold(tau),
+                    "dropped_trees": len(pending["tree_seen"]),
+                }
+                self._pending[tau] = self._new_pending(tau)
                 continue
             result = pending["moments"].result()
             score, adjoints, score_diag = kf_adjoint(
                 result, self.eps, self.strict, self.variant)
             diagnostics[tau] = self._diagnostics(pending, result, score_diag)
             if score is not None:
+                diagnostics[tau]["score"] = float(score)
                 self._next_reference[tau] = {
                     "score": float(score),
                     "adjoints": adjoints,
@@ -677,8 +694,16 @@ class KFLaggedWindow:
             self._pending[tau] = self._new_pending(tau)
         return diagnostics, refreshed
 
-    def commit_reference(self) -> None:
-        """Activate next references; each must lag exactly one update."""
+    def commit_reference(self, current_version: Optional[int] = None) -> None:
+        """Activate next references; each must lag exactly one update.
+
+        ``current_version`` is the representation parameter version AFTER
+        the just-finished group's optimizer step (the loop advances it
+        right before committing); it is recorded so ``reference_age`` can
+        report the lag.
+        """
+        if current_version is not None:
+            self._param_version = int(current_version)
         for tau, ref in self._next_reference.items():
             current = self._reference.get(tau)
             if current is not None:
@@ -731,15 +756,6 @@ class KFLaggedWindow:
     def pending_tree_count(self, tau: str) -> int:
         pending = self._pending.get(tau)
         return 0 if pending is None else int(len(pending["tree_seen"]))
-
-    def all_pending_ready(self) -> bool:
-        """True when every nonempty pending window reached its threshold
-        (the macro-group close condition)."""
-        nonempty = [tau for tau, pending in self._pending.items()
-                    if pending is not None and pending["tree_seen"]]
-        return bool(nonempty) and all(
-            len(self._pending[tau]["tree_seen"]) >= self._threshold(tau)
-            for tau in nonempty)
 
 
 class KFMomentWindow:

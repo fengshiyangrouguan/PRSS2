@@ -275,14 +275,19 @@ class TestKFLaggedWindow(unittest.TestCase):
         rows = make_cut_rows(2, 4, 8, rows_per_cut=2)
         window.begin_group(0, 0)
         scores, surrogates, cold = window.consume(rows)
-        # Below threshold: no active reference, pending keeps the 2 trees.
+        # Below threshold: no active reference, the 2 trees sit pending.
         self.assertEqual(scores, {})
         self.assertIn("t", cold)
         self.assertEqual(window.pending_tree_count("t"), 2)
         diagnostics, refreshed = window.close_group()
         window.commit_reference()
+        # Eighth review C: a below-threshold group DISCARDS its partial
+        # window — a reference must never mix parameter versions.
         self.assertEqual(refreshed, [])
-        self.assertEqual(diagnostics, {})
+        self.assertTrue(diagnostics["t"]["below_threshold"])
+        self.assertEqual(diagnostics["t"]["dropped_trees"], 2)
+        self.assertEqual(window.pending_tree_count("t"), 0)
+        self.assertIsNone(window.reference_score("t"))
 
     def test_kf_lagged_surrogate_ascends_reference_objective(self):
         """Seventh-review sign contract on the lagged path.

@@ -554,6 +554,7 @@ class KFLaggedWindow:
         self._param_version = None
         self._epoch = None
         self.refresh_count = 0
+        self.stale_drops = 0
 
     def _threshold(self, tau: str) -> int:
         # CCA rank is bounded by min(dim Z, dim P).  Count independent query
@@ -694,27 +695,34 @@ class KFLaggedWindow:
             self._pending[tau] = self._new_pending(tau)
         return diagnostics, refreshed
 
-    def commit_reference(self, current_version: Optional[int] = None) -> None:
+    def commit_reference(self, current_version: Optional[int] = None) -> List[str]:
         """Activate next references; each must lag exactly one update.
 
         ``current_version`` is the representation parameter version AFTER
         the just-finished group's optimizer step (the loop advances it
         right before committing); it is recorded so ``reference_age`` can
         report the lag.
+
+        Review B.8: only a reference lagging EXACTLY one representation
+        update may be activated.  A candidate whose version is not
+        current+1 (a group below threshold skipped its refresh, so the
+        window spans several parameter versions) is DISCARDED — never
+        silently reused — and its tau is returned for the caller to
+        alert on.
         """
         if current_version is not None:
             self._param_version = int(current_version)
-        for tau, ref in self._next_reference.items():
+        stale: List[str] = []
+        for tau, ref in list(self._next_reference.items()):
             current = self._reference.get(tau)
-            if current is not None:
-                if ref["param_version"] != current["param_version"] + 1:
-                    raise AssertionError(
-                        "reference must lag exactly one representation "
-                        "update (tau={}, current v{}, new v{})".format(
-                            tau, current["param_version"],
-                            ref["param_version"]))
+            if current is not None and \
+                    ref["param_version"] != current["param_version"] + 1:
+                stale.append(tau)
+                self.stale_drops += 1
+                continue
             self._reference[tau] = ref
         self._next_reference = {}
+        return stale
 
     def _diagnostics(self, pending: dict, result: dict,
                      score_diag: dict) -> dict:

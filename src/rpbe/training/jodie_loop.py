@@ -232,7 +232,14 @@ class JodieNodeClassificationLoop:
         self.repr_optimizer.step()
         param_version += 1
         if self.kf_on:
-            self.kf_window.commit_reference(current_version=param_version)
+            stale = self.kf_window.commit_reference(
+                current_version=param_version)
+            for tau in stale:
+                self.monitor.alert(
+                    "warning", "kf_reference_stale",
+                    "{} candidate spans several parameter versions; "
+                    "discarded".format(tau),
+                    step=global_step, interface=tau)
         return param_version, refreshes
 
     # ----------------------------------------------------------------- training
@@ -414,6 +421,7 @@ class JodieNodeClassificationLoop:
                 "p_cache_misses": getattr(
                     self.fixed_maps, "_p_cache_misses", 0),
                 "reference_refreshes": refreshes,
+                "stale_drops": getattr(self.kf_window, "stale_drops", 0),
                 "aux_batches": aux_batches,
             }
         return {

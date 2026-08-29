@@ -159,6 +159,11 @@ class _SpyOpt:
 
     def step(self):
         self.steps += 1
+        # Real SGD update so parameter fingerprints actually move (the
+        # spy must behave like an optimizer for the timing tests).
+        for p in self.param_groups[0]["params"]:
+            if p.grad is not None:
+                p.data.add_(p.grad, alpha=-1e-3)
         self.param_snaps_at_step.append(self._snap())
         self.grad_snaps.append([
             None if p.grad is None else float(p.grad.detach().abs().sum())
@@ -292,17 +297,25 @@ class TestReferenceLifecycle(unittest.TestCase):
             {"t": 4}, min_ratio=1.0, min_abs=4, fixed_maps=_FakeMaps(8))
 
     def test_commit_reference_enforces_exact_one_update_lag(self):
+        # Review B.8: a candidate reference that does NOT lag exactly one
+        # representation update is discarded (never silently reused) and
+        # reported through the stale list.
         window = self._window()
         _feed_window(window, make_cut_rows(4, 4, 8, offset=0),
                      param_version=0)
         self.assertEqual(window._reference["t"]["param_version"], 0)
-        # Next group claims version 2 — a representation update was skipped.
+        # Next group claims version 2 — a refresh was skipped in between.
         window.begin_group(2, 0)
         window.consume(make_cut_rows(4, 4, 8, offset=50))
         window.close_group()
-        with self.assertRaises(AssertionError) as cm:
-            window.commit_reference()
-        self.assertIn("lag exactly one", str(cm.exception))
+        stale = window.commit_reference(current_version=3)
+        self.assertEqual(stale, ["t"])
+        self.assertEqual(window.stale_drops, 1)
+        # The active reference stays the version-0 one; the candidate is
+        # gone, not queued.
+        self.assertEqual(window._reference["t"]["param_version"], 0)
+        self.assertEqual(window._next_reference, {})
+        self.assertEqual(window.reference_age("t"), 3)
 
     def test_epoch_reset_clears_reference_and_pending(self):
         window = self._window()

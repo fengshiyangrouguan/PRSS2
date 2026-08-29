@@ -403,9 +403,10 @@ class TestAblationVariants(unittest.TestCase):
         self.assertNotAlmostEqual(float(j_full), float(j_diag), places=2)
 
     def test_reconstruction_matches_profiled_closed_form(self):
-        # J_rec = tr(S_UZ S_ZZ^-1 S_ZU) must equal the closed form
-        # ||S_ZZ^-1/2 S_ZU||_F^2 (U in the Z slot, Z in the P slot,
-        # U side unwhitened).
+        # Review form: J_rec = tr(S_UZ (S_ZZ + eps I)^-1 S_ZU) /
+        # (tr(S_UU) + eps) with Z the trainable compressed state and U
+        # the detached pre-compression target; the score is normalized
+        # into ~[0, 1].
         n, r = 300, 5
         g = torch.Generator().manual_seed(31)
         z = torch.randn(n, r, generator=g)
@@ -415,14 +416,17 @@ class TestAblationVariants(unittest.TestCase):
         szz = zc.t() @ zc / n
         szu = zc.t() @ uc / n           # S_ZU = S_UZ^T
         suz = szu.t()
+        # (czz = C_ZZ, czp = C_ZU, cpp = C_UU as the normalizer)
         j_rec, d = _score_from_covs(szz, szu, szz, 1e-4, "reconstruction")
         self.assertIsNone(d["failed"])
         # The score path adds the relative ridge eps to the whitened Z
-        # side; the closed form has none.  Compare with a small tolerance.
-        closed = float(torch.trace(suz @ torch.linalg.solve(szz, szu)))
+        # side and normalizes by tr(S_UU) + eps; the closed form has no
+        # ridge.  Compare with a small tolerance.
+        closed = float(torch.trace(suz @ torch.linalg.solve(szz, szu))
+                       / (float(szz.trace()) + 1e-4))
         self.assertAlmostEqual(float(j_rec), closed, delta=0.02,
                                msg="reconstruction score must match "
-                                   "tr(S_UZ S_ZZ^-1 S_ZU)")
+                                   "tr(S_UZ S_ZZ^-1 S_ZU) / (tr(S_UU)+eps)")
 
     def test_lagged_window_reconstruction_path(self):
         # End-to-end reconstruction variant: cold start builds the
@@ -450,14 +454,13 @@ class TestAblationVariants(unittest.TestCase):
         self.assertIn("t", surrogates)
         self.assertAlmostEqual(float(surrogates["t"].detach()), 0.0)
         (-surrogates["t"]).backward()
-        # In the reconstruction variant U occupies the Z slot; the VJP's
-        # centering terms also flow to the p slot (z), so both sides get
-        # a gradient.
+        # Review form: Z is the trainable slot and U the DETACHED
+        # reconstruction target, so the gradient flows to z only.
         grad_norm = sum(
             float(row.z.grad.norm() if row.z.grad is not None else 0.0)
-            + float(row.u.grad.norm() if row.u.grad is not None else 0.0)
             for row in rows2)
         self.assertGreater(grad_norm, 0.0)
+        self.assertTrue(all(row.u.grad is None for row in rows2))
 
 
 

@@ -118,7 +118,11 @@ def _score_from_covs(czz: torch.Tensor, czp: torch.Tensor,
                       "scale_z": float(sz.detach()),
                       "scale_p": float(sp.detach())}
     if variant == "reconstruction":
-        # Only the Z side is whitened; the U side is not.
+        # Review form: J_rec = tr(C_UZ (C_ZZ + eps I)^-1 C_ZU) /
+        # (tr(C_UU) + eps), Z trainable and U the DETACHED
+        # pre-compression target; the score is normalized into ~[0, 1].
+        # Callers pass czz = C_ZZ (whitened side) and czp = C_ZU; the
+        # third covariance C_UU supplies the normalizer.
         if float(sp.detach()) <= 0.0:
             return None, {"failed": "nonpositive_scale",
                           "scale_z": float(sz.detach()),
@@ -134,11 +138,13 @@ def _score_from_covs(czz: torch.Tensor, czp: torch.Tensor,
                           "info_p": -1,
                           "scale_z": float(sz.detach()),
                           "scale_p": float(sp.detach())}
-        c = czp / torch.sqrt(sz)          # S_ZU / sqrt(scale Z)
+        c = czp / torch.sqrt(sz)          # C_ZU / sqrt(scale Z)
         w = torch.linalg.solve_triangular(lz, c, upper=False)
-        return w.square().sum(), {"failed": None,
-                                  "scale_z": float(sz.detach()),
-                                  "scale_p": float(sp.detach())}
+        denom = cpp.trace() + eps         # tr(C_UU) + eps normalizer
+        return w.square().sum() / denom.clamp(min=1e-30), {
+            "failed": None,
+            "scale_z": float(sz.detach()),
+            "scale_p": float(sp.detach())}
     raise ValueError("unknown variant {}".format(variant))
 
 
@@ -480,19 +486,21 @@ def dedup_cut_rows(rows: List, fixed_maps, u_as_z: bool = False):
         cut_ids.append(r.cut_id)
         tree_ids.append(int(r.tree_id))
         if u_as_z:
-            # Reconstruction ablation: U occupies the Z slot, Z the P slot
-            # (no fixed measurement involved).
+            # Reconstruction ablation (review form): Z (the trainable
+            # compressed state) occupies the Z slot; U (the pre-compression
+            # target) is the DETACHED P slot — J_rec reconstructs U from Z,
+            # the gradient flows to Z only.
             if r.u is None:
                 raise ValueError(
                     "u_as_z requires CutRecord.u (pre-compression state); "
                     "run the adapter with the compressor attached")
-            zs.append(r.u)
+            zs.append(r.z)
         else:
             zs.append(r.z)
         weights.append(float(r.weight))
     zs_t = torch.stack(zs)
     if u_as_z:
-        ps_t = torch.stack([r.z for r in rows])
+        ps_t = torch.stack([r.u.detach() for r in rows])
     elif hasattr(fixed_maps, "pv_batch"):
         # Vectorized P projection: the per-row ``pv`` call is a Python-loop
         # small-operator storm (~0.25 ms/row); ``pv_batch`` computes all rows

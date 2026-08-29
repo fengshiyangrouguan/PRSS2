@@ -159,17 +159,20 @@ class JodieNodeClassificationLoop:
                     "RPBE needs at least one internal interface; leaf/root "
                     "interfaces are not compressible")
         # Eighth review A: per-interface rank normalization coefficients.
-        # J_norm = sum_tau alpha_tau J_tau / min(d_tau, m) / sum alpha_tau
-        # lives in ~[0, 1]; the denominator is FIXED by the configured
+        # J_norm = sum_tau alpha_tau J_tau / rank_tau / sum alpha_tau lives
+        # in ~[0, 1]; the denominator is FIXED by the configured
         # interfaces, never by which taus happen to activate in a batch.
+        # rank_tau is variant-dependent: min(d_tau, m) for full
+        # balancing, d_tau * m for diagonal whitening (its natural
+        # upper bound is dm, not the Ky Fan rank), 1 for reconstruction
+        # (the review form already normalizes J_rec into ~[0, 1]).
         self._tau_coeff = {}
         if self.kf_on:
             alpha_sum = float(sum(
                 rpbe_cfg.alpha(tau) for tau in kf_dims))
             for tau in kf_dims:
                 self._tau_coeff[tau] = rpbe_cfg.alpha(tau) / (
-                    min(int(rpbe_cfg.state_dims[tau]),
-                        int(fixed_maps.m)) * alpha_sum)
+                    self._tau_rank(tau) * alpha_sum)
         self.kf_window = (KFLaggedWindow(
             kf_dims, min_ratio=rpbe_cfg.kf_min_ratio,
             min_abs=rpbe_cfg.kf_min_abs, eps=rpbe_cfg.ridge_eps,
@@ -214,11 +217,19 @@ class JodieNodeClassificationLoop:
             auxiliary = torch.zeros((), device=self.device)
 
         if scores:
-            bounds = {tau: min(int(self.rpbe_cfg.state_dims[tau]),
-                               int(self.fixed_maps.m))
-                      for tau in scores}
+            bounds = {tau: self._tau_rank(tau) for tau in scores}
             self.monitor.validate_kf(scores, bounds, step)
         return raw_score, norm_score, scores, auxiliary, set(cold)
+
+    def _tau_rank(self, tau) -> float:
+        """Normalization bound for one interface, variant-dependent."""
+        d = min(int(self.rpbe_cfg.state_dims[tau]), int(self.fixed_maps.m))
+        if self.rpbe_cfg.kf_variant == "diagonal":
+            return float(int(self.rpbe_cfg.state_dims[tau])
+                         * int(self.fixed_maps.m))
+        if self.rpbe_cfg.kf_variant == "reconstruction":
+            return 1.0
+        return float(d)
 
     def _close_repr_group(self, group_batch_count: int, global_step: int,
                           new_ref_j: dict, param_version: int, stats: dict):
@@ -467,9 +478,8 @@ class JodieNodeClassificationLoop:
                 # J/J_norm are the ACTIVE reference values (honest
                 # monitoring, never the current model's score).
                 "J": means,
-                "J_norm": {tau: value / min(
-                    int(self.rpbe_cfg.state_dims[tau]),
-                    int(self.fixed_maps.m)) for tau, value in means.items()},
+                "J_norm": {tau: value / self._tau_rank(tau)
+                           for tau, value in means.items()},
                 # The NEXT reference built at this epoch's group closes
                 # (None where the group was below threshold).
                 "J_new": dict(new_ref_j),
@@ -491,6 +501,7 @@ class JodieNodeClassificationLoop:
                 "threshold": dict(group_stats["threshold"]),
                 "group_batches": fixed_group,
                 "aux_batches": aux_batches,
+                "repr_steps": param_version,
             }
         return {
             "train_task_loss": total_task / max(num_batch, 1),

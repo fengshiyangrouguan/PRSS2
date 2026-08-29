@@ -95,6 +95,15 @@ def parse_args():
                         "ceil(kf_min_abs / trace_roots), raise it when "
                         "below_threshold_groups > 0 (strict-future masking "
                         "lowers the valid-root rate)")
+    p.add_argument("--kf-variant", default="full_balancing",
+                   choices=["full_balancing", "diagonal", "reconstruction"],
+                   help="Table-2 ablation variant (paper spec section 4)")
+    p.add_argument("--n-observations", type=int, default=2, choices=[1, 2],
+                   help="1 = Y1 only; 2 = two-observation pullback")
+    p.add_argument("--repr-lr", type=float, default=None,
+                   help="separate representation-group learning rate "
+                        "(defaults to --lr); the macro schedule updates "
+                        "these params ~32x less often than the head")
     p.add_argument("--ridge-eps", type=float, default=1e-4)
     p.add_argument("--rpbe-seed", type=int, default=0)
     p.add_argument("--trace-roots", type=int, default=32)
@@ -262,6 +271,8 @@ def build_components(args, device, dataset):
             cuts_per_tau=args.kf_cuts_per_tau, kf_min_ratio=args.kf_min_ratio,
             kf_min_abs=args.kf_min_abs,
             kf_group_batches=args.kf_group_batches,
+            kf_variant=args.kf_variant,
+            n_observations=args.n_observations,
             kf_taus=list(taus[:-1]),
             rpbe_seed=args.rpbe_seed)
         compressor = RecursiveCompressor(rpbe_cfg).to(device)
@@ -307,8 +318,11 @@ def build_components(args, device, dataset):
     head_optimizer = torch.optim.Adam(head_params, lr=args.lr)
     # A frozen-host vanilla baseline has NO representation parameters;
     # torch.optim.Adam([]) raises, so the repr optimizer stays None and
-    # the loop keeps the representation group silent.
-    repr_optimizer = torch.optim.Adam(repr_params, lr=args.lr) \
+    # the loop keeps the representation group silent.  The representation
+    # group updates ~kf_group_batches times less often than the head, so
+    # it may need its own (higher) learning rate.
+    repr_lr = float(args.repr_lr if args.repr_lr is not None else args.lr)
+    repr_optimizer = torch.optim.Adam(repr_params, lr=repr_lr) \
         if repr_params else None
     return dict(tgn=tgn, decoder=decoder, head_optimizer=head_optimizer,
                 repr_optimizer=repr_optimizer,

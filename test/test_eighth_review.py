@@ -446,9 +446,10 @@ class TestMacroGroupTiming(unittest.TestCase):
         loop.train_epoch(0, 0, self.train)  # 3 batches, group length 2
         snaps_zero = repr_opt.param_snaps_at_zero
         snaps_step = repr_opt.param_snaps_at_step
-        self.assertEqual(len(snaps_zero), 2)   # group1 start, group2 start
+        # group1 start, group2 start, and the post-drain cleanup zero_grad
+        self.assertEqual(len(snaps_zero), 3)
         self.assertEqual(len(snaps_step), 2)   # group close + epoch drain
-        s0, s1 = snaps_zero
+        s0, s1 = snaps_zero[:2]
         step0 = snaps_step[0]
         # Nothing touched the representation parameters between the two
         # groups (the batch-3 gradient accumulation does not move params).

@@ -402,7 +402,7 @@ def main():
         with metrics_path.open("a") as f:
             f.write(json.dumps(row, allow_nan=True) + "\n")
         monitor.write_epoch(row)
-        print(f"epoch={epoch} "
+        print(f"[{time.strftime('%H:%M:%S')}] epoch={epoch} "
               f"online_train_auc={train_row['train']['online_auc']:.5f} "
               f"online_train_ap={train_row['train']['online_ap']:.5f} "
               f"val_auc={val_row['auc']:.5f} val_ap={val_row['ap']:.5f} "
@@ -427,6 +427,8 @@ def main():
         improved = (best_epoch < 0) or (
             score_is_finite and score > best_score + 1e-12)
         if improved:
+            print(f"[{time.strftime('%H:%M:%S')}] new best "
+                  f"val_auc={score:.5f} at epoch={epoch}", flush=True)
             best_score = float(score) if score_is_finite else -float("inf")
             best_epoch = epoch
             best_kf = train_row.get("kf")

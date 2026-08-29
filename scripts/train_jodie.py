@@ -93,8 +93,10 @@ def parse_args():
     p.add_argument("--ridge-eps", type=float, default=1e-4)
     p.add_argument("--rpbe-seed", type=int, default=0)
     p.add_argument("--trace-roots", type=int, default=32)
-    p.add_argument("--trace-mode", default="positive_first",
-                   choices=["positive_first", "evenly_spaced", "off"])
+    p.add_argument("--trace-mode", default="evenly_spaced",
+                   choices=["positive_first", "evenly_spaced", "off"],
+                   help="RPBE forbids positive_first (cut selection must "
+                        "not depend on the current root label)")
     p.add_argument("--train-eval-auc", action="store_true",
                    help="epoch-end fixed-checkpoint train evaluation "
                         "(the online concatenated metric is renamed "

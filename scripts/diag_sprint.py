@@ -102,8 +102,14 @@ def main():
     row = loop.train_epoch(0, 0, train, max_batches=args.max_batches)
     kf = row.get("kf") or {}
     rows = grad_diag["rows"]
+    # Diagnostics need the KF component; refuse to silently report a
+    # vanilla run as a failed sprint.
+    if not loop.kf_on:
+        print("SPRINT ABORTED: --rpbe was not passed (kf_on=False); "
+              "the run was plain vanilla.")
+        return
     print("\n===== SPRINT ACCEPTANCE =====")
-    print("batches run:", row["n_batches"])
+    print("batches run:", row["global_step"])
     print("aux_batches:", kf.get("aux_batches", 0))
     print("reference_refreshes:", kf.get("reference_refreshes", 0))
     print("stale_drops:", kf.get("stale_drops", 0))
@@ -112,12 +118,14 @@ def main():
           "threshold:", kf.get("threshold", {}))
     print("group_batches:", kf.get("group_batches", None))
 
+    ratio = np.array([r["ratio_effective"] for r in rows]) if rows \
+        else np.array([])
+    cos = np.array([r["cos_task_kf"] for r in rows]) if rows \
+        else np.array([])
+    rho_all = [v for r in rows for v in r["rho_radial"].values()]
+    age_all = [v for r in rows for v in r["reference_age"].values()
+               if v is not None]
     if rows:
-        ratio = np.array([r["ratio_effective"] for r in rows])
-        cos = np.array([r["cos_task_kf"] for r in rows])
-        rho_all = [v for r in rows for v in r["rho_radial"].values()]
-        age_all = [v for r in rows for v in r["reference_age"].values()
-                   if v is not None]
         print("effective_grad_ratio p50: {:.3f}  p95: {:.3f}  max: {:.3f}"
               .format(float(np.percentile(ratio, 50)),
                       float(np.percentile(ratio, 95)),
@@ -156,12 +164,16 @@ def main():
         ("below_threshold_groups == 0",
          kf.get("below_threshold_groups", 0) == 0),
     ]
-    if rows:
+    if len(ratio):
         p50 = float(np.percentile(ratio, 50))
         p95 = float(np.percentile(ratio, 95))
         checks.append(("effective_grad_ratio p50 in [0.05, 0.30]",
                        0.05 <= p50 <= 0.30))
         checks.append(("effective_grad_ratio p95 < 1", p95 < 1.0))
+    else:
+        p50 = p95 = float("nan")
+        checks.append(("effective_grad_ratio p50 in [0.05, 0.30]", False))
+        checks.append(("effective_grad_ratio p95 < 1", False))
     for name, passed in checks:
         ok = ok and passed
         print(("PASS " if passed else "FAIL ") + name)

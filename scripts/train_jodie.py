@@ -117,6 +117,9 @@ def parse_args():
                         "online_auc)")
     # Diagnostics.
     p.add_argument("--no-early-stop", action="store_true")
+    p.add_argument("--max-batches", type=int, default=0,
+                   help="cap each train epoch at N batches (0 = full; "
+                        "used by the sprint diagnostic)")
     # Monitoring / resume / smoke caps.
     p.add_argument("--grad-clip", type=float, default=5.0)
     p.add_argument("--monitor-every", type=int, default=50)

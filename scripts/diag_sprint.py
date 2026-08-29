@@ -14,7 +14,6 @@ run costs a few minutes.  Cloud usage:
     --bs 200 --n-layer 3 --n-degree 5 --kf-lambda 1e-3 \
     --kf-group-batches 40 --max-batches 160 --seed 0
 """
-import argparse
 import math
 import sys
 
@@ -25,21 +24,6 @@ sys.path.insert(0, 'src')
 import scripts.train_jodie as tj
 from rpbe.monitoring import MonitorWriter
 from rpbe.training.jodie_loop import JodieNodeClassificationLoop
-
-
-def parse_args():
-    p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("-d", "--data", default="wikipedia")
-    p.add_argument("--data-dir", default="old/processed_tgn_data")
-    p.add_argument("--bs", type=int, default=200)
-    p.add_argument("--n-layer", type=int, default=3)
-    p.add_argument("--n-degree", type=int, default=5)
-    p.add_argument("--n-epoch", type=int, default=1)
-    p.add_argument("--patience", type=int, default=5)
-    p.add_argument("--seed", type=int, default=0)
-    p.add_argument("--max-batches", type=int, default=160,
-                   help="cap the diagnostic epoch at N batches")
-    return p
 
 
 def grad_diag_fn(loop, task_loss, auxiliary, step):
@@ -88,10 +72,13 @@ def grad_diag_fn(loop, task_loss, auxiliary, step):
 
 
 def main():
-    args = parse_args().parse_args()
+    # The full train_jodie CLI (data/checkpoint/model/KF switches) plus
+    # --max-batches; defaults match the sprint call in the docstring.
+    args = tj.parse_args()
     tj.seed_all(args.seed)
     device = torch.device(
-        "cuda:0" if torch.cuda.is_available() else "cpu")
+        "cuda:{}".format(args.gpu) if torch.cuda.is_available()
+        else "cpu")
     dataset = tj.JodieDataset(args.data, data_dir=args.data_dir,
                               use_validation=True)
     full, train, val, test = dataset.splits()

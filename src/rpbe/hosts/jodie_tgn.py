@@ -1,42 +1,43 @@
-"""RPBE adapter for the official twitter-research TGN host (JODIE protocol).
+"""RPBE adapter for the official twitter-research TGN host.
 
-The official ``GraphEmbedding`` computes a recursive L-layer temporal-attention
-tree per query node: layer l's occurrence has children = its own layer-(l-1)
-embedding plus the ``n_degree`` layer-(l-1) embeddings of its temporal
-neighbors.  Each recursive layer is one interface (``tjo:layer{l}``), so the
-host computation tree maps 1:1 onto the cut tree.
+The host's recursive aggregation remains intact.  Gamma is inserted only at
+an *internal aggregated state* that is passed to another aggregation:
 
-The host aggregate is never replaced: the adapter computes the vanilla
-aggregate (over the children's compressed states) and passes it to the
-recursive compressor as the child-aggregation token, which stacks A/G/Q on
-top.  With no compressor attached (``compressor=None``) the forward is
-bit-identical to the official host.  The memory lives entirely inside TGN;
-the adapter only wraps ``embedding_module``.
+* layer 0 (leaf): return the raw host state;
+* 0 < layer < L: aggregate normally, then apply Gamma;
+* layer L (task root): return the vanilla host aggregate.
+
+This is both the semantic boundary and the deployment fast path.  Leaves have
+nothing to aggregate, while the root is consumed by the task head rather than
+another tree node.  With ``compressor=None`` the wrapper is bit-identical to
+the official host.
+
+Training trace collection is fused into this same query.  It records only the
+internal states on selected roots' query-node (SELF) spines; temporal-neighbor
+states are still fully computed and aggregated, but no recursive tree object
+is allocated for them.
 """
 
-from typing import Optional, Sequence
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
 
 from rpbe.hosts.base import HostAdapter
-from rpbe.state import OccurrenceState, RecursiveOccurrence, RecursiveTrace
+from rpbe.state import CompactCutTrace, CutCandidate
 
 TAU_TEMPLATE = "tjo:layer{}"
 
 
 def jodie_preagg_dim(host_dim: int, time_dim: int, edge_dim: int,
                      n_neighbors: int) -> int:
-    """Width of the exact aggregate-input packing:
-    [source_lower, source_time, n x (neighbor_lower, edge_time, edge_features),
-     mask]."""
+    """Width of the documented aggregate-input packing."""
     return host_dim + time_dim + n_neighbors * (host_dim + time_dim + edge_dim) \
         + n_neighbors
 
 
 class JodieTGNAdapter(HostAdapter):
-    """Wraps the official ``GraphAttentionEmbedding``; ``TGN.compute_temporal_embeddings``
-    keeps its exact call surface (``compute_embedding`` with numpy arrays)."""
+    """Wrap the official ``GraphEmbedding.compute_embedding`` surface."""
 
     def __init__(self, host_embedding, compressor=None, n_neighbors: int = 10,
                  edge_tables=None):
@@ -48,25 +49,16 @@ class JodieTGNAdapter(HostAdapter):
             raise ValueError("RPBE requires a host time_encoder")
         self.host = host_embedding
         self.compressor = compressor
-        # ``edge_tables`` = (idx -> (src, dst), idx -> label, user set,
-        # page set) from ``records.build_edge_tables``; used ONLY to stamp
-        # each neighbor occurrence's consumption record.  None (tests /
-        # no-data paths) just skips the stamping.
-        if edge_tables is not None:
-            self._endpoints = dict(edge_tables[0])
-            self._user_nodes = set(edge_tables[2])
-        else:
-            self._endpoints = None
-            self._user_nodes = None
+        # Kept only as a source-compatible constructor argument.  Historical
+        # edge tables must never supervise a cut; JodieFutureIndex owns the
+        # strictly-future, train-only outcome lookup in records.py.
+        del edge_tables
         self.n_neighbors = int(n_neighbors)
         if self.n_neighbors <= 0:
             raise ValueError(
                 "RPBE requires n_neighbors > 0 so the host interface width is fixed")
 
         if compressor is not None:
-            # Host-width contract: d_tau must equal the width the host
-            # attention actually consumes; a mismatch would only surface as
-            # a shape error inside the vendored aggregate.
             for tau, d_tau in compressor.cfg.state_dims.items():
                 if int(d_tau) != int(host_embedding.embedding_dimension):
                     raise ValueError(
@@ -81,12 +73,14 @@ class JodieTGNAdapter(HostAdapter):
 
         self.taus = [TAU_TEMPLATE.format(layer)
                      for layer in range(self.n_layers + 1)]
-        # ``jodie_preagg_dim`` remains exported for interface-width docs but
-        # the adapter no longer materializes the preagg packing (the only
-        # consumer, local_features, was removed as wasted GiB-scale storage).
+        # The only interfaces at which Gamma and the KF objective are valid.
+        self.compression_taus = [TAU_TEMPLATE.format(layer)
+                                 for layer in range(1, self.n_layers)]
 
         self._trace_top_rows = set()
         self._trace = None
+        # Global across queries, so CutRecord identities cannot collide when
+        # a lagged moment window spans batches or epochs.
         self._next_oid = 0
 
     # ------------------------------------------------------------ tracing hooks
@@ -98,7 +92,7 @@ class JodieTGNAdapter(HostAdapter):
         self._trace = None
 
     @property
-    def trace(self) -> Optional[RecursiveTrace]:
+    def trace(self) -> Optional[CompactCutTrace]:
         return self._trace
 
     @property
@@ -112,55 +106,53 @@ class JodieTGNAdapter(HostAdapter):
     # ------------------------------------------------------------- main forward
     def compute_embedding(self, memory, source_nodes, timestamps, n_layers,
                           n_neighbors=20, time_diffs=None, use_time_proj=True):
-        """Exact official call surface; tracing is active-row-limited and
-        training-only (bit-identical forward otherwise)."""
+        """Official call surface with optional, bounded in-query tracing."""
+        del time_diffs, use_time_proj
         source_nodes = np.asarray(source_nodes)
         timestamps = np.asarray(timestamps)
         if int(n_neighbors) != self.n_neighbors:
             raise ValueError("adapter fixed n_neighbors {} but got {}".format(
                 self.n_neighbors, n_neighbors))
-        # Trace scope (fifth review): the official TGN concatenates
-        # [source, destination, negative] roots and calls
-        # compute_embedding ONCE (model/tgn.py:148).  The node-
-        # classification protocol trains on task-source roots ([0, B))
-        # only; the POS_DST shadow audit may additionally trace rows
-        # [B, 2B) but they never enter the training loss (the audit script
-        # runs them separately with --scope pos_dst).  NEG_PLACEHOLDER
-        # rows [2B, 3B) must NEVER be traced.
+        if int(n_layers) != int(self.n_layers):
+            raise ValueError("adapter root layer {} but got {}".format(
+                self.n_layers, n_layers))
+
+        # Official TGN queries [src, positive-dst, negative-dst] together.
+        # Only task-source and optional positive-destination rows may be
+        # traced; negative placeholders are not observations.
         if self._trace_top_rows:
             if len(source_nodes) % 3 != 0:
                 raise ValueError(
                     "concatenated [src, dst, neg] roots expected, got {}"
                     .format(len(source_nodes)))
-            B = len(source_nodes) // 3
-            assert max(self._trace_top_rows) < 2 * B, \
-                "trace scope: only task-source roots (rows < {}) and " \
-                "pos-dst shadow roots (rows < {}) may be traced".format(
-                    B, 2 * B)
-        active = np.zeros(len(source_nodes), dtype=bool)
-        for row in self._trace_top_rows:
-            if 0 <= row < len(active):
-                active[row] = True
-        if active.any():
-            self._trace = RecursiveTrace()
-            self._next_oid = 0
+            batch_size = len(source_nodes) // 3
+            if min(self._trace_top_rows) < 0 or \
+                    max(self._trace_top_rows) >= 2 * batch_size:
+                raise ValueError(
+                    "trace rows must select src/positive-dst roots in [0, {})"
+                    .format(2 * batch_size))
+
+        root_rows = sorted(r for r in self._trace_top_rows
+                           if 0 <= r < len(source_nodes))
+        if root_rows:
+            self._trace = CompactCutTrace(root_rows=list(root_rows))
+            paths: Dict[int, List[Tuple[int, float]]] = {
+                int(row): [] for row in root_rows}
         else:
             self._trace = None
-        z, ids = self._compute(memory, source_nodes, timestamps,
-                               int(n_layers), int(n_neighbors), active)
-        if self._trace is not None:
-            roots, rows = [], []
-            for row in np.flatnonzero(active):
-                oid = int(ids[row])
-                if oid >= 0:
-                    roots.append(oid)
-                    rows.append(int(row))
-            self.trace.roots = roots
-            self.trace.root_rows = rows
-        return z
+            paths = {}
+        return self._compute(memory, source_nodes, timestamps,
+                             int(n_layers), int(n_neighbors), paths)
 
     def _compute(self, memory, source_nodes, timestamps, layer, n_neighbors,
-                 active):
+                 trace_paths):
+        """Recursive host query plus a SELF-spine trace token dictionary.
+
+        ``trace_paths`` maps rows in this recursion call to their top-level
+        structural path.  Tokens go only through ``source_lower``.  The
+        neighbor recursion receives no tokens, which removes full-tree trace
+        allocation without changing any embedding computation.
+        """
         device = self.device
         source_nodes_t = torch.from_numpy(source_nodes).long().to(device)
         timestamps_t = torch.from_numpy(timestamps).float().to(device).unsqueeze(1)
@@ -169,38 +161,32 @@ class JodieTGNAdapter(HostAdapter):
         if self.use_memory:
             raw_source = memory[source_nodes] + raw_source
 
-        ids = np.full(len(source_nodes), -1, dtype=np.int64)
+        # A leaf has no child aggregation, so Gamma is undefined here.
         if layer == 0:
-            tau = TAU_TEMPLATE.format(0)
-            # No children: identity passes the raw state through untouched;
-            # the compressor receives it in both slots (own input == aggregate).
-            z = raw_source if self.compressor is None else self.compressor.compress(
-                tau=tau, own_input=raw_source, aggregate_output=raw_source)
-            if self.trace is not None and active.any():
-                for row in np.flatnonzero(active):
-                    ids[row] = self._new_occurrence(
-                        tau, z[row], [], [], [],
-                        node=int(source_nodes[row]),
-                        time=float(timestamps[row]))
-            return z, ids
+            return raw_source
 
-        tau = TAU_TEMPLATE.format(layer)
-        source_lower, source_ids = self._compute(
-            memory, source_nodes, timestamps, layer - 1, n_neighbors, active)
-        neighbors, edge_idxs_np, edge_times = self.neighbor_finder.get_temporal_neighbor(
-            source_nodes, timestamps, n_neighbors=n_neighbors)
+        source_paths = {
+            int(row): list(path) + [(0, 0.0)]
+            for row, path in trace_paths.items()}
+        source_lower = self._compute(
+            memory, source_nodes, timestamps, layer - 1, n_neighbors,
+            source_paths)
+
+        neighbors, edge_idxs_np, edge_times = \
+            self.neighbor_finder.get_temporal_neighbor(
+                source_nodes, timestamps, n_neighbors=n_neighbors)
         neighbors_t = torch.from_numpy(neighbors).long().to(device)
         edge_idxs = torch.from_numpy(edge_idxs_np).long().to(device)
         edge_deltas_np = timestamps[:, None] - edge_times
         edge_deltas = torch.from_numpy(edge_deltas_np).float().to(device)
         flat_neighbors = neighbors.reshape(-1)
         repeated_times = np.repeat(timestamps, n_neighbors)
-        neighbor_active = np.repeat(active, n_neighbors)
-        neighbor_lower, neighbor_ids = self._compute(
+        # Neighbor states are computed exactly as before; only trace tokens
+        # are absent, so no neighbor occurrence objects are retained.
+        neighbor_lower = self._compute(
             memory, flat_neighbors, repeated_times, layer - 1, n_neighbors,
-            neighbor_active)
+            {})
         neighbor_lower = neighbor_lower.view(len(source_nodes), n_neighbors, -1)
-        neighbor_ids = neighbor_ids.reshape(len(source_nodes), n_neighbors)
         edge_time = self.host.time_encoder(edge_deltas)
         edge_features = self.host.edge_features[edge_idxs]
         mask = neighbors_t == 0
@@ -208,85 +194,32 @@ class JodieTGNAdapter(HostAdapter):
             layer, source_lower, source_time, neighbor_lower, edge_time,
             edge_features, mask)
 
-        # The host aggregate (with children's compressed states as input) is
-        # the child-aggregation token of Gamma; the compressor stacks A/G/Q on
-        # top without touching the aggregation itself.
-        z = vanilla if self.compressor is None else self.compressor.compress(
-            tau=tau, own_input=raw_source, aggregate_output=vanilla)
+        # Only an internal aggregate is passed upward to another tree node.
+        if self.compressor is not None and 0 < layer < self.n_layers:
+            tau = TAU_TEMPLATE.format(layer)
+            z = self.compressor.compress(
+                tau=tau, own_input=raw_source, aggregate_output=vanilla)
+        else:
+            z = vanilla
 
-        if self.trace is not None and active.any():
-            # Perf: read the numpy neighbors array, never CUDA scalar bools.
-            np_neighbors = np.asarray(neighbors)
-            for row in np.flatnonzero(active):
-                children, relations, deltas = [], [], []
-                sid = int(source_ids[row])
-                if sid >= 0:
-                    children.append(sid)
-                    relations.append(0)
-                    deltas.append(0.0)
-                    # SELF recursion step: no interaction of its own; the
-                    # cut walker skips it upward (path keeps the step).
-                    self.trace.occurrences[sid].metadata.setdefault(
-                        "consumption", {"kind": "self"})
-                for j in range(n_neighbors):
-                    nid = int(neighbor_ids[row, j])
-                    if nid >= 0 and int(np_neighbors[row, j]) != 0:
-                        children.append(nid)
-                        relations.append(1)
-                        deltas.append(float(edge_deltas_np[row, j]))
-                        # Consumption record of the neighbor occurrence: the
-                        # real historical interaction through which the
-                        # parent consumed its state.  ``edge_idx`` is the
-                        # 1-based graph_df.idx carried by the neighbor
-                        # finder; endpoints/label owner come from the
-                        # explicit tables (no indexing convention assumed).
-                        child_occ = self.trace.occurrences[nid]
-                        cons = {"kind": "edge",
-                                "edge_idx": int(edge_idxs_np[row, j]),
-                                "edge_time": float(edge_times[row, j]),
-                                "counterpart": int(source_nodes[row])}
-                        if self._endpoints is not None:
-                            src, dst = self._endpoints.get(
-                                int(edge_idxs_np[row, j]), (-1, -1))
-                            carrier = int(np_neighbors[row, j])
-                            # JODIE semantics (fifth review): the label is
-                            # the SOURCE user's state change.  The owner is
-                            # ALWAYS src — never inferred from whatever the
-                            # carrier happens to be.  endpoint_role only
-                            # describes the carrier's side (0=source,
-                            # 1=destination); the probe's validity comes
-                            # from the owner lying on the continuation
-                            # path, which a historical edge always does.
-                            if self._user_nodes is not None:
-                                assert src in self._user_nodes, \
-                                    "label owner (source) must be a user"
-                            if src == carrier:
-                                cons.update({"endpoint_role": 0,
-                                             "label_owner": int(src)})
-                            elif dst == carrier:
-                                cons.update({"endpoint_role": 1,
-                                             "label_owner": int(src)})
-                            else:
-                                cons.update({"endpoint_role": -1,
-                                             "label_owner": -1})
-                        child_occ.metadata["consumption"] = cons
-                ids[row] = self._new_occurrence(
-                    tau, z[row], children, relations, deltas,
-                    node=int(source_nodes[row]),
-                    time=float(timestamps[row]))
-        return z, ids
-
-    def _new_occurrence(self, tau, z, children, relations, deltas, *,
-                        node: int, time: float):
-        oid = self._next_oid
-        self._next_oid += 1
-        self.trace.add(RecursiveOccurrence(
-            occurrence_id=oid, tau=tau,
-            state=OccurrenceState(tau=tau, z=z),
-            children=list(children),
-            child_relations=list(relations),
-            child_delta_t=list(deltas),
-            metadata={"layer": int(tau.split(":")[1][len("layer"):]),
-                      "node": int(node), "time": float(time)},
-        ))
-        return oid
+        # Root and leaf are deliberately absent.  Each selected query emits
+        # at most one graph-connected state for this internal interface.
+        if self._trace is not None and 0 < layer < self.n_layers:
+            tau = TAU_TEMPLATE.format(layer)
+            for row, path in trace_paths.items():
+                node = int(source_nodes[row])
+                if node == 0:  # official padding sentinel is not an event node
+                    continue
+                self._trace.add(CutCandidate(
+                    occurrence_id=self._next_oid,
+                    root_row=int(row),
+                    tau=tau,
+                    node=node,
+                    time=float(timestamps[row]),
+                    z=z[row],
+                    # Pre-compression rich state for the reconstruction
+                    # ablation (Table 2, row 2).
+                    u=vanilla[row],
+                    path=list(path)))
+                self._next_oid += 1
+        return z

@@ -1,63 +1,48 @@
-"""Typed states and computation-tree traces for recursive hosts."""
+"""Small, training-only trace records emitted during the host query.
+
+The adapter deliberately does *not* materialize the recursive TGN tree.  A
+traced root keeps only the internal states on its query-node (SELF) spine:
+one candidate per compressible interface.  That is all the future-outcome
+builder consumes, and it bounds trace storage by
+``traced_roots * (n_layers - 1)`` instead of the tree's branching factor.
+"""
 
 from dataclasses import dataclass, field
-from typing import Any, Dict, List
+from typing import List, Optional, Tuple
 
 import torch
 
 
 @dataclass
-class OccurrenceState:
-    """The compressed state actually propagated to the parent: z only.
+class CutCandidate:
+    """One graph-connected internal state eligible for future supervision.
 
-    ``tau`` is the interface type of this occurrence.  The old quotient-era
-    raw/candidate fields are gone with the spectral architecture.
+    ``root_row`` identifies the top-level query that produced the state.
+    ``path`` is the structural route from that query root to the cut.  For
+    the compact JODIE trace it contains only SELF steps; the state itself
+    still aggregates the host's full temporal-neighbor computation.
     """
 
-    tau: str
-    z: torch.Tensor
-
-
-@dataclass
-class RecursiveOccurrence:
     occurrence_id: int
+    root_row: int
     tau: str
-    state: OccurrenceState
-    children: List[int] = field(default_factory=list)
-    child_relations: List[int] = field(default_factory=list)
-    child_delta_t: List[float] = field(default_factory=list)
-    # Contract keys: ``node`` (global node id) and ``time`` (as-of time =
-    # the query timestamp of the tree, for every occurrence).  Filled by
-    # the host adapter.
-    #
-    # ``local_features`` was removed: it cloned the full per-batch preagg
-    # matrix (~GiB of wasted storage per epoch) while nothing consumed it.
-    metadata: Dict[str, Any] = field(default_factory=dict)
+    node: int
+    time: float
+    z: torch.Tensor
+    # Pre-compression rich state (the vanilla host aggregate).  Used only
+    # by the profiled-reconstruction ablation (Table 2, row 2): J_rec
+    # measures how much of U's variance Z can linearly reconstruct.
+    # None for low-level synthetic tests that do not model U.
+    u: Optional[torch.Tensor] = None
+    path: List[Tuple[int, float]] = field(default_factory=list)
 
 
 @dataclass
-class RecursiveTrace:
-    occurrences: Dict[int, RecursiveOccurrence] = field(default_factory=dict)
-    roots: List[int] = field(default_factory=list)
+class CompactCutTrace:
+    """Only selected query roots and their bounded cut candidates."""
+
     root_rows: List[int] = field(default_factory=list)
+    cuts: List[CutCandidate] = field(default_factory=list)
 
-    def add(self, occurrence):
-        if occurrence.occurrence_id in self.occurrences:
-            raise ValueError("Duplicate occurrence id")
-        self.occurrences[occurrence.occurrence_id] = occurrence
-
-    def postorder(self):
-        visited = set()
-        result = []
-
-        def visit(identifier):
-            if identifier in visited:
-                return
-            for child in self.occurrences[identifier].children:
-                visit(child)
-            visited.add(identifier)
-            result.append(identifier)
-
-        for root in self.roots:
-            visit(root)
-        return result
+    def add(self, candidate: CutCandidate) -> None:
+        self.cuts.append(candidate)

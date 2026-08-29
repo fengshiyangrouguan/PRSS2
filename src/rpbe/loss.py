@@ -23,6 +23,7 @@ Numerical contract (after the cloud crash review, 2026-08-27):
   are reported, and ``strict=True`` raises (debug runs).
 """
 
+import math
 from typing import Dict, List, Tuple
 
 import torch
@@ -51,40 +52,94 @@ def _covs(zc: torch.Tensor, pc: torch.Tensor, den: float,
 
 
 def _score_from_covs(czz: torch.Tensor, czp: torch.Tensor,
-                     cpp: torch.Tensor, eps: float):
+                     cpp: torch.Tensor, eps: float,
+                     variant: str = "full_balancing"):
     """Scale-normalized Ky Fan score with gradient; ``(J, diag)``.
 
-    ``diag["failed"]`` is ``None`` on success, else a short code.  The
-    normalization ``A = Czz / mean(diag Czz)`` keeps the ridge ``eps * I``
-    scale-free and keeps the score exactly scale-invariant in ``Z`` and
-    ``P``; ``mean(diag)`` is NOT detached so the gradient path is the true
-    gradient of the normalized objective.
+    Variants (paper Table 2):
+
+    * ``full_balancing`` — ``J_KF = ||S_ZZ^-1/2 S_ZP S_PP^-1/2||_F^2``;
+      the normalization ``A = Czz / mean(diag Czz)`` keeps the ridge
+      scale-free and keeps the score exactly scale-invariant in ``Z`` and
+      ``P``; ``mean(diag)`` is NOT detached so the gradient is the true
+      gradient of the normalized objective.
+    * ``diagonal`` — ``J_diag = ||D_Z^-1/2 S_ZP D_P^-1/2||_F^2``: only the
+      per-coordinate scales are removed, correlations are NOT.
+    * ``reconstruction`` — ``J_rec = tr(S_UZ S_ZZ^-1 S_ZU)`` with ``czz``
+      holding ``S_ZZ`` and ``czp`` holding ``S_ZU`` (callers pass the
+      pre-compression U in the Z slot and Z in the P slot): only the Z
+      side is whitened; the U side is left untouched (PCA-equivalent for
+      a linear encoder).
+
+    ``diag["failed"]`` is ``None`` on success, else a short code.
     """
     sz = czz.diagonal().mean()
     sp = cpp.diagonal().mean()
-    if float(sz.detach()) <= 0.0 or float(sp.detach()) <= 0.0:
+    if float(sz.detach()) <= 0.0:
         return None, {"failed": "nonpositive_scale",
                       "scale_z": float(sz.detach()),
                       "scale_p": float(sp.detach())}
-    a = czz / sz
-    b = cpp / sp
-    c = czp / torch.sqrt(sz * sp)
-    r, q = a.shape[0], b.shape[0]
-    a = 0.5 * (a + a.t()) + eps * torch.eye(r, dtype=a.dtype, device=a.device)
-    b = 0.5 * (b + b.t()) + eps * torch.eye(q, dtype=b.dtype, device=b.device)
-    lz, info_z = torch.linalg.cholesky_ex(a)
-    lp, info_p = torch.linalg.cholesky_ex(b)
-    if bool((info_z != 0).any()) or bool((info_p != 0).any()):
-        return None, {"failed": "cholesky",
-                      "info_z": int(info_z.max().item()),
-                      "info_p": int(info_p.max().item()),
+    if variant == "full_balancing":
+        if float(sp.detach()) <= 0.0:
+            return None, {"failed": "nonpositive_scale",
+                          "scale_z": float(sz.detach()),
+                          "scale_p": float(sp.detach())}
+        a = czz / sz
+        b = cpp / sp
+        c = czp / torch.sqrt(sz * sp)
+        r, q = a.shape[0], b.shape[0]
+        a = 0.5 * (a + a.t()) + eps * torch.eye(
+            r, dtype=a.dtype, device=a.device)
+        b = 0.5 * (b + b.t()) + eps * torch.eye(
+            q, dtype=b.dtype, device=b.device)
+        lz, info_z = torch.linalg.cholesky_ex(a)
+        lp, info_p = torch.linalg.cholesky_ex(b)
+        if bool((info_z != 0).any()) or bool((info_p != 0).any()):
+            return None, {"failed": "cholesky",
+                          "info_z": int(info_z.max().item()),
+                          "info_p": int(info_p.max().item()),
+                          "scale_z": float(sz.detach()),
+                          "scale_p": float(sp.detach())}
+        w = torch.linalg.solve_triangular(lz, c, upper=False)
+        k = torch.linalg.solve_triangular(lp, w.t(), upper=False).t()
+        return k.square().sum(), {"failed": None,
+                                  "scale_z": float(sz.detach()),
+                                  "scale_p": float(sp.detach())}
+    if variant == "diagonal":
+        # Diagonal whitening only: D_Z^-1/2 S_ZP D_P^-1/2.
+        dz = czz.diagonal()
+        dp = cpp.diagonal()
+        if float((dz > 0).all().detach()) and                 float((dp > 0).all().detach()):
+            c = czp / torch.sqrt(dz[:, None] * dp[None, :])
+            return c.square().sum(), {"failed": None,
+                                      "scale_z": float(sz.detach()),
+                                      "scale_p": float(sp.detach())}
+        return None, {"failed": "nonpositive_scale",
                       "scale_z": float(sz.detach()),
                       "scale_p": float(sp.detach())}
-    w = torch.linalg.solve_triangular(lz, c, upper=False)    # Lz^-1 C
-    k = torch.linalg.solve_triangular(lp, w.t(), upper=False).t()  # w Lp^-T
-    return k.square().sum(), {"failed": None,
-                              "scale_z": float(sz.detach()),
-                              "scale_p": float(sp.detach())}
+    if variant == "reconstruction":
+        # Only the Z side is whitened; the U side is not.
+        if float(sp.detach()) <= 0.0:
+            return None, {"failed": "nonpositive_scale",
+                          "scale_z": float(sz.detach()),
+                          "scale_p": float(sp.detach())}
+        a = czz / sz
+        r = a.shape[0]
+        a = 0.5 * (a + a.t()) + eps * torch.eye(
+            r, dtype=a.dtype, device=a.device)
+        lz, info_z = torch.linalg.cholesky_ex(a)
+        if bool((info_z != 0).any()):
+            return None, {"failed": "cholesky",
+                          "info_z": int(info_z.max().item()),
+                          "info_p": -1,
+                          "scale_z": float(sz.detach()),
+                          "scale_p": float(sp.detach())}
+        c = czp / torch.sqrt(sz)          # S_ZU / sqrt(scale Z)
+        w = torch.linalg.solve_triangular(lz, c, upper=False)
+        return w.square().sum(), {"failed": None,
+                                  "scale_z": float(sz.detach()),
+                                  "scale_p": float(sp.detach())}
+    raise ValueError("unknown variant {}".format(variant))
 
 
 def _matrix_diag(name: str, x: torch.Tensor) -> dict:
@@ -105,7 +160,8 @@ def _matrix_diag(name: str, x: torch.Tensor) -> dict:
             "{}_cond".format(name): emax / max(emin, 1e-30)}
 
 
-def kf_adjoint(wf_result: dict, eps: float, strict: bool = False):
+def kf_adjoint(wf_result: dict, eps: float, strict: bool = False,
+               variant: str = "full_balancing"):
     """A = grad of the Ky Fan score w.r.t. the window statistics.
 
     The Moment-Adjoint Replay bridge: the Welford result (pass 1, detached)
@@ -134,16 +190,21 @@ def kf_adjoint(wf_result: dict, eps: float, strict: bool = False):
     czz = wf_result["M2_zz"].clone().requires_grad_(True)
     cpp = wf_result["M2_pp"].clone().requires_grad_(True)
     czp = wf_result["M2_zp"].clone().requires_grad_(True)
-    # _score_from_covs signature is (czz, czp, cpp, eps).
-    j, score_diag = _score_from_covs(czz / D, czp / D, cpp / D, eps)
+    # _score_from_covs signature is (czz, czp, cpp, eps, variant).
+    j, score_diag = _score_from_covs(czz / D, czp / D, cpp / D, eps, variant)
     if score_diag["failed"] is not None:
         if strict:
             raise RuntimeError("kf_adjoint close failed: {}".format(score_diag))
         return None, None, score_diag
     j.backward()
-    adjoints = {"M2_zz": czz.grad.detach(),
-                "M2_pp": cpp.grad.detach(),
-                "M2_zp": czp.grad.detach()}
+
+    def _safe_grad(x):
+        grad = x.grad
+        return torch.zeros_like(x) if grad is None else grad.detach()
+
+    adjoints = {"M2_zz": _safe_grad(czz),
+                "M2_pp": _safe_grad(cpp),
+                "M2_zp": _safe_grad(czp)}
     return float(j.detach()), adjoints, score_diag
 
 
@@ -309,8 +370,9 @@ def score_rows_by_type(rows: List, state_dims: Dict[str, int]) -> Dict[str, list
 class WeightedWelford:
     """FP64 weighted ONLINE central moments (Chan et al. merge form).
 
-    The pass-1 accumulator of the Moment-Adjoint Replay: one no_grad pass
-    merges every batch's weighted centered moments into the whole-window
+    The detached accumulator used by the one-pass lagged reference (and by
+    the exact audit implementation below).  It merges each batch's centered
+    moments into whole-window
     statistics ``W, W2_cut, mu_z, mu_p, M2_zz, M2_pp, M2_zp`` in float64,
     from which the global mean mu_hat and the cluster degrees of freedom
     ``D = W - W2_cut/W`` come out (``W2_cut = sum_v (sum_h w_{v,h})^2``,
@@ -398,7 +460,7 @@ class WeightedWelford:
                 "M2_zp": self.M2_zp.clone()}
 
 
-def dedup_cut_rows(rows: List, fixed_maps):
+def dedup_cut_rows(rows: List, fixed_maps, u_as_z: bool = False):
     """Row-wise projection of CutRecords (NO averaging across horizons).
 
     One row per (cut, horizon) pair: horizons of one cut are mixed by
@@ -417,13 +479,24 @@ def dedup_cut_rows(rows: List, fixed_maps):
         row_ids.append(r.row_id)
         cut_ids.append(r.cut_id)
         tree_ids.append(int(r.tree_id))
-        zs.append(r.z)
+        if u_as_z:
+            # Reconstruction ablation: U occupies the Z slot, Z the P slot
+            # (no fixed measurement involved).
+            if r.u is None:
+                raise ValueError(
+                    "u_as_z requires CutRecord.u (pre-compression state); "
+                    "run the adapter with the compressor attached")
+            zs.append(r.u)
+        else:
+            zs.append(r.z)
         weights.append(float(r.weight))
     zs_t = torch.stack(zs)
-    # Vectorized P projection: the per-row ``pv`` call is a Python-loop
-    # small-operator storm (~0.25 ms/row); ``pv_batch`` computes all rows
-    # in one pass (~0.01 ms/row).  Test stubs only implement ``pv``.
-    if hasattr(fixed_maps, "pv_batch"):
+    if u_as_z:
+        ps_t = torch.stack([r.z for r in rows])
+    elif hasattr(fixed_maps, "pv_batch"):
+        # Vectorized P projection: the per-row ``pv`` call is a Python-loop
+        # small-operator storm (~0.25 ms/row); ``pv_batch`` computes all rows
+        # in one pass (~0.01 ms/row).  Test stubs only implement ``pv``.
         ps_t = fixed_maps.pv_batch([r.context for r in rows],
                                    [r.outcome for r in rows])
     else:
@@ -433,8 +506,193 @@ def dedup_cut_rows(rows: List, fixed_maps):
             torch.tensor(weights, dtype=torch.float64, device=zs_t.device))
 
 
+class KFLaggedWindow:
+    """One-pass, bounded-memory moment-adjoint trainer.
+
+    A completed detached window defines a frozen Ky Fan linearization
+    (global means plus adjoints of all ``C_ZZ``, ``C_ZP`` and ``C_PP``
+    moments).  Subsequent batches use that linearization as a stochastic
+    VJP while simultaneously accumulating the *next* detached reference
+    window.  Consequently:
+
+    * every data batch performs one host query and one ordinary backward;
+    * no autograd graph survives a batch and no stream/memory replay occurs;
+    * the full normalized Ky Fan derivative, including the ``C_ZZ`` path,
+      is retained at the frozen reference point;
+    * the first reference window is an explicit cold start with task loss
+      only, never a fabricated small-sample score.
+
+    This is a lagged stochastic linearization of the population objective,
+    not the exact gradient of a just-collected finite window.  The lag is the
+    price of removing the second complete TGN query without retaining a
+    macro-window of enormous host graphs.
+    """
+
+    def __init__(self, state_dims: Dict[str, int], *, min_ratio: float = 2.0,
+                 min_abs: int = 64, eps: float = 1e-4, fixed_maps=None,
+                 strict: bool = False, variant: str = "full_balancing"):
+        if fixed_maps is None:
+            raise ValueError("KFLaggedWindow requires fixed_maps")
+        if variant not in ("full_balancing", "diagonal", "reconstruction"):
+            raise ValueError("unknown kf_variant {}".format(variant))
+        self.variant = str(variant)
+        self.state_dims = dict(state_dims)
+        self.min_ratio = float(min_ratio)
+        self.min_abs = int(min_abs)
+        self.eps = float(eps)
+        self.fixed_maps = fixed_maps
+        self.strict = bool(strict)
+        self._pending: Dict[str, dict] = {}
+        self._reference: Dict[str, dict] = {}
+        self.refresh_count = 0
+
+    def _threshold(self, tau: str) -> int:
+        # CCA rank is bounded by min(dim Z, dim P).  Count independent query
+        # trees, not correlated cut/horizon rows from the same tree.  The
+        # reconstruction variant pairs U against Z (dim = d_tau) instead of
+        # the sketch dimension.
+        dim_p = int(self.state_dims[tau])             if self.variant == "reconstruction" else int(self.fixed_maps.m)
+        rank_dim = min(int(self.state_dims[tau]), dim_p)
+        return int(math.ceil(max(self.min_ratio * rank_dim,
+                                 float(self.min_abs))))
+
+    def _new_pending(self, tau: str) -> dict:
+        dim_p = int(self.state_dims[tau])             if self.variant == "reconstruction" else int(self.fixed_maps.m)
+        return {
+            "moments": WeightedWelford(int(self.state_dims[tau]), dim_p),
+            "row_seen": set(),
+            "cut_seen": set(),
+            "tree_seen": set(),
+            "n_rows": 0,
+        }
+
+    def step(self, rows: List):
+        """Consume current rows and return one-pass gradient surrogates.
+
+        Returns ``(scores, surrogates, diagnostics, cold_taus, refreshed)``.
+        Scores are detached reference-window values for honest monitoring;
+        each surrogate is numerically zero but carries the correctly scaled
+        VJP gradient.  ``refreshed`` lists references completed this step.
+        """
+        by_tau = score_rows_by_type(rows, self.state_dims)
+        scores: Dict[str, float] = {}
+        surrogates: Dict[str, torch.Tensor] = {}
+        diagnostics: Dict[str, dict] = {}
+        cold_taus: List[str] = []
+        refreshed: List[str] = []
+
+        for tau, tau_rows in by_tau.items():
+            pending = self._pending.get(tau)
+            if pending is None:
+                pending = self._new_pending(tau)
+                self._pending[tau] = pending
+            row_ids, cut_ids, tree_ids, zs, ps, weights = dedup_cut_rows(
+                tau_rows, self.fixed_maps,
+                u_as_z=(self.variant == "reconstruction"))
+            fresh = [i for i, row_id in enumerate(row_ids)
+                     if row_id not in pending["row_seen"]]
+            if not fresh:
+                if tau not in self._reference:
+                    cold_taus.append(tau)
+                continue
+            zs = zs[fresh]
+            ps = ps[fresh]
+            weights = weights[fresh]
+            fresh_cut_ids = [cut_ids[i] for i in fresh]
+            reference = self._reference.get(tau)
+            if reference is not None:
+                batch_weight = float(weights.detach().sum())
+                if batch_weight > 0.0:
+                    raw_vjp = kf_vjp_batch(
+                        zs, ps, weights,
+                        reference["mu_z"], reference["mu_p"],
+                        reference["adjoints"])
+                    # The adjoint scales as 1 / reference weight whereas the
+                    # batch M2 scales with batch weight.  This converts the
+                    # batch contribution to a population-gradient estimate.
+                    scaled = raw_vjp * (reference["W"] / batch_weight)
+                    # Preserve only its gradient.  A VJP surrogate is not a
+                    # meaningful loss value and must not pollute task-loss logs.
+                    surrogates[tau] = scaled.float() - scaled.detach().float()
+                scores[tau] = float(reference["score"])
+            else:
+                cold_taus.append(tau)
+
+            pending["moments"].add(
+                zs.detach(), ps.detach(), weights.detach(), fresh_cut_ids)
+            for i in fresh:
+                pending["row_seen"].add(row_ids[i])
+                pending["cut_seen"].add(cut_ids[i])
+                pending["tree_seen"].add(tree_ids[i])
+            pending["n_rows"] += len(fresh)
+
+            if len(pending["tree_seen"]) >= self._threshold(tau):
+                result = pending["moments"].result()
+                score, adjoints, score_diag = kf_adjoint(
+                    result, self.eps, self.strict, self.variant)
+                diagnostics[tau] = self._diagnostics(
+                    pending, result, score_diag)
+                if score is not None:
+                    self._reference[tau] = {
+                        "score": float(score),
+                        "adjoints": adjoints,
+                        "mu_z": result["mu_z"].detach(),
+                        "mu_p": result["mu_p"].detach(),
+                        "W": float(result["W"]),
+                        "D": float(result["D"]),
+                        "M_unique_trees": len(pending["tree_seen"]),
+                    }
+                    scores[tau] = float(score)
+                    refreshed.append(tau)
+                    self.refresh_count += 1
+                    if tau in cold_taus:
+                        cold_taus.remove(tau)
+                # Whether successful or failed, bound memory by starting a
+                # fresh detached reference window.  A failed refresh leaves
+                # the last valid reference active.
+                self._pending[tau] = self._new_pending(tau)
+
+        return scores, surrogates, diagnostics, cold_taus, refreshed
+
+    def _diagnostics(self, pending: dict, result: dict,
+                     score_diag: dict) -> dict:
+        diag = {
+            "M_unique": int(len(pending["cut_seen"])),
+            "M_rows": int(pending["n_rows"]),
+            "M_unique_trees": int(len(pending["tree_seen"])),
+            "W": float(result["W"]),
+            "D_cut": float(result["D"]),
+            "failed": score_diag.get("failed"),
+        }
+        if result["W2_cut"] > 0.0:
+            diag["w_eff_cut"] = \
+                result["W"] * result["W"] / result["W2_cut"]
+        if result["D"] > 0.0:
+            czz = result["M2_zz"] / result["D"]
+            cpp = result["M2_pp"] / result["D"]
+            czp = result["M2_zp"] / result["D"]
+            diag["symmetry_error"] = float(
+                (czz - czz.t()).detach().abs().max())
+            diag["joint_min_eig"] = _joint_min_eig(czz, czp, cpp)
+            diag.update(_matrix_diag("zz", czz))
+            diag.update(_matrix_diag("pp", cpp))
+        diag.update(score_diag)
+        return diag
+
+    def reference_score(self, tau: str):
+        reference = self._reference.get(tau)
+        return None if reference is None else float(reference["score"])
+
+    def pending_tree_count(self, tau: str) -> int:
+        pending = self._pending.get(tau)
+        return 0 if pending is None else int(len(pending["tree_seen"]))
+
+
 class KFMomentWindow:
-    """Cross-microbatch accumulation for the Ky Fan score.
+    """Exact finite-window reference implementation (audit/tests only).
+
+    Production training uses :class:`KFLaggedWindow`; no training loop calls
+    this graph-retaining/replay implementation.
 
     Per tau, accumulate the graph-connected z rows and the (constant) p
     rows of unique cuts.  The window closes when the number of unique cut
@@ -460,7 +718,11 @@ class KFMomentWindow:
 
     def __init__(self, state_dims: Dict[str, int], *, min_ratio: float = 2.0,
                  min_abs: int = 64, eps: float = 1e-4, fixed_maps=None,
-                 strict: bool = False, autoclose: bool = True):
+                 strict: bool = False, autoclose: bool = True,
+                 variant: str = "full_balancing"):
+        if variant not in ("full_balancing", "diagonal", "reconstruction"):
+            raise ValueError("unknown kf_variant {}".format(variant))
+        self.variant = str(variant)
         self.state_dims = dict(state_dims)
         self.min_ratio = float(min_ratio)
         self.min_abs = int(min_abs)
@@ -494,7 +756,8 @@ class KFMomentWindow:
             if self.fixed_maps is None:
                 raise ValueError("KFMomentWindow requires fixed_maps")
             row_ids, cut_ids, tree_ids, zs, ps, weights = dedup_cut_rows(
-                tau_rows, self.fixed_maps)
+                tau_rows, self.fixed_maps,
+                u_as_z=(self.variant == "reconstruction"))
             win = self._windows.get(tau)
             if win is None:
                 win = {"zs_list": [], "ps_list": [], "weights_list": [],

@@ -1,23 +1,22 @@
-"""Cut-builder factory for the JODIE line.
+"""Leakage-safe cut-builder factory for the JODIE line."""
 
-Builds the explicit ``idx -> endpoints`` / ``idx -> label`` tables over the
-*full* stream (no indexing-convention assumptions) and wraps them in a
-:class:`rpbe.records.JodieCutBuilder` for one training stage: LINK (stage 1,
-self-supervised pretraining) or NODE_CLASS (stage 2, node classification).
-The same tables feed the adapter's consumption-record stamping.
-"""
-
-from rpbe.records import build_edge_tables, JodieCutBuilder
+from rpbe.records import JodieCutBuilder, JodieFutureIndex
 
 
 def build_cut_builder(dataset, *, stage: str, cfg, seed: int = 0,
                       delta_t_scale: float = 1e6,
-                      tables=None) -> JodieCutBuilder:
-    if tables is None:
-        (endpoints, labels, users, pages,
-         _) = build_edge_tables(dataset)
-        tables = (endpoints, labels, users, pages)
+                      tables=None, future_index=None) -> JodieCutBuilder:
+    """Build from ``dataset.train`` only.
+
+    ``tables`` is retained as a no-op compatibility argument for older
+    runners.  Historical edge tables are intentionally never consumed.
+    """
+    del tables
+    if future_index is None:
+        stream = dataset.train if hasattr(dataset, "train") else dataset
+        future_index = JodieFutureIndex(stream)
     cfg.delta_t_scale = float(delta_t_scale) if delta_t_scale > 0 else 1.0
-    return JodieCutBuilder(tables, stage=stage,
+    return JodieCutBuilder(future_index, stage=stage,
                            cuts_per_tau=getattr(cfg, "cuts_per_tau", 32),
-                           seed=int(seed))
+                           seed=int(seed),
+                           n_observations=getattr(cfg, "n_observations", 2))

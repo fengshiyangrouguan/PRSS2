@@ -26,11 +26,18 @@ class RPBConfig:
     cuts_per_tau: int = 32              # depth-balanced cuts per interface/batch
     kf_min_ratio: float = 2.0            # window: unique cuts >= ratio * d_tau
     kf_min_abs: int = 1024               # gate: effective cut count >= this floor
-    kf_taus: Optional[List[str]] = None  # taus entering the KF windows;
-                                         # None = all state_dims. The root
-                                         # interface (no upward walk) is
-                                         # excluded EXPLICITLY here, not by
-                                         # "never accumulating" warnings.
+    kf_taus: Optional[List[str]] = None  # optional whitelist; the host adapter
+                                         # always intersects it with internal
+                                         # compressible interfaces (never leaf/root)
+    # Table-2 ablation switches (paper spec section 4):
+    #   full_balancing  J_KF = ||S_ZZ^-1/2 S_ZP S_PP^-1/2||_F^2 (the method)
+    #   diagonal        J_diag = ||D_Z^-1/2 S_ZP D_P^-1/2||_F^2
+    #   reconstruction  J_rec = tr(S_UZ S_ZZ^-1 S_ZU) (PCA-equivalent when
+    #                   the encoder is linear; needs CutCandidate.u)
+    kf_variant: str = "full_balancing"
+    # 1 = one local task observation (Y1 only); 2 = the two-observation
+    # pullback refinement (Y1 and Y2).  Both keep per-tree total weight 1.
+    n_observations: int = 2
     rpbe_seed: int = 0                   # fixed-measurement seed (independent of host)
 
     def __post_init__(self):
@@ -51,6 +58,11 @@ class RPBConfig:
             raise ValueError("kf_min_ratio > 0 and kf_min_abs >= 2")
         if self.cuts_per_tau < 1:
             raise ValueError("cuts_per_tau must be >= 1")
+        if self.kf_variant not in ("full_balancing", "diagonal",
+                                   "reconstruction"):
+            raise ValueError("unknown kf_variant {}".format(self.kf_variant))
+        if self.n_observations not in (1, 2):
+            raise ValueError("n_observations must be 1 or 2")
         if self.kf_taus is not None:
             bad = set(self.kf_taus) - set(self.state_dims)
             if bad:
@@ -76,5 +88,7 @@ class RPBConfig:
             "kf_min_ratio": self.kf_min_ratio,
             "kf_min_abs": self.kf_min_abs,
             "kf_taus": list(self.kf_taus) if self.kf_taus is not None else None,
+            "kf_variant": self.kf_variant,
+            "n_observations": self.n_observations,
             "rpbe_seed": self.rpbe_seed,
         }

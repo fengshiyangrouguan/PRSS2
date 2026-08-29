@@ -311,6 +311,120 @@ class TestKFLaggedWindow(unittest.TestCase):
             "({:.4f} -> {:.4f})".format(before, after))
 
 
+class TestAblationVariants(unittest.TestCase):
+    """Paper Table 2 variant contracts (P0)."""
+
+    def _data(self, n=120, r=6, mdim=8, seed=3):
+        g = torch.Generator().manual_seed(seed)
+        z = torch.randn(n, r, generator=g)
+        p = torch.randn(n, mdim, generator=g)
+        u = z @ torch.randn(r, r, generator=g) +             0.3 * torch.randn(n, r, generator=g)   # z-related rich state
+        return z, p, u
+
+    def test_diagonal_equals_full_on_diagonal_covariances(self):
+        # When C_ZZ and C_PP are diagonal (independent coordinates), the
+        # diagonal whitening and the full balancing coincide.
+        n, r, mdim = 200, 6, 8
+        g = torch.Generator().manual_seed(11)
+        z = torch.randn(n, r, generator=g) * torch.tensor(
+            [1.0, 2.0, 3.0, 4.0, 5.0, 6.0])
+        p = torch.randn(n, mdim, generator=g) * torch.tensor(
+            [0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0])
+        zc = z - z.mean(0, keepdim=True)
+        pc = p - p.mean(0, keepdim=True)
+        m = n
+        czz = zc.t() @ zc / m
+        cpp = pc.t() @ pc / m
+        czp = zc.t() @ pc / m
+        j_full, d_full = _score_from_covs(
+            czz, czp, cpp, 1e-4, "full_balancing")
+        j_diag, d_diag = _score_from_covs(
+            czz, czp, cpp, 1e-4, "diagonal")
+        self.assertIsNone(d_full["failed"])
+        self.assertIsNone(d_diag["failed"])
+        # Off-diagonals are sampling noise ~1/sqrt(n); allow that size.
+        self.assertAlmostEqual(float(j_full), float(j_diag),
+                               delta=max(0.15, 0.2 * float(j_full)))
+
+    def test_diagonal_differs_from_full_under_correlation(self):
+        # The two variants are NOT ordered in general: diagonal whitening
+        # ignores correlations (both exploitable redundancy and noise),
+        # while full balancing reshapes by S^-1/2.  Both must be finite
+        # and the scores generally differ when correlations exist.
+        n, r = 400, 4
+        g = torch.Generator().manual_seed(21)
+        base = torch.randn(n, 1, generator=g)
+        z = torch.cat([base + 0.05 * torch.randn(n, 1, generator=g),
+                       -base + 0.05 * torch.randn(n, 1, generator=g),
+                       torch.randn(n, 2, generator=g)], dim=1)
+        p = torch.cat([base + 0.05 * torch.randn(n, 1, generator=g),
+                       torch.randn(n, 5, generator=g)], dim=1)
+        zc = z - z.mean(0, keepdim=True)
+        pc = p - p.mean(0, keepdim=True)
+        czz = zc.t() @ zc / n
+        cpp = pc.t() @ pc / n
+        czp = zc.t() @ pc / n
+        j_full, d_full = _score_from_covs(
+            czz, czp, cpp, 1e-4, "full_balancing")
+        j_diag, d_diag = _score_from_covs(
+            czz, czp, cpp, 1e-4, "diagonal")
+        self.assertIsNone(d_full["failed"])
+        self.assertIsNone(d_diag["failed"])
+        self.assertTrue(np.isfinite(float(j_full)))
+        self.assertTrue(np.isfinite(float(j_diag)))
+        self.assertNotAlmostEqual(float(j_full), float(j_diag), places=2)
+
+    def test_reconstruction_matches_profiled_closed_form(self):
+        # J_rec = tr(S_UZ S_ZZ^-1 S_ZU) must equal the closed form
+        # ||S_ZZ^-1/2 S_ZU||_F^2 (U in the Z slot, Z in the P slot,
+        # U side unwhitened).
+        n, r = 300, 5
+        g = torch.Generator().manual_seed(31)
+        z = torch.randn(n, r, generator=g)
+        u = z @ torch.randn(r, r, generator=g) +             0.2 * torch.randn(n, r, generator=g)
+        zc = z - z.mean(0, keepdim=True)
+        uc = u - u.mean(0, keepdim=True)
+        szz = zc.t() @ zc / n
+        szu = zc.t() @ uc / n           # S_ZU = S_UZ^T
+        suz = szu.t()
+        j_rec, d = _score_from_covs(szz, szu, szz, 1e-4, "reconstruction")
+        self.assertIsNone(d["failed"])
+        # The score path adds the relative ridge eps to the whitened Z
+        # side; the closed form has none.  Compare with a small tolerance.
+        closed = float(torch.trace(suz @ torch.linalg.solve(szz, szu)))
+        self.assertAlmostEqual(float(j_rec), closed, delta=0.02,
+                               msg="reconstruction score must match "
+                                   "tr(S_UZ S_ZZ^-1 S_ZU)")
+
+    def test_lagged_window_reconstruction_path(self):
+        # End-to-end reconstruction variant: cold start builds the
+        # detached reference from (U, Z) pairs; the next batch gets a
+        # zero-valued, nonzero-gradient VJP against the same pairs.
+        rows = make_cut_rows(8, 4, 8, offset=0)
+        for row in rows:
+            row.u = row.z + 0.1 * torch.randn(4)
+        window = KFLaggedWindow(
+            {"t": 4}, min_ratio=1.0, min_abs=4, fixed_maps=_FakeMaps(8),
+            variant="reconstruction")
+        scores, surrogates, _, cold, refreshed = window.step(rows)
+        self.assertIn("t", scores)
+        self.assertEqual(surrogates, {})
+        self.assertIn("t", refreshed)
+        rows2 = make_cut_rows(6, 4, 8, offset=100)
+        for row in rows2:
+            row.u = row.z + 0.1 * torch.randn(4)
+            row.z.requires_grad_(True)
+            row.u.requires_grad_(True)
+        scores, surrogates, _, _, _ = window.step(rows2)
+        self.assertIn("t", surrogates)
+        self.assertAlmostEqual(float(surrogates["t"].detach()), 0.0)
+        (-surrogates["t"]).backward()
+        grad_norm = sum(float(row.z.grad.norm() + row.u.grad.norm())
+                        for row in rows2)
+        self.assertGreater(grad_norm, 0.0)
+
+
+
 class TestKFMomentWindow(unittest.TestCase):
     def test_window_gates_small_sample(self):
         # d=32 with <64 unique cuts must stay open (no score yet).

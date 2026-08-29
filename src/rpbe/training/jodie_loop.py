@@ -249,7 +249,9 @@ class JodieNodeClassificationLoop:
             labels_t = torch.from_numpy(labels_np).float().to(self.device)
 
             self.head_optimizer.zero_grad(set_to_none=True)
-            if not repr_group_active:
+            # The macro-group machinery only exists when the compressor is
+            # attached; vanilla keeps the representation optimizer silent.
+            if not repr_group_active and self.component_on:
                 self.repr_optimizer.zero_grad(set_to_none=True)
                 if self.kf_on:
                     self.kf_window.begin_group(param_version, epoch)

@@ -80,14 +80,31 @@ def select_trace_rows(labels, max_roots: int, seed: int, batch_index: int,
 class JodieNodeClassificationLoop:
     """Own the official-TGN stream; RPBE hooks are optional."""
 
-    def __init__(self, *, tgn, decoder, optimizer, device, batch_size,
-                 n_neighbors, grad_clip, monitor, seed, finetune_host=False,
-                 selection_metric="auc", adapter=None, cut_builder=None,
-                 fixed_maps=None, rpbe_cfg=None, trace_roots=8,
-                 trace_mode="evenly_spaced", train_eval_auc=False):
+    def __init__(self, *, tgn, decoder, repr_optimizer, head_optimizer,
+                 device, batch_size, n_neighbors, grad_clip, monitor, seed,
+                 finetune_host=False, selection_metric="auc", adapter=None,
+                 cut_builder=None, fixed_maps=None, rpbe_cfg=None,
+                 trace_roots=8, trace_mode="evenly_spaced",
+                 train_eval_auc=False, grad_diag=None):
         self.tgn = tgn
         self.decoder = decoder
-        self.optimizer = optimizer
+        # Representation parameters (host + compressor, everything that can
+        # change a cut's z) update once per macro-group; the head updates
+        # every batch.  Both groups receive gradients from every backward.
+        # Three SEPARATE switches (review):
+        #   repr_train_on — the representation optimizer is nonempty (pure
+        #                   frozen-host vanilla leaves it None)
+        #   component_on  — the compressor (Gamma) is attached
+        #   kf_on         — the Ky Fan term is computed
+        self.repr_optimizer = repr_optimizer
+        self.head_optimizer = head_optimizer
+        self.repr_train_on = bool(
+            repr_optimizer is not None
+            and repr_optimizer.param_groups
+            and repr_optimizer.param_groups[0]["params"])
+        self.repr_params = (list(repr_optimizer.param_groups[0]["params"])
+                            if self.repr_train_on else [])
+        self.head_params = list(head_optimizer.param_groups[0]["params"])
         self.device = device
         self.batch_size = int(batch_size)
         self.n_neighbors = int(n_neighbors)
@@ -105,9 +122,25 @@ class JodieNodeClassificationLoop:
         self.trace_roots = int(trace_roots)
         self.trace_mode = trace_mode
         self.train_eval_auc = bool(train_eval_auc)
-        self.rpbe_on = bool(adapter is not None and cut_builder is not None
-                            and fixed_maps is not None
-                            and rpbe_cfg is not None)
+        # Optional per-batch gradient diagnostics (the sprint script).
+        # A dict in; its "fn" hook (implemented OUTSIDE the training
+        # module, so the source contract stays replay-free) is called on
+        # every KF batch before the single backward, and its return value
+        # is appended to grad_diag["rows"].
+        self.grad_diag = grad_diag
+        self._grad_diag_fn = None
+        if grad_diag is not None:
+            grad_diag.setdefault("rows", [])
+            self._grad_diag_fn = grad_diag.get("fn")
+        # Eighth review D: lambda=0 is a TRUE task-only fast path — the
+        # compressor still shapes the forward (TGN + Gamma, task only), but
+        # no tracing, no cuts, no P projection, no window updates.
+        self.component_on = bool(adapter is not None
+                                 and fixed_maps is not None
+                                 and rpbe_cfg is not None)
+        self.kf_on = bool(self.component_on and self.lambda_kf > 0.0
+                          and cut_builder is not None)
+        self.rpbe_on = self.component_on
         if self.rpbe_on and self.trace_mode == "positive_first":
             raise ValueError(
                 "RPBE cut selection cannot depend on the current root label; "
@@ -125,20 +158,34 @@ class JodieNodeClassificationLoop:
                 raise ValueError(
                     "RPBE needs at least one internal interface; leaf/root "
                     "interfaces are not compressible")
+        # Eighth review A: per-interface rank normalization coefficients.
+        # J_norm = sum_tau alpha_tau J_tau / rank_tau / sum alpha_tau lives
+        # in ~[0, 1]; the denominator is FIXED by the configured
+        # interfaces, never by which taus happen to activate in a batch.
+        # rank_tau is variant-dependent: min(d_tau, m) for full
+        # balancing, d_tau * m for diagonal whitening (its natural
+        # upper bound is dm, not the Ky Fan rank), 1 for reconstruction
+        # (the review form already normalizes J_rec into ~[0, 1]).
+        self._tau_coeff = {}
+        if self.kf_on:
+            alpha_sum = float(sum(
+                rpbe_cfg.alpha(tau) for tau in kf_dims))
+            for tau in kf_dims:
+                self._tau_coeff[tau] = rpbe_cfg.alpha(tau) / (
+                    self._tau_rank(tau) * alpha_sum)
         self.kf_window = (KFLaggedWindow(
             kf_dims, min_ratio=rpbe_cfg.kf_min_ratio,
             min_abs=rpbe_cfg.kf_min_abs, eps=rpbe_cfg.ridge_eps,
             fixed_maps=fixed_maps, variant=rpbe_cfg.kf_variant)
             if self.rpbe_on else None)
 
-    def _clip_all_groups(self):
+    def _clip(self, params):
         if self.grad_clip <= 0:
             return
-        params = [param for group in self.optimizer.param_groups
-                  for param in group["params"] if param.grad is not None]
-        if params:
+        live = [p for p in params if p.grad is not None]
+        if live:
             torch.nn.utils.clip_grad_norm_(
-                params, max_norm=self.grad_clip, error_if_nonfinite=True)
+                live, max_norm=self.grad_clip, error_if_nonfinite=True)
 
     # ------------------------------------------------------------- stream state
     def reset_memory(self):
@@ -155,56 +202,148 @@ class JodieNodeClassificationLoop:
                 self.n_neighbors)
 
     def _consume_kf(self, cuts, step):
-        scores, surrogates, diagnostics, cold, refreshed = \
-            self.kf_window.step(cuts)
-        weighted_score = float(sum(
+        scores, surrogates, cold = self.kf_window.consume(cuts)
+        raw_score = float(sum(
             self.rpbe_cfg.alpha(tau) * score
+            for tau, score in scores.items()))
+        norm_score = float(sum(
+            self._tau_coeff[tau] * score
             for tau, score in scores.items()))
         if surrogates:
             auxiliary = -self.lambda_kf * sum(
-                self.rpbe_cfg.alpha(tau) * value
+                self._tau_coeff[tau] * value
                 for tau, value in surrogates.items())
         else:
             auxiliary = torch.zeros((), device=self.device)
 
         if scores:
-            bounds = {tau: min(int(self.rpbe_cfg.state_dims[tau]),
-                               int(self.fixed_maps.m))
-                      for tau in scores}
+            bounds = {tau: self._tau_rank(tau) for tau in scores}
             self.monitor.validate_kf(scores, bounds, step)
-        for tau, diag in diagnostics.items():
-            if diag.get("failed"):
+        return raw_score, norm_score, scores, auxiliary, set(cold)
+
+    def _tau_rank(self, tau) -> float:
+        """Normalization bound for one interface, variant-dependent."""
+        d = min(int(self.rpbe_cfg.state_dims[tau]), int(self.fixed_maps.m))
+        if self.rpbe_cfg.kf_variant == "diagonal":
+            return float(int(self.rpbe_cfg.state_dims[tau])
+                         * int(self.fixed_maps.m))
+        if self.rpbe_cfg.kf_variant == "reconstruction":
+            return 1.0
+        return float(d)
+
+    def _close_repr_group(self, group_batch_count: int, global_step: int,
+                          new_ref_j: dict, param_version: int, stats: dict):
+        """Close one macro group: build the next KF reference (KF path),
+        step the representation optimizer, advance the version, commit.
+
+        The commit happens strictly AFTER the optimizer step, so the new
+        reference always lags the updated parameters by exactly one
+        version.  Returns ``(new_param_version, refreshes)``; collects
+        below-threshold and pending-tree bookkeeping into ``stats``.
+        """
+        refreshes = 0
+        if self.kf_on:
+            diagnostics, refreshed = self.kf_window.close_group()
+            refreshes = len(refreshed)
+            for tau, diag in diagnostics.items():
+                if diag.get("failed"):
+                    self.monitor.alert(
+                        "warning", "kf_reference_failed",
+                        "{} {} scale_z={:.3e} scale_p={:.3e} trees={}".format(
+                            tau, diag["failed"],
+                            diag.get("scale_z", float("nan")),
+                            diag.get("scale_p", float("nan")),
+                            diag["M_unique_trees"]),
+                        step=global_step, interface=tau)
+                if diag.get("below_threshold"):
+                    # Never silently discard: a window below threshold
+                    # means the group length is too short for the real
+                    # valid-root rate.
+                    stats["below_threshold_groups"] += 1
+                    stats["pending_trees"][tau] = diag["M_unique_trees"]
+                    stats["threshold"][tau] = diag["threshold"]
+                    self.monitor.alert(
+                        "warning", "kf_below_threshold",
+                        "{} window {} trees < threshold {}; discarded. "
+                        "Consider raising kf_group_batches.".format(
+                            tau, diag["M_unique_trees"], diag["threshold"]),
+                        step=global_step, interface=tau)
+                if diag.get("score") is not None:
+                    new_ref_j[tau] = diag["score"]
+        for p in self.repr_params:
+            if p.grad is not None:
+                p.grad.div_(float(max(1, group_batch_count)))
+        self._clip(self.repr_params)
+        self.repr_optimizer.step()
+        param_version += 1
+        if self.kf_on:
+            stale = self.kf_window.commit_reference(
+                current_version=param_version)
+            for tau in stale:
                 self.monitor.alert(
-                    "warning", "kf_reference_failed",
-                    "{} {} scale_z={:.3e} scale_p={:.3e} trees={}".format(
-                        tau, diag["failed"],
-                        diag.get("scale_z", float("nan")),
-                        diag.get("scale_p", float("nan")),
-                        diag["M_unique_trees"]),
-                    step=step, interface=tau)
-        return (weighted_score, scores, auxiliary, diagnostics,
-                set(cold), len(refreshed))
+                    "warning", "kf_reference_stale",
+                    "{} candidate spans several parameter versions; "
+                    "discarded".format(tau),
+                    step=global_step, interface=tau)
+        return param_version, refreshes
 
     # ----------------------------------------------------------------- training
-    def train_epoch(self, epoch: int, global_step: int, train: object) -> Dict:
-        """One chronological epoch, one query/backward/step per batch."""
-        del epoch
+    def train_epoch(self, epoch: int, global_step: int, train: object,
+                    max_batches: int = None) -> Dict:
+        """One chronological epoch.
+
+        Macro-group timing (eighth review C): representation parameters
+        (host + compressor) are frozen within a macro-group and update once
+        per FIXED group of ceil(kf_min_abs / trace_roots) batches — the
+        same cadence for the KF path and the lambda=0 task-only fast path
+        (fair ablation, review D).  The head updates every batch.  One
+        query, one backward, one head step per batch — no replay, no
+        cross-batch graphs.
+
+        ``max_batches`` (the sprint diagnostic) stops the epoch after N
+        batches without the epoch-drain close.
+        """
         self.reset_memory()
+        if self.kf_window is not None:
+            self.kf_window.reset(clear_reference=True)   # eighth review C
         self.tgn.train(self.finetune_host)
         self.decoder.train()
 
+        # Fixed group length shared by both component protocols.  The
+        # default ceil(kf_min_abs / trace_roots) assumes every traced
+        # root contributes a cut; the real valid-root rate is lower
+        # (strict-future masking), so kf_group_batches overrides it.  A
+        # pure host finetune (no compressor) updates every batch.
+        if self.component_on:
+            if self.rpbe_cfg.kf_group_batches is not None:
+                fixed_group = max(1, int(self.rpbe_cfg.kf_group_batches))
+            else:
+                fixed_group = max(1, math.ceil(
+                    self.rpbe_cfg.kf_min_abs / max(1, self.trace_roots)))
+        else:
+            fixed_group = 1
+
         total_task = 0.0
-        total_kf = 0.0
+        total_raw = 0.0
+        total_norm = 0.0
         kf_sum = {}
         kf_count_tau = {}
-        skipped_types = set()
+        new_ref_j = {}
+        cold_types = set()
         refreshes = 0
         aux_batches = 0
-        train_probs, train_labels = [], []
         no_cuts_alerted = False
+        param_version = 0
+        repr_group_active = False
+        group_batch_count = 0
+        group_stats = {"below_threshold_groups": 0,
+                       "pending_trees": {}, "threshold": {}}
+        train_probs, train_labels = [], []
         num_batch = math.ceil(len(train.sources) / self.batch_size)
 
         for batch_index in range(num_batch):
+            if max_batches is not None and batch_index >= max_batches:
+                break
             start = batch_index * self.batch_size
             stop = min(len(train.sources), (batch_index + 1) * self.batch_size)
             sources = train.sources[start:stop]
@@ -214,9 +353,20 @@ class JodieNodeClassificationLoop:
             labels_np = train.labels[start:stop]
             labels_t = torch.from_numpy(labels_np).float().to(self.device)
 
-            self.optimizer.zero_grad(set_to_none=True)
+            self.head_optimizer.zero_grad(set_to_none=True)
+            # The macro-group machinery runs whenever representation
+            # parameters exist (compressor attached OR host finetune);
+            # only a fully frozen vanilla run keeps it silent.
+            if not repr_group_active and self.repr_optimizer is not None \
+                    and (self.component_on or self.repr_train_on):
+                self.repr_optimizer.zero_grad(set_to_none=True)
+                if self.kf_on:
+                    self.kf_window.begin_group(param_version, epoch)
+                repr_group_active = True
+                group_batch_count = 0
+
             trace_rows = []
-            if self.rpbe_on:
+            if self.kf_on:
                 trace_rows = select_trace_rows(
                     labels_np, self.trace_roots, self.seed, global_step,
                     self.trace_mode)
@@ -226,20 +376,20 @@ class JodieNodeClassificationLoop:
 
             src_emb, _, _ = self._full_official_embedding_call(
                 sources, destinations, timestamps, edge_idxs,
-                grad_enabled=(self.finetune_host or self.rpbe_on))
+                grad_enabled=(self.finetune_host or self.component_on))
             prediction = self.decoder(src_emb).sigmoid()
             task_loss = F.binary_cross_entropy(prediction, labels_t)
             auxiliary = torch.zeros((), device=self.device)
-            kf_value = 0.0
+            raw_score = 0.0
+            norm_score = 0.0
 
-            if self.rpbe_on and trace_rows and self.adapter.trace is not None:
+            if self.kf_on and trace_rows and self.adapter.trace is not None:
                 cuts = self.cut_builder.build(
                     self.adapter.trace, batch_seed=global_step)
                 if cuts:
-                    (kf_value, scores, auxiliary, _diagnostics, cold,
-                     new_refreshes) = self._consume_kf(cuts, global_step)
-                    skipped_types.update(cold)
-                    refreshes += new_refreshes
+                    (raw_score, norm_score, scores, auxiliary,
+                     cold) = self._consume_kf(cuts, global_step)
+                    cold_types.update(cold)
                     if auxiliary.requires_grad:
                         aux_batches += 1
                     for tau, score in scores.items():
@@ -252,23 +402,59 @@ class JodieNodeClassificationLoop:
                         step=global_step)
                     no_cuts_alerted = True
 
+            # Per-batch gradient diagnostics (the sprint script): task
+            # vs KF gradients on the representation parameters, before
+            # the single backward.  Implemented outside this module.
+            if self._grad_diag_fn is not None and self.kf_on \
+                    and auxiliary.requires_grad and self.repr_params:
+                row = self._grad_diag_fn(
+                    self, task_loss, auxiliary, global_step)
+                self.grad_diag["rows"].append(row)
+
             loss = task_loss + auxiliary
             self.monitor.validate_losses({
                 "task": float(task_loss.detach()),
-                "kf_score": kf_value,
+                "kf_score": raw_score,
+                "kf_normalized": norm_score,
                 "main_total": float(loss.detach()),
             }, global_step)
             loss.backward()
-            self._clip_all_groups()
-            self.optimizer.step()
-            if self.tgn.use_memory and (self.finetune_host or self.rpbe_on):
+            self._clip(self.head_params)
+            self.head_optimizer.step()
+            if self.tgn.use_memory and \
+                    (self.finetune_host or self.component_on):
                 self.tgn.memory.detach_memory()
 
             total_task += float(task_loss.detach())
-            total_kf += kf_value
+            total_raw += raw_score
+            total_norm += norm_score
             train_probs.append(prediction.detach().cpu().numpy())
             train_labels.append(labels_np)
+            group_batch_count += 1
             global_step += 1
+
+            # Macro-group close (eighth review C): FIXED cadence shared by
+            # the KF path and the lambda=0 task-only path —
+            # ceil(kf_min_abs / trace_roots) batches — so both protocols
+            # share the same representation-update timing (fair ablation,
+            # review D).  The window's threshold gate lives in
+            # close_group, which discards below-threshold windows.
+            if repr_group_active and group_batch_count >= fixed_group:
+                param_version, refs = self._close_repr_group(
+                    group_batch_count, global_step, new_ref_j, param_version,
+                    group_stats)
+                refreshes += refs
+                repr_group_active = False
+
+        # Epoch drain: the same close sequence for the unfinished group
+        # (close + commit + one representation step), so the reference
+        # lifecycle never crosses an epoch boundary.
+        if repr_group_active:
+            param_version, refs = self._close_repr_group(
+                group_batch_count, global_step, new_ref_j, param_version,
+                group_stats)
+            refreshes += refs
+            self.repr_optimizer.zero_grad(set_to_none=True)
 
         train_metrics = metric_bundle(np.concatenate(train_labels),
                                       np.concatenate(train_probs))
@@ -289,24 +475,38 @@ class JodieNodeClassificationLoop:
                      for tau, value in kf_sum.items()}
             kf_out = {
                 "estimator": "one_pass_lagged_moment_adjoint",
+                # J/J_norm are the ACTIVE reference values (honest
+                # monitoring, never the current model's score).
                 "J": means,
-                "J_frac": {
-                    tau: value / min(int(self.rpbe_cfg.state_dims[tau]),
-                                     int(self.fixed_maps.m))
-                    for tau, value in means.items()},
-                "skipped_types": sorted(skipped_types),
-                "kf_score": total_kf / max(num_batch, 1),
-                "kf_loss": -self.lambda_kf * total_kf / max(num_batch, 1),
+                "J_norm": {tau: value / self._tau_rank(tau)
+                           for tau, value in means.items()},
+                # The NEXT reference built at this epoch's group closes
+                # (None where the group was below threshold).
+                "J_new": dict(new_ref_j),
+                "reference_age": {
+                    tau: self.kf_window.reference_age(tau)
+                    for tau in means},
+                "skipped_types": sorted(cold_types),
+                "kf_score": total_raw / max(num_batch, 1),
+                "kf_normalized": total_norm / max(num_batch, 1),
+                "kf_loss": -self.lambda_kf * total_norm / max(num_batch, 1),
                 "p_cache_hits": getattr(self.fixed_maps, "_p_cache_hits", 0),
                 "p_cache_misses": getattr(
                     self.fixed_maps, "_p_cache_misses", 0),
                 "reference_refreshes": refreshes,
+                "stale_drops": getattr(self.kf_window, "stale_drops", 0),
+                "below_threshold_groups": group_stats[
+                    "below_threshold_groups"],
+                "pending_trees": dict(group_stats["pending_trees"]),
+                "threshold": dict(group_stats["threshold"]),
+                "group_batches": fixed_group,
                 "aux_batches": aux_batches,
+                "repr_steps": param_version,
             }
         return {
             "train_task_loss": total_task / max(num_batch, 1),
-            "train_kf_score": total_kf / max(num_batch, 1),
-            "train_kf_loss": -self.lambda_kf * total_kf / max(num_batch, 1),
+            "train_kf_score": total_raw / max(num_batch, 1),
+            "train_kf_normalized": total_norm / max(num_batch, 1),
             "kf": kf_out,
             "train": train_metrics,
             "n_batches": num_batch,

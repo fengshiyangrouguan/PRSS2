@@ -69,7 +69,8 @@ def main():
 
     loop = JodieNodeClassificationLoop(
         tgn=tgn, decoder=components["decoder"],
-        optimizer=components["optimizer"], device=device,
+        repr_optimizer=components["repr_optimizer"],
+        head_optimizer=components["head_optimizer"], device=device,
         batch_size=cli.get("bs", 200), n_neighbors=cli.get("n_degree", 5),
         grad_clip=cli.get("grad_clip", 5.0), monitor=MonitorWriter(out),
         seed=cli.get("seed", 0), finetune_host=cli.get("finetune_host", False),

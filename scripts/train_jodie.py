@@ -80,7 +80,7 @@ def parse_args():
     p.add_argument("--rpbe", action="store_true",
                    help="Attach the RPBE component (compressor + fixed maps "
                         "+ cut builder + Ky Fan term)")
-    p.add_argument("--kf-lambda", type=float, default=1.0)
+    p.add_argument("--kf-lambda", type=float, default=1e-3)
     p.add_argument("--rpbe-width", type=int, default=128)
     p.add_argument("--sketch-dim", type=int, default=64)
     p.add_argument("--kf-cuts-per-tau", type=int, default=1024,
@@ -90,6 +90,20 @@ def parse_args():
                         "within 1-2 batches")
     p.add_argument("--kf-min-ratio", type=float, default=2.0)
     p.add_argument("--kf-min-abs", type=int, default=1024)
+    p.add_argument("--kf-group-batches", type=int, default=None,
+                   help="macro-group length in batches; default "
+                        "ceil(kf_min_abs / trace_roots), raise it when "
+                        "below_threshold_groups > 0 (strict-future masking "
+                        "lowers the valid-root rate)")
+    p.add_argument("--kf-variant", default="full_balancing",
+                   choices=["full_balancing", "diagonal", "reconstruction"],
+                   help="Table-2 ablation variant (paper spec section 4)")
+    p.add_argument("--n-observations", type=int, default=2, choices=[1, 2],
+                   help="1 = Y1 only; 2 = two-observation pullback")
+    p.add_argument("--repr-lr", type=float, default=None,
+                   help="separate representation-group learning rate "
+                        "(defaults to --lr); the macro schedule updates "
+                        "these params ~32x less often than the head")
     p.add_argument("--ridge-eps", type=float, default=1e-4)
     p.add_argument("--rpbe-seed", type=int, default=0)
     p.add_argument("--trace-roots", type=int, default=32)
@@ -103,6 +117,9 @@ def parse_args():
                         "online_auc)")
     # Diagnostics.
     p.add_argument("--no-early-stop", action="store_true")
+    p.add_argument("--max-batches", type=int, default=0,
+                   help="cap each train epoch at N batches (0 = full; "
+                        "used by the sprint diagnostic)")
     # Monitoring / resume / smoke caps.
     p.add_argument("--grad-clip", type=float, default=5.0)
     p.add_argument("--monitor-every", type=int, default=50)
@@ -256,6 +273,9 @@ def build_components(args, device, dataset):
             delta_t_scale=delta_scale,
             cuts_per_tau=args.kf_cuts_per_tau, kf_min_ratio=args.kf_min_ratio,
             kf_min_abs=args.kf_min_abs,
+            kf_group_batches=args.kf_group_batches,
+            kf_variant=args.kf_variant,
+            n_observations=args.n_observations,
             kf_taus=list(taus[:-1]),
             rpbe_seed=args.rpbe_seed)
         compressor = RecursiveCompressor(rpbe_cfg).to(device)
@@ -285,17 +305,30 @@ def build_components(args, device, dataset):
     # Exact upstream decoder type/dimension.
     decoder = MLP(dataset.node_features.shape[1], drop=args.drop_out).to(device)
 
-    main_params = list(decoder.parameters())
+    # Eighth review C: two optimizers.  The representation group (host +
+    # compressor — everything that can change a cut's z) updates once per
+    # macro-group; the head updates every batch.
+    head_params = list(decoder.parameters())
+    repr_params = []
     if args.finetune_host:
-        main_params.extend(p for p in tgn.parameters() if p.requires_grad)
+        repr_params.extend(p for p in tgn.parameters() if p.requires_grad)
     if compressor is not None:
-        main_params.extend(p for p in compressor.parameters()
+        repr_params.extend(p for p in compressor.parameters()
                            if p.requires_grad)
     seen = set()
-    main_params = [p for p in main_params
+    repr_params = [p for p in repr_params
                    if not (id(p) in seen or seen.add(id(p)))]
-    optimizer = torch.optim.Adam(main_params, lr=args.lr)
-    return dict(tgn=tgn, decoder=decoder, optimizer=optimizer,
+    head_optimizer = torch.optim.Adam(head_params, lr=args.lr)
+    # A frozen-host vanilla baseline has NO representation parameters;
+    # torch.optim.Adam([]) raises, so the repr optimizer stays None and
+    # the loop keeps the representation group silent.  The representation
+    # group updates ~kf_group_batches times less often than the head, so
+    # it may need its own (higher) learning rate.
+    repr_lr = float(args.repr_lr if args.repr_lr is not None else args.lr)
+    repr_optimizer = torch.optim.Adam(repr_params, lr=repr_lr) \
+        if repr_params else None
+    return dict(tgn=tgn, decoder=decoder, head_optimizer=head_optimizer,
+                repr_optimizer=repr_optimizer,
                 compressor=compressor, adapter=adapter, fixed_maps=fixed_maps,
                 cut_builder=cut_builder, rpbe_cfg=rpbe_cfg)
 
@@ -323,7 +356,8 @@ def main():
     tgn = components["tgn"]
     loop = JodieNodeClassificationLoop(
         tgn=tgn, decoder=components["decoder"],
-        optimizer=components["optimizer"],
+        repr_optimizer=components["repr_optimizer"],
+        head_optimizer=components["head_optimizer"],
         device=device, batch_size=args.bs, n_neighbors=args.n_degree,
         grad_clip=args.grad_clip, monitor=monitor,
         seed=args.seed, finetune_host=args.finetune_host,
@@ -371,7 +405,8 @@ def main():
             model_components={"tgn": tgn, "decoder": components["decoder"],
                               **({"compressor": components["compressor"]}
                                  if components["compressor"] is not None else {})},
-            optimizer=components["optimizer"], device=device)
+            optimizer=components["head_optimizer"],
+            optimizer2=components["repr_optimizer"], device=device)
         start_epoch = int(resume["epoch"])
         global_step = int(resume["global_step"])
         best_score = float(resume.get("best_score", best_score))
@@ -420,8 +455,17 @@ def main():
             if train_row.get("kf"):
                 tb_writer.add_scalar("epoch/kf_loss",
                                      train_row["kf"]["kf_loss"], epoch)
-                for tau, frac in train_row["kf"]["J_frac"].items():
-                    tb_writer.add_scalar("epoch/J_frac/" + tau, frac, epoch)
+                for tau, frac in train_row["kf"]["J_norm"].items():
+                    tb_writer.add_scalar("epoch/J_norm/" + tau, frac, epoch)
+                tb_writer.add_scalar(
+                    "epoch/reference_refreshes",
+                    train_row["kf"].get("reference_refreshes", 0), epoch)
+                tb_writer.add_scalar(
+                    "epoch/below_threshold_groups",
+                    train_row["kf"].get("below_threshold_groups", 0), epoch)
+                tb_writer.add_scalar(
+                    "epoch/stale_drops",
+                    train_row["kf"].get("stale_drops", 0), epoch)
 
         score_is_finite = bool(np.isfinite(score))
         improved = (best_epoch < 0) or (
@@ -452,7 +496,8 @@ def main():
                 "tgn": tgn, "decoder": components["decoder"],
                 **({"compressor": components["compressor"]}
                    if components["compressor"] is not None else {})},
-                optimizer=components["optimizer"],
+                optimizer=components["head_optimizer"],
+                optimizer2=components["repr_optimizer"],
                 epoch=epoch + 1, next_batch=0, global_step=global_step,
                 best_score=best_score, best_epoch=best_epoch,
                 bad_rounds=bad_rounds, train_state={},

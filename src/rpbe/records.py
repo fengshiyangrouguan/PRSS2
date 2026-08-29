@@ -196,6 +196,12 @@ class JodieCutBuilder:
 
     def build(self, trace, batch_seed: int = 0, stats=None):
         """Build rows without walking a tree or invoking the host again."""
+        if self.stage == LINK:
+            raise NotImplementedError(
+                "RPBE link supervision is not supported yet: the future "
+                "index stores node-classification labels, which must not "
+                "masquerade as link outcomes (paper spec section 2).  "
+                "Use vanilla link pretraining.")
         if trace is None or not trace.root_rows or not trace.cuts:
             return []
         self._build_calls += 1

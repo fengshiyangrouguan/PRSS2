@@ -126,18 +126,18 @@ class TestLoopSmoke(unittest.TestCase):
         tgn = self.tgn
         from rpbe.hosts.official_tgn import MLP
         decoder = MLP(dim=8, drop=0.1).to(self.device)
-        main_params = list(decoder.parameters()) + [
-            p for p in tgn.parameters() if p.requires_grad]
+        head_params = list(decoder.parameters())
+        repr_params = [p for p in tgn.parameters() if p.requires_grad]
         adapter = cut_builder = fixed_maps = rpbe_cfg = None
         if rpbe:
             cfg = RPBConfig(
                 state_dims={"tjo:layer0": 8, "tjo:layer1": 8, "tjo:layer2": 8},
                 own_dims={"tjo:layer0": 8, "tjo:layer1": 8, "tjo:layer2": 8},
-                width_D=16, m=64, kf_min_abs=4, rpbe_seed=0,
-                delta_t_scale=1.0)
+                width_D=16, m=64, kf_min_abs=4, kf_min_ratio=0.5,
+                rpbe_seed=0, delta_t_scale=1.0)
             rpbe_cfg = cfg
             compressor = RecursiveCompressor(cfg).to(self.device)
-            main_params += [p for p in compressor.parameters()]
+            repr_params += [p for p in compressor.parameters()]
             adapter = install_adapter(tgn)
             adapter.compressor = compressor
             fixed_maps = FixedMaps(cfg).to(self.device)
@@ -145,11 +145,13 @@ class TestLoopSmoke(unittest.TestCase):
                 JodieFutureIndex(self.train),
                 stage=NODE_CLASS, seed=0)
         seen = set()
-        main_params = [p for p in main_params
+        repr_params = [p for p in repr_params
                        if not (id(p) in seen or seen.add(id(p)))]
-        optimizer = torch.optim.Adam(main_params, lr=3e-4)
+        head_optimizer = torch.optim.Adam(head_params, lr=3e-4)
+        repr_optimizer = torch.optim.Adam(repr_params, lr=3e-4)
         return JodieNodeClassificationLoop(
-            tgn=tgn, decoder=decoder, optimizer=optimizer,
+            tgn=tgn, decoder=decoder, repr_optimizer=repr_optimizer,
+            head_optimizer=head_optimizer,
             device=self.device, batch_size=8, n_neighbors=4, grad_clip=5.0,
             monitor=_FakeMonitor(), seed=0, finetune_host=True,
             adapter=adapter, cut_builder=cut_builder, fixed_maps=fixed_maps,
@@ -172,8 +174,11 @@ class TestLoopSmoke(unittest.TestCase):
     def test_rpbe_train_epoch_finite_kf(self):
         loop = self._make_loop(rpbe=True)
         row = loop.train_epoch(0, 0, self.train)
-        self.assertIn("train_kf_loss", row)
-        self.assertTrue(np.isfinite(row["train_kf_loss"]))
+        self.assertIn("train_kf_score", row)
+        self.assertTrue(np.isfinite(row["train_kf_score"]))
+        self.assertIsNotNone(row["kf"])
+        self.assertTrue(np.isfinite(row["kf"]["kf_loss"]))
+        self.assertIn("J_norm", row["kf"])
         self.assertGreater(row["n_batches"], 0)
         val_row = loop.evaluate_split(self.val, reset=False)
         self.assertIn("auc", val_row)

@@ -19,13 +19,19 @@ class RPBConfig:
     m: int = 64                          # sketch output dim (loss test dim)
     d_c: int = 32                        # context feature dim
     d_f: int = 32                        # future feature dim
-    lambda_kf: float = 1.0               # weight of the component loss in the total
+    lambda_kf: float = 1e-3              # weight of the component loss in the total
     alphas: Dict[str, float] = field(default_factory=dict)  # tau -> weight; default 1
     ridge_eps: float = 1e-4              # relative ridge (x tr(Sigma)/dim)
     delta_t_scale: float = 1e6           # fixed scale for continuous delta_t RFF
     cuts_per_tau: int = 32              # depth-balanced cuts per interface/batch
     kf_min_ratio: float = 2.0            # window: unique cuts >= ratio * d_tau
     kf_min_abs: int = 1024               # gate: effective cut count >= this floor
+    # Macro-group length in batches.  Default None = ceil(kf_min_abs /
+    # trace_roots), which assumes every traced root contributes a cut;
+    # the real valid-root rate is lower (strict-future masking), so runs
+    # that observe below_threshold_groups > 0 should set this explicitly
+    # (e.g. 40 for 32 roots at ~80% validity).
+    kf_group_batches: Optional[int] = None
     kf_taus: Optional[List[str]] = None  # optional whitelist; the host adapter
                                          # always intersects it with internal
                                          # compressible interfaces (never leaf/root)
@@ -87,6 +93,7 @@ class RPBConfig:
             "cuts_per_tau": self.cuts_per_tau,
             "kf_min_ratio": self.kf_min_ratio,
             "kf_min_abs": self.kf_min_abs,
+            "kf_group_batches": self.kf_group_batches,
             "kf_taus": list(self.kf_taus) if self.kf_taus is not None else None,
             "kf_variant": self.kf_variant,
             "n_observations": self.n_observations,

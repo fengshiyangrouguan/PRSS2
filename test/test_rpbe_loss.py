@@ -218,6 +218,17 @@ def make_cut_rows(n_cuts, r, m, rows_per_cut=1, offset=0):
     return rows
 
 
+def _feed_window(window, rows, param_version=0, epoch=0):
+    """The loop's macro-group sequence on one group: consume -> close ->
+    commit.  Returns ``(scores, surrogates, diagnostics, cold, refreshed)``
+    (the order the old ``step()`` returned)."""
+    window.begin_group(param_version, epoch)
+    scores, surrogates, cold = window.consume(rows)
+    diagnostics, refreshed = window.close_group()
+    window.commit_reference()
+    return scores, surrogates, diagnostics, cold, refreshed
+
+
 class TestKFLaggedWindow(unittest.TestCase):
     def test_cold_start_builds_detached_reference(self):
         window = KFLaggedWindow(
@@ -226,23 +237,29 @@ class TestKFLaggedWindow(unittest.TestCase):
         rows = make_cut_rows(4, 4, 8)
         for row in rows:
             row.z.requires_grad_(True)
-        scores, surrogates, diagnostics, cold, refreshed = window.step(rows)
-        self.assertIn("t", scores)
+        scores, surrogates, diagnostics, cold, refreshed = _feed_window(
+            window, rows, param_version=0)
+        # Cold-start group: no active reference yet, so no score/surrogate;
+        # the group only accumulates and builds the NEXT reference.
+        self.assertEqual(scores, {})
         self.assertEqual(surrogates, {})
+        self.assertIn("t", cold)
         self.assertIn("t", refreshed)
-        self.assertNotIn("t", cold)
         self.assertIsNone(rows[0].z.grad)
         self.assertFalse(window._reference["t"]["mu_z"].requires_grad)
+        self.assertEqual(window._reference["t"]["param_version"], 0)
 
     def test_next_batch_gets_zero_valued_nonzero_gradient_vjp(self):
         window = KFLaggedWindow(
             {"t": 4}, min_ratio=1.0, min_abs=4,
             fixed_maps=_FakeMaps(8))
-        window.step(make_cut_rows(4, 4, 8, offset=0))
+        _feed_window(window, make_cut_rows(4, 4, 8, offset=0),
+                     param_version=0)
         rows = make_cut_rows(3, 4, 8, offset=100)
         for row in rows:
             row.z.requires_grad_(True)
-        scores, surrogates, diagnostics, cold, refreshed = window.step(rows)
+        scores, surrogates, diagnostics, cold, refreshed = _feed_window(
+            window, rows, param_version=1)
         self.assertIn("t", scores)
         self.assertIn("t", surrogates)
         self.assertAlmostEqual(float(surrogates["t"].detach()), 0.0)
@@ -256,12 +273,21 @@ class TestKFLaggedWindow(unittest.TestCase):
             {"t": 4}, min_ratio=1.0, min_abs=4,
             fixed_maps=_FakeMaps(8))
         rows = make_cut_rows(2, 4, 8, rows_per_cut=2)
-        scores, _, _, cold, refreshed = window.step(rows)
+        window.begin_group(0, 0)
+        scores, surrogates, cold = window.consume(rows)
+        # Below threshold: no active reference, the 2 trees sit pending.
         self.assertEqual(scores, {})
-        self.assertEqual(refreshed, [])
         self.assertIn("t", cold)
         self.assertEqual(window.pending_tree_count("t"), 2)
-
+        diagnostics, refreshed = window.close_group()
+        window.commit_reference()
+        # Eighth review C: a below-threshold group DISCARDS its partial
+        # window — a reference must never mix parameter versions.
+        self.assertEqual(refreshed, [])
+        self.assertTrue(diagnostics["t"]["below_threshold"])
+        self.assertEqual(diagnostics["t"]["dropped_trees"], 2)
+        self.assertEqual(window.pending_tree_count("t"), 0)
+        self.assertIsNone(window.reference_score("t"))
 
     def test_kf_lagged_surrogate_ascends_reference_objective(self):
         """Seventh-review sign contract on the lagged path.
@@ -277,15 +303,17 @@ class TestKFLaggedWindow(unittest.TestCase):
         """
         window = KFLaggedWindow(
             {"t": 4}, min_ratio=1.0, min_abs=4, fixed_maps=_FakeMaps(8))
-        # Cold start: build the detached reference window.
-        window.step(make_cut_rows(40, 4, 8, offset=0))
+        # Cold start: build the detached reference window (group v0).
+        _feed_window(window, make_cut_rows(40, 4, 8, offset=0),
+                     param_version=0)
         reference = window._reference["t"]
         # Next batch: graph-connected z.
         rows = make_cut_rows(40, 4, 8, offset=100)
         zs = [row.z for row in rows]
         for z in zs:
             z.requires_grad_(True)
-        _, surrogates, _, _, _ = window.step(rows)
+        window.begin_group(1, 0)
+        _, surrogates, _ = window.consume(rows)
         self.assertIn("t", surrogates)
         surrogate = surrogates["t"]
 
@@ -375,9 +403,10 @@ class TestAblationVariants(unittest.TestCase):
         self.assertNotAlmostEqual(float(j_full), float(j_diag), places=2)
 
     def test_reconstruction_matches_profiled_closed_form(self):
-        # J_rec = tr(S_UZ S_ZZ^-1 S_ZU) must equal the closed form
-        # ||S_ZZ^-1/2 S_ZU||_F^2 (U in the Z slot, Z in the P slot,
-        # U side unwhitened).
+        # Review form: J_rec = tr(S_UZ (S_ZZ + eps I)^-1 S_ZU) /
+        # (tr(S_UU) + eps) with Z the trainable compressed state and U
+        # the detached pre-compression target; the score is normalized
+        # into ~[0, 1].
         n, r = 300, 5
         g = torch.Generator().manual_seed(31)
         z = torch.randn(n, r, generator=g)
@@ -387,14 +416,17 @@ class TestAblationVariants(unittest.TestCase):
         szz = zc.t() @ zc / n
         szu = zc.t() @ uc / n           # S_ZU = S_UZ^T
         suz = szu.t()
+        # (czz = C_ZZ, czp = C_ZU, cpp = C_UU as the normalizer)
         j_rec, d = _score_from_covs(szz, szu, szz, 1e-4, "reconstruction")
         self.assertIsNone(d["failed"])
         # The score path adds the relative ridge eps to the whitened Z
-        # side; the closed form has none.  Compare with a small tolerance.
-        closed = float(torch.trace(suz @ torch.linalg.solve(szz, szu)))
+        # side and normalizes by tr(S_UU) + eps; the closed form has no
+        # ridge.  Compare with a small tolerance.
+        closed = float(torch.trace(suz @ torch.linalg.solve(szz, szu))
+                       / (float(szz.trace()) + 1e-4))
         self.assertAlmostEqual(float(j_rec), closed, delta=0.02,
                                msg="reconstruction score must match "
-                                   "tr(S_UZ S_ZZ^-1 S_ZU)")
+                                   "tr(S_UZ S_ZZ^-1 S_ZU) / (tr(S_UU)+eps)")
 
     def test_lagged_window_reconstruction_path(self):
         # End-to-end reconstruction variant: cold start builds the
@@ -406,8 +438,10 @@ class TestAblationVariants(unittest.TestCase):
         window = KFLaggedWindow(
             {"t": 4}, min_ratio=1.0, min_abs=4, fixed_maps=_FakeMaps(8),
             variant="reconstruction")
-        scores, surrogates, _, cold, refreshed = window.step(rows)
-        self.assertIn("t", scores)
+        scores, surrogates, diagnostics, cold, refreshed = _feed_window(
+            window, rows, param_version=0)
+        # Cold-start group: accumulates (U, Z) pairs into the reference.
+        self.assertEqual(scores, {})
         self.assertEqual(surrogates, {})
         self.assertIn("t", refreshed)
         rows2 = make_cut_rows(6, 4, 8, offset=100)
@@ -415,13 +449,18 @@ class TestAblationVariants(unittest.TestCase):
             row.u = row.z + 0.1 * torch.randn(4)
             row.z.requires_grad_(True)
             row.u.requires_grad_(True)
-        scores, surrogates, _, _, _ = window.step(rows2)
+        window.begin_group(1, 0)
+        scores, surrogates, _ = window.consume(rows2)
         self.assertIn("t", surrogates)
         self.assertAlmostEqual(float(surrogates["t"].detach()), 0.0)
         (-surrogates["t"]).backward()
-        grad_norm = sum(float(row.z.grad.norm() + row.u.grad.norm())
-                        for row in rows2)
+        # Review form: Z is the trainable slot and U the DETACHED
+        # reconstruction target, so the gradient flows to z only.
+        grad_norm = sum(
+            float(row.z.grad.norm() if row.z.grad is not None else 0.0)
+            for row in rows2)
         self.assertGreater(grad_norm, 0.0)
+        self.assertTrue(all(row.u.grad is None for row in rows2))
 
 
 

@@ -2,8 +2,9 @@
 
 The JODIE line carries the host memory backup through ``extra_payload``
 (``tgn.memory.backup_memory()``), so an interrupted run resumes with the exact
-memory state.  There is no second optimizer and no PyG message store anymore
-(the TGB line was removed from this branch).
+memory state.  Two optimizers (representation group + head group, eighth
+review C) are carried when ``optimizer2`` is given; old single-optimizer
+checkpoints remain loadable.
 """
 
 import os
@@ -52,7 +53,8 @@ class CheckpointManager:
     def save(self, *, model_components: Dict[str, torch.nn.Module],
              optimizer, epoch: int, next_batch: int, global_step: int,
              best_score: float, best_epoch: int, bad_rounds: int,
-             train_state: Dict, extra_payload: Optional[Dict] = None) -> None:
+             train_state: Dict, extra_payload: Optional[Dict] = None,
+             optimizer2=None) -> None:
         """``extra_payload`` is stored verbatim under payload["extra"]."""
         payload = {
             "model": {k: m.state_dict() for k, m in model_components.items()},
@@ -67,16 +69,20 @@ class CheckpointManager:
             "rng": _rng_state(),
             "extra": extra_payload,
         }
+        if optimizer2 is not None:
+            payload["optimizer2"] = optimizer2.state_dict()
         tmp = Path(str(self.path) + ".tmp")
         torch.save(payload, tmp)
         os.replace(tmp, self.path)
 
     def load(self, *, model_components: Dict[str, torch.nn.Module],
-             optimizer, device) -> Dict:
+             optimizer, device, optimizer2=None) -> Dict:
         payload = torch.load(self.path, map_location=device, weights_only=False)
         for k, m in model_components.items():
             m.load_state_dict(payload["model"][k])
         optimizer.load_state_dict(payload["optimizer"])
+        if optimizer2 is not None and "optimizer2" in payload:
+            optimizer2.load_state_dict(payload["optimizer2"])
         _restore_rng(payload.get("rng"))
         return payload
 

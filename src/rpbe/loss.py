@@ -24,7 +24,7 @@ Numerical contract (after the cloud crash review, 2026-08-27):
 """
 
 import math
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import torch
 
@@ -118,7 +118,11 @@ def _score_from_covs(czz: torch.Tensor, czp: torch.Tensor,
                       "scale_z": float(sz.detach()),
                       "scale_p": float(sp.detach())}
     if variant == "reconstruction":
-        # Only the Z side is whitened; the U side is not.
+        # Review form: J_rec = tr(C_UZ (C_ZZ + eps I)^-1 C_ZU) /
+        # (tr(C_UU) + eps), Z trainable and U the DETACHED
+        # pre-compression target; the score is normalized into ~[0, 1].
+        # Callers pass czz = C_ZZ (whitened side) and czp = C_ZU; the
+        # third covariance C_UU supplies the normalizer.
         if float(sp.detach()) <= 0.0:
             return None, {"failed": "nonpositive_scale",
                           "scale_z": float(sz.detach()),
@@ -134,11 +138,13 @@ def _score_from_covs(czz: torch.Tensor, czp: torch.Tensor,
                           "info_p": -1,
                           "scale_z": float(sz.detach()),
                           "scale_p": float(sp.detach())}
-        c = czp / torch.sqrt(sz)          # S_ZU / sqrt(scale Z)
+        c = czp / torch.sqrt(sz)          # C_ZU / sqrt(scale Z)
         w = torch.linalg.solve_triangular(lz, c, upper=False)
-        return w.square().sum(), {"failed": None,
-                                  "scale_z": float(sz.detach()),
-                                  "scale_p": float(sp.detach())}
+        denom = cpp.trace() + eps         # tr(C_UU) + eps normalizer
+        return w.square().sum() / denom.clamp(min=1e-30), {
+            "failed": None,
+            "scale_z": float(sz.detach()),
+            "scale_p": float(sp.detach())}
     raise ValueError("unknown variant {}".format(variant))
 
 
@@ -480,19 +486,21 @@ def dedup_cut_rows(rows: List, fixed_maps, u_as_z: bool = False):
         cut_ids.append(r.cut_id)
         tree_ids.append(int(r.tree_id))
         if u_as_z:
-            # Reconstruction ablation: U occupies the Z slot, Z the P slot
-            # (no fixed measurement involved).
+            # Reconstruction ablation (review form): Z (the trainable
+            # compressed state) occupies the Z slot; U (the pre-compression
+            # target) is the DETACHED P slot — J_rec reconstructs U from Z,
+            # the gradient flows to Z only.
             if r.u is None:
                 raise ValueError(
                     "u_as_z requires CutRecord.u (pre-compression state); "
                     "run the adapter with the compressor attached")
-            zs.append(r.u)
+            zs.append(r.z)
         else:
             zs.append(r.z)
         weights.append(float(r.weight))
     zs_t = torch.stack(zs)
     if u_as_z:
-        ps_t = torch.stack([r.z for r in rows])
+        ps_t = torch.stack([r.u.detach() for r in rows])
     elif hasattr(fixed_maps, "pv_batch"):
         # Vectorized P projection: the per-row ``pv`` call is a Python-loop
         # small-operator storm (~0.25 ms/row); ``pv_batch`` computes all rows
@@ -507,25 +515,31 @@ def dedup_cut_rows(rows: List, fixed_maps, u_as_z: bool = False):
 
 
 class KFLaggedWindow:
-    """One-pass, bounded-memory moment-adjoint trainer.
+    """One-pass, bounded-memory lagged moment-adjoint trainer.
 
-    A completed detached window defines a frozen Ky Fan linearization
-    (global means plus adjoints of all ``C_ZZ``, ``C_ZP`` and ``C_PP``
-    moments).  Subsequent batches use that linearization as a stochastic
-    VJP while simultaneously accumulating the *next* detached reference
-    window.  Consequently:
+    Lifecycle (eighth review): a macro-group of batches shares ONE frozen
+    representation parameter version.  Within the group:
 
-    * every data batch performs one host query and one ordinary backward;
-    * no autograd graph survives a batch and no stream/memory replay occurs;
-    * the full normalized Ky Fan derivative, including the ``C_ZZ`` path,
-      is retained at the frozen reference point;
-    * the first reference window is an explicit cold start with task loss
-      only, never a fabricated small-sample score.
+    * ``consume`` reads only the ACTIVE reference to build gradient
+      surrogates; the batch rows enter the pending moments detached;
+    * ``close_group`` produces the NEXT reference from the pending moments
+      (never mutating the active one mid-group);
+    * the caller updates the representation parameters, bumps the param
+      version, and THEN ``commit_reference`` activates the next reference.
 
-    This is a lagged stochastic linearization of the population objective,
-    not the exact gradient of a just-collected finite window.  The lag is the
-    price of removing the second complete TGN query without retaining a
-    macro-window of enormous host graphs.
+    The reference stores its epoch and param_version; a committed reference
+    must lag the current version by exactly one (older ones are invalid, a
+    silent reuse would linearize across several updates).  ``reset`` at
+    epoch start clears pending AND reference (TGN memory resets each epoch,
+    so a stale reference would mix mature-memory statistics with a
+    zero-memory batch).
+
+    The population scaling ``raw_vjp * (W_ref / W_batch)`` is KEPT: the
+    reference adjoint carries 1/D_ref ~ 1/W_ref, and the batch contribution
+    is restored to a population-gradient estimate (the /W_ref "fix" would
+    double-normalize and couple the method to an arbitrary window size).
+    Loss units are normalized by the CALLER via per-interface coefficients
+    (J_norm = sum alpha_tau J_tau / min(d_tau, m) / sum alpha_tau), not here.
     """
 
     def __init__(self, state_dims: Dict[str, int], *, min_ratio: float = 2.0,
@@ -544,20 +558,26 @@ class KFLaggedWindow:
         self.strict = bool(strict)
         self._pending: Dict[str, dict] = {}
         self._reference: Dict[str, dict] = {}
+        self._next_reference: Dict[str, dict] = {}
+        self._param_version = None
+        self._epoch = None
         self.refresh_count = 0
+        self.stale_drops = 0
+        self._last_rho: Dict[str, float] = {}
+        self._last_batch_weight: Dict[str, float] = {}
 
     def _threshold(self, tau: str) -> int:
         # CCA rank is bounded by min(dim Z, dim P).  Count independent query
-        # trees, not correlated cut/horizon rows from the same tree.  The
-        # reconstruction variant pairs U against Z (dim = d_tau) instead of
-        # the sketch dimension.
-        dim_p = int(self.state_dims[tau])             if self.variant == "reconstruction" else int(self.fixed_maps.m)
+        # trees, not correlated cut/horizon rows from the same tree.
+        dim_p = int(self.state_dims[tau]) \
+            if self.variant == "reconstruction" else int(self.fixed_maps.m)
         rank_dim = min(int(self.state_dims[tau]), dim_p)
         return int(math.ceil(max(self.min_ratio * rank_dim,
                                  float(self.min_abs))))
 
     def _new_pending(self, tau: str) -> dict:
-        dim_p = int(self.state_dims[tau])             if self.variant == "reconstruction" else int(self.fixed_maps.m)
+        dim_p = int(self.state_dims[tau]) \
+            if self.variant == "reconstruction" else int(self.fixed_maps.m)
         return {
             "moments": WeightedWelford(int(self.state_dims[tau]), dim_p),
             "row_seen": set(),
@@ -566,21 +586,31 @@ class KFLaggedWindow:
             "n_rows": 0,
         }
 
-    def step(self, rows: List):
-        """Consume current rows and return one-pass gradient surrogates.
+    # ------------------------------------------------------------ lifecycle
+    def reset(self, clear_reference: bool = True) -> None:
+        """Epoch start: pending always cleared; reference cleared by default
+        (memory resets each epoch, so a stale reference is invalid)."""
+        self._pending = {}
+        self._next_reference = {}
+        if clear_reference:
+            self._reference = {}
 
-        Returns ``(scores, surrogates, diagnostics, cold_taus, refreshed)``.
-        Scores are detached reference-window values for honest monitoring;
-        each surrogate is numerically zero but carries the correctly scaled
-        VJP gradient.  ``refreshed`` lists references completed this step.
+    def begin_group(self, param_version: int, epoch: int) -> None:
+        self._param_version = int(param_version)
+        self._epoch = int(epoch)
+
+    def consume(self, rows):
+        """Surrogates from the ACTIVE reference only; detached rows to pending.
+
+        Returns ``(scores, surrogates, cold_taus)``.  Scores are the active
+        reference values (honest monitoring, never the current model's J);
+        each surrogate is numerically zero with the correctly scaled VJP
+        gradient.
         """
         by_tau = score_rows_by_type(rows, self.state_dims)
         scores: Dict[str, float] = {}
         surrogates: Dict[str, torch.Tensor] = {}
-        diagnostics: Dict[str, dict] = {}
         cold_taus: List[str] = []
-        refreshed: List[str] = []
-
         for tau, tau_rows in by_tau.items():
             pending = self._pending.get(tau)
             if pending is None:
@@ -603,17 +633,42 @@ class KFLaggedWindow:
             if reference is not None:
                 batch_weight = float(weights.detach().sum())
                 if batch_weight > 0.0:
+                    self._last_batch_weight[tau] = batch_weight
                     raw_vjp = kf_vjp_batch(
                         zs, ps, weights,
                         reference["mu_z"], reference["mu_p"],
                         reference["adjoints"])
-                    # The adjoint scales as 1 / reference weight whereas the
-                    # batch M2 scales with batch weight.  This converts the
-                    # batch contribution to a population-gradient estimate.
-                    scaled = raw_vjp * (reference["W"] / batch_weight)
-                    # Preserve only its gradient.  A VJP surrogate is not a
-                    # meaningful loss value and must not pollute task-loss logs.
-                    surrogates[tau] = scaled.float() - scaled.detach().float()
+                    # Macro-window surrogate (review scheme B): the raw
+                    # VJP <A_ref, M_b> is this batch's contribution to the
+                    # whole-window linearization <A_ref, M_window>.  The
+                    # representation parameters are frozen inside the
+                    # macro-group and updated once at its end, so summing
+                    # the per-batch gradients over the group IS the
+                    # window-linearized gradient — no W_ref/W_batch
+                    # rescaling.  (The score is degree-0 homogeneous:
+                    # J(cM) = J(M) and grad_M J(cM) = grad_M J(M)/c, so
+                    # the adjoint's inverse scale carries the batch
+                    # multiplicity; the group sum absorbs it.  See the
+                    # k-fold detached test in test_eighth_review.)
+                    # Gradient-only surrogate: numerically zero, must not
+                    # pollute task-loss logs.
+                    surrogates[tau] = raw_vjp.float() \
+                        - raw_vjp.detach().float()
+                    # First-order radial proportion (review E): the exact
+                    # Ky Fan gradient at the same reference point is
+                    # tangential (|rho| ~ 0); a large |rho| means the
+                    # lagged linearization leaks a radial push.  Reported
+                    # by the loop's diagnostics.
+                    if zs.requires_grad:
+                        gz = torch.autograd.grad(
+                            raw_vjp, zs, retain_graph=True,
+                            allow_unused=True)[0]
+                        zc = zs - reference["mu_z"]
+                        denom = float(
+                            (gz.detach().norm()
+                             * zc.detach().norm()).clamp(min=1e-30))
+                        self._last_rho[tau] = float(
+                            (gz * zc).detach().sum()) / denom
                 scores[tau] = float(reference["score"])
             else:
                 cold_taus.append(tau)
@@ -625,34 +680,84 @@ class KFLaggedWindow:
                 pending["cut_seen"].add(cut_ids[i])
                 pending["tree_seen"].add(tree_ids[i])
             pending["n_rows"] += len(fresh)
+        return scores, surrogates, cold_taus
 
-            if len(pending["tree_seen"]) >= self._threshold(tau):
-                result = pending["moments"].result()
-                score, adjoints, score_diag = kf_adjoint(
-                    result, self.eps, self.strict, self.variant)
-                diagnostics[tau] = self._diagnostics(
-                    pending, result, score_diag)
-                if score is not None:
-                    self._reference[tau] = {
-                        "score": float(score),
-                        "adjoints": adjoints,
-                        "mu_z": result["mu_z"].detach(),
-                        "mu_p": result["mu_p"].detach(),
-                        "W": float(result["W"]),
-                        "D": float(result["D"]),
-                        "M_unique_trees": len(pending["tree_seen"]),
-                    }
-                    scores[tau] = float(score)
-                    refreshed.append(tau)
-                    self.refresh_count += 1
-                    if tau in cold_taus:
-                        cold_taus.remove(tau)
-                # Whether successful or failed, bound memory by starting a
-                # fresh detached reference window.  A failed refresh leaves
-                # the last valid reference active.
+    def close_group(self):
+        """Build the NEXT reference from pending moments (never the active
+        one).  Returns ``(diagnostics, refreshed)``.
+
+        Eighth review C: a window must live inside ONE macro group — the
+        representation parameters are frozen within a group, so rows from
+        older groups would mix parameter versions and break the "single
+        theta_ref" property of the linearization.  A group that closes
+        below threshold DISCARDS its partial window instead of carrying
+        it across versions.
+        """
+        diagnostics: Dict[str, dict] = {}
+        refreshed: List[str] = []
+        for tau, pending in list(self._pending.items()):
+            if len(pending["tree_seen"]) < self._threshold(tau):
+                diagnostics[tau] = {
+                    "failed": None,
+                    "below_threshold": True,
+                    "M_unique_trees": len(pending["tree_seen"]),
+                    "threshold": self._threshold(tau),
+                    "dropped_trees": len(pending["tree_seen"]),
+                }
                 self._pending[tau] = self._new_pending(tau)
+                continue
+            result = pending["moments"].result()
+            score, adjoints, score_diag = kf_adjoint(
+                result, self.eps, self.strict, self.variant)
+            diagnostics[tau] = self._diagnostics(pending, result, score_diag)
+            if score is not None:
+                diagnostics[tau]["score"] = float(score)
+                self._next_reference[tau] = {
+                    "score": float(score),
+                    "adjoints": adjoints,
+                    "mu_z": result["mu_z"].detach(),
+                    "mu_p": result["mu_p"].detach(),
+                    "W": float(result["W"]),
+                    "D": float(result["D"]),
+                    "M_unique_trees": len(pending["tree_seen"]),
+                    "epoch": self._epoch,
+                    "param_version": self._param_version,
+                }
+                refreshed.append(tau)
+                self.refresh_count += 1
+            self._pending[tau] = self._new_pending(tau)
+        return diagnostics, refreshed
 
-        return scores, surrogates, diagnostics, cold_taus, refreshed
+    def commit_reference(self, current_version: Optional[int] = None) -> List[str]:
+        """Activate next references; each must lag exactly one update.
+
+        ``current_version`` is the representation parameter version AFTER
+        the just-finished group's optimizer step (the loop advances it
+        right before committing); it is recorded so ``reference_age`` can
+        report the lag.
+
+        Review B.8: only a reference lagging EXACTLY one representation
+        update may be activated.  A candidate whose version is not
+        current+1 (a group below threshold skipped its refresh, so the
+        window spans several parameter versions) is DISCARDED — and the
+        OLD active reference is dropped too: an age>=2 reference must
+        never keep being used, so the next group goes cold for that tau.
+        The stale taus are returned for the caller to alert on.
+        """
+        if current_version is not None:
+            self._param_version = int(current_version)
+        stale: List[str] = []
+        for tau, ref in list(self._next_reference.items()):
+            current = self._reference.get(tau)
+            if current is not None and \
+                    ref["param_version"] != current["param_version"] + 1:
+                stale.append(tau)
+                self.stale_drops += 1
+                del self._reference[tau]   # cold restart, never age >= 2
+                continue
+            self._reference[tau] = ref
+        self._next_reference = {}
+        return stale
 
     def _diagnostics(self, pending: dict, result: dict,
                      score_diag: dict) -> dict:
@@ -682,6 +787,14 @@ class KFLaggedWindow:
     def reference_score(self, tau: str):
         reference = self._reference.get(tau)
         return None if reference is None else float(reference["score"])
+
+    def reference_age(self, tau: str):
+        """Current param_version minus the reference's version; None when
+        either is missing."""
+        reference = self._reference.get(tau)
+        if reference is None or self._param_version is None:
+            return None
+        return self._param_version - reference["param_version"]
 
     def pending_tree_count(self, tau: str) -> int:
         pending = self._pending.get(tau)

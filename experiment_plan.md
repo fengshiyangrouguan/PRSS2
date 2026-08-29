@@ -7,7 +7,7 @@
 | 项 | 设置 | 理由 |
 |---|---|---|
 | 时间划分 | 任何树/cut 构造前完成 train/val/test（quantile 0.70/0.85） | 规格 §七：防泄漏 |
-| 邻居预算 | n_degree=5、三层采样树（n_layer=2 → layer0/1/2） | TGN 与 TGN+RPBE 必须完全同树（规格 §三） |
+| 邻居预算 | n_degree=5、三跳采样树（n_layer=3 → layer0/1/2/3，root=layer3；压缩接口 layer1+2） | TGN 与 TGN+RPBE 必须完全同树（规格 §三） |
 | batch / 根查询 | bs=200、trace_roots=32、evenly_spaced | 同树同 cut；RPBE 禁 positive_first（防 label 依赖） |
 | Γ 架构 | 统一 width_D=128、GELU 核心、每接口独立头 | 规格 §四：所有消融完全相同 Γ |
 | 输出维度 | r_τ = 宿主接口维（172） | 宿主决定，不调 |
@@ -57,7 +57,7 @@
 
 | 附录 | 内容 | 参数 |
 |---|---|---|
-| A 深度测试 | 深度 2/3/4，仅 TGN / 1Obs / 2Obs-full，报 AP、AUC、远程 PIR | n_layer=1/2/3 |
+| A 深度测试 | 深度 2/3/4，仅 TGN / 1Obs / 2Obs-full，报 AP、AUC、远程 PIR | n_layer=1/2/3（1/2/3 跳） |
 | B 超参数 | λ_KF 完整曲线；m、ridge ε、窗口有效样本阈值紧凑表 | λ ∈ {0.001, 0.005, 0.01, 0.015, 0.02, 0.05} |
 | C 次要消融 | 去上下文只留任务观测 / 均匀 cut 权重 vs 推导权重 / 离线 PCA / 随机投影 / raw cross-covariance | — |
 | D 效率 | 参数量、每 epoch 时间、总收敛时间、峰值显存、推理延迟、各环节耗时分解 | — |

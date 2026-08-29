@@ -10,7 +10,7 @@ import unittest
 import numpy as np
 import torch
 
-from rpbe.loss import (KFMomentWindow, WeightedWelford, _covs,
+from rpbe.loss import (KFLaggedWindow, KFMomentWindow, WeightedWelford, _covs,
                        _score_from_covs, dedup_cut_rows, kf_adjoint,
                        kf_score, kf_score_fixed, kf_vjp_batch)
 from rpbe.records import CutRecord
@@ -216,6 +216,99 @@ def make_cut_rows(n_cuts, r, m, rows_per_cut=1, offset=0):
                 outcome_id=("edge", offset + c),
                 weight=1.0 / rows_per_cut))
     return rows
+
+
+class TestKFLaggedWindow(unittest.TestCase):
+    def test_cold_start_builds_detached_reference(self):
+        window = KFLaggedWindow(
+            {"t": 4}, min_ratio=1.0, min_abs=4,
+            fixed_maps=_FakeMaps(8))
+        rows = make_cut_rows(4, 4, 8)
+        for row in rows:
+            row.z.requires_grad_(True)
+        scores, surrogates, diagnostics, cold, refreshed = window.step(rows)
+        self.assertIn("t", scores)
+        self.assertEqual(surrogates, {})
+        self.assertIn("t", refreshed)
+        self.assertNotIn("t", cold)
+        self.assertIsNone(rows[0].z.grad)
+        self.assertFalse(window._reference["t"]["mu_z"].requires_grad)
+
+    def test_next_batch_gets_zero_valued_nonzero_gradient_vjp(self):
+        window = KFLaggedWindow(
+            {"t": 4}, min_ratio=1.0, min_abs=4,
+            fixed_maps=_FakeMaps(8))
+        window.step(make_cut_rows(4, 4, 8, offset=0))
+        rows = make_cut_rows(3, 4, 8, offset=100)
+        for row in rows:
+            row.z.requires_grad_(True)
+        scores, surrogates, diagnostics, cold, refreshed = window.step(rows)
+        self.assertIn("t", scores)
+        self.assertIn("t", surrogates)
+        self.assertAlmostEqual(float(surrogates["t"].detach()), 0.0)
+        (-surrogates["t"]).backward()
+        grad_norm = sum(float(row.z.grad.norm()) for row in rows
+                        if row.z.grad is not None)
+        self.assertGreater(grad_norm, 0.0)
+
+    def test_gate_counts_trees_not_horizon_rows(self):
+        window = KFLaggedWindow(
+            {"t": 4}, min_ratio=1.0, min_abs=4,
+            fixed_maps=_FakeMaps(8))
+        rows = make_cut_rows(2, 4, 8, rows_per_cut=2)
+        scores, _, _, cold, refreshed = window.step(rows)
+        self.assertEqual(scores, {})
+        self.assertEqual(refreshed, [])
+        self.assertIn("t", cold)
+        self.assertEqual(window.pending_tree_count("t"), 2)
+
+
+    def test_kf_lagged_surrogate_ascends_reference_objective(self):
+        """Seventh-review sign contract on the lagged path.
+
+        The surrogate's gradient must ascend the reference-linearized
+        objective ``<A_ref, M2_batch>`` (kf_adjoint returns +dJ/dM2 and the
+        loop multiplies by -lambda).  Comparing against the TRUE batch J is
+        NOT the right check: the lagged linearization carries a radial
+        degree of freedom while the true score is scale-invariant (pure
+        tangential gradient), so a stale reference may legitimately point
+        elsewhere.  One optimizer step on -surrogate must therefore raise
+        the linearized objective itself.
+        """
+        window = KFLaggedWindow(
+            {"t": 4}, min_ratio=1.0, min_abs=4, fixed_maps=_FakeMaps(8))
+        # Cold start: build the detached reference window.
+        window.step(make_cut_rows(40, 4, 8, offset=0))
+        reference = window._reference["t"]
+        # Next batch: graph-connected z.
+        rows = make_cut_rows(40, 4, 8, offset=100)
+        zs = [row.z for row in rows]
+        for z in zs:
+            z.requires_grad_(True)
+        _, surrogates, _, _, _ = window.step(rows)
+        self.assertIn("t", surrogates)
+        surrogate = surrogates["t"]
+
+        def linearized_value():
+            z_stack = torch.stack(zs)
+            p_stack = torch.stack(
+                [_FakeMaps(8).pv(row.context, row.outcome) for row in rows])
+            w = torch.tensor([row.weight for row in rows],
+                             dtype=torch.float64)
+            return kf_vjp_batch(z_stack, p_stack, w,
+                                reference["mu_z"], reference["mu_p"],
+                                reference["adjoints"])
+
+        before = float(linearized_value().detach())
+        opt = torch.optim.Adam(zs, lr=0.01)
+        opt.zero_grad()
+        (-surrogate).backward()
+        opt.step()
+        after = float(linearized_value().detach())
+        self.assertGreater(
+            after, before,
+            "one lagged KF step must ascend the reference objective "
+            "({:.4f} -> {:.4f})".format(before, after))
 
 
 class TestKFMomentWindow(unittest.TestCase):
@@ -796,12 +889,12 @@ class TestReviewRegression(unittest.TestCase):
         # Several horizons per cut: rows stay SEPARATE (no p averaging —
         # averaging would create p1*p2^T cross terms and change Cov(P));
         # cut_ids collapse to one unique id per cut.
-        dup = make_cut_rows(n, r, mdim, rows_per_cut=3)
+        dup = make_cut_rows(n, r, mdim, rows_per_cut=2)
         k2, c2, t2, z2, p2, w2 = dedup_cut_rows(dup, _FakeMaps(mdim))
-        self.assertEqual(z2.shape[0], 3 * n, "rows stay separate")
-        self.assertEqual(p2.shape[0], 3 * n)
+        self.assertEqual(z2.shape[0], 2 * n, "rows stay separate")
+        self.assertEqual(p2.shape[0], 2 * n)
         self.assertEqual(len(set(c2)), n, "cut_ids collapse per cut")
-        self.assertEqual(len(set(k2)), 3 * n, "row_ids stay distinct")
+        self.assertEqual(len(set(k2)), 2 * n, "row_ids stay distinct")
         # The close path asserts the invariant itself.
         w = KFMomentWindow({"t": r}, min_ratio=1.0, min_abs=64,
                            fixed_maps=_FakeMaps(mdim))

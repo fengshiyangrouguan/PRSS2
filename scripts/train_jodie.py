@@ -46,7 +46,7 @@ from rpbe.hosts.jodie_tgn import JodieTGNAdapter, TAU_TEMPLATE
 from rpbe.hosts.official_tgn import MLP, TGN, get_neighbor_finder
 from rpbe.maps import FixedMaps
 from rpbe.monitoring import MonitorWriter
-from rpbe.records import NODE_CLASS, build_edge_tables
+from rpbe.records import NODE_CLASS
 from rpbe.training.checkpoint import CheckpointManager
 from rpbe.training.jodie_loop import JodieNodeClassificationLoop
 
@@ -257,21 +257,17 @@ def build_components(args, device, dataset):
             kf_taus=list(taus[:-1]),
             rpbe_seed=args.rpbe_seed)
         compressor = RecursiveCompressor(rpbe_cfg).to(device)
-        # Explicit edge tables: consumption-record stamping (adapter) and
-        # probe Y lookup (cut builder) share ONE source of truth.
-        (endpoints, labels_tbl, user_nodes, page_nodes,
-         edge_table_stats) = build_edge_tables(dataset)
-        edge_tables = (endpoints, labels_tbl, user_nodes, page_nodes)
+        # Strict-future supervision (new architecture): Y1/Y2 come from the
+        # train-only JodieFutureIndex inside the cut builder; historical
+        # edge tables are no longer built or passed anywhere.
         adapter = JodieTGNAdapter(tgn.embedding_module, compressor,
-                                  n_neighbors=args.n_degree,
-                                  edge_tables=edge_tables)
+                                  n_neighbors=args.n_degree)
         # Swap AFTER pretrained-key validation and freezing.
         tgn.embedding_module = adapter
         fixed_maps = FixedMaps(rpbe_cfg).to(device)
         cut_builder = build_cut_builder(dataset, stage=NODE_CLASS, cfg=rpbe_cfg,
                                         seed=args.rpbe_seed,
-                                        delta_t_scale=delta_scale,
-                                        tables=edge_tables)
+                                        delta_t_scale=delta_scale)
         # Carry the stage-1 compressor over when the checkpoint provides one
         # (--stage1-rpbe product); otherwise Gamma starts from scratch here.
         if pretrained_payload is not None and isinstance(pretrained_payload, dict):

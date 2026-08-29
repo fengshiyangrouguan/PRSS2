@@ -251,7 +251,8 @@ class JodieNodeClassificationLoop:
             self.head_optimizer.zero_grad(set_to_none=True)
             if not repr_group_active:
                 self.repr_optimizer.zero_grad(set_to_none=True)
-                self.kf_window.begin_group(param_version, epoch)
+                if self.kf_on:
+                    self.kf_window.begin_group(param_version, epoch)
                 repr_group_active = True
                 group_batch_count = 0
 

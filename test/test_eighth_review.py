@@ -90,17 +90,17 @@ class TestRankNormalization(unittest.TestCase):
     """Section A: per-interface rank normalization of the KF loss."""
 
     def _cfg(self, lambda_kf=0.01):
+        # kf_dims is intersected with the adapter's compression_taus
+        # (internal layers 0 < layer < L), so the config must name exactly
+        # those interfaces; a 3-layer tree compresses layers 1 and 2.
         return RPBConfig(
-            state_dims={"tjo:layer0": 64, "tjo:layer1": 128,
-                        "tjo:layer2": 256},
-            own_dims={"tjo:layer0": 64, "tjo:layer1": 128,
-                      "tjo:layer2": 256},
+            state_dims={"tjo:layer1": 128, "tjo:layer2": 256},
+            own_dims={"tjo:layer1": 128, "tjo:layer2": 256},
             m=32, kf_min_abs=4, rpbe_seed=0, delta_t_scale=1.0,
-            lambda_kf=lambda_kf, kf_taus=["tjo:layer0", "tjo:layer1",
-                                          "tjo:layer2"])
+            lambda_kf=lambda_kf, kf_taus=["tjo:layer1", "tjo:layer2"])
 
     def _loop(self, lambda_kf=0.01):
-        tgn, device, stream_data = make_tiny_tgn()
+        tgn, device, stream_data = make_tiny_tgn(n_layers=3)
         sources, destinations, timestamps, edge_idxs, labels = stream_data
         train = JodieData(sources[:24], destinations[:24], timestamps[:24],
                           edge_idxs[:24], labels[:24])
@@ -126,16 +126,15 @@ class TestRankNormalization(unittest.TestCase):
         # (all 1.0): coeff_tau = 1 / (min(d_tau, m) * n_taus).
         loop, cfg, _ = self._loop()
         coeffs = loop._tau_coeff
-        self.assertEqual(set(coeffs), {"tjo:layer0", "tjo:layer1",
-                                       "tjo:layer2"})
+        self.assertEqual(set(coeffs), {"tjo:layer1", "tjo:layer2"})
         # Normalization identity: sum_tau coeff_tau * min(d_tau, m) == 1.
         total = sum(coeffs[t] * min(cfg.state_dims[t], cfg.m)
                     for t in coeffs)
         self.assertAlmostEqual(total, 1.0, places=6)
-        self.assertAlmostEqual(coeffs["tjo:layer0"],
-                               1.0 / (min(64, 32) * 3), places=6)
+        self.assertAlmostEqual(coeffs["tjo:layer1"],
+                               1.0 / (min(128, 32) * 2), places=6)
         self.assertAlmostEqual(coeffs["tjo:layer2"],
-                               1.0 / (min(256, 32) * 3), places=6)
+                               1.0 / (min(256, 32) * 2), places=6)
 
     def test_consume_kf_raw_versus_normalized_arithmetic(self):
         # raw uses the plain alpha weighting (J_hat in "score units"),
@@ -144,12 +143,12 @@ class TestRankNormalization(unittest.TestCase):
 
         class _FakeWindow:
             def consume(self, rows):
-                return ({"tjo:layer0": 0.5}, {}, set())
+                return ({"tjo:layer1": 0.5}, {}, set())
 
         loop.kf_window = _FakeWindow()
         raw, norm, scores, auxiliary, cold = loop._consume_kf([], 0)
-        self.assertAlmostEqual(raw, 0.5 * cfg.alpha("tjo:layer0"))
-        coeff = loop._tau_coeff["tjo:layer0"]
+        self.assertAlmostEqual(raw, 0.5 * cfg.alpha("tjo:layer1"))
+        coeff = loop._tau_coeff["tjo:layer1"]
         self.assertAlmostEqual(norm, 0.5 * coeff)
         self.assertEqual(cold, set())
         self.assertEqual(float(auxiliary.detach()), 0.0)

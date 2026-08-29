@@ -199,7 +199,7 @@ class FixedMaps(nn.Module):
             deltas = torch.tensor(
                 [float(c["delta_t"]) for c in contexts],
                 dtype=self.rff_w.dtype, device=dev).reshape(n, 1) \
-                / float(self.cfg.delta_t_scale)
+                / float(self._delta_t_scale)
             rff = torch.cos(deltas @ self.rff_w + self.rff_b)        # [N, d_c]
             partners = torch.tensor(
                 [int(c["counterpart"]) % self.num_counter_bins

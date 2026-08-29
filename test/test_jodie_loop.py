@@ -126,8 +126,8 @@ class TestLoopSmoke(unittest.TestCase):
         tgn = self.tgn
         from rpbe.hosts.official_tgn import MLP
         decoder = MLP(dim=8, drop=0.1).to(self.device)
-        main_params = list(decoder.parameters()) + [
-            p for p in tgn.parameters() if p.requires_grad]
+        head_params = list(decoder.parameters())
+        repr_params = [p for p in tgn.parameters() if p.requires_grad]
         adapter = cut_builder = fixed_maps = rpbe_cfg = None
         if rpbe:
             cfg = RPBConfig(
@@ -137,7 +137,7 @@ class TestLoopSmoke(unittest.TestCase):
                 delta_t_scale=1.0)
             rpbe_cfg = cfg
             compressor = RecursiveCompressor(cfg).to(self.device)
-            main_params += [p for p in compressor.parameters()]
+            repr_params += [p for p in compressor.parameters()]
             adapter = install_adapter(tgn)
             adapter.compressor = compressor
             fixed_maps = FixedMaps(cfg).to(self.device)
@@ -145,11 +145,13 @@ class TestLoopSmoke(unittest.TestCase):
                 JodieFutureIndex(self.train),
                 stage=NODE_CLASS, seed=0)
         seen = set()
-        main_params = [p for p in main_params
+        repr_params = [p for p in repr_params
                        if not (id(p) in seen or seen.add(id(p)))]
-        optimizer = torch.optim.Adam(main_params, lr=3e-4)
+        head_optimizer = torch.optim.Adam(head_params, lr=3e-4)
+        repr_optimizer = torch.optim.Adam(repr_params, lr=3e-4)
         return JodieNodeClassificationLoop(
-            tgn=tgn, decoder=decoder, optimizer=optimizer,
+            tgn=tgn, decoder=decoder, repr_optimizer=repr_optimizer,
+            head_optimizer=head_optimizer,
             device=self.device, batch_size=8, n_neighbors=4, grad_clip=5.0,
             monitor=_FakeMonitor(), seed=0, finetune_host=True,
             adapter=adapter, cut_builder=cut_builder, fixed_maps=fixed_maps,

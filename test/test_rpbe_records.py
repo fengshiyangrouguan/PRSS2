@@ -78,12 +78,13 @@ class TestCutBuilder(unittest.TestCase):
             root_rows=[0], cuts=[candidate(node=10, time=3.0)])
         stats = {}
         rows = JodieCutBuilder(
-            JodieFutureIndex(stream()), stage=LINK).build(trace, stats=stats)
+            JodieFutureIndex(stream()), stage=NODE_CLASS).build(
+                trace, stats=stats)
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0].horizon, 1)
         self.assertEqual(rows[0].outcome_time, 6.0)
         self.assertEqual(rows[0].context["role"], 1)
-        self.assertEqual(rows[0].context["query_type"], 0)
+        self.assertEqual(rows[0].context["query_type"], 1)
         self.assertAlmostEqual(rows[0].weight, 1.0)
         self.assertEqual(stats["missing_horizons"][("layer1", 2)], 1)
 

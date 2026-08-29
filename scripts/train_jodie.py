@@ -285,17 +285,23 @@ def build_components(args, device, dataset):
     # Exact upstream decoder type/dimension.
     decoder = MLP(dataset.node_features.shape[1], drop=args.drop_out).to(device)
 
-    main_params = list(decoder.parameters())
+    # Eighth review C: two optimizers.  The representation group (host +
+    # compressor — everything that can change a cut's z) updates once per
+    # macro-group; the head updates every batch.
+    head_params = list(decoder.parameters())
+    repr_params = []
     if args.finetune_host:
-        main_params.extend(p for p in tgn.parameters() if p.requires_grad)
+        repr_params.extend(p for p in tgn.parameters() if p.requires_grad)
     if compressor is not None:
-        main_params.extend(p for p in compressor.parameters()
+        repr_params.extend(p for p in compressor.parameters()
                            if p.requires_grad)
     seen = set()
-    main_params = [p for p in main_params
+    repr_params = [p for p in repr_params
                    if not (id(p) in seen or seen.add(id(p)))]
-    optimizer = torch.optim.Adam(main_params, lr=args.lr)
-    return dict(tgn=tgn, decoder=decoder, optimizer=optimizer,
+    head_optimizer = torch.optim.Adam(head_params, lr=args.lr)
+    repr_optimizer = torch.optim.Adam(repr_params, lr=args.lr)
+    return dict(tgn=tgn, decoder=decoder, head_optimizer=head_optimizer,
+                repr_optimizer=repr_optimizer,
                 compressor=compressor, adapter=adapter, fixed_maps=fixed_maps,
                 cut_builder=cut_builder, rpbe_cfg=rpbe_cfg)
 
@@ -323,7 +329,8 @@ def main():
     tgn = components["tgn"]
     loop = JodieNodeClassificationLoop(
         tgn=tgn, decoder=components["decoder"],
-        optimizer=components["optimizer"],
+        repr_optimizer=components["repr_optimizer"],
+        head_optimizer=components["head_optimizer"],
         device=device, batch_size=args.bs, n_neighbors=args.n_degree,
         grad_clip=args.grad_clip, monitor=monitor,
         seed=args.seed, finetune_host=args.finetune_host,
@@ -371,7 +378,8 @@ def main():
             model_components={"tgn": tgn, "decoder": components["decoder"],
                               **({"compressor": components["compressor"]}
                                  if components["compressor"] is not None else {})},
-            optimizer=components["optimizer"], device=device)
+            optimizer=components["head_optimizer"],
+            optimizer2=components["repr_optimizer"], device=device)
         start_epoch = int(resume["epoch"])
         global_step = int(resume["global_step"])
         best_score = float(resume.get("best_score", best_score))
@@ -452,7 +460,8 @@ def main():
                 "tgn": tgn, "decoder": components["decoder"],
                 **({"compressor": components["compressor"]}
                    if components["compressor"] is not None else {})},
-                optimizer=components["optimizer"],
+                optimizer=components["head_optimizer"],
+                optimizer2=components["repr_optimizer"],
                 epoch=epoch + 1, next_batch=0, global_step=global_step,
                 best_score=best_score, best_epoch=best_epoch,
                 bad_rounds=bad_rounds, train_state={},

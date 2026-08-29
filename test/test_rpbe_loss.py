@@ -218,6 +218,17 @@ def make_cut_rows(n_cuts, r, m, rows_per_cut=1, offset=0):
     return rows
 
 
+def _feed_window(window, rows, param_version=0, epoch=0):
+    """The loop's macro-group sequence on one group: consume -> close ->
+    commit.  Returns ``(scores, surrogates, diagnostics, cold, refreshed)``
+    (the order the old ``step()`` returned)."""
+    window.begin_group(param_version, epoch)
+    scores, surrogates, cold = window.consume(rows)
+    diagnostics, refreshed = window.close_group()
+    window.commit_reference()
+    return scores, surrogates, diagnostics, cold, refreshed
+
+
 class TestKFLaggedWindow(unittest.TestCase):
     def test_cold_start_builds_detached_reference(self):
         window = KFLaggedWindow(
@@ -226,23 +237,29 @@ class TestKFLaggedWindow(unittest.TestCase):
         rows = make_cut_rows(4, 4, 8)
         for row in rows:
             row.z.requires_grad_(True)
-        scores, surrogates, diagnostics, cold, refreshed = window.step(rows)
-        self.assertIn("t", scores)
+        scores, surrogates, diagnostics, cold, refreshed = _feed_window(
+            window, rows, param_version=0)
+        # Cold-start group: no active reference yet, so no score/surrogate;
+        # the group only accumulates and builds the NEXT reference.
+        self.assertEqual(scores, {})
         self.assertEqual(surrogates, {})
+        self.assertIn("t", cold)
         self.assertIn("t", refreshed)
-        self.assertNotIn("t", cold)
         self.assertIsNone(rows[0].z.grad)
         self.assertFalse(window._reference["t"]["mu_z"].requires_grad)
+        self.assertEqual(window._reference["t"]["param_version"], 0)
 
     def test_next_batch_gets_zero_valued_nonzero_gradient_vjp(self):
         window = KFLaggedWindow(
             {"t": 4}, min_ratio=1.0, min_abs=4,
             fixed_maps=_FakeMaps(8))
-        window.step(make_cut_rows(4, 4, 8, offset=0))
+        _feed_window(window, make_cut_rows(4, 4, 8, offset=0),
+                     param_version=0)
         rows = make_cut_rows(3, 4, 8, offset=100)
         for row in rows:
             row.z.requires_grad_(True)
-        scores, surrogates, diagnostics, cold, refreshed = window.step(rows)
+        scores, surrogates, diagnostics, cold, refreshed = _feed_window(
+            window, rows, param_version=1)
         self.assertIn("t", scores)
         self.assertIn("t", surrogates)
         self.assertAlmostEqual(float(surrogates["t"].detach()), 0.0)
@@ -256,12 +273,16 @@ class TestKFLaggedWindow(unittest.TestCase):
             {"t": 4}, min_ratio=1.0, min_abs=4,
             fixed_maps=_FakeMaps(8))
         rows = make_cut_rows(2, 4, 8, rows_per_cut=2)
-        scores, _, _, cold, refreshed = window.step(rows)
+        window.begin_group(0, 0)
+        scores, surrogates, cold = window.consume(rows)
+        # Below threshold: no active reference, pending keeps the 2 trees.
         self.assertEqual(scores, {})
-        self.assertEqual(refreshed, [])
         self.assertIn("t", cold)
         self.assertEqual(window.pending_tree_count("t"), 2)
-
+        diagnostics, refreshed = window.close_group()
+        window.commit_reference()
+        self.assertEqual(refreshed, [])
+        self.assertEqual(diagnostics, {})
 
     def test_kf_lagged_surrogate_ascends_reference_objective(self):
         """Seventh-review sign contract on the lagged path.
@@ -277,15 +298,17 @@ class TestKFLaggedWindow(unittest.TestCase):
         """
         window = KFLaggedWindow(
             {"t": 4}, min_ratio=1.0, min_abs=4, fixed_maps=_FakeMaps(8))
-        # Cold start: build the detached reference window.
-        window.step(make_cut_rows(40, 4, 8, offset=0))
+        # Cold start: build the detached reference window (group v0).
+        _feed_window(window, make_cut_rows(40, 4, 8, offset=0),
+                     param_version=0)
         reference = window._reference["t"]
         # Next batch: graph-connected z.
         rows = make_cut_rows(40, 4, 8, offset=100)
         zs = [row.z for row in rows]
         for z in zs:
             z.requires_grad_(True)
-        _, surrogates, _, _, _ = window.step(rows)
+        window.begin_group(1, 0)
+        _, surrogates, _ = window.consume(rows)
         self.assertIn("t", surrogates)
         surrogate = surrogates["t"]
 
@@ -406,8 +429,10 @@ class TestAblationVariants(unittest.TestCase):
         window = KFLaggedWindow(
             {"t": 4}, min_ratio=1.0, min_abs=4, fixed_maps=_FakeMaps(8),
             variant="reconstruction")
-        scores, surrogates, _, cold, refreshed = window.step(rows)
-        self.assertIn("t", scores)
+        scores, surrogates, diagnostics, cold, refreshed = _feed_window(
+            window, rows, param_version=0)
+        # Cold-start group: accumulates (U, Z) pairs into the reference.
+        self.assertEqual(scores, {})
         self.assertEqual(surrogates, {})
         self.assertIn("t", refreshed)
         rows2 = make_cut_rows(6, 4, 8, offset=100)
@@ -415,12 +440,18 @@ class TestAblationVariants(unittest.TestCase):
             row.u = row.z + 0.1 * torch.randn(4)
             row.z.requires_grad_(True)
             row.u.requires_grad_(True)
-        scores, surrogates, _, _, _ = window.step(rows2)
+        window.begin_group(1, 0)
+        scores, surrogates, _ = window.consume(rows2)
         self.assertIn("t", surrogates)
         self.assertAlmostEqual(float(surrogates["t"].detach()), 0.0)
         (-surrogates["t"]).backward()
-        grad_norm = sum(float(row.z.grad.norm() + row.u.grad.norm())
-                        for row in rows2)
+        # In the reconstruction variant U occupies the Z slot; the VJP's
+        # centering terms also flow to the p slot (z), so both sides get
+        # a gradient.
+        grad_norm = sum(
+            float(row.z.grad.norm() if row.z.grad is not None else 0.0)
+            + float(row.u.grad.norm() if row.u.grad is not None else 0.0)
+            for row in rows2)
         self.assertGreater(grad_norm, 0.0)
 
 

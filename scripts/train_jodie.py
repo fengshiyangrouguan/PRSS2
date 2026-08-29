@@ -80,7 +80,7 @@ def parse_args():
     p.add_argument("--rpbe", action="store_true",
                    help="Attach the RPBE component (compressor + fixed maps "
                         "+ cut builder + Ky Fan term)")
-    p.add_argument("--kf-lambda", type=float, default=1.0)
+    p.add_argument("--kf-lambda", type=float, default=1e-3)
     p.add_argument("--rpbe-width", type=int, default=128)
     p.add_argument("--sketch-dim", type=int, default=64)
     p.add_argument("--kf-cuts-per-tau", type=int, default=1024,
@@ -90,6 +90,11 @@ def parse_args():
                         "within 1-2 batches")
     p.add_argument("--kf-min-ratio", type=float, default=2.0)
     p.add_argument("--kf-min-abs", type=int, default=1024)
+    p.add_argument("--kf-group-batches", type=int, default=None,
+                   help="macro-group length in batches; default "
+                        "ceil(kf_min_abs / trace_roots), raise it when "
+                        "below_threshold_groups > 0 (strict-future masking "
+                        "lowers the valid-root rate)")
     p.add_argument("--ridge-eps", type=float, default=1e-4)
     p.add_argument("--rpbe-seed", type=int, default=0)
     p.add_argument("--trace-roots", type=int, default=32)
@@ -256,6 +261,7 @@ def build_components(args, device, dataset):
             delta_t_scale=delta_scale,
             cuts_per_tau=args.kf_cuts_per_tau, kf_min_ratio=args.kf_min_ratio,
             kf_min_abs=args.kf_min_abs,
+            kf_group_batches=args.kf_group_batches,
             kf_taus=list(taus[:-1]),
             rpbe_seed=args.rpbe_seed)
         compressor = RecursiveCompressor(rpbe_cfg).to(device)
@@ -299,7 +305,11 @@ def build_components(args, device, dataset):
     repr_params = [p for p in repr_params
                    if not (id(p) in seen or seen.add(id(p)))]
     head_optimizer = torch.optim.Adam(head_params, lr=args.lr)
-    repr_optimizer = torch.optim.Adam(repr_params, lr=args.lr)
+    # A frozen-host vanilla baseline has NO representation parameters;
+    # torch.optim.Adam([]) raises, so the repr optimizer stays None and
+    # the loop keeps the representation group silent.
+    repr_optimizer = torch.optim.Adam(repr_params, lr=args.lr) \
+        if repr_params else None
     return dict(tgn=tgn, decoder=decoder, head_optimizer=head_optimizer,
                 repr_optimizer=repr_optimizer,
                 compressor=compressor, adapter=adapter, fixed_maps=fixed_maps,
@@ -428,8 +438,17 @@ def main():
             if train_row.get("kf"):
                 tb_writer.add_scalar("epoch/kf_loss",
                                      train_row["kf"]["kf_loss"], epoch)
-                for tau, frac in train_row["kf"]["J_frac"].items():
-                    tb_writer.add_scalar("epoch/J_frac/" + tau, frac, epoch)
+                for tau, frac in train_row["kf"]["J_norm"].items():
+                    tb_writer.add_scalar("epoch/J_norm/" + tau, frac, epoch)
+                tb_writer.add_scalar(
+                    "epoch/reference_refreshes",
+                    train_row["kf"].get("reference_refreshes", 0), epoch)
+                tb_writer.add_scalar(
+                    "epoch/below_threshold_groups",
+                    train_row["kf"].get("below_threshold_groups", 0), epoch)
+                tb_writer.add_scalar(
+                    "epoch/stale_drops",
+                    train_row["kf"].get("stale_drops", 0), epoch)
 
         score_is_finite = bool(np.isfinite(score))
         improved = (best_epoch < 0) or (

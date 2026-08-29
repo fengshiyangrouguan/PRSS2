@@ -266,12 +266,84 @@ class TestVJPEquivalence(unittest.TestCase):
                         / b.double().norm().clamp(min=1e-30))
             self.assertLess(err, 1e-5)
 
+    def test_kfold_detached_reference_adjoint_scales_inversely(self):
+        """The review's decisive test: J(cM) = J(M) (degree-0 homogeneous)
+        implies grad_M J(cM) = (1/c) grad_M J(M).
+
+        Build a batch B, then a reference R of k DETACHED copies of B
+        with fresh tree/cut ids and NO weight renormalization (so
+        M_R = k M_B, W_R = k W_B).  Then:
+
+            A_R = A_B / k
+            g_raw = grad_z <A_R, M_B(z)> = g_direct / k
+            (W_R/W_B) g_raw = k g_raw = g_direct
+
+        The copies MUST be detached (production references are); using
+        one repeated graph-connected tensor would let autograd sum the k
+        paths and falsely show raw == direct.  The weights must NOT be
+        renormalized to total 1, or the scale information is lost.
+        """
+        k = 3
+        rows_b = make_cut_rows(8, 4, 8, rows_per_cut=4)
+        z_b = torch.stack([row.z.detach().clone() for row in rows_b])
+        p_b = torch.stack([_FakeMaps(8).pv(row.context, row.outcome)
+                           for row in rows_b])
+        w_b = torch.tensor([row.weight for row in rows_b],
+                           dtype=torch.float64)
+        cut_b = [(row.tree_id, row.occurrence_id, row.tau)
+                 for row in rows_b]
+
+        wf_b = WeightedWelford(4, 8)
+        wf_b.add(z_b, p_b, w_b, cut_b)
+        res_b = wf_b.result()
+        _, a_batch, _ = kf_adjoint(res_b, eps=1e-4)
+
+        # Reference: k detached copies, fresh ids, weights unchanged.
+        z_r = z_b.repeat(k, 1)
+        p_r = p_b.repeat(k, 1)
+        w_r = w_b.repeat(k)
+        cut_r = [("c", j * 1000 + i) for j in range(k)
+                 for i in range(len(cut_b))]
+        wf_r = WeightedWelford(4, 8)
+        wf_r.add(z_r, p_r, w_r, cut_r)
+        res_r = wf_r.result()
+        self.assertAlmostEqual(res_r["W"], k * res_b["W"], places=9)
+        _, a_ref, _ = kf_adjoint(res_r, eps=1e-4)
+
+        # A_R = A_B / k (zero-degree homogeneity of the gradient).
+        for key in ("M2_zz", "M2_zp", "M2_pp"):
+            err = float((a_ref[key] - a_batch[key] / k).norm()
+                        / a_batch[key].norm().clamp(min=1e-30))
+            self.assertLess(err, 1e-6, key)
+
+        # g_raw = grad_z <A_R, M_B(z)> = g_direct / k.
+        zl = z_b.clone().requires_grad_(True)
+        raw = kf_vjp_batch(zl, p_b, w_b, res_r["mu_z"], res_r["mu_p"],
+                           a_ref)
+        raw.backward()
+        g_raw = zl.grad.detach()
+        zl2 = z_b.clone().requires_grad_(True)
+        direct = kf_vjp_batch(zl2, p_b, w_b, res_b["mu_z"], res_b["mu_p"],
+                              a_batch)
+        direct.backward()
+        g_direct = zl2.grad.detach()
+        err_raw = float((g_raw - g_direct / k).norm()
+                        / g_direct.norm().clamp(min=1e-30))
+        self.assertLess(err_raw, 1e-6)
+
+        # (W_R / W_B) * g_raw = k * g_raw = g_direct.
+        err_scaled = float((k * g_raw - g_direct).norm()
+                           / g_direct.norm().clamp(min=1e-30))
+        self.assertLess(err_scaled, 1e-6)
+
     def test_divide_by_wref_breaks_equivalence(self):
-        # Acceptance 4: on the SAME window data (where the equivalence of
-        # acceptance 1-3 holds), the /W_ref convention breaks it — it
-        # shrinks the gradient by 1/W_ref — while the raw VJP remains the
-        # exact direct gradient (the scale-invariant score cancels the
-        # 1/D factor, so no rescaling is the correct recovery).
+        # Acceptance 4 (updated to scheme B): the raw VJP is the exact
+        # direct gradient on the same window data — that is the
+        # production surrogate.  BOTH rescaling conventions break the
+        # equivalence: /W_ref shrinks it by 1/W_ref; W_ref/W_batch blows
+        # it up by W_ref/W_batch (here = 1 on the same window, so use the
+        # k-fold perspective: the group sum of raw VJPs already carries
+        # the window multiplicity, any extra factor double-counts it).
         result, rows, _ = self._window()
         _, adjoints, _ = kf_adjoint(result, eps=1e-4)
         g_raw = self._vjp_row_grads(rows, adjoints, result)
@@ -298,8 +370,9 @@ class TestReferenceLifecycle(unittest.TestCase):
 
     def test_commit_reference_enforces_exact_one_update_lag(self):
         # Review B.8: a candidate reference that does NOT lag exactly one
-        # representation update is discarded (never silently reused) and
-        # reported through the stale list.
+        # representation update is discarded AND the old active reference
+        # is dropped — an age>=2 reference must never keep being used, so
+        # the next group goes cold for that tau.
         window = self._window()
         _feed_window(window, make_cut_rows(4, 4, 8, offset=0),
                      param_version=0)
@@ -311,11 +384,19 @@ class TestReferenceLifecycle(unittest.TestCase):
         stale = window.commit_reference(current_version=3)
         self.assertEqual(stale, ["t"])
         self.assertEqual(window.stale_drops, 1)
-        # The active reference stays the version-0 one; the candidate is
-        # gone, not queued.
-        self.assertEqual(window._reference["t"]["param_version"], 0)
+        # The old reference is GONE (cold restart); the candidate is not
+        # queued either.
+        self.assertIsNone(window.reference_score("t"))
         self.assertEqual(window._next_reference, {})
-        self.assertEqual(window.reference_age("t"), 3)
+        # The next group that reaches threshold builds a fresh reference
+        # (first activation skips the version check).
+        window.begin_group(4, 0)
+        window.consume(make_cut_rows(4, 4, 8, offset=100))
+        window.close_group()
+        self.assertEqual(window.commit_reference(current_version=5), [])
+        self.assertIsNotNone(window.reference_score("t"))
+        self.assertEqual(window._reference["t"]["param_version"], 4)
+        self.assertEqual(window.reference_age("t"), 1)
 
     def test_epoch_reset_clears_reference_and_pending(self):
         window = self._window()

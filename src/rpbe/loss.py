@@ -555,6 +555,8 @@ class KFLaggedWindow:
         self._epoch = None
         self.refresh_count = 0
         self.stale_drops = 0
+        self._last_rho: Dict[str, float] = {}
+        self._last_batch_weight: Dict[str, float] = {}
 
     def _threshold(self, tau: str) -> int:
         # CCA rank is bounded by min(dim Z, dim P).  Count independent query
@@ -623,19 +625,40 @@ class KFLaggedWindow:
             if reference is not None:
                 batch_weight = float(weights.detach().sum())
                 if batch_weight > 0.0:
+                    self._last_batch_weight[tau] = batch_weight
                     raw_vjp = kf_vjp_batch(
                         zs, ps, weights,
                         reference["mu_z"], reference["mu_p"],
                         reference["adjoints"])
-                    # Population-gradient restoration: A_ref carries
-                    # 1/D_ref ~ 1/W_ref, the batch M2 scales with W_batch,
-                    # so this recovers the population-scale contribution.
-                    population_vjp = raw_vjp \
-                        * (reference["W"] / batch_weight)
+                    # Macro-window surrogate (review scheme B): the raw
+                    # VJP <A_ref, M_b> is this batch's contribution to the
+                    # whole-window linearization <A_ref, M_window>.  The
+                    # representation parameters are frozen inside the
+                    # macro-group and updated once at its end, so summing
+                    # the per-batch gradients over the group IS the
+                    # window-linearized gradient — no W_ref/W_batch
+                    # rescaling.  (The score is degree-0 homogeneous:
+                    # J(cM) = J(M) and grad_M J(cM) = grad_M J(M)/c, so
+                    # the adjoint's inverse scale carries the batch
+                    # multiplicity; the group sum absorbs it.  See the
+                    # k-fold detached test in test_eighth_review.)
                     # Gradient-only surrogate: numerically zero, must not
                     # pollute task-loss logs.
-                    surrogates[tau] = population_vjp.float() \
-                        - population_vjp.detach().float()
+                    surrogates[tau] = raw_vjp.float() \
+                        - raw_vjp.detach().float()
+                    # First-order radial proportion (review E): the exact
+                    # Ky Fan gradient at the same reference point is
+                    # tangential (|rho| ~ 0); a large |rho| means the
+                    # lagged linearization leaks a radial push.  Reported
+                    # by the loop's diagnostics.
+                    if zs.requires_grad:
+                        gz = torch.autograd.grad(
+                            raw_vjp, zs, retain_graph=True,
+                            allow_unused=True)[0]
+                        zc = zs - reference["mu_z"]
+                        denom = float(
+                            (gz.norm() * zc.norm()).clamp(min=1e-30))
+                        self._last_rho[tau] = float((gz * zc).sum()) / denom
                 scores[tau] = float(reference["score"])
             else:
                 cold_taus.append(tau)
@@ -706,9 +729,10 @@ class KFLaggedWindow:
         Review B.8: only a reference lagging EXACTLY one representation
         update may be activated.  A candidate whose version is not
         current+1 (a group below threshold skipped its refresh, so the
-        window spans several parameter versions) is DISCARDED — never
-        silently reused — and its tau is returned for the caller to
-        alert on.
+        window spans several parameter versions) is DISCARDED — and the
+        OLD active reference is dropped too: an age>=2 reference must
+        never keep being used, so the next group goes cold for that tau.
+        The stale taus are returned for the caller to alert on.
         """
         if current_version is not None:
             self._param_version = int(current_version)
@@ -719,6 +743,7 @@ class KFLaggedWindow:
                     ref["param_version"] != current["param_version"] + 1:
                 stale.append(tau)
                 self.stale_drops += 1
+                del self._reference[tau]   # cold restart, never age >= 2
                 continue
             self._reference[tau] = ref
         self._next_reference = {}

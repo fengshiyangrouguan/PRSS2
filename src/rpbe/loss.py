@@ -607,10 +607,14 @@ class KFLaggedWindow:
                         zs, ps, weights,
                         reference["mu_z"], reference["mu_p"],
                         reference["adjoints"])
-                    # The adjoint scales as 1 / reference weight whereas the
-                    # batch M2 scales with batch weight.  This converts the
-                    # batch contribution to a population-gradient estimate.
-                    scaled = raw_vjp * (reference["W"] / batch_weight)
+                    # Reference-average normalization: the lagged adjoint
+                    # is defined per unit of reference window weight, so a
+                    # batch contribution is scaled by 1 / W_ref (NOT by
+                    # W_ref / W_batch).  The previous population-scaling
+                    # inflated the KF gradient by ~1e4 relative to the task
+                    # gradient (measured cos(task, kf) ~ 0, norm ratio
+                    # 10628x), which made every lambda > 0 crush the task.
+                    scaled = raw_vjp / reference["W"]
                     # Preserve only its gradient.  A VJP surrogate is not a
                     # meaningful loss value and must not pollute task-loss logs.
                     surrogates[tau] = scaled.float() - scaled.detach().float()

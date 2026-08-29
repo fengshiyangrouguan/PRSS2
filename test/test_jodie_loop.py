@@ -174,8 +174,11 @@ class TestLoopSmoke(unittest.TestCase):
     def test_rpbe_train_epoch_finite_kf(self):
         loop = self._make_loop(rpbe=True)
         row = loop.train_epoch(0, 0, self.train)
-        self.assertIn("train_kf_loss", row)
-        self.assertTrue(np.isfinite(row["train_kf_loss"]))
+        self.assertIn("train_kf_score", row)
+        self.assertTrue(np.isfinite(row["train_kf_score"]))
+        self.assertIsNotNone(row["kf"])
+        self.assertTrue(np.isfinite(row["kf"]["kf_loss"]))
+        self.assertIn("J_norm", row["kf"])
         self.assertGreater(row["n_batches"], 0)
         val_row = loop.evaluate_split(self.val, reset=False)
         self.assertIn("auc", val_row)

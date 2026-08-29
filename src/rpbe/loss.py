@@ -665,8 +665,10 @@ class KFLaggedWindow:
                             allow_unused=True)[0]
                         zc = zs - reference["mu_z"]
                         denom = float(
-                            (gz.norm() * zc.norm()).clamp(min=1e-30))
-                        self._last_rho[tau] = float((gz * zc).sum()) / denom
+                            (gz.detach().norm()
+                             * zc.detach().norm()).clamp(min=1e-30))
+                        self._last_rho[tau] = float(
+                            (gz * zc).detach().sum()) / denom
                 scores[tau] = float(reference["score"])
             else:
                 cold_taus.append(tau)

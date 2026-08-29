@@ -126,14 +126,16 @@ def main():
     age_all = [v for r in rows for v in r["reference_age"].values()
                if v is not None]
     if rows:
-        print("effective_grad_ratio p50: {:.3f}  p95: {:.3f}  max: {:.3f}"
+        print("effective_grad_ratio p50: {:.5f}  p95: {:.5f}  max: {:.5f}"
               .format(float(np.percentile(ratio, 50)),
                       float(np.percentile(ratio, 95)),
                       float(ratio.max())))
-        print("raw g_kf/g_task norm ratio p50: {:.3f}"
-              .format(float(np.percentile(
-                  [r["g_kf_norm"] / max(r["g_task_norm"], 1e-12)
-                   for r in rows], 50))))
+        # Lambda-free ratio (rank-normalized, scheme-B window scale): the
+        # quantity the lambda sweep must calibrate into [0.05, 0.30].
+        raw_ratio = np.array([r["g_kf_norm"] / max(r["g_task_norm"], 1e-12)
+                              / max(args.kf_lambda, 1e-12) for r in rows])
+        print("lambda-free rank-normalized ratio p50: {:.5f}"
+              .format(float(np.percentile(raw_ratio, 50))))
         print("cos(task, kf): mean {:.4f}  min {:.4f}".format(
             float(np.mean(cos)), float(cos.min())))
         print("rho_radial: mean |rho| {:.4f}  max |rho| {:.4f}".format(

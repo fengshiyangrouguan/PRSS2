@@ -18,7 +18,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from prss.data.jodie import JodieDataset, compute_time_statistics
+from rpbe.data.jodie import JodieDataset, compute_time_statistics
 
 REAL_DATA_DIR = Path(__file__).resolve().parents[1] / "old" / "processed_tgn_data"
 

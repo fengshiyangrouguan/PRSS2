@@ -817,6 +817,28 @@ def _common_probe_report(last_record, params):
     out["exact_vec_norm"] = float(
         last_record["exact_vec"].norm()) if last_record.get(
             "exact_vec") is not None else None
+    # Review: the all-zero cosines were not believable until the probe
+    # gradients are shown to be nonzero and repeatable.
+    out["grad_norms"] = {k: float(v.norm()) for k, v in combos.items()}
+    out["nonzero_counts"] = {
+        k: int((v.abs() > 1e-12).sum()) for k, v in combos.items()}
+    intersections = {}
+    for i, ka in enumerate(keys):
+        for kb in keys[i + 1:]:
+            nz_a = combos[ka].abs() > 1e-12
+            nz_b = combos[kb].abs() > 1e-12
+            intersections[ka + "_vs_" + kb] = int(
+                (nz_a & nz_b).sum())
+    out["nonzero_intersections"] = intersections
+    # Repeatability: the same (mu, A) recomputed twice must have
+    # cosine ~ 1 — a low value here means the 0.0 cross-cosines are a
+    # numerical artifact, not a signal.
+    if cur_ref is not None:
+        repeat = vjp_grad({"mu_z": cur_ref["mu_z"],
+                           "mu_p": cur_ref["mu_p"],
+                           "adjoints": cur_ref["adjoints"]})
+        out["repeat_consistency_cosine"] = _cos(
+            combos["mu_cur_A_cur"], repeat)
     return out
 
 
@@ -909,24 +931,32 @@ def _multi_window_virtual_steps(result, tgn, decoder, adapter, stream,
                                 batch_size, n_neighbors, trace_roots,
                                 group_batches, seed, builder, fixed_maps,
                                 eps, params, ratios=(0.05, 0.1, 0.2)):
-    """Diagnostics 1-2: repeated virtual steps over adjacent windows.
+    """Diagnostics 1-2 (review-corrected): repeated virtual steps.
 
-    For every adjacent pair (t, t+1): directions from window t (task /
-    exact / lagged / joint(r) = task - lambda_r * exact with lambda_r =
-    r * |task| / |exact|), each applied at +-eps (1% of the parameter
-    norm), and window t+1's (J, J_outcome_contrast, task_nll) measured
-    by replay — window t+1 never contributed to window t's gradients.
-    Reports the mean delta per direction and its sign consistency.
+    For every adjacent pair (t, t+1): directions from window t, each
+    applied at +-eps (1% of the parameter norm), and window t+1's
+    (J, J_outcome_contrast, task_nll) measured by replay — window t+1
+    never contributed to window t's gradients.
 
-    The decisive reading (review): exact must raise J on the untouched
-    future window; joint(r) should not hurt task NLL relative to the
-    task-only step; whether the J gain is outcome-contrast or context
-    says which one the objective actually rewards.
+    Direction convention (review): g_J and g_T are unit gradients.
+      * ``exact``          = +g_J   (expect D_J > 0);
+      * ``task_grad``      = +g_T   (expect D_NLL > 0 — verifies the
+                            metric is gradient-sensitive);
+      * ``task_update``    = -g_T   (the REAL task optimizer step);
+      * ``joint_update_rX``= normalize(-g_T + r g_J)  (the REAL joint
+                            optimizer step for relative strength r);
+      * ``lagged``         = +g_lagged.
+
+    The +-eps deltas are NEVER averaged together: their average measures
+    curvature, not direction.  Per pair and direction the report keeps
+    the central directional effect A_i = (delta^+ - delta^-)/2, the
+    curvature C_i = (delta^+ + delta^-)/2, and a per-pair median /
+    sign-rate / clustered bootstrap CI over pairs.
     """
     groups = result["groups"]
     total_norm = float(sum(p_.norm() ** 2 for p_ in params)) ** 0.5
     step_size = 0.01 * total_norm
-    deltas = defaultdict(list)
+    records = []
     n_pairs = 0
     for t in range(len(groups) - 1):
         g = groups[t]
@@ -936,21 +966,19 @@ def _multi_window_virtual_steps(result, tgn, decoder, adapter, stream,
         task_vec = g.get("task_vec")
         exact = g["exact_vec"]
         lagged = g.get("lagged_vec")
-        directions = {}
+        g_unit = exact / exact.norm().clamp(min=1e-30)
+        directions = {"exact": g_unit}
         if task_vec is not None:
-            directions["task"] = task_vec / task_vec.norm().clamp(
-                min=1e-30)
-        directions["exact"] = exact / exact.norm().clamp(min=1e-30)
-        if lagged is not None:
-            directions["lagged"] = lagged / lagged.norm().clamp(min=1e-30)
-        if task_vec is not None:
+            t_unit = task_vec / task_vec.norm().clamp(min=1e-30)
+            directions["task_grad"] = t_unit
+            directions["task_update"] = -t_unit
             for r in ratios:
-                lam_r = r * task_vec.norm() \
-                    / exact.norm().clamp(min=1e-30)
-                joint = task_vec - lam_r * exact
-                directions["joint_r{}".format(r)] = joint \
+                joint = -t_unit + r * g_unit
+                directions["joint_update_r{}".format(r)] = joint \
                     / joint.norm().clamp(min=1e-30)
-        # Before-baseline: untouched window t+1.
+        if lagged is not None:
+            directions["lagged"] = lagged \
+                / lagged.norm().clamp(min=1e-30)
         if tgn.use_memory:
             tgn.memory.restore_memory(nxt["memory"])
         before = _forward_heldout_metrics(
@@ -973,19 +1001,65 @@ def _multi_window_virtual_steps(result, tgn, decoder, adapter, stream,
                 for key in ("J", "J_outcome_contrast", "task_nll"):
                     b = before.get(key)
                     a = after.get(key)
-                    if b is not None and a is not None:
-                        deltas[name + "_" + key].append(a - b)
-    out = {"n_pairs": n_pairs,
-           "step_size": step_size, "deltas": {}}
-    for key, vals in deltas.items():
-        vals = np.asarray(vals, dtype=np.float64)
-        out["deltas"][key] = {
-            "n": len(vals),
-            "mean": float(vals.mean()),
-            "std": float(vals.std(ddof=1)) if len(vals) > 1 else 0.0,
-            "sign_consistency": float(np.mean(vals > 0.0)),
-        }
+                    if b is None or a is None:
+                        continue
+                    records.append({
+                        "pair": t, "direction": name, "sign": int(sign),
+                        "metric": key, "before": b, "after": a,
+                        "delta": a - b,
+                    })
+    out = {"n_pairs": n_pairs, "step_size": step_size,
+           "records": records,
+           "summary": _summarize_virtual_records(records)}
     return out
+
+
+def _summarize_virtual_records(records):
+    """Per direction/metric: plus/minus means, the CENTRAL directional
+    effect (plus-minus)/2 (review: averaging the two deltas measures
+    curvature, not direction), curvature (plus+minus)/2, and a
+    per-pair clustered bootstrap CI / sign-rate."""
+    summary = {}
+
+    def _bootstrap_mean_ci(values, n_boot=2000, seed_boot=0):
+        values = np.asarray(values, dtype=np.float64)
+        if len(values) == 0:
+            return None
+        rng = np.random.RandomState(seed_boot)
+        means = np.array([
+            values[rng.randint(0, len(values), len(values))].mean()
+            for _ in range(n_boot)])
+        return {"mean": float(values.mean()),
+                "median": float(np.median(values)),
+                "ci_lo": float(np.percentile(means, 5)),
+                "ci_hi": float(np.percentile(means, 95)),
+                "sign_rate": float(np.mean(values > 0.0)),
+                "n": int(len(values))}
+
+    for direction in sorted({r["direction"] for r in records}):
+        for metric in ("J", "J_outcome_contrast", "task_nll"):
+            plus = np.asarray([
+                r["delta"] for r in records
+                if r["direction"] == direction and r["sign"] == 1
+                and r["metric"] == metric], dtype=np.float64)
+            minus = np.asarray([
+                r["delta"] for r in records
+                if r["direction"] == direction and r["sign"] == -1
+                and r["metric"] == metric], dtype=np.float64)
+            if len(plus) == 0 or len(minus) != len(plus):
+                continue
+            n = min(len(plus), len(minus))
+            effects = (plus[:n] - minus[:n]) / 2.0
+            curvatures = (plus[:n] + minus[:n]) / 2.0
+            key = direction + "_" + metric
+            summary[key] = {
+                "plus_mean": float(plus[:n].mean()),
+                "minus_mean": float(minus[:n].mean()),
+                "central_directional_effect": _bootstrap_mean_ci(
+                    effects),
+                "curvature_mean": float(curvatures.mean()),
+            }
+    return summary
 
 
 def _pairwise_report(pass_result):

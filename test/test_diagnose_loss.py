@@ -151,6 +151,53 @@ class TestResiduals(unittest.TestCase):
                 self.assertEqual(sorted(orig), sorted(perm))
 
 
+class TestVirtualStepSummary(unittest.TestCase):
+    def _linear_records(self, effect=0.01, curvature=0.0, n_pairs=7):
+        """Pure first-order fake: f(+e d) = f0 + effect, f(-e d) = f0 -
+        effect.  The +-eps average is 0; the central effect is the
+        signal."""
+        records = []
+        for t in range(n_pairs):
+            for sign in (1, -1):
+                records.append({
+                    "pair": t, "direction": "exact", "sign": sign,
+                    "metric": "J", "before": 0.0,
+                    "after": float(sign) * effect
+                    + float(sign ** 2) * curvature,
+                    "delta": float(sign) * effect
+                    + float(sign ** 2) * curvature,
+                })
+        return records
+
+    def test_central_effect_is_direction_not_average(self):
+        summary = dl._summarize_virtual_records(
+            self._linear_records(effect=0.01))
+        entry = summary["exact_J"]
+        # The naive +-eps average would be (0.01 - 0.01)/2 = 0.
+        self.assertAlmostEqual(entry["plus_mean"], 0.01, places=6)
+        self.assertAlmostEqual(entry["minus_mean"], -0.01, places=6)
+        eff = entry["central_directional_effect"]
+        self.assertAlmostEqual(eff["mean"], 0.01, places=6)
+        self.assertEqual(eff["sign_rate"], 1.0)
+        self.assertEqual(eff["median"], 0.01)
+        self.assertAlmostEqual(entry["curvature_mean"], 0.0, places=9)
+
+    def test_curvature_goes_to_curvature_slot(self):
+        summary = dl._summarize_virtual_records(
+            self._linear_records(effect=0.0, curvature=0.005))
+        entry = summary["exact_J"]
+        eff = entry["central_directional_effect"]
+        self.assertAlmostEqual(eff["mean"], 0.0, places=9)
+        self.assertAlmostEqual(entry["curvature_mean"], 0.005, places=9)
+
+    def test_bootstrap_ci_sanity(self):
+        summary = dl._summarize_virtual_records(
+            self._linear_records(effect=0.01, n_pairs=20))
+        eff = summary["exact_J"]["central_directional_effect"]
+        self.assertGreater(eff["ci_lo"], 0.0)   # consistent positive
+        self.assertAlmostEqual(eff["ci_hi"], 0.01, places=6)
+
+
 class TestCommonProbe(unittest.TestCase):
     def test_common_probe_fails_cleanly_without_reference(self):
         out = dl._common_probe_report({}, [])

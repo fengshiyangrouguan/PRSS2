@@ -941,18 +941,22 @@ def _parameter_space_report(tgn, decoder, adapter, stream, batch_size,
         tgn, decoder, adapter, stream, batch_size, n_neighbors,
         trace_roots, group_batches, max_groups, seed, builder, fixed_maps,
         eps, params, prefix=prefix, heldout_extra=True)
+    last = result["groups"][-1] if result["groups"] else {}
+    # Order matters: the common-probe backprops through the retained
+    # graph of the last group, so it must run BEFORE the held-out
+    # virtual step (whose inplace add_/sub_ bumps the autograd version
+    # counters of the parameters).
     report = {
         "n_groups": len(result["groups"]),
         "n_batches": result["n_batches"],
         "pairwise": _pairwise_report(result),
         "group_scores": [float(g["score"]) if g.get("score") is not None
                          else None for g in result["groups"]],
+        "common_probe": _common_probe_report(last, params),
         "heldout_virtual_step": _heldout_virtual_step(
             result, tgn, adapter, stream, batch_size, n_neighbors,
             trace_roots, seed, builder, fixed_maps, eps, params),
     }
-    last = result["groups"][-1] if result["groups"] else {}
-    report["common_probe"] = _common_probe_report(last, params)
     # Ridge-after-condition diagnostics from the last group's score diag.
     diag = last.get("diag") or {}
     report["condition"] = {

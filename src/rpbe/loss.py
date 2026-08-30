@@ -1109,7 +1109,7 @@ class KFMomentWindow:
             len(self._windows[tau]["tree_seen"]) >= self._threshold(tau)
             for tau in nonempty)
 
-    def reset(self):
+    def reset(self, clear_reference: bool = True):
         """Discard all open windows (used at epoch drain: the accumulated
         z rows' graphs are consumed by the task-only backward, so the
         unfinished window cannot survive into the next epoch)."""

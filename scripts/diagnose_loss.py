@@ -575,9 +575,11 @@ def _exact_stability_sweep(batch_rows, window_sizes, fixed_maps, eps):
                     group, tau, fixed_maps, eps)
                 if exact and diag.get("failed") is None:
                     exacts.append(exact)
-            cosines = [
-                float(_gradient_comparison(a, b)["cosine"])
-                for a, b in zip(exacts, exacts[1:])]
+            cosines = []
+            for a, b in zip(exacts, exacts[1:]):
+                cmp = _gradient_comparison(a, b)
+                if cmp.get("cosine") is not None:
+                    cosines.append(float(cmp["cosine"]))
             per_tau[tau] = {
                 "n_groups": len(exacts),
                 "adjacent_exact_cosine_mean": float(np.mean(cosines))

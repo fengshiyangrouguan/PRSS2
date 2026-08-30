@@ -74,6 +74,12 @@ def parse_args():
     # builder seed must stay below 2**32 / 1000003 ~ 4294.
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--out-json", default="")
+    # Task-51 frozen sweep overrides (one axis at a time).
+    parser.add_argument("--ridge-override", type=float, default=None,
+                        help="override the checkpoint ridge_eps")
+    parser.add_argument("--m-override", type=int, default=None,
+                        help="rebuild the fixed measurement with this "
+                             "sketch dim (same rpbe_seed)")
     return parser.parse_args()
 
 
@@ -1454,6 +1460,13 @@ def main():
     adapter = components["adapter"]
     fixed_maps = components["fixed_maps"]
     rpbe_cfg = components["rpbe_cfg"]
+    # Task-51 frozen sweep: one axis at a time.
+    if args.m_override is not None:
+        rpbe_cfg.m = int(args.m_override)
+        fixed_maps = FixedMaps(rpbe_cfg).to(device)
+        components["fixed_maps"] = fixed_maps
+    if args.ridge_override is not None:
+        rpbe_cfg.ridge_eps = float(args.ridge_override)
     batch_size = int(cli.get("bs", 200))
     n_neighbors = int(cli.get("n_degree", 5))
     trace_roots = int(args.trace_roots or cli.get("trace_roots", 32))

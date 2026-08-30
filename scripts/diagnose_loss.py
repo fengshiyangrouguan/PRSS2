@@ -962,10 +962,13 @@ def _multi_window_virtual_steps(result, tgn, decoder, adapter, stream,
         if task_vec is not None:
             t_unit = task_vec / task_vec.norm().clamp(min=1e-30)
             directions["task_grad"] = t_unit
-            directions["task_update"] = -t_unit
+            # Review: -g/|g| is the RAW gradient-descent direction, NOT
+            # the actual Adam update — name it accordingly.  A true
+            # optimizer-fidelity check would need Adam state.
+            directions["task_raw_descent"] = -t_unit
             for r in ratios:
                 joint = -t_unit + r * g_unit
-                directions["joint_update_r{}".format(r)] = joint \
+                directions["joint_raw_descent_r{}".format(r)] = joint \
                     / joint.norm().clamp(min=1e-30)
         if lagged is not None:
             directions["lagged"] = lagged \
@@ -979,33 +982,59 @@ def _multi_window_virtual_steps(result, tgn, decoder, adapter, stream,
         if before.get("J") is None:
             continue
         n_pairs += 1
-        # Exact parameter restore (review): never accumulate FP32
-        # add/sub drift — every evaluation starts from a cloned base
-        # and restores it verbatim afterwards.
+        # Exact parameter restore (review): every evaluation starts from
+        # a cloned base constructed in one place and restores it via
+        # try/finally so exceptions cannot leave the model perturbed.
         theta_base = [p.detach().clone() for p in params]
+        # Zero-perturbation replay consistency: the FULL state restore
+        # (memory + RNG + occurrence counter + builder counters) must
+        # reproduce the window bit-for-bit.
+        state = {
+            "memory": nxt["memory"],
+            "rng": ckpt._rng_state(),
+            "next_oid": getattr(adapter, "_next_oid", 0),
+            "tree_counter": getattr(builder, "_tree_counter", 0),
+            "build_calls": getattr(builder, "_build_calls", 0),
+        }
+
+        def _restore_full():
+            if tgn.use_memory and state["memory"] is not None:
+                tgn.memory.restore_memory(state["memory"])
+            ckpt._restore_rng(state["rng"])
+            if hasattr(adapter, "_next_oid"):
+                adapter._next_oid = state["next_oid"]
+            if hasattr(builder, "_tree_counter"):
+                builder._tree_counter = state["tree_counter"]
+            if hasattr(builder, "_build_calls"):
+                builder._build_calls = state["build_calls"]
+
+        zero_repeat = None
         for name, d in directions.items():
             for step_frac in step_fracs:
                 step_size = step_frac * total_norm
                 for sign in (+1.0, -1.0):
-                    with torch.no_grad():
-                        offset = 0
-                        for p_, base in zip(params, theta_base):
-                            n = p_.numel()
-                            p_.copy_(base + (
-                                d[offset:offset + n].reshape(
-                                    p_.shape).float() * sign
-                                * step_size))
-                            offset += n
-                    if tgn.use_memory:
-                        tgn.memory.restore_memory(nxt["memory"])
-                    after = _forward_heldout_metrics(
-                        tgn, decoder, adapter, stream,
-                        nxt["batch_start"], group_batches, batch_size,
-                        n_neighbors, trace_roots, seed, builder,
-                        fixed_maps, eps)
-                    with torch.no_grad():
-                        for p_, base in zip(params, theta_base):
-                            p_.copy_(base)
+                    try:
+                        with torch.no_grad():
+                            offset = 0
+                            for p_, base in zip(params, theta_base):
+                                n = p_.numel()
+                                p_.copy_(base + (
+                                    d[offset:offset + n].reshape(
+                                        p_.shape).float() * sign
+                                    * step_size))
+                                offset += n
+                        _restore_full()
+                        after = _forward_heldout_metrics(
+                            tgn, decoder, adapter, stream,
+                            nxt["batch_start"], group_batches, batch_size,
+                            n_neighbors, trace_roots, seed, builder,
+                            fixed_maps, eps)
+                        if zero_repeat is None:
+                            zero_repeat = after.get("J")
+                    finally:
+                        with torch.no_grad():
+                            for p_, base in zip(params, theta_base):
+                                p_.copy_(base)
                     for key in ("J", "J_outcome_contrast", "task_nll"):
                         b = before.get(key)
                         a = after.get(key)
@@ -1024,10 +1053,32 @@ def _multi_window_virtual_steps(result, tgn, decoder, adapter, stream,
            "summary": _summarize_virtual_records(records),
            # Disjoint (non-overlapping) window pairs (0,1),(2,3),(4,5),
            # (6,7): too few for significance, but checks whether the
-           # conclusions depend on overlapping windows.
-           "disjoint_summary": _summarize_virtual_records(
-               [r for r in records if r["pair"] % 2 == 0])}
+           # conclusions depend on overlapping windows.  Still only a
+           # DESCRIPTIVE bootstrap (temporal windows may correlate even
+           # when they do not share a group).
+           "disjoint_summary": _summarize_disjoint_records(records),
+           # Zero-perturbation replay consistency: the full state
+           # restore must reproduce the window's J bit-for-bit.
+           "zero_replay_consistency": {
+               "J_before": before.get("J"),
+               "J_zero_repeat": zero_repeat,
+               "identical": (before.get("J") == zero_repeat),
+           }}
     return out
+
+
+def _summarize_disjoint_records(records):
+    global _CI_KIND
+    saved = _CI_KIND
+    _CI_KIND = "descriptive_bootstrap_disjoint_pairs"
+    try:
+        return _summarize_virtual_records(
+            [r for r in records if r["pair"] % 2 == 0])
+    finally:
+        _CI_KIND = saved
+
+
+_CI_KIND = "descriptive_bootstrap_overlapping_pairs"
 
 
 def _summarize_virtual_records(records):
@@ -1090,9 +1141,15 @@ def _summarize_virtual_records(records):
             entry["missing_minus_pairs"] += 1
         if 1 not in sides or -1 not in sides:
             continue
+        eps_plus = float(sides[1]["step_size"])
+        eps_minus = float(sides[-1]["step_size"])
+        if eps_plus <= 0 or abs(eps_plus - eps_minus) > 1e-12:
+            raise AssertionError(
+                "mismatched step sizes: {} vs {}".format(
+                    eps_plus, eps_minus))
         d_plus = sides[1]["delta"]
         d_minus = sides[-1]["delta"]
-        entry["step_size"] = float(sides[1]["step_size"])
+        entry["step_size"] = eps_plus
         entry["effects"].append((d_plus - d_minus) / 2.0)
         entry["sym_sums"].append(d_plus + d_minus)
     for key, entry in summary.items():
@@ -1108,7 +1165,7 @@ def _summarize_virtual_records(records):
         entry["n_complete_pairs"] = int(len(effects))
         entry.pop("effects")
         entry.pop("sym_sums")
-        entry["ci_kind"] = "descriptive_bootstrap_overlapping_pairs"
+        entry["ci_kind"] = _CI_KIND
     return summary
 
 

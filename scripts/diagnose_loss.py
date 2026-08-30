@@ -612,6 +612,14 @@ def _parameter_gradient_pass(tgn, decoder, adapter, stream, batch_size,
                     tgn.memory.backup_memory() if tgn.use_memory
                     else None),
                     "batch_start": batch_index}
+            if batch_index % group_batches == 0 and not is_heldout:
+                # Each statistical group snapshots its memory so the
+                # multi-window virtual steps can replay it.
+                current_record = {"memory": (
+                    tgn.memory.backup_memory() if tgn.use_memory
+                    else None),
+                    "batch_start": batch_index}
+                groups.append(current_record)
             roots = select_trace_rows(
                 np.zeros(stop - start), trace_roots, seed, batch_index,
                 "evenly_spaced")
@@ -665,7 +673,9 @@ def _parameter_gradient_pass(tgn, decoder, adapter, stream, batch_size,
                     break
                 record = {"index": group_index,
                           "exact_vec": None, "lagged_vec": None,
-                          "task_vec": None, "reference": None}
+                          "task_vec": None, "reference": None,
+                          "memory": current_record["memory"],
+                          "batch_start": current_record["batch_start"]}
                 if z_pool:
                     z = torch.stack(z_pool)
                     p = torch.stack(p_pool)
@@ -808,11 +818,14 @@ def _common_probe_report(last_record, params):
     return out
 
 
-def _forward_heldout_j(tgn, adapter, stream, batch_start, group_batches,
-                       batch_size, n_neighbors, trace_roots, seed,
-                       builder, fixed_maps, eps):
-    """No-grad replay of the held-out group from its batch start."""
+def _forward_heldout_metrics(tgn, decoder, adapter, stream, batch_start,
+                             group_batches, batch_size, n_neighbors,
+                             trace_roots, seed, builder, fixed_maps, eps):
+    """No-grad replay of a window: (J_joint, J_outcome_contrast, task NLL)."""
     z_pool, p_pool, w_pool, cut_pool = [], [], [], []
+    rows_meta = []
+    labels_all = []
+    probs_all = []
     total = math.ceil(len(stream.sources) / batch_size)
     with torch.no_grad():
         for batch_index in range(batch_start,
@@ -823,7 +836,7 @@ def _forward_heldout_j(tgn, adapter, stream, batch_start, group_batches,
                 np.zeros(stop - start), trace_roots, seed, batch_index,
                 "evenly_spaced")
             adapter.set_trace_source_rows(roots)
-            tgn.compute_temporal_embeddings(
+            src_emb, _, _ = tgn.compute_temporal_embeddings(
                 stream.sources[start:stop], stream.destinations[start:stop],
                 stream.destinations[start:stop], stream.timestamps[start:stop],
                 stream.edge_idxs[start:stop], n_neighbors)
@@ -835,66 +848,141 @@ def _forward_heldout_j(tgn, adapter, stream, batch_start, group_batches,
                     p_pool.append(fixed_maps.pv(row.context, row.outcome))
                     w_pool.append(float(row.weight))
                     cut_pool.append(tuple(row.cut_id))
+                    rows_meta.append((row.context, row.outcome))
             adapter.clear_trace()
+            if decoder is not None:
+                probs_all.append(decoder(src_emb).sigmoid()
+                                 .detach().cpu().numpy().ravel())
+                labels_all.append(stream.labels[start:stop])
     if not z_pool:
-        return None, {"failed": "no_heldout_rows"}
+        return {"failed": "no_heldout_rows"}
     z = torch.stack(z_pool)
     p = torch.stack(p_pool)
     w = torch.tensor(w_pool, dtype=torch.float64, device=z.device)
-    score, diag = _weighted_score_tensor(z, p, w, cut_pool, eps)
-    return (float(score.detach()) if score is not None else None), diag
+    score, _ = _weighted_score_tensor(z, p, w, cut_pool, eps)
+    out = {
+        "J": float(score.detach()) if score is not None else None,
+        "J_outcome_contrast": None,
+        "task_nll": None,
+    }
+    # outcome-contrast J: the SAME z rows, P restricted to the
+    # outcome-dependent part b_y of the future signature.
+    p_contrast = fixed_maps.pv_batch(
+        [meta[0] for meta in rows_meta],
+        [meta[1] for meta in rows_meta],
+        future_mode="outcome_contrast", use_cache=False)
+    score_contrast, _ = _weighted_score_tensor(
+        z, p_contrast, w, cut_pool, eps)
+    out["J_outcome_contrast"] = float(score_contrast.detach()) \
+        if score_contrast is not None else None
+    if probs_all and labels_all:
+        probs = np.clip(np.concatenate(probs_all), 1e-7, 1 - 1e-7)
+        labels = np.concatenate(labels_all)
+        out["task_nll"] = float(-(labels * np.log(probs)
+                                  + (1 - labels) * np.log(1 - probs)).mean())
+    return out
 
 
-def _heldout_virtual_step(pass_result, tgn, adapter, stream, batch_size,
-                          n_neighbors, trace_roots, seed, builder,
-                          fixed_maps, eps, params):
-    """The decisive check: does a small step along exact/lagged IMPROVE
-    the exact J on an independent FUTURE window that never contributed
-    to the gradient?  (review: '某个方向是否能在没参与算梯度的未来窗口
-    上改善目标' — cosine alone cannot answer this.)"""
-    held = pass_result.get("heldout")
-    groups = pass_result.get("groups") or []
-    if not held or held.get("z") is None or not groups:
-        return {"failed": "no_heldout_group"}
-    j_before, _ = _weighted_score_tensor(
-        held["z"], held["p"], held["w"], held["cut_ids"], eps)
-    j_before = float(j_before.detach()) if j_before is not None else None
-    if j_before is None:
-        return {"failed": "heldout_score_failed"}
-    last = groups[-1]
+def _perturb_params(params, direction, step_size):
+    with torch.no_grad():
+        offset = 0
+        for p_ in params:
+            n = p_.numel()
+            p_.add_(direction[offset:offset + n].reshape(p_.shape).float()
+                    * step_size)
+            offset += n
+
+
+def _undo_params(params, direction, step_size):
+    with torch.no_grad():
+        offset = 0
+        for p_ in params:
+            n = p_.numel()
+            p_.sub_(direction[offset:offset + n].reshape(p_.shape).float()
+                    * step_size)
+            offset += n
+
+
+def _multi_window_virtual_steps(result, tgn, decoder, adapter, stream,
+                                batch_size, n_neighbors, trace_roots,
+                                group_batches, seed, builder, fixed_maps,
+                                eps, params, ratios=(0.05, 0.1, 0.2)):
+    """Diagnostics 1-2: repeated virtual steps over adjacent windows.
+
+    For every adjacent pair (t, t+1): directions from window t (task /
+    exact / lagged / joint(r) = task - lambda_r * exact with lambda_r =
+    r * |task| / |exact|), each applied at +-eps (1% of the parameter
+    norm), and window t+1's (J, J_outcome_contrast, task_nll) measured
+    by replay — window t+1 never contributed to window t's gradients.
+    Reports the mean delta per direction and its sign consistency.
+
+    The decisive reading (review): exact must raise J on the untouched
+    future window; joint(r) should not hurt task NLL relative to the
+    task-only step; whether the J gain is outcome-contrast or context
+    says which one the objective actually rewards.
+    """
+    groups = result["groups"]
     total_norm = float(sum(p_.norm() ** 2 for p_ in params)) ** 0.5
-    out = {}
-    for name in ("exact", "lagged"):
-        vec = last.get(name + "_vec")
-        if vec is None:
-            out[name] = None
+    step_size = 0.01 * total_norm
+    deltas = defaultdict(list)
+    n_pairs = 0
+    for t in range(len(groups) - 1):
+        g = groups[t]
+        nxt = groups[t + 1]
+        if g.get("exact_vec") is None or nxt.get("memory") is None:
             continue
-        step_size = 0.01 * total_norm  # 1% of the parameter norm
-        unit = vec / vec.norm().clamp(min=1e-30)
-        with torch.no_grad():
-            offset = 0
-            for p_ in params:
-                n = p_.numel()
-                p_.add_(unit[offset:offset + n].reshape(p_.shape).float()
-                        * step_size)
-                offset += n
-        if tgn.use_memory and held.get("memory") is not None:
-            tgn.memory.restore_memory(held["memory"])
-        j_after, diag = _forward_heldout_j(
-            tgn, adapter, stream, held["batch_start"],
-            int(held.get("n_batches", 1)), batch_size, n_neighbors,
-            trace_roots, seed, builder, fixed_maps, eps)
-        with torch.no_grad():
-            offset = 0
-            for p_ in params:
-                n = p_.numel()
-                p_.sub_(unit[offset:offset + n].reshape(p_.shape).float()
-                        * step_size)
-                offset += n
-        out[name] = {"J_before": j_before,
-                     "J_after": j_after,
-                     "delta": (j_after - j_before)
-                     if j_after is not None else None}
+        task_vec = g.get("task_vec")
+        exact = g["exact_vec"]
+        lagged = g.get("lagged_vec")
+        directions = {}
+        if task_vec is not None:
+            directions["task"] = task_vec / task_vec.norm().clamp(
+                min=1e-30)
+        directions["exact"] = exact / exact.norm().clamp(min=1e-30)
+        if lagged is not None:
+            directions["lagged"] = lagged / lagged.norm().clamp(min=1e-30)
+        if task_vec is not None:
+            for r in ratios:
+                lam_r = r * task_vec.norm() \
+                    / exact.norm().clamp(min=1e-30)
+                joint = task_vec - lam_r * exact
+                directions["joint_r{}".format(r)] = joint \
+                    / joint.norm().clamp(min=1e-30)
+        # Before-baseline: untouched window t+1.
+        if tgn.use_memory:
+            tgn.memory.restore_memory(nxt["memory"])
+        before = _forward_heldout_metrics(
+            tgn, decoder, adapter, stream, nxt["batch_start"],
+            group_batches, batch_size, n_neighbors, trace_roots, seed,
+            builder, fixed_maps, eps)
+        if before.get("J") is None:
+            continue
+        n_pairs += 1
+        for name, d in directions.items():
+            for sign in (+1.0, -1.0):
+                _perturb_params(params, d, sign * step_size)
+                if tgn.use_memory:
+                    tgn.memory.restore_memory(nxt["memory"])
+                after = _forward_heldout_metrics(
+                    tgn, decoder, adapter, stream, nxt["batch_start"],
+                    group_batches, batch_size, n_neighbors, trace_roots,
+                    seed, builder, fixed_maps, eps)
+                _undo_params(params, d, sign * step_size)
+                for key in ("J", "J_outcome_contrast", "task_nll"):
+                    b = before.get(key)
+                    a = after.get(key)
+                    if b is not None and a is not None:
+                        deltas[name + "_" + key].append(a - b)
+    out = {"n_pairs": n_pairs,
+           "step_size": step_size, "deltas": {}}
+    for key, vals in deltas.items():
+        vals = np.asarray(vals, dtype=np.float64)
+        out["deltas"][key] = {
+            "n": len(vals),
+            "mean": float(vals.mean()),
+            "std": float(vals.std(ddof=1)) if len(vals) > 1 else 0.0,
+            "sign_consistency": float(np.mean(vals > 0.0)),
+        }
     return out
 
 
@@ -953,9 +1041,10 @@ def _parameter_space_report(tgn, decoder, adapter, stream, batch_size,
         "group_scores": [float(g["score"]) if g.get("score") is not None
                          else None for g in result["groups"]],
         "common_probe": _common_probe_report(last, params),
-        "heldout_virtual_step": _heldout_virtual_step(
-            result, tgn, adapter, stream, batch_size, n_neighbors,
-            trace_roots, seed, builder, fixed_maps, eps, params),
+        "multi_window_virtual_steps": _multi_window_virtual_steps(
+            result, tgn, decoder, adapter, stream, batch_size, n_neighbors,
+            trace_roots, group_batches, seed, builder, fixed_maps, eps,
+            params),
     }
     # Ridge-after-condition diagnostics from the last group's score diag.
     diag = last.get("diag") or {}

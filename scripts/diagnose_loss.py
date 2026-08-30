@@ -1006,7 +1006,7 @@ def _exact_stability_sweep(tgn, decoder, adapter, stream, batch_size,
 def _label_residual_values(rows, pi):
     """Class-balanced residual y_tilde = (y - pi) / sqrt(pi (1 - pi))."""
     scale = math.sqrt(pi * (1.0 - pi)) if 0.0 < pi < 1.0 else 1.0
-    return [(1.0 if row.outcome > 0.5 else 0.0 - pi) / scale
+    return [((1.0 if row.outcome > 0.5 else 0.0) - pi) / scale
             for row in rows]
 
 

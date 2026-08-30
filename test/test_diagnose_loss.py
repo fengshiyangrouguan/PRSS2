@@ -1,0 +1,161 @@
+"""Unit tests for the diagnose_loss.py pure logic (P1 audit).
+
+The full audit needs a GPU checkpoint; these lock the arithmetic and the
+group-bookkeeping pieces that previously crashed on the cloud
+(None-grad params, mixed-dim tensor concatenation, no-aligned-cuts
+comparisons).  Pure torch/numpy: runs on the local box.
+"""
+
+import unittest
+from types import SimpleNamespace
+
+import numpy as np
+import torch
+
+import scripts.diagnose_loss as dl
+
+
+def _fake_rows(n=12, seed=0):
+    g = torch.Generator().manual_seed(seed)
+    rows = []
+    for i in range(n):
+        rows.append(SimpleNamespace(
+            horizon=1 + (i % 2),
+            outcome=float(i % 5 == 0),
+            context={"role": i % 2, "delta_t": float(i), "counterpart": i,
+                     "query_type": 0, "path": []},
+            weight=0.5 if i % 3 else 1.0,
+            cut_id=("t", i, "layer1"),
+            tree_id=i // 2,
+            tau="layer1"))
+    return rows
+
+
+class TestGradientVec(unittest.TestCase):
+    def test_param_grad_vec_handles_none_grads(self):
+        a = torch.nn.Parameter(torch.randn(3, 4))
+        b = torch.nn.Parameter(torch.randn(2))
+        a.grad = torch.randn(3, 4)
+        b.grad = None
+        vec = dl._param_grad_vec([a, b])
+        self.assertEqual(vec.numel(), 3 * 4 + 2)
+        # a-part equals its gradient, b-part is zeros.
+        self.assertTrue(torch.allclose(
+            vec[:12].reshape(3, 4), a.grad.detach().double()))
+        self.assertTrue(torch.all(vec[12:] == 0.0))
+
+    def test_param_grad_vec_divides(self):
+        a = torch.nn.Parameter(torch.ones(4))
+        a.grad = torch.full((4,), 2.0)
+        vec = dl._param_grad_vec([a], divide_by=2.0)
+        self.assertTrue(torch.all(vec == 1.0))
+
+
+class TestCosAndComparisons(unittest.TestCase):
+    def test_cos_basic(self):
+        u = torch.tensor([1.0, 0.0])
+        v = torch.tensor([0.0, 1.0])
+        self.assertAlmostEqual(dl._cos(u, v), 0.0, places=6)
+        self.assertAlmostEqual(dl._cos(u, u), 1.0, places=6)
+        self.assertAlmostEqual(dl._cos(u, -u), -1.0, places=6)
+
+    def test_gradient_comparison_identical(self):
+        g = {"a": torch.randn(5)}
+        cmp = dl._gradient_comparison(g, g)
+        self.assertAlmostEqual(cmp["cosine"], 1.0, places=6)
+        self.assertAlmostEqual(cmp["norm_ratio"], 1.0, places=6)
+        self.assertAlmostEqual(cmp["relative_error"], 0.0, places=6)
+
+    def test_gradient_comparison_no_aligned_cuts(self):
+        cmp = dl._gradient_comparison({"a": torch.randn(3)},
+                                      {"b": torch.randn(3)})
+        self.assertEqual(cmp, {"failed": "no_aligned_cuts"})
+
+    def test_flatten_aligned_intersection(self):
+        left = {"a": torch.randn(3), "b": torch.randn(2)}
+        right = {"b": torch.randn(2), "c": torch.randn(4)}
+        lf, rf = dl._flatten_aligned(left, right)
+        self.assertEqual(lf.numel(), 2)
+        self.assertTrue(torch.allclose(lf, left["b"].double()))
+
+    def test_merge_cut_gradients_sums(self):
+        merged = dl._merge_cut_gradients(
+            [torch.tensor([1.0, 2.0]), torch.tensor([3.0, 4.0])],
+            ["a", "a"])
+        self.assertTrue(torch.allclose(merged["a"],
+                                       torch.tensor([4.0, 6.0])))
+
+
+class TestPairwiseSeries(unittest.TestCase):
+    def _pairs(self):
+        u = torch.tensor([1.0, 0.0])
+        v = torch.tensor([0.0, 1.0])
+        return [(u, v), (u, u), (v, v)]
+
+    def test_adjacent_cosines(self):
+        exact, lagged = dl._adjacent_cosines(self._pairs())
+        # exacts = u, u, v -> adjacent cos = 1, 0
+        self.assertEqual([round(x, 2) for x in exact], [1.0, 0.0])
+        # lagged vs exact at same index: (v,u)=0, (u,u)=1, (v,v)=1
+        self.assertEqual([round(x, 2) for x in lagged], [0.0, 1.0, 1.0])
+
+    def test_pairwise_report_structure(self):
+        groups = [
+            {"exact_vec": torch.tensor([1.0, 0.0]),
+             "lagged_vec": torch.tensor([0.0, 1.0]),
+             "task_vec": torch.tensor([1.0, 0.0])},
+            {"exact_vec": torch.tensor([1.0, 0.0]),
+             "lagged_vec": torch.tensor([1.0, 0.0]),
+             "task_vec": torch.tensor([0.0, 1.0])},
+        ]
+        rep = dl._pairwise_report({"groups": groups})
+        for key in ("exact_exact", "task_task", "task_exact",
+                    "task_lagged", "lagged_exact"):
+            self.assertIn(key, rep)
+        self.assertAlmostEqual(rep["exact_exact"][0], 1.0)
+        self.assertAlmostEqual(rep["task_task"][0], 0.0)
+        self.assertAlmostEqual(rep["lagged_exact"][0], 0.0)
+        self.assertAlmostEqual(rep["lagged_exact"][1], 1.0)
+
+
+class TestResiduals(unittest.TestCase):
+    def test_label_residual_balanced_pi_half(self):
+        rows = [SimpleNamespace(outcome=1.0), SimpleNamespace(outcome=0.0)]
+        vals = dl._label_residual_values(rows, pi=0.5)
+        self.assertAlmostEqual(vals[0], 1.0, places=6)
+        self.assertAlmostEqual(vals[1], -1.0, places=6)
+
+    def test_label_residual_balanced_pi_quarter(self):
+        rows = [SimpleNamespace(outcome=1.0), SimpleNamespace(outcome=0.0)]
+        vals = dl._label_residual_values(rows, pi=0.25)
+        # y=1 -> (1-0.25)/sqrt(0.25*0.75) = 0.75/sqrt(0.1875) = sqrt(3)
+        self.assertAlmostEqual(vals[0], 3.0 ** 0.5, places=6)
+        # y=0 -> -0.25/sqrt(0.1875) = -1/sqrt(3)
+        self.assertAlmostEqual(vals[1], -(3.0 ** -0.5), places=6)
+
+    def test_stratified_outcome_permutation_stays_in_strata(self):
+        rows = _fake_rows(24, seed=7)
+        rng = np.random.RandomState(0)
+        for _ in range(5):
+            shuffled = dl._stratified_outcome_permutation(rows, rng)
+            for r, y in zip(rows, shuffled):
+                self.assertEqual(int(r.horizon), int(1 + (rows.index(r) % 2)))
+            # Each (horizon, role) stratum is a permutation of itself.
+            by_stratum = {}
+            for r, y in zip(rows, shuffled):
+                key = (int(r.horizon), int(r.context["role"]))
+                by_stratum.setdefault(key, ([], []))
+                by_stratum[key][0].append(r.outcome)
+                by_stratum[key][1].append(y)
+            for (orig, perm) in by_stratum.values():
+                self.assertEqual(sorted(orig), sorted(perm))
+
+
+class TestCommonProbe(unittest.TestCase):
+    def test_common_probe_fails_cleanly_without_reference(self):
+        out = dl._common_probe_report({}, [])
+        self.assertEqual(out, {"failed": "no_current_reference"})
+
+
+if __name__ == "__main__":
+    unittest.main()

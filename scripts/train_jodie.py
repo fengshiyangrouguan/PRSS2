@@ -438,7 +438,9 @@ def main():
     patience = args.patience if not args.no_early_stop else 10 ** 9
     for epoch in range(start_epoch, args.n_epoch):
         t0 = time.time()
-        train_row = loop.train_epoch(epoch, global_step, train)
+        train_row = loop.train_epoch(
+            epoch, global_step, train,
+            max_batches=args.max_batches if args.max_batches > 0 else None)
         global_step = train_row["global_step"]
 
         val_row = loop.evaluate_split(val, reset=False)

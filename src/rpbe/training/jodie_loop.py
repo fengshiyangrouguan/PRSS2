@@ -349,13 +349,18 @@ class JodieNodeClassificationLoop:
             for name, buf in module.named_buffers():
                 buf.copy_(state["buffers"]["{}.{}".format(mname, name)])
 
-    def _batch_surrogate_exact(self, cuts, replay_plan, group_k):
+    def _batch_surrogate_exact(self, cuts, replay_plan, group_k,
+                               batch_offset):
         """Pass-2 surrogate: numerically zero, gradient = exact J.
 
-        Matches each traced z to its replay gradient by (tau,
-        occurrence_id); ``S = sum_tau c_tau sum_v <sg(g), z> - sg(<g,z>)``
-        and the auxiliary is ``-lambda * K * S`` (K cancels the common
-        repr grad /= K at group close).  Returns (auxiliary, n_terms).
+        Matches THIS batch's traced z to its replay gradients by (tau,
+        occurrence_id); ``by_batch[batch_offset]`` is the plan slice for
+        the current batch of the group (pass-1 and pass-2 share RNG and
+        the occurrence counter, so ids agree exactly).
+        ``S = sum_tau c_tau sum_v <sg(g), z> - sg(<g,z>)`` and the
+        auxiliary is ``-lambda * K * S`` (K cancels the common repr
+        grad /= K at group close).  Returns (auxiliary, n_terms,
+        (n_planned, n_matched)).
         """
         z_by_oid = {}
         for cut in cuts:
@@ -364,17 +369,18 @@ class JodieNodeClassificationLoop:
         n_terms = 0
         n_planned = 0
         for tau, plan in replay_plan.items():
-            by_batch = plan.get("by_batch") or [[]]
-            for entries in by_batch:
-                for oid, g in entries:
-                    n_planned += 1
-                    z = z_by_oid.get((tau, oid))
-                    if z is None:
-                        continue
-                    gd = g.detach()
-                    terms.append(self._tau_coeff[tau] * (
-                        (gd * z).sum() - (gd * z.detach()).sum()))
-                    n_terms += 1
+            by_batch = plan.get("by_batch") or []
+            if batch_offset >= len(by_batch):
+                continue
+            for oid, g in by_batch[batch_offset]:
+                n_planned += 1
+                z = z_by_oid.get((tau, oid))
+                if z is None:
+                    continue
+                gd = g.detach()
+                terms.append(self._tau_coeff[tau] * (
+                    (gd * z).sum() - (gd * z.detach()).sum()))
+                n_terms += 1
         if not terms:
             return torch.zeros((), device=self.device), 0, (n_planned, 0)
         auxiliary = -self.lambda_kf * float(group_k) * sum(terms)
@@ -503,7 +509,7 @@ class JodieNodeClassificationLoop:
                     (auxiliary, n_terms,
                      (aligned_planned, aligned_matched)) = \
                         self._batch_surrogate_exact(
-                            cuts, replay_plan, group_k)
+                            cuts, replay_plan, group_k, b - group_start)
                     if n_terms:
                         aux_batches += 1
                 loss = task_loss + auxiliary

@@ -38,7 +38,7 @@ class TestExactReplaySurrogate(unittest.TestCase):
         g = torch.randn(4)
         plan = {"t": {"by_batch": [[(7, g)]]}}
         auxiliary, n_terms, align = loop._batch_surrogate_exact(
-            [_Cut(z)], plan, group_k=5)
+            [_Cut(z)], plan, group_k=5, batch_offset=0)
         self.assertEqual(n_terms, 1)
         self.assertEqual(align, (1, 1))
         self.assertAlmostEqual(float(auxiliary.detach()), 0.0, places=6)
@@ -51,7 +51,7 @@ class TestExactReplaySurrogate(unittest.TestCase):
         z = torch.randn(4, requires_grad=True)
         plan = {"t": {"by_batch": [[(99, torch.randn(4))]]}}
         auxiliary, n_terms, align = loop._batch_surrogate_exact(
-            [_Cut(z)], plan, group_k=5)
+            [_Cut(z)], plan, group_k=5, batch_offset=0)
         self.assertEqual(n_terms, 0)
         self.assertEqual(align, (1, 0))  # planned but not matched
         self.assertEqual(float(auxiliary.detach()), 0.0)
@@ -63,7 +63,7 @@ class TestExactReplaySurrogate(unittest.TestCase):
         plan = {"t": {"by_batch": [[(7, torch.randn(4))]]},
                 "u": {"by_batch": [[(8, torch.randn(4))]]}}
         auxiliary, n_terms, align = loop._batch_surrogate_exact(
-            [_Cut(z)], plan, group_k=5)
+            [_Cut(z)], plan, group_k=5, batch_offset=0)
         self.assertEqual(n_terms, 1)  # occurrence 8 not present
         self.assertEqual(align, (2, 1))
         self.assertAlmostEqual(float(auxiliary.detach()), 0.0, places=6)

@@ -614,12 +614,14 @@ def _parameter_gradient_pass(tgn, decoder, adapter, stream, batch_size,
                     "batch_start": batch_index}
             if batch_index % group_batches == 0 and not is_heldout:
                 # Each statistical group snapshots its memory so the
-                # multi-window virtual steps can replay it.
+                # multi-window virtual steps can replay it.  Stored in
+                # current_record and merged into the group record at the
+                # group close (NOT appended separately — the pairwise
+                # report would see a record without gradient vectors).
                 current_record = {"memory": (
                     tgn.memory.backup_memory() if tgn.use_memory
                     else None),
                     "batch_start": batch_index}
-                groups.append(current_record)
             roots = select_trace_rows(
                 np.zeros(stop - start), trace_roots, seed, batch_index,
                 "evenly_spaced")

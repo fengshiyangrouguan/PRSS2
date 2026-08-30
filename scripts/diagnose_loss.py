@@ -549,24 +549,37 @@ def _lag_audit(groups, fixed_maps, eps):
     return report
 
 
-def _parameter_gradient_pass(tgn, adapter, stream, batch_size, n_neighbors,
-                             trace_roots, group_batches, max_groups, seed,
-                             builder, fixed_maps, eps, params, prefix=None):
-    """Chronological pass WITH grad: per-group exact J backprop to ``params``.
+def _param_grad_vec(params, divide_by=1.0):
+    parts = []
+    for p_ in params:
+        g = p_.grad
+        parts.append((torch.zeros_like(p_) if g is None else g)
+                     .detach().double().reshape(-1) / divide_by)
+    return torch.cat(parts)
 
-    The z-space comparison cannot measure exact-exact stability because
-    adjacent groups share no cut identity (cut ids are globally unique);
-    the model PARAMETERS are the only shared coordinate system.  This
-    replays the stream once with gradient enabled, builds the exact
-    window score J(M_w) from each group's graph-connected cuts, and
-    records the parameter gradient vector per group.  Host parameters
-    keep requires_grad=False (frozen checkpoint), so the backward
-    traverses them but only compressor gradients are recorded.
 
-    Returns ``[vec or None per group]``.
+def _parameter_gradient_pass(tgn, decoder, adapter, stream, batch_size,
+                             n_neighbors, trace_roots, group_batches,
+                             max_groups, seed, builder, fixed_maps, eps,
+                             params, prefix=None, heldout_extra=True):
+    """Chronological pass WITH grad (review P1).
+
+    Per-group records, all in the compressor PARAMETER space (the only
+    shared coordinate system across windows):
+
+    * ``exact_vec``  — grad of this group's exact J(M_w);
+    * ``lagged_vec`` — the production one-group-lag surrogate (previous
+      group's adjoints on this group's z, group-K cancelled);
+    * ``task_vec``   — mean BCE gradient over the group's batches (the
+      ordinary-SGD noise baseline);
+    * ``reference``  — the group's adjoints/means (close_group semantics);
+    * the LAST statistical group keeps its z/p/w/cut_pool (graph
+      retained) for the common-probe and moment decomposition.
+
+    One extra group (``heldout_extra``) runs at the end with NO backward:
+    its z is detached and its memory state snapshotted so the held-out
+    virtual step can replay it after parameter perturbations.
     """
-    # Each sweep pass replays the stream from its beginning: reset the
-    # host memory first (and then warm it with the prefix, if any).
     if tgn.use_memory:
         tgn.memory.__init_memory__()
     if prefix is not None:
@@ -574,11 +587,16 @@ def _parameter_gradient_pass(tgn, adapter, stream, batch_size, n_neighbors,
                         trace_roots=0)
     for p in params:
         p.requires_grad_(True)
+    total_groups = max_groups + (1 if heldout_extra else 0)
     total_batches = min(math.ceil(len(stream.sources) / batch_size),
-                        group_batches * max_groups)
-    grads = []
+                        group_batches * total_groups)
+    groups = []
+    heldout = None
     z_pool, p_pool, w_pool, cut_pool = [], [], [], []
+    task_grads_b = []
     previous_reference = None
+    group_index = 0
+    device = next(iter(params)).device
     with torch.enable_grad():
         for batch_index in range(total_batches):
             start = batch_index * batch_size
@@ -588,27 +606,66 @@ def _parameter_gradient_pass(tgn, adapter, stream, batch_size, n_neighbors,
             destinations = stream.destinations[start:stop]
             timestamps = stream.timestamps[start:stop]
             edge_idxs = stream.edge_idxs[start:stop]
+            is_heldout = group_index >= max_groups
+            if is_heldout and heldout is None:
+                heldout = {"memory": (
+                    tgn.memory.backup_memory() if tgn.use_memory
+                    else None),
+                    "batch_start": batch_index}
             roots = select_trace_rows(
                 np.zeros(stop - start), trace_roots, seed, batch_index,
                 "evenly_spaced")
             adapter.set_trace_source_rows(roots)
-            tgn.compute_temporal_embeddings(
+            src_emb, _, _ = tgn.compute_temporal_embeddings(
                 sources, destinations, destinations, timestamps,
                 edge_idxs, n_neighbors)
             if adapter.trace is not None:
                 rows = builder.build(adapter.trace,
                                      batch_seed=batch_index)
                 for row in rows:
-                    z_pool.append(row.z)          # graph-connected
+                    if is_heldout:
+                        z_pool.append(row.z.detach())
+                    else:
+                        z_pool.append(row.z)      # graph-connected
                     p_pool.append(fixed_maps.pv(row.context, row.outcome))
                     w_pool.append(float(row.weight))
                     cut_pool.append(tuple(row.cut_id))
             adapter.clear_trace()
+            # Task gradient: mean BCE over the group, per-batch gradient
+            # collected with the graph retained for the later VJPs.
+            if not is_heldout and decoder is not None:
+                labels_t = torch.from_numpy(
+                    stream.labels[start:stop]).float().to(device)
+                pred = decoder(src_emb).sigmoid()
+                task_loss = torch.nn.functional.binary_cross_entropy(
+                    pred, labels_t)
+                for p_ in params:
+                    p_.grad = None
+                g_task = torch.autograd.grad(
+                    task_loss, params, retain_graph=True,
+                    allow_unused=True)
+                task_grads_b.append([
+                    torch.zeros_like(p_).double()
+                    if g is None else g.detach().double()
+                    for g, p_ in zip(g_task, params)])
             if tgn.use_memory:
                 tgn.memory.detach_memory()
             at_boundary = ((batch_index + 1) % group_batches == 0
                            or batch_index == total_batches - 1)
             if at_boundary:
+                if is_heldout:
+                    heldout["n_batches"] = batch_index \
+                        - heldout["batch_start"] + 1
+                    heldout["z"] = torch.stack(z_pool) if z_pool else None
+                    heldout["p"] = torch.stack(p_pool) if p_pool else None
+                    heldout["w"] = torch.tensor(
+                        w_pool, dtype=torch.float64,
+                        device=device) if w_pool else None
+                    heldout["cut_ids"] = list(cut_pool)
+                    break
+                record = {"index": group_index,
+                          "exact_vec": None, "lagged_vec": None,
+                          "task_vec": None, "reference": None}
                 if z_pool:
                     z = torch.stack(z_pool)
                     p = torch.stack(p_pool)
@@ -616,35 +673,26 @@ def _parameter_gradient_pass(tgn, adapter, stream, batch_size, n_neighbors,
                                      device=z.device)
                     score, diag = _weighted_score_tensor(
                         z, p, w, cut_pool, eps)
-                    exact_vec = None
-                    lagged_vec = None
+                    record["score"] = score.detach() \
+                        if score is not None else None
+                    record["diag"] = diag
+                    prev_ref = previous_reference
                     if score is not None and diag.get("failed") is None:
                         for p_ in params:
                             p_.grad = None
                         score.backward(retain_graph=True)
-                        exact_vec = torch.cat(
-                            [p_.grad.detach().double().reshape(-1)
-                             for p_ in params])
-                        # Production lagged gradient in the SAME parameter
-                        # space: the previous group's reference adjoints
-                        # applied to this group's z, with the group-K
-                        # cancellation the training loop performs.
-                        if previous_reference is not None:
+                        record["exact_vec"] = _param_grad_vec(params)
+                        if prev_ref is not None:
                             for p_ in params:
                                 p_.grad = None
                             lag_value = kf_vjp_batch(
                                 z, p, w,
-                                previous_reference["mu_z"],
-                                previous_reference["mu_p"],
-                                previous_reference["adjoints"]) \
+                                prev_ref["mu_z"],
+                                prev_ref["mu_p"],
+                                prev_ref["adjoints"]) \
                                 * float(group_batches)
-                            lag_value.backward()
-                            lagged_vec = torch.cat(
-                                [p_.grad.detach().double().reshape(-1)
-                                 for p_ in params])
-                    if score is not None and diag.get("failed") is None:
-                        # The reference for the NEXT group: built from THIS
-                        # group's moments (same as close_group does).
+                            lag_value.backward(retain_graph=True)
+                            record["lagged_vec"] = _param_grad_vec(params)
                         accumulator = WeightedWelford(
                             z.shape[1], p.shape[1])
                         accumulator.add(z.detach(), p.detach(),
@@ -655,14 +703,35 @@ def _parameter_gradient_pass(tgn, adapter, stream, batch_size, n_neighbors,
                         if adjoints is not None:
                             previous_reference = {
                                 "mu_z": res["mu_z"], "mu_p": res["mu_p"],
-                                "adjoints": adjoints}
-                    grads.append((exact_vec, lagged_vec))
-                else:
-                    grads.append((None, None))
+                                "adjoints": adjoints,
+                                "score": score.detach()}
+                        record["reference"] = previous_reference
+                    if task_grads_b:
+                        record["task_vec"] = sum(
+                            torch.cat(g) for g in task_grads_b) \
+                            / float(len(task_grads_b))
+                    # The last statistical group keeps its pools for the
+                    # common-probe / moment decomposition (graph still
+                    # alive thanks to retain_graph).
+                    if group_index == max_groups - 1:
+                        record["z_pool"] = z
+                        record["p_pool"] = p
+                        record["w_pool"] = w
+                        record["cut_pool"] = list(cut_pool)
+                        record["prev_reference"] = prev_ref
+                groups.append(record)
                 z_pool, p_pool, w_pool, cut_pool = [], [], [], []
+                task_grads_b = []
+                group_index += 1
     for p in params:
         p.requires_grad_(False)
-    return grads
+    return {"groups": groups, "heldout": heldout,
+            "n_batches": total_batches}
+
+
+def _cos(u, v):
+    denom = u.norm() * v.norm()
+    return float((u * v).sum() / denom.clamp(min=1e-30))
 
 
 def _adjacent_cosines(pairs):
@@ -681,52 +750,255 @@ def _adjacent_cosines(pairs):
         a = exacts[t]
         b = exacts[t + 1]
         if a is not None and b is not None:
-            denom = a.norm() * b.norm()
-            out_exact.append(
-                float((a * b).sum() / denom.clamp(min=1e-30)))
+            out_exact.append(_cos(a, b))
     for t in range(len(pairs)):
         a = exacts[t]
         b = lagged[t]
         if a is not None and b is not None:
-            denom = a.norm() * b.norm()
-            out_lagged.append(
-                float((a * b).sum() / denom.clamp(min=1e-30)))
+            out_lagged.append(_cos(a, b))
     return out_exact, out_lagged
 
 
-def _exact_stability_sweep(tgn, adapter, stream, batch_size, n_neighbors,
-                           trace_roots, window_sizes, max_groups, seed,
-                           builder, fixed_maps, eps, params, prefix=None):
+def _common_probe_report(last_record, params):
+    """A_{t-1} and A_t applied to the SAME current-window cuts.
+
+    Isolates the covariance-adjoint drift from sample-Jacobian drift:
+    a high cosine means the adjoints agree when facing identical data,
+    so window-to-window rotation comes from the samples; a low cosine
+    means the whitening adjoint itself drifts.
+    """
+    out = {"failed": None}
+    z = last_record.get("z_pool")
+    prev_ref = last_record.get("prev_reference")
+    cur_ref = last_record.get("reference")
+    if z is None or cur_ref is None:
+        out["failed"] = "no_current_reference"
+        return out
+    p = last_record["p_pool"]
+    w = last_record["w_pool"]
+
+    def vjp_grad(ref):
+        for p_ in params:
+            p_.grad = None
+        value = kf_vjp_batch(z, p, w, ref["mu_z"], ref["mu_p"],
+                             ref["adjoints"])
+        value.backward(retain_graph=True)
+        return _param_grad_vec(params)
+
+    combos = {}
+    labels = []
+    for mu_name, mu_ref in (("mu_prev", prev_ref), ("mu_cur", cur_ref)):
+        for a_name, a_ref in (("A_prev", prev_ref), ("A_cur", cur_ref)):
+            if mu_ref is None or a_ref is None:
+                continue
+            combos[mu_name + "_" + a_name] = vjp_grad(
+                {"mu_z": mu_ref["mu_z"], "mu_p": mu_ref["mu_p"],
+                 "adjoints": a_ref["adjoints"]})
+            labels.append((mu_name, a_name))
+    cosines = {}
+    keys = sorted(combos)
+    for i, ka in enumerate(keys):
+        for kb in keys[i + 1:]:
+            cosines[ka + "_vs_" + kb] = _cos(combos[ka], combos[kb])
+    out["pairwise_cosines"] = cosines
+    out["exact_vec_norm"] = float(
+        last_record["exact_vec"].norm()) if last_record.get(
+            "exact_vec") is not None else None
+    return out
+
+
+def _forward_heldout_j(tgn, adapter, stream, batch_start, group_batches,
+                       batch_size, n_neighbors, trace_roots, seed,
+                       builder, fixed_maps, eps):
+    """No-grad replay of the held-out group from its batch start."""
+    z_pool, p_pool, w_pool, cut_pool = [], [], [], []
+    total = math.ceil(len(stream.sources) / batch_size)
+    with torch.no_grad():
+        for batch_index in range(batch_start,
+                                 min(total, batch_start + group_batches)):
+            start = batch_index * batch_size
+            stop = min(len(stream.sources), (batch_index + 1) * batch_size)
+            roots = select_trace_rows(
+                np.zeros(stop - start), trace_roots, seed, batch_index,
+                "evenly_spaced")
+            adapter.set_trace_source_rows(roots)
+            tgn.compute_temporal_embeddings(
+                stream.sources[start:stop], stream.destinations[start:stop],
+                stream.destinations[start:stop], stream.timestamps[start:stop],
+                stream.edge_idxs[start:stop], n_neighbors)
+            if adapter.trace is not None:
+                rows = builder.build(adapter.trace,
+                                     batch_seed=batch_index)
+                for row in rows:
+                    z_pool.append(row.z.detach())
+                    p_pool.append(fixed_maps.pv(row.context, row.outcome))
+                    w_pool.append(float(row.weight))
+                    cut_pool.append(tuple(row.cut_id))
+            adapter.clear_trace()
+    if not z_pool:
+        return None, {"failed": "no_heldout_rows"}
+    z = torch.stack(z_pool)
+    p = torch.stack(p_pool)
+    w = torch.tensor(w_pool, dtype=torch.float64, device=z.device)
+    score, diag = _weighted_score_tensor(z, p, w, cut_pool, eps)
+    return (float(score.detach()) if score is not None else None), diag
+
+
+def _heldout_virtual_step(pass_result, tgn, adapter, stream, batch_size,
+                          n_neighbors, trace_roots, seed, builder,
+                          fixed_maps, eps, params):
+    """The decisive check: does a small step along exact/lagged IMPROVE
+    the exact J on an independent FUTURE window that never contributed
+    to the gradient?  (review: '某个方向是否能在没参与算梯度的未来窗口
+    上改善目标' — cosine alone cannot answer this.)"""
+    held = pass_result.get("heldout")
+    groups = pass_result.get("groups") or []
+    if not held or held.get("z") is None or not groups:
+        return {"failed": "no_heldout_group"}
+    j_before, _ = _weighted_score_tensor(
+        held["z"], held["p"], held["w"], held["cut_ids"], eps)
+    j_before = float(j_before.detach()) if j_before is not None else None
+    if j_before is None:
+        return {"failed": "heldout_score_failed"}
+    last = groups[-1]
+    total_norm = float(sum(p_.norm() ** 2 for p_ in params)) ** 0.5
+    out = {}
+    for name in ("exact", "lagged"):
+        vec = last.get(name + "_vec")
+        if vec is None:
+            out[name] = None
+            continue
+        step_size = 0.01 * total_norm  # 1% of the parameter norm
+        unit = vec / vec.norm().clamp(min=1e-30)
+        with torch.no_grad():
+            offset = 0
+            for p_ in params:
+                n = p_.numel()
+                p_.add_(unit[offset:offset + n].reshape(p_.shape).float()
+                        * step_size)
+                offset += n
+        if tgn.use_memory and held.get("memory") is not None:
+            tgn.memory.restore_memory(held["memory"])
+        j_after, diag = _forward_heldout_j(
+            tgn, adapter, stream, held["batch_start"],
+            int(held.get("n_batches", 1)), batch_size, n_neighbors,
+            trace_roots, seed, builder, fixed_maps, eps)
+        with torch.no_grad():
+            offset = 0
+            for p_ in params:
+                n = p_.numel()
+                p_.sub_(unit[offset:offset + n].reshape(p_.shape).float()
+                        * step_size)
+                offset += n
+        out[name] = {"J_before": j_before,
+                     "J_after": j_after,
+                     "delta": (j_after - j_before)
+                     if j_after is not None else None}
+    return out
+
+
+def _pairwise_report(pass_result):
+    """Five cosine series (review P1): exact-exact, task-task,
+    task-exact, task-lagged, lagged-exact — with the task-task series as
+    the ordinary-SGD noise baseline instead of an arbitrary 0.9 gate."""
+    groups = pass_result["groups"]
+    exacts = [g.get("exact_vec") for g in groups]
+    lagged = [g.get("lagged_vec") for g in groups]
+    tasks = [g.get("task_vec") for g in groups]
+
+    def series(vecs, shift, base=None):
+        out = []
+        for t in range(len(groups) - shift):
+            a = vecs[t]
+            b = (base[t + shift] if base is not None
+                 else vecs[t + shift])
+            if a is not None and b is not None:
+                out.append(_cos(a, b))
+        return out
+
+    return {
+        "exact_exact": series(exacts, 1),
+        "task_task": series(tasks, 1),
+        "task_exact": [ _cos(a, b) for a, b in zip(tasks, exacts)
+                        if a is not None and b is not None],
+        "task_lagged": [_cos(a, b) for a, b in zip(tasks, lagged)
+                        if a is not None and b is not None],
+        "lagged_exact": [_cos(a, b) for a, b in zip(lagged, exacts)
+                         if a is not None and b is not None],
+    }
+
+
+def _parameter_space_report(tgn, decoder, adapter, stream, batch_size,
+                            n_neighbors, trace_roots, group_batches,
+                            max_groups, seed, builder, fixed_maps, eps,
+                            params, prefix=None):
+    """Review P1 full report on one frozen checkpoint: five cosine
+    series, common-probe, moment decomposition and the held-out virtual
+    step (the decisive check — does a small step along exact/lagged
+    improve the exact J on an INDEPENDENT future window?)."""
+    result = _parameter_gradient_pass(
+        tgn, decoder, adapter, stream, batch_size, n_neighbors,
+        trace_roots, group_batches, max_groups, seed, builder, fixed_maps,
+        eps, params, prefix=prefix, heldout_extra=True)
+    report = {
+        "n_groups": len(result["groups"]),
+        "n_batches": result["n_batches"],
+        "pairwise": _pairwise_report(result),
+        "group_scores": [float(g["score"]) if g.get("score") is not None
+                         else None for g in result["groups"]],
+        "heldout_virtual_step": _heldout_virtual_step(
+            result, tgn, adapter, stream, batch_size, n_neighbors,
+            trace_roots, seed, builder, fixed_maps, eps, params),
+    }
+    last = result["groups"][-1] if result["groups"] else {}
+    report["common_probe"] = _common_probe_report(last, params)
+    # Ridge-after-condition diagnostics from the last group's score diag.
+    diag = last.get("diag") or {}
+    report["condition"] = {
+        "zz_min_eig": diag.get("zz_min_eig"),
+        "zz_max_eig": diag.get("zz_max_eig"),
+        "zz_cond": diag.get("zz_cond"),
+        "zz_r_eff": diag.get("zz_r_eff"),
+        "pp_r_eff": diag.get("pp_r_eff"),
+        "ridge_eps": eps,
+        "zz_cond_after_ridge": (
+            (diag["zz_max_eig"] + eps) / (diag["zz_min_eig"] + eps)
+            if diag.get("zz_max_eig") is not None
+            and diag.get("zz_min_eig") is not None else None),
+    }
+    return report
+
+
+def _exact_stability_sweep(tgn, decoder, adapter, stream, batch_size,
+                           n_neighbors, trace_roots, window_sizes,
+                           max_groups, seed, builder, fixed_maps, eps,
+                           params, prefix=None):
     """Parameter-space gradient comparisons for several window sizes.
 
     ``exact_exact`` — adjacent windows' EXACT gradients: if these are
     also near-orthogonal, the window CCA objective itself is noisy and a
     two-pass replay would only chase random directions (then fix window
     size / measurement dims first).  ``lagged_exact`` — the production
-    lagged gradient (previous window's adjoints, group-K cancelled)
-    against the current window's exact gradient: the direction error of
-    the lag mechanism itself.
+    lagged gradient against the current window's exact gradient.  The
+    task-task series is the ordinary-SGD noise baseline.
     """
     out = {}
     for window in window_sizes:
-        pairs = _parameter_gradient_pass(
-            tgn, adapter, stream, batch_size, n_neighbors, trace_roots,
-            window, max_groups, seed, builder, fixed_maps, eps, params,
-            prefix=prefix)
-        cos_exact, cos_lagged = _adjacent_cosines(pairs)
-        out[str(window)] = {
-            "n_groups": len(pairs),
-            "exact_exact_cosine_mean": float(np.mean(cos_exact))
-            if cos_exact else None,
-            "exact_exact_cosine_min": float(np.min(cos_exact))
-            if cos_exact else None,
-            "exact_exact_cosine_list": cos_exact,
-            "lagged_exact_cosine_mean": float(np.mean(cos_lagged))
-            if cos_lagged else None,
-            "lagged_exact_cosine_min": float(np.min(cos_lagged))
-            if cos_lagged else None,
-            "lagged_exact_cosine_list": cos_lagged,
-        }
+        result = _parameter_gradient_pass(
+            tgn, decoder, adapter, stream, batch_size, n_neighbors,
+            trace_roots, window, max_groups, seed, builder, fixed_maps,
+            eps, params, prefix=prefix, heldout_extra=False)
+        series = _pairwise_report(result)
+        entry = {"n_groups": len(result["groups"])}
+        for name in ("exact_exact", "task_task", "task_exact",
+                     "task_lagged", "lagged_exact"):
+            vals = series[name]
+            entry[name + "_cosine_mean"] = float(np.mean(vals)) \
+                if vals else None
+            entry[name + "_cosine_min"] = float(np.min(vals)) \
+                if vals else None
+            entry[name + "_cosine_list"] = [float(v) for v in vals]
+        out[str(window)] = entry
     return out
 
 
@@ -905,10 +1177,15 @@ def main():
                 dataset.train.labels > 0.5))),
         "lagged_gradient": _lag_audit(
             groups, fixed_maps, rpbe_cfg.ridge_eps),
+        "parameter_space": _parameter_space_report(
+            tgn, components["decoder"], adapter, stream, batch_size,
+            n_neighbors, trace_roots, group_batches, args.groups,
+            args.seed, builder, fixed_maps, rpbe_cfg.ridge_eps,
+            list(components["compressor"].parameters()), prefix=prefix),
         "exact_stability_sweep": _exact_stability_sweep(
-            tgn, adapter, stream, batch_size, n_neighbors, trace_roots,
-            sweep_sizes, args.groups, args.seed, builder, fixed_maps,
-            rpbe_cfg.ridge_eps,
+            tgn, components["decoder"], adapter, stream, batch_size,
+            n_neighbors, trace_roots, sweep_sizes, args.groups,
+            args.seed, builder, fixed_maps, rpbe_cfg.ridge_eps,
             list(components["compressor"].parameters()),
             prefix=prefix),
         "interpretation_contract": {

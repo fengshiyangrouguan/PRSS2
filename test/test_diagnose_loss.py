@@ -291,7 +291,7 @@ class TestZeroReplayCheck(unittest.TestCase):
         for key in ("J", "J_outcome_contrast", "task_nll"):
             self.assertTrue(per[key]["available"])
             self.assertTrue(per[key]["identical"])
-            self.assertLessEqual(per[key]["abs_diff"], 1e-12)
+            self.assertLessEqual(per[key]["abs_diff"], 1e-6)
 
     def test_mismatch_fails_with_diff(self):
         a = self._metrics(4.5, 2.0, 0.1)
@@ -299,7 +299,7 @@ class TestZeroReplayCheck(unittest.TestCase):
         per, ok = dl._zero_replay_check(a, b)
         self.assertFalse(ok)
         self.assertFalse(per["task_nll"]["identical"])
-        self.assertGreater(per["task_nll"]["abs_diff"], 1e-12)
+        self.assertGreater(per["task_nll"]["abs_diff"], 1e-6)
 
     def test_none_is_not_consistency(self):
         a = self._metrics(4.5, None, 0.1)
@@ -310,11 +310,13 @@ class TestZeroReplayCheck(unittest.TestCase):
         self.assertFalse(per["J_outcome_contrast"]["identical"])
 
     def test_tolerance_boundary(self):
+        # float32-scale tolerance: last-bit CUDA noise (~1e-8) passes,
+        # a genuine state-restore failure (~1e-3) fails.
         a = self._metrics(4.5, 2.0, 0.1)
-        b = self._metrics(4.5 + 1e-13, 2.0, 0.1)
+        b = self._metrics(4.5 + 1e-8, 2.0, 0.1)
         per, ok = dl._zero_replay_check(a, b)
-        self.assertTrue(ok)  # within tol
-        b2 = self._metrics(4.5 + 1e-9, 2.0, 0.1)
+        self.assertTrue(ok)  # within float32 tol
+        b2 = self._metrics(4.5 + 1e-3, 2.0, 0.1)
         per2, ok2 = dl._zero_replay_check(a, b2)
         self.assertFalse(ok2)
 

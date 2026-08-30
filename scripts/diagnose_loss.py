@@ -799,54 +799,65 @@ def _common_probe_report(last_record, params):
         value.backward(retain_graph=True)
         return _param_grad_vec(params)
 
-    combos = {}
-    labels = []
-    for mu_name, mu_ref in (("mu_prev", prev_ref), ("mu_cur", cur_ref)):
-        for a_name, a_ref in (("A_prev", prev_ref), ("A_cur", cur_ref)):
-            if mu_ref is None or a_ref is None:
-                continue
-            combos[mu_name + "_" + a_name] = vjp_grad(
-                {"mu_z": mu_ref["mu_z"], "mu_p": mu_ref["mu_p"],
-                 "adjoints": a_ref["adjoints"]})
-            labels.append((mu_name, a_name))
-    cosines = {}
-    keys = sorted(combos)
-    for i, ka in enumerate(keys):
-        for kb in keys[i + 1:]:
-            cosines[ka + "_vs_" + kb] = _cos(combos[ka], combos[kb])
-    out["pairwise_cosines"] = cosines
-    out["exact_vec_norm"] = float(
-        last_record["exact_vec"].norm()) if last_record.get(
-            "exact_vec") is not None else None
-    # Review: the all-zero cosines were not believable until the probe
-    # gradients are shown to be nonzero and repeatable.
-    out["grad_norms"] = {k: float(v.norm()) for k, v in combos.items()}
-    out["nonzero_counts"] = {
-        k: int((v.abs() > 1e-12).sum()) for k, v in combos.items()}
-    intersections = {}
-    for i, ka in enumerate(keys):
-        for kb in keys[i + 1:]:
-            nz_a = combos[ka].abs() > 1e-12
-            nz_b = combos[kb].abs() > 1e-12
-            intersections[ka + "_vs_" + kb] = int(
-                (nz_a & nz_b).sum())
-    out["nonzero_intersections"] = intersections
-    # Repeatability: the same (mu, A) recomputed twice must have
-    # cosine ~ 1 AND matching norms — a low value here means the 0.0
-    # cross-cosines are a numerical artifact, not a signal.
-    if cur_ref is not None:
-        repeat = vjp_grad({"mu_z": cur_ref["mu_z"],
-                           "mu_p": cur_ref["mu_p"],
-                           "adjoints": cur_ref["adjoints"]})
-        first = combos["mu_cur_A_cur"]
-        out["repeat_consistency"] = {
-            "cosine": _cos(first, repeat),
-            "norm_ratio": float(repeat.norm()
-                                / first.norm().clamp(min=1e-30)),
-            "relative_error": float(
-                (repeat - first).norm()
-                / first.norm().clamp(min=1e-30)),
-        }
+    # The pass ends with requires_grad_(False); the probe MUST re-enable
+    # it or every VJP comes back as the zero vector (the historical
+    # all-0.0 cosines were exactly this artifact).
+    for p_ in params:
+        p_.requires_grad_(True)
+    try:
+        combos = {}
+        labels = []
+        for mu_name, mu_ref in (("mu_prev", prev_ref),
+                                ("mu_cur", cur_ref)):
+            for a_name, a_ref in (("A_prev", prev_ref),
+                                  ("A_cur", cur_ref)):
+                if mu_ref is None or a_ref is None:
+                    continue
+                combos[mu_name + "_" + a_name] = vjp_grad(
+                    {"mu_z": mu_ref["mu_z"], "mu_p": mu_ref["mu_p"],
+                     "adjoints": a_ref["adjoints"]})
+                labels.append((mu_name, a_name))
+        cosines = {}
+        keys = sorted(combos)
+        for i, ka in enumerate(keys):
+            for kb in keys[i + 1:]:
+                cosines[ka + "_vs_" + kb] = _cos(combos[ka], combos[kb])
+        out["pairwise_cosines"] = cosines
+        out["exact_vec_norm"] = float(
+            last_record["exact_vec"].norm()) if last_record.get(
+                "exact_vec") is not None else None
+        # Review: the all-zero cosines were not believable until the
+        # probe gradients are shown to be nonzero and repeatable.
+        out["grad_norms"] = {k: float(v.norm()) for k, v in combos.items()}
+        out["nonzero_counts"] = {
+            k: int((v.abs() > 1e-12).sum()) for k, v in combos.items()}
+        intersections = {}
+        for i, ka in enumerate(keys):
+            for kb in keys[i + 1:]:
+                nz_a = combos[ka].abs() > 1e-12
+                nz_b = combos[kb].abs() > 1e-12
+                intersections[ka + "_vs_" + kb] = int(
+                    (nz_a & nz_b).sum())
+        out["nonzero_intersections"] = intersections
+        # Repeatability: the same (mu, A) recomputed twice must have
+        # cosine ~ 1 AND matching norms — a low value here means the
+        # cross-cosines are a numerical artifact, not a signal.
+        if cur_ref is not None:
+            repeat = vjp_grad({"mu_z": cur_ref["mu_z"],
+                               "mu_p": cur_ref["mu_p"],
+                               "adjoints": cur_ref["adjoints"]})
+            first = combos["mu_cur_A_cur"]
+            out["repeat_consistency"] = {
+                "cosine": _cos(first, repeat),
+                "norm_ratio": float(repeat.norm()
+                                    / first.norm().clamp(min=1e-30)),
+                "relative_error": float(
+                    (repeat - first).norm()
+                    / first.norm().clamp(min=1e-30)),
+            }
+    finally:
+        for p_ in params:
+            p_.requires_grad_(False)
     return out
 
 
@@ -1085,7 +1096,7 @@ def _multi_window_virtual_steps(result, tgn, decoder, adapter, stream,
     return out
 
 
-def _zero_replay_check(before, zero_baseline, tol=1e-12):
+def _zero_replay_check(before, zero_baseline, tol=1e-6):
     """Two unperturbed replays from the same saved state must agree.
 
     Returns ``(per_metric, all_consistent)``: each metric reports
@@ -1094,6 +1105,11 @@ def _zero_replay_check(before, zero_baseline, tol=1e-12):
     ``all_consistent`` is False when any metric is missing or differs;
     the caller then SKIPS the pair (no +-eps data is collected from an
     unreproducible replay).
+
+    The tolerance is float32-scale: the z rows are float32 forward
+    outputs, and CUDA kernel scheduling makes bit-exact replay
+    unrealistic (observed ~1e-8 J differences); 1e-6 catches genuine
+    state-restore failures without flagging last-bit noise.
     """
     out = {}
     all_consistent = True

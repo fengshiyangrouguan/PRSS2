@@ -145,16 +145,26 @@ class FixedMaps(nn.Module):
         * ``context_common`` — only ``a = (phi_Y(0)+phi_Y(1))/2``, the part
           that does not depend on the outcome at all;
         * ``outcome_contrast`` — only ``b_y = phi_Y(y) - a``, the part that
-          carries the outcome signal.
+          carries the outcome signal;
+        * ``residual`` — the outcome is a CONTINUOUS scalar y_tilde (e.g.
+          the class-balanced residual (y-pi)/sqrt(pi(1-pi)) or the context
+          conditional residual y - p_hat(y|C)); the signature is linearly
+          extended: phi_Y(y_tilde) = a + (2 y_tilde - 1) b_1, which
+          reproduces phi_Y(0)/phi_Y(1) at the endpoints.
         """
-        y = 1 if float(outcome) > 0.5 else 0
         if mode == "joint":
-            f = self.future_table[y]
+            f = self.future_table[1 if float(outcome) > 0.5 else 0]
         elif mode == "context_common":
             f = 0.5 * (self.future_table[0] + self.future_table[1])
         elif mode == "outcome_contrast":
-            f = self.future_table[y] - 0.5 * (
+            f = self.future_table[1 if float(outcome) > 0.5 else 0] \
+                - 0.5 * (self.future_table[0] + self.future_table[1])
+        elif mode == "residual":
+            y_tilde = float(outcome)
+            b1 = self.future_table[1] - 0.5 * (
                 self.future_table[0] + self.future_table[1])
+            f = 0.5 * (self.future_table[0] + self.future_table[1]) \
+                + (2.0 * y_tilde - 1.0) * b1
         else:
             raise ValueError("unknown future_mode {}".format(mode))
         return f.to(self.rff_w.dtype)  # [d_f]
@@ -271,6 +281,18 @@ class FixedMaps(nn.Module):
                 f_vec = (self.future_table[y_idx]
                          - 0.5 * (self.future_table[0]
                                   + self.future_table[1])).to(rff.dtype)
+            elif future_mode == "residual":
+                # Continuous y_tilde: phi_Y(t) = a + (2 t - 1) b_1.
+                a_vec = 0.5 * (self.future_table[0]
+                               + self.future_table[1]).to(rff.dtype)
+                b1_vec = (self.future_table[1]
+                          - 0.5 * (self.future_table[0]
+                                   + self.future_table[1])).to(rff.dtype)
+                y_tilde = torch.tensor(
+                    [float(y) for y in outcomes],
+                    dtype=rff.dtype, device=dev).reshape(n, 1)
+                f_vec = a_vec.unsqueeze(0) \
+                    + (2.0 * y_tilde - 1.0) * b1_vec.unsqueeze(0)
             else:
                 raise ValueError("unknown future_mode {}"
                                  .format(future_mode))

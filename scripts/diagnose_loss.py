@@ -65,7 +65,10 @@ def parse_args():
                         help="consecutive groups to collect; >=2 for lag audit")
     parser.add_argument("--trace-roots", type=int, default=0,
                         help="0 = value from run config")
-    parser.add_argument("--permutations", type=int, default=20)
+    parser.add_argument("--permutations", type=int, default=200)
+    parser.add_argument("--window-sweep", default="20,40,80",
+                        help="comma list of group sizes for the "
+                             "exact-exact gradient stability sweep")
     # Records.py seeds np.random.RandomState with seed * 1000003, so the
     # builder seed must stay below 2**32 / 1000003 ~ 4294.
     parser.add_argument("--seed", type=int, default=0)
@@ -249,7 +252,8 @@ def _stratified_row_permutation(rows, rng):
     return permutation
 
 
-def _score_audit(all_rows, fixed_maps, eps, permutations, seed):
+def _score_audit(all_rows, fixed_maps, eps, permutations, seed,
+                 pi_train=0.5):
     report = {}
     taus = sorted({row.tau for row in all_rows})
     for tau_index, tau in enumerate(taus):
@@ -322,6 +326,48 @@ def _score_audit(all_rows, fixed_maps, eps, permutations, seed):
             "outcome_contrast_above_shuffle_p95": bool(
                 contrast_p95 is not None and contrast_real > contrast_p95),
         }
+        # Review follow-up: pure label-residual tests for Z and U.  A
+        # residual test removes the context-predictable channel BEFORE
+        # scoring; passing with U but failing with Z means the
+        # compression lost information, failing with U too means the
+        # future state-change label itself carries nothing beyond
+        # context here.
+        for res_name, res_values in (
+                ("residual_balanced",
+                 _label_residual_values(rows, float(pi_train))),
+                ("residual_context",
+                 _context_residual_values(rows, fixed_maps))):
+            if res_values is None:
+                entry[res_name] = None
+                continue
+            value_z, _ = _score(rows, fixed_maps, eps,
+                                future_mode="residual",
+                                outcomes=res_values)
+            value_u, _ = _score(rows, fixed_maps, eps,
+                                future_mode="residual",
+                                outcomes=res_values, use_u=True)
+            shuffled_scores = []
+            rng_local = np.random.RandomState(seed + 7331)
+            base = np.asarray(res_values, dtype=np.float64)
+            for _ in range(permutations):
+                perm = base[rng_local.permutation(len(base))]
+                v, _ = _score(rows, fixed_maps, eps,
+                              future_mode="residual",
+                              outcomes=perm.tolist())
+                if v is not None:
+                    shuffled_scores.append(v)
+            p95 = float(np.percentile(shuffled_scores, 95)) \
+                if shuffled_scores else None
+            entry[res_name] = {
+                "J_Z": value_z, "J_U": value_u,
+                "shuffle_p95": p95,
+                "Z_above_shuffle_p95": bool(
+                    value_z is not None and p95 is not None
+                    and value_z > p95),
+                "U_above_shuffle_p95": bool(
+                    value_u is not None and p95 is not None
+                    and value_u > p95),
+            }
         report[tau] = entry
     return report
 
@@ -431,6 +477,13 @@ def _lag_audit(groups, fixed_maps, eps):
                 previous, tau, fixed_maps, dim_z, eps)
             j_current, exact, current_diag = _exact_latent_gradient(
                 current, tau, fixed_maps, eps)
+            # Review follow-up: the decisive control — do the EXACT
+            # gradients of adjacent groups point the same way?  If they
+            # are near-orthogonal too, the window CCA gradient itself is
+            # noisy and a two-pass replay would only chase random
+            # directions more precisely.
+            j_prev, exact_prev, prev_diag = _exact_latent_gradient(
+                previous, tau, fixed_maps, eps)
             if adjoints is None or not exact:
                 pair["taus"][tau] = {
                     "failed": "reference_or_current_score_failed",
@@ -473,6 +526,8 @@ def _lag_audit(groups, fixed_maps, eps):
                 "production_lagged": lag_metrics,
                 "unscaled_regression_control": raw_metrics,
                 "same_point_control": same_metrics,
+                "exact_exact": (_gradient_comparison(exact_prev, exact)
+                                if exact_prev and exact else None),
                 "gates": {
                     "same_point_cosine_ge_0_99": bool(
                         same_metrics.get("cosine", -1.0) >= 0.99),
@@ -492,6 +547,77 @@ def _lag_audit(groups, fixed_maps, eps):
             }
         report.append(pair)
     return report
+
+
+def _exact_stability_sweep(batch_rows, window_sizes, fixed_maps, eps):
+    """Adjacent-window EXACT gradient cosine for several window sizes.
+
+    Distinguishes "the lagged mechanism is broken" (exact-exact stable,
+    lag-exact unstable) from "the window CCA gradient itself is noisy"
+    (exact-exact also near-orthogonal -> larger window / lower dims /
+    reconsider before replay).
+    """
+    out = {}
+    taus = sorted({row.tau for batch in batch_rows for row in batch})
+    for window in window_sizes:
+        groups = [batch_rows[start:start + window]
+                  for start in range(0, len(batch_rows), window)]
+        groups = [g for g in groups if len(g) == window]
+        per_tau = {}
+        for tau in taus:
+            exacts = []
+            for group in groups:
+                rows = [row for batch in group for row in batch
+                        if row.tau == tau]
+                if not rows:
+                    continue
+                _, exact, diag = _exact_latent_gradient(
+                    group, tau, fixed_maps, eps)
+                if exact and diag.get("failed") is None:
+                    exacts.append(exact)
+            cosines = [
+                float(_gradient_comparison(a, b)["cosine"])
+                for a, b in zip(exacts, exacts[1:])]
+            per_tau[tau] = {
+                "n_groups": len(exacts),
+                "adjacent_exact_cosine_mean": float(np.mean(cosines))
+                if cosines else None,
+                "adjacent_exact_cosine_min": float(np.min(cosines))
+                if cosines else None,
+                "adjacent_exact_cosine_list": cosines,
+            }
+        out[str(window)] = per_tau
+    return out
+
+
+def _label_residual_values(rows, pi):
+    """Class-balanced residual y_tilde = (y - pi) / sqrt(pi (1 - pi))."""
+    scale = math.sqrt(pi * (1.0 - pi)) if 0.0 < pi < 1.0 else 1.0
+    return [(1.0 if row.outcome > 0.5 else 0.0 - pi) / scale
+            for row in rows]
+
+
+def _context_residual_values(rows, fixed_maps):
+    """Context-conditional residual y_tilde = y - p_hat(y=1 | C).
+
+    p_hat comes from an in-sample logistic fit on phi_C — an UPPER-bound
+    control: in-sample residuals remove everything context can predict,
+    so passing this test is stronger than passing balanced residuals,
+    while a failure here cannot be blamed on context predictability.
+    """
+    try:
+        from sklearn.linear_model import LogisticRegression
+    except Exception:
+        return None
+    feats = np.stack([fixed_maps.context_vector(
+        row.context).detach().cpu().numpy().ravel() for row in rows])
+    ys = np.asarray([1.0 if row.outcome > 0.5 else 0.0 for row in rows],
+                    dtype=np.float64)
+    if len(np.unique(ys)) < 2:
+        return None
+    clf = LogisticRegression(max_iter=500, C=1.0).fit(feats, ys)
+    p_hat = clf.predict_proba(feats)[:, 1]
+    return (ys - p_hat).tolist()
 
 
 def _population_audit(rows, candidates, stats, stream):
@@ -597,8 +723,11 @@ def main():
     builder = JodieCutBuilder(
         future_index, stage=NODE_CLASS, cuts_per_tau=10 ** 9,
         seed=args.seed, n_observations=2)
+    sweep_sizes = [int(part) for part in args.window_sweep.split(",")
+                   if part.strip()]
+    max_needed = max([group_batches] + sweep_sizes)
     max_batches = min(math.ceil(len(stream.sources) / batch_size),
-                      group_batches * args.groups)
+                      max_needed * args.groups)
     batch_rows, candidates, stats = _forward_stream(
         tgn, adapter, stream, batch_size, n_neighbors,
         trace_roots=trace_roots, future_index=future_index, builder=builder,
@@ -631,9 +760,13 @@ def main():
         "population": _population_audit(all_rows, candidates, stats, stream),
         "scores": _score_audit(
             all_rows, fixed_maps, rpbe_cfg.ridge_eps,
-            args.permutations, args.seed),
+            args.permutations, args.seed,
+            pi_train=float(np.mean(
+                dataset.train.labels > 0.5))),
         "lagged_gradient": _lag_audit(
             groups, fixed_maps, rpbe_cfg.ridge_eps),
+        "exact_stability_sweep": _exact_stability_sweep(
+            batch_rows, sweep_sizes, fixed_maps, rpbe_cfg.ridge_eps),
         "interpretation_contract": {
             "balancing_claim":
                 "finite-feature joint predictive CCA energy",

@@ -95,6 +95,12 @@ def parse_args():
                         "ceil(kf_min_abs / trace_roots), raise it when "
                         "below_threshold_groups > 0 (strict-future masking "
                         "lowers the valid-root rate)")
+    p.add_argument("--kf-estimator", default="exact_replay",
+                   choices=["exact_replay", "lagged", "off"],
+                   help="exact_replay = same-window two-pass exact "
+                        "gradient (default, review P2); lagged = the "
+                        "retired one-window-lag surrogate (diagnostics "
+                        "only); off = KF disabled")
     p.add_argument("--kf-variant", default="full_balancing",
                    choices=["full_balancing", "diagonal", "reconstruction"],
                    help="Table-2 ablation variant (paper spec section 4)")
@@ -370,7 +376,8 @@ def main():
         fixed_maps=components["fixed_maps"], rpbe_cfg=components["rpbe_cfg"],
         trace_roots=args.trace_roots,
         trace_mode=args.trace_mode,
-        train_eval_auc=args.train_eval_auc)
+        train_eval_auc=args.train_eval_auc,
+        kf_estimator=args.kf_estimator)
 
     save_json(out / "config.json", {
         "data": args.data,
@@ -396,6 +403,7 @@ def main():
         # (pre-K-cancellation) are never mixed with post-fix runs.
         "rpbe_loss_units": "raw_batch_vjp_sum_with_group_K_cancellation"
                            if components["rpbe_cfg"] is not None else None,
+        "kf_estimator": args.kf_estimator,
         "cli": vars(args),
     })
 

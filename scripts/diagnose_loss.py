@@ -565,6 +565,10 @@ def _parameter_gradient_pass(tgn, adapter, stream, batch_size, n_neighbors,
 
     Returns ``[vec or None per group]``.
     """
+    # Each sweep pass replays the stream from its beginning: reset the
+    # host memory first (and then warm it with the prefix, if any).
+    if tgn.use_memory:
+        tgn.memory.__init_memory__()
     if prefix is not None:
         _forward_stream(tgn, adapter, prefix, batch_size, n_neighbors,
                         trace_roots=0)

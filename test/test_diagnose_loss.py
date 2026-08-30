@@ -153,10 +153,12 @@ class TestResiduals(unittest.TestCase):
 
 class TestVirtualStepSummary(unittest.TestCase):
     def _linear_records(self, effect=0.01, curvature=0.0, n_pairs=7,
-                        step_frac=0.01):
+                        step_frac=0.01, step_size=None):
         """Pure first-order fake: f(+e d) = f0 + effect, f(-e d) = f0 -
         effect.  The +-eps average is 0; the central effect is the
-        signal."""
+        signal.  ``step_size`` is the REAL parameter step (eps_abs)."""
+        if step_size is None:
+            step_size = step_frac  # |theta| = 1 default
         records = []
         for t in range(n_pairs):
             for sign in (1, -1):
@@ -168,6 +170,7 @@ class TestVirtualStepSummary(unittest.TestCase):
                     "delta": float(sign) * effect
                     + float(sign ** 2) * curvature,
                     "step_frac": step_frac,
+                    "step_size": step_size,
                 })
         return records
 
@@ -180,11 +183,34 @@ class TestVirtualStepSummary(unittest.TestCase):
         self.assertEqual(eff["sign_rate"], 1.0)
         self.assertEqual(eff["median"], 0.01)
         self.assertEqual(entry["n_complete_pairs"], 7)
-        # Directional derivative = effect / eps = 0.01 / 0.01 = 1.0.
+        # Directional derivative = effect / eps_abs = 0.01 / 0.01 = 1.
         der = entry["directional_derivative"]
         self.assertAlmostEqual(der["mean"], 1.0, places=6)
         self.assertAlmostEqual(
             entry["second_directional_derivative_mean"], 0.0, places=9)
+        self.assertEqual(entry["missing_plus_pairs"], 0)
+        self.assertEqual(entry["missing_minus_pairs"], 0)
+        self.assertEqual(entry["ci_kind"],
+                         "descriptive_bootstrap_overlapping_pairs")
+
+    def test_derivative_uses_real_step_size_not_frac(self):
+        # |theta| = 5, eps_abs = 0.01 * 5 = 0.05.  A per-step effect of
+        # 0.05 must give D = 0.05 / 0.05 = 1 (the old code would divide
+        # by 0.01 and report 5).
+        summary = dl._summarize_virtual_records(
+            self._linear_records(effect=0.05, step_frac=0.01,
+                                 step_size=0.05))
+        entry = summary["exact_J_step0.01"]
+        self.assertAlmostEqual(
+            entry["directional_derivative"]["mean"], 1.0, places=6)
+        # H = (d+ + d-)/eps_abs^2 with pure curvature 0.005.
+        summary2 = dl._summarize_virtual_records(
+            self._linear_records(effect=0.0, curvature=0.005,
+                                 step_frac=0.01, step_size=0.05))
+        e2 = summary2["exact_J_step0.01"]
+        # sym sum = 0.01 -> / 0.05^2 = 4.0
+        self.assertAlmostEqual(
+            e2["second_directional_derivative_mean"], 4.0, places=6)
 
     def test_curvature_goes_to_second_derivative_slot(self):
         summary = dl._summarize_virtual_records(
@@ -229,8 +255,17 @@ class TestVirtualStepSummary(unittest.TestCase):
         summary = dl._summarize_virtual_records(records)
         entry = summary["exact_J_step0.01"]
         self.assertEqual(entry["n_complete_pairs"], 2)
+        self.assertEqual(entry["missing_minus_pairs"], 1)
+        self.assertEqual(entry["missing_plus_pairs"], 0)
         eff = entry["central_directional_effect"]
         self.assertEqual(eff["n"], 2)
+
+    def test_duplicate_side_raises(self):
+        records = self._linear_records(effect=0.01, n_pairs=1)
+        duplicate = dict(records[0])
+        records.append(duplicate)
+        with self.assertRaises(AssertionError):
+            dl._summarize_virtual_records(records)
 
     def test_bootstrap_ci_95(self):
         # With a strictly positive effect the 95% CI must not cross 0.

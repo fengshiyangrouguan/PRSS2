@@ -914,26 +914,6 @@ def _forward_heldout_metrics(tgn, decoder, adapter, stream, batch_start,
     return out
 
 
-def _perturb_params(params, direction, step_size):
-    with torch.no_grad():
-        offset = 0
-        for p_ in params:
-            n = p_.numel()
-            p_.add_(direction[offset:offset + n].reshape(p_.shape).float()
-                    * step_size)
-            offset += n
-
-
-def _undo_params(params, direction, step_size):
-    with torch.no_grad():
-        offset = 0
-        for p_ in params:
-            n = p_.numel()
-            p_.sub_(direction[offset:offset + n].reshape(p_.shape).float()
-                    * step_size)
-            offset += n
-
-
 def _multi_window_virtual_steps(result, tgn, decoder, adapter, stream,
                                 batch_size, n_neighbors, trace_roots,
                                 group_batches, seed, builder, fixed_maps,
@@ -999,11 +979,23 @@ def _multi_window_virtual_steps(result, tgn, decoder, adapter, stream,
         if before.get("J") is None:
             continue
         n_pairs += 1
+        # Exact parameter restore (review): never accumulate FP32
+        # add/sub drift — every evaluation starts from a cloned base
+        # and restores it verbatim afterwards.
+        theta_base = [p.detach().clone() for p in params]
         for name, d in directions.items():
             for step_frac in step_fracs:
                 step_size = step_frac * total_norm
                 for sign in (+1.0, -1.0):
-                    _perturb_params(params, d, sign * step_size)
+                    with torch.no_grad():
+                        offset = 0
+                        for p_, base in zip(params, theta_base):
+                            n = p_.numel()
+                            p_.copy_(base + (
+                                d[offset:offset + n].reshape(
+                                    p_.shape).float() * sign
+                                * step_size))
+                            offset += n
                     if tgn.use_memory:
                         tgn.memory.restore_memory(nxt["memory"])
                     after = _forward_heldout_metrics(
@@ -1011,7 +1003,9 @@ def _multi_window_virtual_steps(result, tgn, decoder, adapter, stream,
                         nxt["batch_start"], group_batches, batch_size,
                         n_neighbors, trace_roots, seed, builder,
                         fixed_maps, eps)
-                    _undo_params(params, d, sign * step_size)
+                    with torch.no_grad():
+                        for p_, base in zip(params, theta_base):
+                            p_.copy_(base)
                     for key in ("J", "J_outcome_contrast", "task_nll"):
                         b = before.get(key)
                         a = after.get(key)
@@ -1022,11 +1016,17 @@ def _multi_window_virtual_steps(result, tgn, decoder, adapter, stream,
                             "sign": int(sign), "metric": key,
                             "before": b, "after": a, "delta": a - b,
                             "step_frac": step_frac,
+                            "step_size": step_size,
                         })
     out = {"n_pairs": n_pairs,
            "step_fracs": list(step_fracs),
            "records": records,
-           "summary": _summarize_virtual_records(records)}
+           "summary": _summarize_virtual_records(records),
+           # Disjoint (non-overlapping) window pairs (0,1),(2,3),(4,5),
+           # (6,7): too few for significance, but checks whether the
+           # conclusions depend on overlapping windows.
+           "disjoint_summary": _summarize_virtual_records(
+               [r for r in records if r["pair"] % 2 == 0])}
     return out
 
 
@@ -1036,11 +1036,14 @@ def _summarize_virtual_records(records):
 
     Review corrections baked in:
     * the +1/-1 deltas are paired by (pair, direction, metric,
-      step_frac) — never by list order;
-    * the 95% clustered bootstrap uses the 2.5/97.5 percentiles;
-    * the directional derivative D = (d+ - d-)/(2 eps) makes different
-      step sizes comparable, with the second directional derivative
-      H = (d+ + d-)/eps^2 as the curvature counterpart;
+      step_frac) — never by list order; duplicates raise;
+    * the denominators are the REAL parameter step
+      ``eps_abs = step_frac * |theta|``: D = (d+ - d-)/(2 eps_abs),
+      H = (d+ + d-)/eps_abs^2;
+    * missing sides are counted per (direction, metric, step_frac);
+    * the 95% clustered bootstrap uses the 2.5/97.5 percentiles and is
+      labelled DESCRIPTIVE (adjacent pairs share windows — the CIs are
+      not independent-sample intervals);
     * the raw per-pair effects are kept (7 pairs is too few to trust a
       CI alone).
     """
@@ -1048,7 +1051,11 @@ def _summarize_virtual_records(records):
     for r in records:
         key = (r["pair"], r["direction"], r["metric"],
                r.get("step_frac", 0.01))
-        paired.setdefault(key, {})[int(r["sign"])] = r["delta"]
+        sides = paired.setdefault(key, {})
+        if int(r["sign"]) in sides:
+            raise AssertionError(
+                "duplicate virtual-step side: {}".format(key))
+        sides[int(r["sign"])] = r
     summary = {}
 
     def _bootstrap_mean_ci(values, n_boot=2000, seed_boot=0):
@@ -1069,8 +1076,6 @@ def _summarize_virtual_records(records):
 
     for (pair, direction, metric, step_frac), sides in sorted(
             paired.items()):
-        if 1 not in sides or -1 not in sides:
-            continue
         key = direction + "_" + metric + "_step{}".format(step_frac)
         entry = summary.get(key)
         if entry is None:
@@ -1079,23 +1084,31 @@ def _summarize_virtual_records(records):
                      "step_frac": step_frac, "metric": metric,
                      "direction": direction}
             summary[key] = entry
-        d_plus = sides[1]
-        d_minus = sides[-1]
+        if 1 not in sides:
+            entry["missing_plus_pairs"] += 1
+        if -1 not in sides:
+            entry["missing_minus_pairs"] += 1
+        if 1 not in sides or -1 not in sides:
+            continue
+        d_plus = sides[1]["delta"]
+        d_minus = sides[-1]["delta"]
+        entry["step_size"] = float(sides[1]["step_size"])
         entry["effects"].append((d_plus - d_minus) / 2.0)
         entry["sym_sums"].append(d_plus + d_minus)
     for key, entry in summary.items():
-        eps = float(entry["step_frac"])
+        eps_abs = float(entry.get("step_size", 1.0))
         effects = np.asarray(entry["effects"], dtype=np.float64)
         sym_sums = np.asarray(entry["sym_sums"], dtype=np.float64)
         entry["central_directional_effect"] = _bootstrap_mean_ci(effects)
         entry["directional_derivative"] = _bootstrap_mean_ci(
-            effects / eps)
-        # Review: H_i = (d+ + d-)/eps^2 (NO extra /2).
+            effects / eps_abs)
+        # Review: H_i = (d+ + d-)/eps_abs^2 (NO extra /2).
         entry["second_directional_derivative_mean"] = float(
-            (sym_sums / (eps * eps)).mean())
+            (sym_sums / (eps_abs * eps_abs)).mean())
         entry["n_complete_pairs"] = int(len(effects))
         entry.pop("effects")
         entry.pop("sym_sums")
+        entry["ci_kind"] = "descriptive_bootstrap_overlapping_pairs"
     return summary
 
 

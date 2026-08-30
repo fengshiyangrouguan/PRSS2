@@ -46,6 +46,7 @@ if str(SRC) not in sys.path:
 from rpbe.data.jodie import JodieDataset
 from rpbe.loss import (WeightedWelford, _matrix_diag, _score_from_covs,
                        kf_adjoint, kf_vjp_batch)
+from rpbe.training import checkpoint as ckpt
 from rpbe.maps import FixedMaps
 from rpbe.records import JodieCutBuilder, JodieFutureIndex, NODE_CLASS
 from rpbe.training.jodie_loop import select_trace_rows

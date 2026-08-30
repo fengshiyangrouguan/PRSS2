@@ -66,7 +66,9 @@ def parse_args():
     parser.add_argument("--trace-roots", type=int, default=0,
                         help="0 = value from run config")
     parser.add_argument("--permutations", type=int, default=20)
-    parser.add_argument("--seed", type=int, default=20260830)
+    # Records.py seeds np.random.RandomState with seed * 1000003, so the
+    # builder seed must stay below 2**32 / 1000003 ~ 4294.
+    parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--out-json", default="")
     return parser.parse_args()
 

@@ -362,10 +362,12 @@ class JodieNodeClassificationLoop:
             z_by_oid[(cut.tau, cut.occurrence_id)] = cut.z
         terms = []
         n_terms = 0
+        n_planned = 0
         for tau, plan in replay_plan.items():
             by_batch = plan.get("by_batch") or [[]]
             for entries in by_batch:
                 for oid, g in entries:
+                    n_planned += 1
                     z = z_by_oid.get((tau, oid))
                     if z is None:
                         continue
@@ -374,9 +376,9 @@ class JodieNodeClassificationLoop:
                         (gd * z).sum() - (gd * z.detach()).sum()))
                     n_terms += 1
         if not terms:
-            return torch.zeros((), device=self.device), 0
+            return torch.zeros((), device=self.device), 0, (n_planned, 0)
         auxiliary = -self.lambda_kf * float(group_k) * sum(terms)
-        return auxiliary, n_terms
+        return auxiliary, n_terms, (n_planned, n_terms)
 
     def _train_epoch_exact_replay(self, epoch: int, global_step: int,
                                   train: object, max_batches: int = None
@@ -422,6 +424,8 @@ class JodieNodeClassificationLoop:
         pending_trees = {}
         threshold = {}
         param_version = 0
+        total_planned = 0
+        total_matched = 0
         train_probs, train_labels = [], []
 
         def _run_one_pass(batch_index, grad_enabled):
@@ -493,9 +497,13 @@ class JodieNodeClassificationLoop:
                     self.device)
                 task_loss = F.binary_cross_entropy(prediction, labels_t)
                 auxiliary = torch.zeros((), device=self.device)
+                aligned_planned = 0
+                aligned_matched = 0
                 if cuts and closed:
-                    auxiliary, n_terms = self._batch_surrogate_exact(
-                        cuts, replay_plan, group_k)
+                    (auxiliary, n_terms,
+                     (aligned_planned, aligned_matched)) = \
+                        self._batch_surrogate_exact(
+                            cuts, replay_plan, group_k)
                     if n_terms:
                         aux_batches += 1
                 loss = task_loss + auxiliary
@@ -511,6 +519,8 @@ class JodieNodeClassificationLoop:
                         (self.finetune_host or self.component_on):
                     self.tgn.memory.detach_memory()
                 total_task += float(task_loss.detach())
+                total_planned += aligned_planned
+                total_matched += aligned_matched
                 train_probs.append(prediction.detach().cpu().numpy())
                 train_labels.append(labels_np)
                 global_step += 1
@@ -547,6 +557,11 @@ class JodieNodeClassificationLoop:
                 "group_batches": fixed_group,
                 "aux_batches": aux_batches,
                 "repr_steps": param_version,
+                # Gate 1: pass-1/pass-2 occurrence alignment (must be
+                # 100%: duplicate = missing = 0).
+                "replay_align_planned": total_planned,
+                "replay_align_matched": total_matched,
+                "replay_align_missing": total_planned - total_matched,
             }
         return {
             "train_task_loss": total_task / max(run_batches, 1),

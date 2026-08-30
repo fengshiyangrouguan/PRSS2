@@ -926,13 +926,14 @@ def _multi_window_virtual_steps(result, tgn, decoder, adapter, stream,
     never contributed to window t's gradients.
 
     Direction convention (review): g_J and g_T are unit gradients.
-      * ``exact``          = +g_J   (expect D_J > 0);
-      * ``task_grad``      = +g_T   (expect D_NLL > 0 — verifies the
-                            metric is gradient-sensitive);
-      * ``task_update``    = -g_T   (the REAL task optimizer step);
-      * ``joint_update_rX``= normalize(-g_T + r g_J)  (the REAL joint
-                            optimizer step for relative strength r);
-      * ``lagged``         = +g_lagged.
+      * ``exact``               = +g_J   (expect D_J > 0);
+      * ``task_grad``           = +g_T   (expect D_NLL > 0 — verifies
+                                  the metric is gradient-sensitive);
+      * ``task_raw_descent``    = -g_T   (RAW gradient-descent step,
+                                  NOT the actual Adam update);
+      * ``joint_raw_descent_rX``= normalize(-g_T + r g_J)  (RAW joint
+                                  descent for relative strength r);
+      * ``lagged``              = +g_lagged.
 
     The +-eps deltas are NEVER averaged together: their average measures
     curvature, not direction.  Per pair and direction the report keeps
@@ -1013,53 +1014,59 @@ def _multi_window_virtual_steps(result, tgn, decoder, adapter, stream,
                     p_.copy_(base)
 
         # ---- TWO unperturbed baselines from the SAME state (review):
-        # the zero-replay consistency must be a real zero perturbation. ----
-        _restore_full()
-        before = _forward_heldout_metrics(
-            tgn, decoder, adapter, stream, nxt["batch_start"],
-            group_batches, batch_size, n_neighbors, trace_roots, seed,
-            builder, fixed_maps, eps)
-        _restore_full()
-        zero_baseline = _forward_heldout_metrics(
-            tgn, decoder, adapter, stream, nxt["batch_start"],
-            group_batches, batch_size, n_neighbors, trace_roots, seed,
-            builder, fixed_maps, eps)
-        zero_consistency = {}
-        for key in ("J", "J_outcome_contrast", "task_nll"):
-            b = before.get(key)
-            z = zero_baseline.get(key)
-            zero_consistency[key] = (b, z, b == z)
-        if before.get("J") is None:
-            continue
-        n_pairs += 1
-        for name, d in directions.items():
-            for step_frac in step_fracs:
-                step_size = step_frac * total_norm
-                for sign in (+1.0, -1.0):
-                    try:
-                        _restore_full()          # same state as baseline
-                        _set_params(d, sign * step_size)
-                        after = _forward_heldout_metrics(
-                            tgn, decoder, adapter, stream,
-                            nxt["batch_start"], group_batches, batch_size,
-                            n_neighbors, trace_roots, seed, builder,
-                            fixed_maps, eps)
-                    finally:
-                        _reset_params()          # parameters first
-                        _restore_full()          # then memory/RNG/counters
-                    for key in ("J", "J_outcome_contrast", "task_nll"):
-                        b = before.get(key)
-                        a = after.get(key)
-                        if b is None or a is None:
-                            continue
-                        records.append({
-                            "pair": t, "direction": name,
-                            "sign": int(sign), "metric": key,
-                            "before": b, "after": a, "delta": a - b,
-                            "step_frac": step_frac,
-                            "step_size": step_size,
-                        })
-        zero_checks.append({"pair": t, "per_metric": zero_consistency})
+        # the zero-replay consistency must be a real zero perturbation.
+        # An inconsistent pair is SKIPPED (its +-eps data is never
+        # collected); the outer try/finally restores the state even on
+        # early exits.
+        try:
+            _restore_full()
+            before = _forward_heldout_metrics(
+                tgn, decoder, adapter, stream, nxt["batch_start"],
+                group_batches, batch_size, n_neighbors, trace_roots,
+                seed, builder, fixed_maps, eps)
+            _restore_full()
+            zero_baseline = _forward_heldout_metrics(
+                tgn, decoder, adapter, stream, nxt["batch_start"],
+                group_batches, batch_size, n_neighbors, trace_roots,
+                seed, builder, fixed_maps, eps)
+            zero_consistency, zero_ok = _zero_replay_check(
+                before, zero_baseline)
+            zero_checks.append({"pair": t,
+                                "per_metric": zero_consistency,
+                                "all_consistent": zero_ok})
+            if before.get("J") is None or not zero_ok:
+                continue
+            n_pairs += 1
+            for name, d in directions.items():
+                for step_frac in step_fracs:
+                    step_size = step_frac * total_norm
+                    for sign in (+1.0, -1.0):
+                        try:
+                            _restore_full()      # same state as baseline
+                            _set_params(d, sign * step_size)
+                            after = _forward_heldout_metrics(
+                                tgn, decoder, adapter, stream,
+                                nxt["batch_start"], group_batches,
+                                batch_size, n_neighbors, trace_roots,
+                                seed, builder, fixed_maps, eps)
+                        finally:
+                            _reset_params()      # parameters first
+                            _restore_full()      # then memory/RNG/counters
+                        for key in ("J", "J_outcome_contrast", "task_nll"):
+                            b = before.get(key)
+                            a = after.get(key)
+                            if b is None or a is None:
+                                continue
+                            records.append({
+                                "pair": t, "direction": name,
+                                "sign": int(sign), "metric": key,
+                                "before": b, "after": a, "delta": a - b,
+                                "step_frac": step_frac,
+                                "step_size": step_size,
+                            })
+        finally:
+            _reset_params()
+            _restore_full()
     out = {"n_pairs": n_pairs,
            "step_fracs": list(step_fracs),
            "records": records,
@@ -1075,6 +1082,32 @@ def _multi_window_virtual_steps(result, tgn, decoder, adapter, stream,
            # saved state must match exactly.
            "zero_replay_consistency": zero_checks}
     return out
+
+
+def _zero_replay_check(before, zero_baseline, tol=1e-12):
+    """Two unperturbed replays from the same saved state must agree.
+
+    Returns ``(per_metric, all_consistent)``: each metric reports
+    ``available`` (both sides non-None — None == None is NOT
+    consistency), ``abs_diff`` and ``identical`` (abs_diff <= tol).
+    ``all_consistent`` is False when any metric is missing or differs;
+    the caller then SKIPS the pair (no +-eps data is collected from an
+    unreproducible replay).
+    """
+    out = {}
+    all_consistent = True
+    for key in ("J", "J_outcome_contrast", "task_nll"):
+        b = before.get(key)
+        z = zero_baseline.get(key)
+        available = b is not None and z is not None
+        diff = abs(float(b) - float(z)) if available else None
+        identical = bool(available and diff is not None
+                         and diff <= tol)
+        if not available or not identical:
+            all_consistent = False
+        out[key] = {"available": bool(available),
+                    "abs_diff": diff, "identical": identical}
+    return out, all_consistent
 
 
 def _summarize_disjoint_records(records):

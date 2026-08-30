@@ -276,6 +276,49 @@ class TestVirtualStepSummary(unittest.TestCase):
         self.assertAlmostEqual(eff["ci_hi"], 0.01, places=6)
 
 
+class TestZeroReplayCheck(unittest.TestCase):
+    """Locks the zero-replay consistency contract (the regression that
+    once reported a +eps result as the 'zero' replay)."""
+
+    def _metrics(self, j, contrast, nll):
+        return {"J": j, "J_outcome_contrast": contrast,
+                "task_nll": nll}
+
+    def test_identical_passes(self):
+        m = self._metrics(4.5, 2.0, 0.1)
+        per, ok = dl._zero_replay_check(m, m)
+        self.assertTrue(ok)
+        for key in ("J", "J_outcome_contrast", "task_nll"):
+            self.assertTrue(per[key]["available"])
+            self.assertTrue(per[key]["identical"])
+            self.assertLessEqual(per[key]["abs_diff"], 1e-12)
+
+    def test_mismatch_fails_with_diff(self):
+        a = self._metrics(4.5, 2.0, 0.1)
+        b = self._metrics(4.5, 2.0, 0.2)  # NLL differs
+        per, ok = dl._zero_replay_check(a, b)
+        self.assertFalse(ok)
+        self.assertFalse(per["task_nll"]["identical"])
+        self.assertGreater(per["task_nll"]["abs_diff"], 1e-12)
+
+    def test_none_is_not_consistency(self):
+        a = self._metrics(4.5, None, 0.1)
+        b = self._metrics(4.5, None, 0.1)
+        per, ok = dl._zero_replay_check(a, b)
+        self.assertFalse(ok)
+        self.assertFalse(per["J_outcome_contrast"]["available"])
+        self.assertFalse(per["J_outcome_contrast"]["identical"])
+
+    def test_tolerance_boundary(self):
+        a = self._metrics(4.5, 2.0, 0.1)
+        b = self._metrics(4.5 + 1e-13, 2.0, 0.1)
+        per, ok = dl._zero_replay_check(a, b)
+        self.assertTrue(ok)  # within tol
+        b2 = self._metrics(4.5 + 1e-9, 2.0, 0.1)
+        per2, ok2 = dl._zero_replay_check(a, b2)
+        self.assertFalse(ok2)
+
+
 class TestCommonProbe(unittest.TestCase):
     def test_common_probe_fails_cleanly_without_reference(self):
         out = dl._common_probe_report({}, [])

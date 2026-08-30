@@ -948,6 +948,7 @@ def _multi_window_virtual_steps(result, tgn, decoder, adapter, stream,
     # the Task-51 comparisons.
     step_fracs = (0.0025, 0.005, 0.01)
     records = []
+    zero_checks = []
     n_pairs = 0
     for t in range(len(groups) - 1):
         g = groups[t]
@@ -973,22 +974,9 @@ def _multi_window_virtual_steps(result, tgn, decoder, adapter, stream,
         if lagged is not None:
             directions["lagged"] = lagged \
                 / lagged.norm().clamp(min=1e-30)
-        if tgn.use_memory:
-            tgn.memory.restore_memory(nxt["memory"])
-        before = _forward_heldout_metrics(
-            tgn, decoder, adapter, stream, nxt["batch_start"],
-            group_batches, batch_size, n_neighbors, trace_roots, seed,
-            builder, fixed_maps, eps)
-        if before.get("J") is None:
-            continue
-        n_pairs += 1
-        # Exact parameter restore (review): every evaluation starts from
-        # a cloned base constructed in one place and restores it via
-        # try/finally so exceptions cannot leave the model perturbed.
-        theta_base = [p.detach().clone() for p in params]
-        # Zero-perturbation replay consistency: the FULL state restore
-        # (memory + RNG + occurrence counter + builder counters) must
-        # reproduce the window bit-for-bit.
+        # ---- FULL state snapshot BEFORE any baseline replay (review):
+        # memory + RNG + occurrence counter + builder counters.  The
+        # parameter base is cloned here too (untouched by pass 1). ----
         state = {
             "memory": nxt["memory"],
             "rng": ckpt._rng_state(),
@@ -996,6 +984,7 @@ def _multi_window_virtual_steps(result, tgn, decoder, adapter, stream,
             "tree_counter": getattr(builder, "_tree_counter", 0),
             "build_calls": getattr(builder, "_build_calls", 0),
         }
+        theta_base = [p.detach().clone() for p in params]
 
         def _restore_full():
             if tgn.use_memory and state["memory"] is not None:
@@ -1008,33 +997,56 @@ def _multi_window_virtual_steps(result, tgn, decoder, adapter, stream,
             if hasattr(builder, "_build_calls"):
                 builder._build_calls = state["build_calls"]
 
-        zero_repeat = None
+        def _set_params(direction, signed_step):
+            with torch.no_grad():
+                offset = 0
+                for p_, base in zip(params, theta_base):
+                    n = p_.numel()
+                    p_.copy_(base + (
+                        direction[offset:offset + n].reshape(
+                            p_.shape).float() * signed_step))
+                    offset += n
+
+        def _reset_params():
+            with torch.no_grad():
+                for p_, base in zip(params, theta_base):
+                    p_.copy_(base)
+
+        # ---- TWO unperturbed baselines from the SAME state (review):
+        # the zero-replay consistency must be a real zero perturbation. ----
+        _restore_full()
+        before = _forward_heldout_metrics(
+            tgn, decoder, adapter, stream, nxt["batch_start"],
+            group_batches, batch_size, n_neighbors, trace_roots, seed,
+            builder, fixed_maps, eps)
+        _restore_full()
+        zero_baseline = _forward_heldout_metrics(
+            tgn, decoder, adapter, stream, nxt["batch_start"],
+            group_batches, batch_size, n_neighbors, trace_roots, seed,
+            builder, fixed_maps, eps)
+        zero_consistency = {}
+        for key in ("J", "J_outcome_contrast", "task_nll"):
+            b = before.get(key)
+            z = zero_baseline.get(key)
+            zero_consistency[key] = (b, z, b == z)
+        if before.get("J") is None:
+            continue
+        n_pairs += 1
         for name, d in directions.items():
             for step_frac in step_fracs:
                 step_size = step_frac * total_norm
                 for sign in (+1.0, -1.0):
                     try:
-                        with torch.no_grad():
-                            offset = 0
-                            for p_, base in zip(params, theta_base):
-                                n = p_.numel()
-                                p_.copy_(base + (
-                                    d[offset:offset + n].reshape(
-                                        p_.shape).float() * sign
-                                    * step_size))
-                                offset += n
-                        _restore_full()
+                        _restore_full()          # same state as baseline
+                        _set_params(d, sign * step_size)
                         after = _forward_heldout_metrics(
                             tgn, decoder, adapter, stream,
                             nxt["batch_start"], group_batches, batch_size,
                             n_neighbors, trace_roots, seed, builder,
                             fixed_maps, eps)
-                        if zero_repeat is None:
-                            zero_repeat = after.get("J")
                     finally:
-                        with torch.no_grad():
-                            for p_, base in zip(params, theta_base):
-                                p_.copy_(base)
+                        _reset_params()          # parameters first
+                        _restore_full()          # then memory/RNG/counters
                     for key in ("J", "J_outcome_contrast", "task_nll"):
                         b = before.get(key)
                         a = after.get(key)
@@ -1047,6 +1059,7 @@ def _multi_window_virtual_steps(result, tgn, decoder, adapter, stream,
                             "step_frac": step_frac,
                             "step_size": step_size,
                         })
+        zero_checks.append({"pair": t, "per_metric": zero_consistency})
     out = {"n_pairs": n_pairs,
            "step_fracs": list(step_fracs),
            "records": records,
@@ -1057,13 +1070,10 @@ def _multi_window_virtual_steps(result, tgn, decoder, adapter, stream,
            # DESCRIPTIVE bootstrap (temporal windows may correlate even
            # when they do not share a group).
            "disjoint_summary": _summarize_disjoint_records(records),
-           # Zero-perturbation replay consistency: the full state
-           # restore must reproduce the window's J bit-for-bit.
-           "zero_replay_consistency": {
-               "J_before": before.get("J"),
-               "J_zero_repeat": zero_repeat,
-               "identical": (before.get("J") == zero_repeat),
-           }}
+           # Zero-perturbation replay consistency, PER PAIR and per
+           # metric: two unperturbed baselines replayed from the SAME
+           # saved state must match exactly.
+           "zero_replay_consistency": zero_checks}
     return out
 
 

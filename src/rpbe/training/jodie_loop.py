@@ -301,7 +301,7 @@ class JodieNodeClassificationLoop:
         cross-batch graphs.
 
         ``max_batches`` (the sprint diagnostic) stops the epoch after N
-        batches without the epoch-drain close.
+        batches and drains that final, possibly partial macro-group.
         """
         self.reset_memory()
         if self.kf_window is not None:
@@ -340,6 +340,9 @@ class JodieNodeClassificationLoop:
                        "pending_trees": {}, "threshold": {}}
         train_probs, train_labels = [], []
         num_batch = math.ceil(len(train.sources) / self.batch_size)
+        run_batches = num_batch if max_batches is None else min(
+            num_batch, max(0, int(max_batches)))
+        group_target_count = 1
 
         for batch_index in range(num_batch):
             if max_batches is not None and batch_index >= max_batches:
@@ -364,6 +367,8 @@ class JodieNodeClassificationLoop:
                     self.kf_window.begin_group(param_version, epoch)
                 repr_group_active = True
                 group_batch_count = 0
+                group_target_count = min(
+                    fixed_group, max(1, run_batches - batch_index))
 
             trace_rows = []
             if self.kf_on:
@@ -391,6 +396,14 @@ class JodieNodeClassificationLoop:
                      cold) = self._consume_kf(cuts, global_step)
                     cold_types.update(cold)
                     if auxiliary.requires_grad:
+                        # Raw per-batch moment VJPs SUM to the macro-window
+                        # linearization.  _close_repr_group divides every
+                        # accumulated representation gradient by K to average
+                        # the task loss, so multiply this zero-valued
+                        # auxiliary by the actual group K to leave the KF
+                        # window gradient unshrunk.  This is exact even when
+                        # batches have unequal valid-cut weights.
+                        auxiliary = auxiliary * float(group_target_count)
                         aux_batches += 1
                     for tau, score in scores.items():
                         kf_sum[tau] = kf_sum.get(tau, 0.0) + score

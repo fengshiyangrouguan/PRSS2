@@ -137,10 +137,27 @@ class FixedMaps(nn.Module):
                                      self.rff_w.dtype, self.rff_w.device)
         return rff + cat.to(rff.dtype) + path_vec  # [1, d_c]
 
-    def future_vector(self, outcome: float) -> torch.Tensor:
-        """phi_Y(y) for one row; y in {0, 1}."""
+    def future_vector(self, outcome: float, mode: str = "joint") -> torch.Tensor:
+        """phi_Y(y) for one row; y in {0, 1}.
+
+        ``mode`` (LOSS_DIAGNOSIS measurement decomposition):
+        * ``joint`` — the production vector phi_Y(y);
+        * ``context_common`` — only ``a = (phi_Y(0)+phi_Y(1))/2``, the part
+          that does not depend on the outcome at all;
+        * ``outcome_contrast`` — only ``b_y = phi_Y(y) - a``, the part that
+          carries the outcome signal.
+        """
         y = 1 if float(outcome) > 0.5 else 0
-        return self.future_table[y].to(self.rff_w.dtype)  # [d_f]
+        if mode == "joint":
+            f = self.future_table[y]
+        elif mode == "context_common":
+            f = 0.5 * (self.future_table[0] + self.future_table[1])
+        elif mode == "outcome_contrast":
+            f = self.future_table[y] - 0.5 * (
+                self.future_table[0] + self.future_table[1])
+        else:
+            raise ValueError("unknown future_mode {}".format(mode))
+        return f.to(self.rff_w.dtype)  # [d_f]
 
     def psi(self, context, outcome: float) -> torch.Tensor:
         """sketch([1; phi_C] (x) phi_Y) -> [m]; no gradient."""
@@ -156,25 +173,38 @@ class FixedMaps(nn.Module):
                            prod[self.sketch_indices[0]] * self.sketch_signs)
             return out
 
-    def pv(self, context, outcome: float) -> torch.Tensor:
+    def pv(self, context, outcome: float, future_mode: str = "joint") -> torch.Tensor:
         """One joint-test row for one cut."""
-        return self.psi(context, outcome)
+        with torch.no_grad():
+            c = self.context_vector(context)
+            f = self.future_vector(outcome, mode=future_mode)
+            body = torch.cat([torch.ones(1, dtype=c.dtype, device=c.device),
+                              c[0]])
+            prod = torch.outer(body, f).reshape(-1)
+            out = torch.zeros(self.m, dtype=prod.dtype, device=prod.device)
+            out.index_add_(0, self.sketch_indices[1],
+                           prod[self.sketch_indices[0]] * self.sketch_signs)
+            return out
 
     # ----------------------------------------------------------- batch path
-    def pv_batch(self, contexts, outcomes) -> torch.Tensor:
+    def pv_batch(self, contexts, outcomes, future_mode: str = "joint",
+                 use_cache: bool = True) -> torch.Tensor:
         """Vectorized joint tests: [N, m], no gradient, one pass.
 
         ``contexts`` is a list of context dicts, ``outcomes`` a float list;
         the per-row small-operator storm of ``pv`` is avoided by batching the
         RFF pass, the categorical gathers and a single index_add.
 
+        ``future_mode`` selects the measurement decomposition (joint /
+        context_common / outcome_contrast, see ``future_vector``).
+
         Fixed-measurement cache (sixth review, step 4): psi is a FIXED map
         and the sampling/tree structure is deterministic, so the same
         batch of (context, outcome) rows recurs every epoch.  The batch is
-        keyed by its full row-semantic tuple; hits skip the CountSketch
-        scatter entirely (the measured ~210 ms/batch hotspot).  The cache
-        holds CPU float32 copies and is bounded (oldest-eviction by
-        dict order); a map/seed change produces different keys by
+        keyed by its full row-semantic tuple plus the mode; hits skip the
+        CountSketch scatter entirely (the measured ~210 ms/batch hotspot).
+        The cache holds CPU float32 copies and is bounded (oldest-eviction
+        by dict order); a map/seed change produces different keys by
         construction, so no version stamping is needed.
         """
         n = len(contexts)
@@ -187,8 +217,17 @@ class FixedMaps(nn.Module):
                      int(c["query_type"]),
                      tuple((int(rel), float(dt))
                            for rel, dt in c.get("path", [])),
-                     float(y))
-                    for c, y in zip(contexts, outcomes))
+                     (0.0 if future_mode == "context_common"
+                      else float(y)))
+                    for c, y in zip(contexts, outcomes)) \
+            + (future_mode,)
+        if use_cache:
+            self._pv_batch_calls += 1
+            hit = self._p_cache.get(key)
+            if hit is not None:
+                self._p_cache_hits += 1
+                return hit.to(dev, dtype=self.rff_w.dtype)
+            self._p_cache_misses += 1
         self._pv_batch_calls += 1
         hit = self._p_cache.get(key)
         if hit is not None:
@@ -223,7 +262,18 @@ class FixedMaps(nn.Module):
             y_idx = torch.tensor([1 if float(y) > 0.5 else 0
                                   for y in outcomes],
                                  dtype=torch.long, device=dev)
-            f_vec = self.future_table[y_idx].to(rff.dtype)           # [N, d_f]
+            if future_mode == "joint":
+                f_vec = self.future_table[y_idx].to(rff.dtype)       # [N, d_f]
+            elif future_mode == "context_common":
+                f_vec = 0.5 * (self.future_table[0] + self.future_table[1]) \
+                    .to(rff.dtype).unsqueeze(0).expand(n, -1)
+            elif future_mode == "outcome_contrast":
+                f_vec = (self.future_table[y_idx]
+                         - 0.5 * (self.future_table[0]
+                                  + self.future_table[1])).to(rff.dtype)
+            else:
+                raise ValueError("unknown future_mode {}"
+                                 .format(future_mode))
             body = torch.cat([
                 torch.ones(n, 1, dtype=c_vec.dtype, device=dev), c_vec],
                 dim=1)                                               # [N, 1+d_c]
@@ -238,7 +288,7 @@ class FixedMaps(nn.Module):
             out.view(-1).index_add_(
                 0, col_idx,
                 flat[row_idx] * self.sketch_signs.repeat(n))
-            if self.p_cache_max_entries > 0:
+            if use_cache and self.p_cache_max_entries > 0:
                 while len(self._p_cache) >= self.p_cache_max_entries:
                     self._p_cache.pop(next(iter(self._p_cache)))
                 self._p_cache[key] = out.detach().float().cpu()
@@ -249,6 +299,29 @@ class FixedMaps(nn.Module):
         if h not in (1, 2):
             raise ValueError("horizon must be 1 or 2, got {}".format(h))
         return h
+
+    def future_decomposition(self) -> dict:
+        """Structure of phi_Y = a + b_y (LOSS_DIAGNOSIS P1 audit).
+
+        Reports the norm split between the outcome-independent common part
+        ``a`` and the two outcome-contrast parts ``b_0/b_1`` — a small
+        contrast norm means the joint test is mostly rewardable context.
+        """
+        a = 0.5 * (self.future_table[0] + self.future_table[1]).double()
+        b0 = self.future_table[0].double() - a
+        b1 = self.future_table[1].double() - a
+        def _info(v):
+            return {"norm": float(v.norm()), "max_abs": float(v.abs().max())}
+
+        def _cos(u, v):
+            denom = u.norm() * v.norm()
+            return float((u * v).sum() / denom.clamp(min=1e-30))
+        return {
+            "mode": "phi_Y(y) = a + b_y",
+            "a": _info(a), "b0": _info(b0), "b1": _info(b1),
+            "cos_a_b0": _cos(a, b0), "cos_a_b1": _cos(a, b1),
+            "cos_b0_b1": _cos(b0, b1),
+        }
 
     # ------------------------------------------------------------------ audit
     def isolation_fingerprint(self) -> dict:

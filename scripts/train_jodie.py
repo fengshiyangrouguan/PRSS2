@@ -262,7 +262,11 @@ def build_components(args, device, dataset):
             p.requires_grad_(True)
         host_dim = int(tgn.embedding_dimension)
         taus = [TAU_TEMPLATE.format(l) for l in range(args.n_layer + 1)]
-        delta_scale = float(np.median(np.diff(np.sort(full.timestamps)))) or 1.0
+        # LOSS_DIAGNOSIS: the fixed-measurement time scale must come from
+        # TRAIN ONLY — using the full stream (train+val+test) leaks the
+        # evaluation splits into the fixed measurement.
+        delta_scale = float(np.median(
+            np.diff(np.sort(train.timestamps)))) or 1.0
         # The root interface (highest layer) has no upward walk and is
         # excluded from the KF windows EXPLICITLY (kf_taus whitelist).
         rpbe_cfg = RPBConfig(
@@ -388,6 +392,10 @@ def main():
                     "(held-out val early stop, zero-memory replay test)",
         "rpbe": components["rpbe_cfg"].as_dict()
                 if components["rpbe_cfg"] is not None else False,
+        # LOSS_DIAGNOSIS: mark the loss-unit convention so old checkpoints
+        # (pre-K-cancellation) are never mixed with post-fix runs.
+        "rpbe_loss_units": "raw_batch_vjp_sum_with_group_K_cancellation"
+                           if components["rpbe_cfg"] is not None else None,
         "cli": vars(args),
     })
 

@@ -534,12 +534,18 @@ class KFLaggedWindow:
     so a stale reference would mix mature-memory statistics with a
     zero-memory batch).
 
-    The population scaling ``raw_vjp * (W_ref / W_batch)`` is KEPT: the
-    reference adjoint carries 1/D_ref ~ 1/W_ref, and the batch contribution
-    is restored to a population-gradient estimate (the /W_ref "fix" would
-    double-normalize and couple the method to an arbitrary window size).
-    Loss units are normalized by the CALLER via per-interface coefficients
-    (J_norm = sum alpha_tau J_tau / min(d_tau, m) / sum alpha_tau), not here.
+    The raw per-batch VJPs are deliberately left unscaled.  Because every
+    batch is centered with the same reference means, their SUM is exactly the
+    macro-window linearization ``<A_ref, M_current>``.  The caller multiplies
+    the numerically-zero auxiliary by the current macro-group batch count K
+    before backward, which cancels the caller's common ``grad /= K`` at group
+    close.  This preserves the exact additive VJP contract even when batches
+    contain different amounts of valid cut weight; ``W_ref / W_batch`` would
+    instead impose an unintended equal-batch reweighting.
+
+    Loss units are otherwise normalized by the caller via per-interface
+    coefficients (J_norm = sum alpha_tau J_tau / min(d_tau, m) / sum
+    alpha_tau), not here.
     """
 
     def __init__(self, state_dims: Dict[str, int], *, min_ratio: float = 2.0,
@@ -638,18 +644,10 @@ class KFLaggedWindow:
                         zs, ps, weights,
                         reference["mu_z"], reference["mu_p"],
                         reference["adjoints"])
-                    # Macro-window surrogate (review scheme B): the raw
-                    # VJP <A_ref, M_b> is this batch's contribution to the
-                    # whole-window linearization <A_ref, M_window>.  The
-                    # representation parameters are frozen inside the
-                    # macro-group and updated once at its end, so summing
-                    # the per-batch gradients over the group IS the
-                    # window-linearized gradient — no W_ref/W_batch
-                    # rescaling.  (The score is degree-0 homogeneous:
-                    # J(cM) = J(M) and grad_M J(cM) = grad_M J(M)/c, so
-                    # the adjoint's inverse scale carries the batch
-                    # multiplicity; the group sum absorbs it.  See the
-                    # k-fold detached test in test_eighth_review.)
+                    # Raw batch moment VJPs add exactly to the current
+                    # macro-window linearization.  Do not normalize by batch
+                    # weight here: the training loop separately compensates
+                    # its common K-batch gradient average.
                     # Gradient-only surrogate: numerically zero, must not
                     # pollute task-loss logs.
                     surrogates[tau] = raw_vjp.float() \

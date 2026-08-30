@@ -708,7 +708,8 @@ def _parameter_gradient_pass(tgn, decoder, adapter, stream, batch_size,
                         record["reference"] = previous_reference
                     if task_grads_b:
                         record["task_vec"] = sum(
-                            torch.cat(g) for g in task_grads_b) \
+                            torch.cat([gg.reshape(-1) for gg in g])
+                            for g in task_grads_b) \
                             / float(len(task_grads_b))
                     # The last statistical group keeps its pools for the
                     # common-probe / moment decomposition (graph still

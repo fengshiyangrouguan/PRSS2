@@ -152,7 +152,8 @@ class TestResiduals(unittest.TestCase):
 
 
 class TestVirtualStepSummary(unittest.TestCase):
-    def _linear_records(self, effect=0.01, curvature=0.0, n_pairs=7):
+    def _linear_records(self, effect=0.01, curvature=0.0, n_pairs=7,
+                        step_frac=0.01):
         """Pure first-order fake: f(+e d) = f0 + effect, f(-e d) = f0 -
         effect.  The +-eps average is 0; the central effect is the
         signal."""
@@ -166,35 +167,77 @@ class TestVirtualStepSummary(unittest.TestCase):
                     + float(sign ** 2) * curvature,
                     "delta": float(sign) * effect
                     + float(sign ** 2) * curvature,
+                    "step_frac": step_frac,
                 })
         return records
 
     def test_central_effect_is_direction_not_average(self):
         summary = dl._summarize_virtual_records(
             self._linear_records(effect=0.01))
-        entry = summary["exact_J"]
-        # The naive +-eps average would be (0.01 - 0.01)/2 = 0.
-        self.assertAlmostEqual(entry["plus_mean"], 0.01, places=6)
-        self.assertAlmostEqual(entry["minus_mean"], -0.01, places=6)
+        entry = summary["exact_J_step0.01"]
         eff = entry["central_directional_effect"]
         self.assertAlmostEqual(eff["mean"], 0.01, places=6)
         self.assertEqual(eff["sign_rate"], 1.0)
         self.assertEqual(eff["median"], 0.01)
-        self.assertAlmostEqual(entry["curvature_mean"], 0.0, places=9)
+        self.assertEqual(entry["n_complete_pairs"], 7)
+        # Directional derivative = effect / eps = 0.01 / 0.01 = 1.0.
+        der = entry["directional_derivative"]
+        self.assertAlmostEqual(der["mean"], 1.0, places=6)
+        self.assertAlmostEqual(
+            entry["second_directional_derivative_mean"], 0.0, places=9)
 
-    def test_curvature_goes_to_curvature_slot(self):
+    def test_curvature_goes_to_second_derivative_slot(self):
         summary = dl._summarize_virtual_records(
             self._linear_records(effect=0.0, curvature=0.005))
-        entry = summary["exact_J"]
+        entry = summary["exact_J_step0.01"]
         eff = entry["central_directional_effect"]
         self.assertAlmostEqual(eff["mean"], 0.0, places=9)
-        self.assertAlmostEqual(entry["curvature_mean"], 0.005, places=9)
+        # H = (d+ + d-)/eps^2 = 2*0.005 / 1e-4 = 100.
+        self.assertAlmostEqual(
+            entry["second_directional_derivative_mean"], 100.0, places=6)
 
-    def test_bootstrap_ci_sanity(self):
+    def test_directional_derivative_scales_with_step(self):
+        # Same linear slope: derivative must be step-independent.
+        s1 = dl._summarize_virtual_records(
+            self._linear_records(effect=0.0025, step_frac=0.0025))
+        s2 = dl._summarize_virtual_records(
+            self._linear_records(effect=0.01, step_frac=0.01))
+        d1 = s1["exact_J_step0.0025"]["directional_derivative"]["mean"]
+        d2 = s2["exact_J_step0.01"]["directional_derivative"]["mean"]
+        self.assertAlmostEqual(d1, d2, places=6)
+        self.assertAlmostEqual(d1, 1.0, places=6)
+
+    def test_pair_alignment_insensitive_to_record_order(self):
+        records = self._linear_records(effect=0.01, n_pairs=7)
+        rng = np.random.RandomState(3)
+        shuffled = list(records)
+        rng.shuffle(shuffled)
+        s_orig = dl._summarize_virtual_records(records)
+        s_shuf = dl._summarize_virtual_records(shuffled)
+        a = s_orig["exact_J_step0.01"]
+        b = s_shuf["exact_J_step0.01"]
+        self.assertAlmostEqual(
+            a["central_directional_effect"]["mean"],
+            b["central_directional_effect"]["mean"], places=9)
+        self.assertEqual(a["n_complete_pairs"], b["n_complete_pairs"])
+
+    def test_incomplete_pair_excluded_and_counted(self):
+        records = self._linear_records(effect=0.01, n_pairs=3)
+        # Drop the -1 side of pair 1 entirely.
+        records = [r for r in records
+                   if not (r["pair"] == 1 and r["sign"] == -1)]
+        summary = dl._summarize_virtual_records(records)
+        entry = summary["exact_J_step0.01"]
+        self.assertEqual(entry["n_complete_pairs"], 2)
+        eff = entry["central_directional_effect"]
+        self.assertEqual(eff["n"], 2)
+
+    def test_bootstrap_ci_95(self):
+        # With a strictly positive effect the 95% CI must not cross 0.
         summary = dl._summarize_virtual_records(
             self._linear_records(effect=0.01, n_pairs=20))
-        eff = summary["exact_J"]["central_directional_effect"]
-        self.assertGreater(eff["ci_lo"], 0.0)   # consistent positive
+        eff = summary["exact_J_step0.01"]["central_directional_effect"]
+        self.assertGreater(eff["ci_lo"], 0.0)
         self.assertAlmostEqual(eff["ci_hi"], 0.01, places=6)
 
 

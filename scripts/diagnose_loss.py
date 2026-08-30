@@ -831,14 +831,21 @@ def _common_probe_report(last_record, params):
                 (nz_a & nz_b).sum())
     out["nonzero_intersections"] = intersections
     # Repeatability: the same (mu, A) recomputed twice must have
-    # cosine ~ 1 — a low value here means the 0.0 cross-cosines are a
-    # numerical artifact, not a signal.
+    # cosine ~ 1 AND matching norms — a low value here means the 0.0
+    # cross-cosines are a numerical artifact, not a signal.
     if cur_ref is not None:
         repeat = vjp_grad({"mu_z": cur_ref["mu_z"],
                            "mu_p": cur_ref["mu_p"],
                            "adjoints": cur_ref["adjoints"]})
-        out["repeat_consistency_cosine"] = _cos(
-            combos["mu_cur_A_cur"], repeat)
+        first = combos["mu_cur_A_cur"]
+        out["repeat_consistency"] = {
+            "cosine": _cos(first, repeat),
+            "norm_ratio": float(repeat.norm()
+                                / first.norm().clamp(min=1e-30)),
+            "relative_error": float(
+                (repeat - first).norm()
+                / first.norm().clamp(min=1e-30)),
+        }
     return out
 
 
@@ -955,7 +962,11 @@ def _multi_window_virtual_steps(result, tgn, decoder, adapter, stream,
     """
     groups = result["groups"]
     total_norm = float(sum(p_.norm() ** 2 for p_ in params)) ** 0.5
-    step_size = 0.01 * total_norm
+    # Linearity check (review): three step sizes; the directional
+    # derivative must be similar across them and the symmetric term must
+    # scale ~ eps^2 — then the largest still-linear step is used for
+    # the Task-51 comparisons.
+    step_fracs = (0.0025, 0.005, 0.01)
     records = []
     n_pairs = 0
     for t in range(len(groups) - 1):
@@ -989,36 +1000,55 @@ def _multi_window_virtual_steps(result, tgn, decoder, adapter, stream,
             continue
         n_pairs += 1
         for name, d in directions.items():
-            for sign in (+1.0, -1.0):
-                _perturb_params(params, d, sign * step_size)
-                if tgn.use_memory:
-                    tgn.memory.restore_memory(nxt["memory"])
-                after = _forward_heldout_metrics(
-                    tgn, decoder, adapter, stream, nxt["batch_start"],
-                    group_batches, batch_size, n_neighbors, trace_roots,
-                    seed, builder, fixed_maps, eps)
-                _undo_params(params, d, sign * step_size)
-                for key in ("J", "J_outcome_contrast", "task_nll"):
-                    b = before.get(key)
-                    a = after.get(key)
-                    if b is None or a is None:
-                        continue
-                    records.append({
-                        "pair": t, "direction": name, "sign": int(sign),
-                        "metric": key, "before": b, "after": a,
-                        "delta": a - b,
-                    })
-    out = {"n_pairs": n_pairs, "step_size": step_size,
+            for step_frac in step_fracs:
+                step_size = step_frac * total_norm
+                for sign in (+1.0, -1.0):
+                    _perturb_params(params, d, sign * step_size)
+                    if tgn.use_memory:
+                        tgn.memory.restore_memory(nxt["memory"])
+                    after = _forward_heldout_metrics(
+                        tgn, decoder, adapter, stream,
+                        nxt["batch_start"], group_batches, batch_size,
+                        n_neighbors, trace_roots, seed, builder,
+                        fixed_maps, eps)
+                    _undo_params(params, d, sign * step_size)
+                    for key in ("J", "J_outcome_contrast", "task_nll"):
+                        b = before.get(key)
+                        a = after.get(key)
+                        if b is None or a is None:
+                            continue
+                        records.append({
+                            "pair": t, "direction": name,
+                            "sign": int(sign), "metric": key,
+                            "before": b, "after": a, "delta": a - b,
+                            "step_frac": step_frac,
+                        })
+    out = {"n_pairs": n_pairs,
+           "step_fracs": list(step_fracs),
            "records": records,
            "summary": _summarize_virtual_records(records)}
     return out
 
 
 def _summarize_virtual_records(records):
-    """Per direction/metric: plus/minus means, the CENTRAL directional
-    effect (plus-minus)/2 (review: averaging the two deltas measures
-    curvature, not direction), curvature (plus+minus)/2, and a
-    per-pair clustered bootstrap CI / sign-rate."""
+    """Per direction/metric/step_frac: the CENTRAL directional effect
+    and its step-normalized derivative.
+
+    Review corrections baked in:
+    * the +1/-1 deltas are paired by (pair, direction, metric,
+      step_frac) — never by list order;
+    * the 95% clustered bootstrap uses the 2.5/97.5 percentiles;
+    * the directional derivative D = (d+ - d-)/(2 eps) makes different
+      step sizes comparable, with the second directional derivative
+      H = (d+ + d-)/eps^2 as the curvature counterpart;
+    * the raw per-pair effects are kept (7 pairs is too few to trust a
+      CI alone).
+    """
+    paired = {}
+    for r in records:
+        key = (r["pair"], r["direction"], r["metric"],
+               r.get("step_frac", 0.01))
+        paired.setdefault(key, {})[int(r["sign"])] = r["delta"]
     summary = {}
 
     def _bootstrap_mean_ci(values, n_boot=2000, seed_boot=0):
@@ -1031,34 +1061,41 @@ def _summarize_virtual_records(records):
             for _ in range(n_boot)])
         return {"mean": float(values.mean()),
                 "median": float(np.median(values)),
-                "ci_lo": float(np.percentile(means, 5)),
-                "ci_hi": float(np.percentile(means, 95)),
+                "ci_lo": float(np.percentile(means, 2.5)),
+                "ci_hi": float(np.percentile(means, 97.5)),
                 "sign_rate": float(np.mean(values > 0.0)),
-                "n": int(len(values))}
+                "n": int(len(values)),
+                "values": [float(v) for v in values]}
 
-    for direction in sorted({r["direction"] for r in records}):
-        for metric in ("J", "J_outcome_contrast", "task_nll"):
-            plus = np.asarray([
-                r["delta"] for r in records
-                if r["direction"] == direction and r["sign"] == 1
-                and r["metric"] == metric], dtype=np.float64)
-            minus = np.asarray([
-                r["delta"] for r in records
-                if r["direction"] == direction and r["sign"] == -1
-                and r["metric"] == metric], dtype=np.float64)
-            if len(plus) == 0 or len(minus) != len(plus):
-                continue
-            n = min(len(plus), len(minus))
-            effects = (plus[:n] - minus[:n]) / 2.0
-            curvatures = (plus[:n] + minus[:n]) / 2.0
-            key = direction + "_" + metric
-            summary[key] = {
-                "plus_mean": float(plus[:n].mean()),
-                "minus_mean": float(minus[:n].mean()),
-                "central_directional_effect": _bootstrap_mean_ci(
-                    effects),
-                "curvature_mean": float(curvatures.mean()),
-            }
+    for (pair, direction, metric, step_frac), sides in sorted(
+            paired.items()):
+        if 1 not in sides or -1 not in sides:
+            continue
+        key = direction + "_" + metric + "_step{}".format(step_frac)
+        entry = summary.get(key)
+        if entry is None:
+            entry = {"effects": [], "sym_sums": [],
+                     "missing_plus_pairs": 0, "missing_minus_pairs": 0,
+                     "step_frac": step_frac, "metric": metric,
+                     "direction": direction}
+            summary[key] = entry
+        d_plus = sides[1]
+        d_minus = sides[-1]
+        entry["effects"].append((d_plus - d_minus) / 2.0)
+        entry["sym_sums"].append(d_plus + d_minus)
+    for key, entry in summary.items():
+        eps = float(entry["step_frac"])
+        effects = np.asarray(entry["effects"], dtype=np.float64)
+        sym_sums = np.asarray(entry["sym_sums"], dtype=np.float64)
+        entry["central_directional_effect"] = _bootstrap_mean_ci(effects)
+        entry["directional_derivative"] = _bootstrap_mean_ci(
+            effects / eps)
+        # Review: H_i = (d+ + d-)/eps^2 (NO extra /2).
+        entry["second_directional_derivative_mean"] = float(
+            (sym_sums / (eps * eps)).mean())
+        entry["n_complete_pairs"] = int(len(effects))
+        entry.pop("effects")
+        entry.pop("sym_sums")
     return summary
 
 

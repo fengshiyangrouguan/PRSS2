@@ -512,6 +512,15 @@ class JodieNodeClassificationLoop:
                             cuts, replay_plan, group_k, b - group_start)
                     if n_terms:
                         aux_batches += 1
+                # Per-batch gradient diagnostics (the sprint script),
+                # same hook as the single-pass path: r_eff =
+                # |grad(aux)| / |grad(task)| carries lambda and the rank
+                # coefficients already.
+                if self._grad_diag_fn is not None and self.kf_on \
+                        and auxiliary.requires_grad and self.repr_params:
+                    row = self._grad_diag_fn(
+                        self, task_loss, auxiliary, global_step)
+                    self.grad_diag["rows"].append(row)
                 loss = task_loss + auxiliary
                 self.monitor.validate_losses({
                     "task": float(task_loss.detach()),

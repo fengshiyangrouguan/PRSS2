@@ -49,14 +49,16 @@ def grad_diag_fn(loop, task_loss, auxiliary, step):
     wb_wr = {}
     age = {}
     adj_norm = {}
-    for tau in loop._tau_coeff:
-        ref = loop.kf_window._reference.get(tau)
-        if ref is not None:
-            wb = loop.kf_window._last_batch_weight.get(tau, 0.0)
-            wb_wr[tau] = wb / ref["W"] if ref["W"] > 0 else float("nan")
-            adj_norm[tau] = float(sum(
-                a.norm() for a in ref["adjoints"].values()))
-        age[tau] = loop.kf_window.reference_age(tau)
+    if hasattr(loop.kf_window, "_reference"):
+        # Lagged window bookkeeping (diagnostics only).
+        for tau in loop._tau_coeff:
+            ref = loop.kf_window._reference.get(tau)
+            if ref is not None:
+                wb = loop.kf_window._last_batch_weight.get(tau, 0.0)
+                wb_wr[tau] = wb / ref["W"] if ref["W"] > 0 else float("nan")
+                adj_norm[tau] = float(sum(
+                    a.norm() for a in ref["adjoints"].values()))
+            age[tau] = loop.kf_window.reference_age(tau)
     return {
         "step": int(step),
         "g_task_norm": tn,

@@ -1296,18 +1296,34 @@ def _parameter_space_report(tgn, decoder, adapter, stream, batch_size,
             params),
     }
     # Ridge-after-condition diagnostics from the last group's score diag.
+    # Review correction: the whitening is A = C_ZZ/s_Z + eps I, so the
+    # post-ridge condition number is
+    #   kappa(A) = (l_max + eps*s_Z) / (l_min + eps*s_Z)
+    # (the old (l_max + eps)/(l_min + eps) mixed raw eigenvalues with the
+    # scale-normalized ridge).  P is whitened too, so its side is
+    # reported the same way.
     diag = last.get("diag") or {}
+    scale_z = diag.get("scale_z")
+    scale_p = diag.get("scale_p")
+
+    def _cond_after(max_eig, min_eig, scale):
+        if max_eig is None or min_eig is None or scale is None:
+            return None
+        return (max_eig + eps * scale) / (min_eig + eps * scale)
+
     report["condition"] = {
         "zz_min_eig": diag.get("zz_min_eig"),
         "zz_max_eig": diag.get("zz_max_eig"),
         "zz_cond": diag.get("zz_cond"),
         "zz_r_eff": diag.get("zz_r_eff"),
         "pp_r_eff": diag.get("pp_r_eff"),
+        "scale_z": scale_z,
+        "scale_p": scale_p,
         "ridge_eps": eps,
-        "zz_cond_after_ridge": (
-            (diag["zz_max_eig"] + eps) / (diag["zz_min_eig"] + eps)
-            if diag.get("zz_max_eig") is not None
-            and diag.get("zz_min_eig") is not None else None),
+        "zz_cond_after_ridge": _cond_after(
+            diag.get("zz_max_eig"), diag.get("zz_min_eig"), scale_z),
+        "pp_cond_after_ridge": _cond_after(
+            diag.get("pp_max_eig"), diag.get("pp_min_eig"), scale_p),
     }
     return report
 

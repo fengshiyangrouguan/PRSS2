@@ -121,3 +121,71 @@ configs/ccm/frozen_method.json      # 冻结方法配置（机器可读）
 3. L7：smoke 有限值/梯度生效；pilot step time ≤1.5×、aux 生效、Γ 离开 zero-init
 4. L8：5-seed 配对差 + NLL depth 曲线符合"深层递归信息保持"
 5. 全程：commit hash、frozen_method.json、per-seed 指标落盘
+
+---
+
+# v3 修订（第二轮审阅封口，2026-09-01）
+
+## 三点必须写进规格的修正
+
+### 修正 1：窗口门槛不能用 128——TGN 实际冻结值是 1024
+
+`2m=128` 只是维数层面的最低门槛。TGN 五 seed 正式实验实际使用 `kf_min_abs=1024`（`run_multiseed_TGN.sh` 未覆盖，`RPBConfig` 默认），窗口按**独立 tree** 计数。LLM 直接改 128 不能写成"继承 TGN"，且 d_z=m=64、N=128 处于小样本 CCA 虚高区。
+
+**修正**：
+- L1 后增加 **estimator validity audit**（不训练、不看 PPL）：固定初始 checkpoint + training split，扫 `N ∈ {128, 256, 512, 1024}`，检查：real J vs dialogue-level permutation J、J/min(d_z,m) 是否接近虚假满秩上限、条件数、有效秩、相邻窗口规模 exact-gradient cosine、Cholesky failure rate。
+- 预先规定"选最小稳定 N"后冻结。这是统计估计器有效性检查，不是 LLM 性能 sweep。
+- `frozen_method.json` 新增：
+  ```json
+  {"kf_min_abs": "<audit-selected>", "kf_min_ratio": 2.0,
+   "window_unit": "unique_dialogue_id"}
+  ```
+  窗口门槛数**独立 dialogue**，不数两条 horizon rows。
+
+### 修正 2：L5 明确 loss 符号与跨 microbatch 缩放
+
+- 含 K 个 microbatches 的优化器窗口目标：
+  `L_group = (1/K)·Σ_b L_task,b − λ·J_norm`，单 CCM 接口下 `J_norm = J/min(d_z,m)`。
+- 每 microbatch 反传：`L_task,b/K − (λ/min(d_z,m))·s_b`（Σ∇s_b = ∇J），窗口末**一次** optimizer step。
+- **禁止**依赖 HF 按固定 `gradient_accumulation_steps=128` 自动除（自适应 K 会重复/错误缩放）。
+- 明确：用官方每 dialogue 的 CE 标量再除实际 K；`p/means/adjoints` 全部 detach；k=3 只有 task 项；训练恰好 1000 个完整 optimizer windows；checkpoint 只落窗口边界；三臂读取同一 `sample_id + random_k + window_boundary` manifest。
+
+### 修正 3：matched cohort 必须固定同一预测目标
+
+官方各 depth 取不同长度前缀 → 不同深度预测不同 utterance。改为**固定 current/target、只裁剪历史**（suffix-depth）：
+
+| Depth | 压缩历史 | 当前输入 | 固定目标 |
+|---|---|---|---|
+| 1 | u₁₂ | u₁₃ | u₁₄ |
+| 2 | u₁₁:₁₂ | u₁₃ | u₁₄ |
+| 4 | u₉:₁₂ | u₁₃ | u₁₄ |
+| 8 | u₅:₁₂ | u₁₃ | u₁₄ |
+| 12 | u₁:₁₂ | u₁₃ | u₁₄ |
+
+- depth 12 需要 **≥14 turns**（不是 ≥12）。
+- 主机制量 `Δ_log(T) = NLL_Γtask(T) − NLL_Ours(T)` 在**完全相同的 target tokens** 上计算。
+- **预注册**深浅对比：`(Δ_log(8)+Δ_log(12))/2 − (Δ_log(1)+Δ_log(2))/2`，禁止结果后肉眼定义趋势。
+
+## 五个规格细节补齐
+
+1. **L4 精确索引写回**（Test D 唯一真值）：v=k−3；C₁=u_{k−2}, Y₁=u_{k−1}；C₂=(u_{k−2}, u_{k−1}, one-update), Y₂=u_k。
+2. **frozen_method.json 扩展冻结**：kf_variant=full_balancing、d_z/J_mem 输出维、J 归一化规则、d_c/d_f、全部 CountSketch/TensorSketch seeds、Γ rank/activation/gate shape、K/V 是否分模块、layer/head/slot 共享规则、时间编码、RPBE 接收梯度的参数集合、checkpoint_selection=final_step_1000。
+3. **J_mem 不 detach 输入**：`requires_grad=False` 只表示固定映射参数不训练；pass2 必须保留 `M_v → J_mem(M_v) → J` 的梯度路径。K/V flatten 顺序固定为 `[layer, K_or_V, head, COMP_slot, head_dim]`。
+4. **L6 Γ 梯度口径修正**：gate s=0 时 step 0 的 U/V 梯度为零是**正常**。正确断言：① step 0 Γ 模块总梯度非零、gate 梯度非零 ② gate 更新后后续 step 的 U/V 梯度非零 ③ Γ 输出开始偏离零。
+5. **pass1/pass2 缓存 collated tensors**：不重新调用带随机 `sample_dialog` 的 collator；先缓存确定 collated CPU tensors，恢复 RNG 后只重放模型。断言：`row_ids_pass1 == row_ids_pass2`、`cut_ids_pass1 == cut_ids_pass2`、`max_abs(z_pass1 − z_pass2) <= dtype 容差`、`RNG_after_pass2 == RNG_after_one_control_forward`。
+
+## Test A 再强化
+
+- 官方 `sum_attn_mask @ key/value_states` 继续作为**精确 base mean**；Γ 只递归计算 residual；最终写回 `official_mean + residual`（避免 FP16/FP32 顺序递推的加法序差异）。
+- Test A 比较：每层/每 head/每 slot 的 merged K/V + 最终 logits + gate=0 时与官方 CCM 一致。
+
+## 最终裁决表
+
+| 模块 | 裁决 |
+|---|---|
+| L0/L1 | 立即开 |
+| L2/L3 | 可并行实现，先冻结 Γ/J_mem 完整结构参数 |
+| L4 | 补回 C₁/Y₁/C₂/Y₂ 后开 |
+| L5 | 补窗口审计 + loss 公式 + 可变 K 缩放后编码 |
+| L7–L8 | estimator validity audit 通过后启动 |
+| L9 | 改为固定 target 的 suffix-depth 评估 |

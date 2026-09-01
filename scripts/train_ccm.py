@@ -217,10 +217,16 @@ def parse_meta(batch, comp_ids, sum_ids, sample_id_global):
 def run_forward(model, batch, device, grad_enabled):
     # labels are NOT passed here: the task CE is computed once by
     # task_ce (passing them would compute the same loss a second time).
+    # fp16 autocast matches the official Trainer protocol: the vendored
+    # conditional-LoRA layer computes its lora branch in fp32, so the
+    # forward MUST run under autocast (mixed fp16/fp32 without autocast
+    # raises on the fp16 base path).
     ctx = torch.enable_grad() if grad_enabled else torch.no_grad()
     with ctx:
-        return model(input_ids=batch["input_ids"].to(device),
-                     attention_mask=batch["attention_mask"].to(device))
+        with torch.autocast(device_type="cuda", dtype=torch.float16,
+                            enabled=(device.type == "cuda")):
+            return model(input_ids=batch["input_ids"].to(device),
+                         attention_mask=batch["attention_mask"].to(device))
 
 
 def task_ce(out, labels, device):
@@ -292,6 +298,10 @@ def main():
     tokenizer = build_tokenizer(args)
     model = build_model(args, device)
     model = wrap_lora(model, args.lora_r)
+    # The PEFT wrap can replace the CausalLM wrapper; re-assert the
+    # comp/sum token registration on the wrapped object.
+    model.update_comp_token([32000 + k for k in range(N_TOK)],
+                            [32000 + N_TOK + k for k in range(N_TOK)])
     use_rpbe = args.arm in ("ours", "gamma_task_only")
     if use_rpbe:
         attach_gamma(model, hidden=args.gamma_hidden)

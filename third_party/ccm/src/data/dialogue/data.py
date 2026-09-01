@@ -45,7 +45,28 @@ class DialogueDataset():
         # if os.path.exists(os.path.join(self.path, f"trainset.pt")):
         #     self.trainset = torch.load(os.path.join(self.path, f"trainset.pt"))
         #     self.valset = torch.load(os.path.join(self.path, f"valset.pt"))
-        dataset = datasets.load_dataset("daily_dialog")
+        # RPBE modification (L0): the original data URL (yanran.li) is
+        # dead and the HF dataset script cannot fetch it on this host.
+        # A local mirror with the official zip layout
+        # (ijcnlp_dailydialog/{train,validation,test}/dialogues_*.txt) is
+        # read directly when DIALOG_MIRROR points at it.
+        mirror = os.environ.get("DIALOG_MIRROR", "")
+        if mirror and os.path.isdir(mirror):
+            dataset = {
+                split: {
+                    "dialog": open(
+                        os.path.join(mirror, split,
+                                     "dialogues_{}.txt".format(split)),
+                        encoding="utf-8").read().strip().split("\n"),
+                    "act": open(
+                        os.path.join(mirror, split,
+                                     "dialogues_act_{}.txt".format(split)),
+                        encoding="utf-8").read().strip().split("\n"),
+                }
+                for split in ("train", "validation", "test")
+            }
+        else:
+            dataset = datasets.load_dataset("daily_dialog")
         self.trainset = {}
         self.valset = {}
         # RPBE modification (L0, plan v2 section 15): ``clean_split=True``

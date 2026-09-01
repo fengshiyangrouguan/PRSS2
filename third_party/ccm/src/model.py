@@ -15,10 +15,16 @@ from .arch.config import PRETRAINED_VOCAB_SIZE_LLAMA, PRETRAINED_VOCAB_SIZE_T5
 try:
     from .arch.gist_t5 import GistT5ForConditionalGeneration
     from .arch.ccm_t5 import T5ForConditionalGeneration_CCM
+except Exception:
+    # T5 arch is unused by the dialog/llama experiments; transformers
+    # >= 4.4x moved its checkpoint helpers.
+    GistT5ForConditionalGeneration = None
+    T5ForConditionalGeneration_CCM = None
+try:
     from .arch.gist_llama import GistLlamaForCausalLM
     from .arch.ccm_llama import LlamaForCausalLM_CCM
     from .arch.ccm_llama_stream import LlamaForCausalLM_CCM_Stream
-except:
+except Exception:
     from .arch.ccm_mistral import MistralForCausalLM_CCM
 
 from .utils import SeparatedEmbedding, transpose, load_from_safetensor

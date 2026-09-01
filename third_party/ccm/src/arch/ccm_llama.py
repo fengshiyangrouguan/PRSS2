@@ -20,10 +20,40 @@ from transformers.models.llama.modeling_llama import (
     LlamaRMSNorm,
     LlamaMLP,
     LlamaRotaryEmbedding,
-    _make_causal_mask,
-    _expand_mask,
     apply_rotary_pos_emb,
 )
+
+
+def _make_causal_mask(input_ids_shape: torch.Size, dtype: torch.dtype,
+                      device: torch.device,
+                      past_key_values_length: int = 0) -> torch.Tensor:
+    """Inlined from transformers 4.29 modeling_llama (removed upstream in
+    >= 4.4x; this file keeps its own attention implementation)."""
+    bsz, tgt_len = input_ids_shape
+    min_dtype = torch.finfo(dtype).min
+    mask = torch.full((tgt_len, tgt_len), min_dtype, dtype=dtype,
+                      device=device)
+    mask_cond = torch.arange(mask.size(-1), device=device)
+    mask.masked_fill_(mask_cond < (mask_cond + 1).view(mask.size(-1), 1), 0)
+    mask = mask.to(dtype)
+    if past_key_values_length > 0:
+        mask = torch.cat([torch.zeros(tgt_len, past_key_values_length,
+                                      dtype=dtype, device=device), mask],
+                         dim=-1)
+    return mask[None, None, :, :].expand(
+        bsz, 1, tgt_len, tgt_len + past_key_values_length)
+
+
+def _expand_mask(mask: torch.Tensor, dtype: torch.dtype,
+                 tgt_len: Optional[int] = None) -> torch.Tensor:
+    """Inlined from transformers 4.29 modeling_llama."""
+    bsz, src_len = mask.size()
+    tgt_len = tgt_len if tgt_len is not None else src_len
+    expanded_mask = mask[:, None, None, :].expand(
+        bsz, 1, tgt_len, src_len).to(dtype)
+    inverted_mask = 1.0 - expanded_mask
+    return inverted_mask.masked_fill(inverted_mask.to(torch.bool),
+                                     torch.finfo(dtype).min)
 from transformers.utils import logging
 from .generation_utils import GistGenerationMixin
 
@@ -104,11 +134,10 @@ class LlamaAttention(nn.Module):
         if max_id is not None:
             embed_len = max_id
 
-        cos, sin = self.rotary_emb(value_states, seq_len=embed_len)
+        cos, sin = self.rotary_emb(value_states, position_ids)
         #####################################################
 
-        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin,
-                                                        position_ids)
+        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
         # [bsz, nh, t, hd]
 
         #####################################################
@@ -183,11 +212,7 @@ class LlamaDecoderLayer(nn.Module):
         super().__init__()
         self.hidden_size = config.hidden_size
         self.self_attn = LlamaAttention(config=config)
-        self.mlp = LlamaMLP(
-            hidden_size=self.hidden_size,
-            intermediate_size=config.intermediate_size,
-            hidden_act=config.hidden_act,
-        )
+        self.mlp = LlamaMLP(config)
         self.input_layernorm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 

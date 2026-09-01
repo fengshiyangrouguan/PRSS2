@@ -74,11 +74,19 @@ class CompressionTrainingArguments(TrainingArguments):
     okay, and control when _post_init happens.
     """
 
-    comp: CompressionArguments = CompressionArguments()
+    comp: CompressionArguments = field(default_factory=CompressionArguments)
 
     # Change these types to strs so that they typecheck with str configs
     evaluation_strategy: Optional[str] = "no"
     lr_scheduler_type: Optional[str] = "linear"
+    # transformers>=4.31 declares these as Unions of containers, which
+    # omegaconf rejects; pin them to plain str/None (unused by CCM).
+    lr_scheduler_kwargs: Optional[str] = None
+    fsdp_config: Optional[str] = None
+    accelerator_config: Optional[str] = None
+    deepspeed: Optional[str] = None
+    gradient_checkpointing_kwargs: Optional[str] = None
+    optim_target_modules: Optional[str] = None
     logging_strategy: Optional[str] = "steps"
     save_strategy: Optional[str] = "steps"
     optim: Optional[str] = "adamw_torch"
@@ -305,10 +313,11 @@ class DataTrainingArguments:
 
 @dataclass
 class Arguments:
-    model: ModelArguments = ModelArguments()
-    data: DataTrainingArguments = DataTrainingArguments()
-    wandb: WandBArguments = WandBArguments()
-    training: CompSeq2SeqTrainingArguments = CompSeq2SeqTrainingArguments("result/dummy")
+    model: ModelArguments = field(default_factory=ModelArguments)
+    data: DataTrainingArguments = field(default_factory=DataTrainingArguments)
+    wandb: WandBArguments = field(default_factory=WandBArguments)
+    training: CompSeq2SeqTrainingArguments = field(
+        default_factory=lambda: CompSeq2SeqTrainingArguments("result/dummy"))
     user: Optional[str] = os.environ.get("USER", None)
 
 

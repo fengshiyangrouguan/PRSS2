@@ -20,11 +20,10 @@ from transformers.models.llama.modeling_llama import (
     LlamaRMSNorm,
     LlamaMLP,
     LlamaRotaryEmbedding,
-    _make_causal_mask,
-    _expand_mask,
     apply_rotary_pos_emb,
     rotate_half,
 )
+from .ccm_llama import _make_causal_mask, _expand_mask
 from transformers.utils import logging
 from .generation_utils import GistGenerationMixin
 
@@ -116,7 +115,7 @@ class LlamaAttention(nn.Module):
             embed_len = max_id
         #####################################################
 
-        cos, sin = self.rotary_emb(value_states, seq_len=embed_len)
+        cos, sin = self.rotary_emb(value_states, position_ids)
         # query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin,
         #                                                 position_ids)
         query_states = apply_rotary_pos_emb_single(query_states, cos, sin, position_ids)
@@ -199,11 +198,7 @@ class LlamaDecoderLayer(nn.Module):
         super().__init__()
         self.hidden_size = config.hidden_size
         self.self_attn = LlamaAttention(config=config)
-        self.mlp = LlamaMLP(
-            hidden_size=self.hidden_size,
-            intermediate_size=config.intermediate_size,
-            hidden_act=config.hidden_act,
-        )
+        self.mlp = LlamaMLP(config)
         self.input_layernorm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 

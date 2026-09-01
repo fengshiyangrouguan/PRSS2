@@ -69,4 +69,4 @@ class DataCollatorForDialogue_LLAMA:
                                                     self.pad_token,
                                                     sink_token=sink_token)
 
-        return model_inputs
+        return dict(model_inputs)

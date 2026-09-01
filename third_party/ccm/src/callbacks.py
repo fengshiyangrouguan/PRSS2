@@ -54,7 +54,7 @@ class CustomWandbCallback(WandbCallback):
                     group=args.wandb.group,
                     name=args.wandb.name,
                     config=dataclasses.asdict(args),
-                    settings=wandb.Settings(start_method="fork"),
+                    settings=wandb.Settings(),
                 )
 
             # define default x-axis (for latest wandb versions)

@@ -51,7 +51,7 @@ def pad_inputs(loc, model_inputs, label_pad_token_id, pad_token):
             model_inputs[key] = pad_sequence(value_tensors,
                                              batch_first=True,
                                              padding_value=pad_token_id)
-    return model_inputs
+    return dict(model_inputs)
 
 
 def prepare_comp_attn_mask_llama(model_inputs,
@@ -128,7 +128,7 @@ def prepare_comp_attn_mask_llama(model_inputs,
             sink_token=sink_token,
         )
 
-    return model_inputs
+    return dict(model_inputs)
 
 
 @dataclass
@@ -226,4 +226,4 @@ class DataCollator_LLAMA:
                                                     self.pad_token,
                                                     sink_token=sink_token)
 
-        return model_inputs
+        return dict(model_inputs)

@@ -10,8 +10,10 @@ modification markers; this package holds the learnable pieces.
 """
 
 from .adapter import CCMHostAdapter
-from .ccm_patch import N_TOK_LOCK, attach_gamma, paired_seed_hash
+from .ccm_patch import (N_TOK_LOCK, attach_gamma, paired_seed_hash,
+                        wrap_lora)
 from .gamma_residual import GammaResidual, time_features
 
 __all__ = ["GammaResidual", "time_features", "attach_gamma",
-           "paired_seed_hash", "N_TOK_LOCK", "CCMHostAdapter"]
+           "paired_seed_hash", "wrap_lora", "N_TOK_LOCK",
+           "CCMHostAdapter"]

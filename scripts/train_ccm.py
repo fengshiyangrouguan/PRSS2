@@ -52,7 +52,8 @@ for p in (str(SRC), str(CCM)):
         sys.path.insert(0, p)
 
 from rpbe.hosts.ccm.adapter import CCMHostAdapter
-from rpbe.hosts.ccm.ccm_patch import N_TOK_LOCK, attach_gamma, paired_seed_hash
+from rpbe.hosts.ccm.ccm_patch import (N_TOK_LOCK, attach_gamma,
+                                      paired_seed_hash, wrap_lora)
 from rpbe.llm.dialogue_records import (DialogueCutBuilder, DialogueMeta,
                                        Llmmaps, MEM_TAU)
 from rpbe.llm.utterance_embed import UtteranceEmbed
@@ -147,11 +148,8 @@ def build_model(args, device):
 
 
 def wrap_lora(model, r):
-    from peft import LoraConfig, get_peft_model
-    return get_peft_model(model, LoraConfig(
-        r=int(r), lora_alpha=2 * int(r), lora_dropout=0.0,
-        target_modules=["q_proj", "k_proj", "v_proj", "o_proj"],
-        task_type="CAUSAL_LM"))
+    from rpbe.hosts.ccm.ccm_patch import wrap_lora as _wrap
+    return _wrap(model, r=int(r))
 
 
 def build_dataset(args, tokenizer):
@@ -208,7 +206,8 @@ def parse_meta(batch, comp_ids, sum_ids, sample_id_global):
             utterance_spans.append((prev_end + 1, c0_pos))
             prev_end = c0_pos + 3  # S1 position
         utterance_spans.append((prev_end + 1, prompt_end))
-        metas.append({"sample_id": int(sample_id_global) + b, "k": k,
+        metas.append({"sample_id": int(sample_id_global) + b, "row": b,
+                      "k": k,
                       "blocks": blocks,
                       "utterance_spans": utterance_spans,
                       "prompt_end": prompt_end, "ok": ok})
@@ -216,11 +215,12 @@ def parse_meta(batch, comp_ids, sum_ids, sample_id_global):
 
 
 def run_forward(model, batch, device, grad_enabled):
+    # labels are NOT passed here: the task CE is computed once by
+    # task_ce (passing them would compute the same loss a second time).
     ctx = torch.enable_grad() if grad_enabled else torch.no_grad()
     with ctx:
         return model(input_ids=batch["input_ids"].to(device),
-                     attention_mask=batch["attention_mask"].to(device),
-                     labels=batch["labels"].to(device))
+                     attention_mask=batch["attention_mask"].to(device))
 
 
 def task_ce(out, labels, device):
@@ -240,7 +240,7 @@ def collect_rows(meta, adapter, builder, utter_embed, embed_tokens, batch,
                                  dtype=torch.long, device=device)
     z = adapter.extract_z(sum_positions)  # [1, z_dim]
     spans = meta["utterance_spans"]
-    ids = batch["input_ids"][meta["sample_id"] % batch["input_ids"].shape[0]]
+    ids = batch["input_ids"][meta["row"]]
     chi1 = utter_embed(embed_tokens,
                        ids[spans[v + 1][0]:spans[v + 1][1]]
                        .unsqueeze(0).to(device), tag=0)

@@ -72,6 +72,29 @@ def attach_gamma(model, *, head_dim=None, hidden=64, time_dim=16,
     return modules
 
 
+def wrap_lora(model, *, r: int = 8, target_modules=None):
+    """LoRA wrap with the official conditional-LoRA path first.
+
+    The vendored attention calls ``q_proj(x, comp_mask=...)``; the
+    official peft_custom LoRA layer accepts that keyword, while modern
+    peft only forwards it on newer versions (>= ~0.20).  Prefer the
+    official path when importable (cloud peft 0.4), fall back to modern
+    peft otherwise (local tests on peft 0.20).
+    """
+    from peft import LoraConfig
+    if target_modules is None:
+        target_modules = ["q_proj", "k_proj", "v_proj", "o_proj"]
+    config = LoraConfig(r=int(r), lora_alpha=2 * int(r), lora_dropout=0.0,
+                        bias="none", task_type="CAUSAL_LM",
+                        target_modules=list(target_modules))
+    try:
+        from src import peft_custom  # vendored, comp_mask-aware
+        return peft_custom.get_peft_model(model, config)
+    except ImportError:
+        from peft import get_peft_model
+        return get_peft_model(model, config)
+
+
 def paired_seed_hash(base_seed: int, model, *, extra_components=()) -> str:
     """Per-arm seed derivation (plan L2 closure 5).
 

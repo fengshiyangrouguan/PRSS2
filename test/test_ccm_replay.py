@@ -27,7 +27,7 @@ from transformers.models.llama.configuration_llama import LlamaConfig
 
 from src.arch.ccm_llama import LlamaForCausalLM_CCM
 from rpbe.hosts.ccm.adapter import CCMHostAdapter
-from rpbe.hosts.ccm.ccm_patch import attach_gamma
+from rpbe.hosts.ccm.ccm_patch import attach_gamma, wrap_lora
 from rpbe.llm.dialogue_records import DialogueCutBuilder, Llmmaps, MEM_TAU
 from rpbe.llm.utterance_embed import UtteranceEmbed
 from rpbe.loss import KFMomentWindow
@@ -170,15 +170,12 @@ class TestReplayGradients(unittest.TestCase):
 
     def test_all_components_receive_gradient(self):
         try:
-            from peft import LoraConfig, get_peft_model
+            import peft  # noqa: F401
         except ImportError:
             self.skipTest("peft not installed")
         torch.manual_seed(2)
         model = make_model()
-        model = get_peft_model(
-            model, LoraConfig(r=4, lora_alpha=8,
-                              target_modules=["q_proj", "k_proj",
-                                              "v_proj", "o_proj"]))
+        model = wrap_lora(model, r=4)
         adapter, maps, builder, utter, window = build_rpbe_kit(
             model, z_dim=16, seed=5, min_abs=2)
         # Pass 1: collect 10 cuts (k=6 -> v=3 per sample); threshold =

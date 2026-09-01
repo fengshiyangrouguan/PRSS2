@@ -501,6 +501,9 @@ def dedup_cut_rows(rows: List, fixed_maps, u_as_z: bool = False):
     zs_t = torch.stack(zs)
     if u_as_z:
         ps_t = torch.stack([r.u.detach() for r in rows])
+    elif all(getattr(r, "p_override", None) is not None for r in rows):
+        # LLM line (plan L4): P rows are precomputed content sketches.
+        ps_t = torch.stack([r.p_override.detach() for r in rows])
     elif hasattr(fixed_maps, "pv_batch"):
         # Vectorized P projection: the per-row ``pv`` call is a Python-loop
         # small-operator storm (~0.25 ms/row); ``pv_batch`` computes all rows
@@ -995,6 +998,8 @@ class KFMomentWindow:
             d = {"M_unique": int(len(win["cut_seen"])),
                  "M_rows": int(m_rows),
                  "M_unique_trees": int(len(win["tree_seen"])),
+                 "W": float(W),
+                 "D": float(D),
                  "w_eff_cut": (W * W / W2_cut) if W2_cut > 0.0
                  else float("nan"),
                  "J_shuffled": (float(j_shuffled) if j_shuffled is not None

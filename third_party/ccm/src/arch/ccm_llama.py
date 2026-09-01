@@ -103,6 +103,12 @@ class LlamaAttention(nn.Module):
         ##### RPBE modification (L2): Gamma residual slot #####
         self.gamma = None
         #####################################################
+        #####################################################
+        ##### RPBE modification (L3): memory extraction callback #####
+        # Set by the host adapter to grab the MERGED (post-Gamma) K/V at
+        # SUM rows for z_v = J_mem(M_v).  None = official behavior.
+        self.mem_callback = None
+        #####################################################
 
     def _shape(self, tensor: torch.Tensor, seq_len: int, bsz: int):
         return tensor.view(bsz, seq_len, self.num_heads, self.head_dim).transpose(1, 2).contiguous()
@@ -215,6 +221,15 @@ class LlamaAttention(nn.Module):
                 # while the gate s == 0 this whole block adds exactly 0.
                 key_states = key_states + res_k
                 value_states = value_states + res_v
+            #####################################################
+
+            #####################################################
+            ##### RPBE modification (L3): memory extraction ######
+            # Post-merge K/V of the current sequence (before the past
+            # cache concatenation); the callback keeps the SUM rows.
+            if self.mem_callback is not None:
+                self.mem_callback(key_states, value_states, sum_mask,
+                                  sum_count)
             #####################################################
         #####################################################
 

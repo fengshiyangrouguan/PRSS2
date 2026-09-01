@@ -118,6 +118,11 @@ class CutRecord:
     outcome_time: float = float("nan")
     weight: float = 1.0
     valid: bool = True
+    # LLM line (plan L4): the builder precomputes the P row (content sketch
+    # of the future utterance) because chi is a per-utterance tensor, not a
+    # dict the fixed maps could re-derive.  dedup_cut_rows prefers it over
+    # the fixed_maps projections.
+    p_override: Optional[torch.Tensor] = None
 
     @property
     def cut_id(self):

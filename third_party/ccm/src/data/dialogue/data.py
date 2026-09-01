@@ -24,7 +24,8 @@ def path_name(model_name):
 
 class DialogueDataset():
 
-    def __init__(self, tokenizer, comp_token=[], online=True, add_comp_token=True):
+    def __init__(self, tokenizer, comp_token=[], online=True, add_comp_token=True,
+                 clean_split=False):
         self.tokenizer = tokenizer
         self.model_name = tokenizer.name_or_path.split('/')[-1]
         self.path = path_name(self.model_name)
@@ -47,25 +48,45 @@ class DialogueDataset():
         dataset = datasets.load_dataset("daily_dialog")
         self.trainset = {}
         self.valset = {}
+        # RPBE modification (L0, plan v2 section 15): ``clean_split=True``
+        # restores the official train/validation/test split for the primary
+        # protocol; the default (False) keeps the official pooled
+        # validation+test reproduction mode.
+        self.clean_split = clean_split
+        if clean_split:
+            self.trainset['dialog'] = self._tokenize(dataset['train']['dialog'])
+            self.valset['dialog'] = self._tokenize(dataset['validation']['dialog'])
+            self.testset = {
+                'dialog': self._tokenize(dataset['test']['dialog']),
+                'act': dataset['test']['act'],
+            }
+            self.trainset['act'] = dataset['train']['act']
+            self.valset['act'] = dataset['validation']['act']
+        else:
+            self.trainset['dialog'] = self._tokenize(dataset['train']['dialog'])
+            self.valset['dialog'] = self._tokenize(dataset['validation']['dialog'])
+            self.valset['dialog'] += self._tokenize(dataset['test']['dialog'])
 
-        self.trainset['dialog'] = self._tokenize(dataset['train']['dialog'])
-        self.valset['dialog'] = self._tokenize(dataset['validation']['dialog'])
-        self.valset['dialog'] += self._tokenize(dataset['test']['dialog'])
-
-        self.trainset['act'] = dataset['train']['act']
-        self.valset['act'] = dataset['validation']['act']
-        self.valset['act'] += dataset['test']['act']
+            self.trainset['act'] = dataset['train']['act']
+            self.valset['act'] = dataset['validation']['act']
+            self.valset['act'] += dataset['test']['act']
 
         os.makedirs(self.path, exist_ok=True)
         torch.save(self.trainset, os.path.join(self.path, f"trainset.pt"))
         torch.save(self.valset, os.path.join(self.path, f"valset.pt"))
+        if clean_split:
+            torch.save(self.testset, os.path.join(self.path, f"testset.pt"))
 
         self.max_len = 400
         self.trainset = self._threshold(self.trainset, max_len_total=self.max_len)
         self.valset = self._threshold(self.valset, max_len_total=600)
+        if clean_split:
+            self.testset = self._threshold(self.testset, max_len_total=600)
 
         self.trainset['is_train'] = [True] * len(self.trainset['dialog'])
         self.valset['is_train'] = [False] * len(self.valset['dialog'])
+        if clean_split:
+            self.testset['is_train'] = [False] * len(self.testset['dialog'])
 
         self.train_dataset = Dataset.from_dict(self.trainset, split='train')
         self.eval_dataset = DatasetDict({

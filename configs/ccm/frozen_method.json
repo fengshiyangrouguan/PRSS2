@@ -1,0 +1,43 @@
+{
+  "_comment": "CCM-merge x RPBE frozen method (plan v2 P0-3): machine-readable freeze of the method decisions. The trainer must read values from here (no silent defaults). Sources: Ky-Fan ridge/m from the completed 5-seed TGN experiment; lambda from the r_eff~0.1 calibration rule (plan L5).",
+  "frozen_source": "five-seed TGN experiment on Wikipedia (exact_replay, ridge=1e-3, m=64, lambda calibrated to r_eff~0.1 = 0.088)",
+  "backbone": {
+    "model": "llama-7b (original LLaMA-7B, not LLaMA-2)",
+    "hf_identifier": "huggyllama/llama-7b",
+    "vendored_commit": "a89dd08e2c9587ec9c6c3ad339bb154c33e6b41a",
+    "attn_type": "merge_recur",
+    "n_tok_lock": 2,
+    "torch_compile": "disabled on all three arms"
+  },
+  "rpbe": {
+    "ridge_eps": 1e-3,
+    "sketch_dim_m": 64,
+    "rpbe_map_seed": 0,
+    "horizon_weights": [0.5, 0.5],
+    "lambda_calibration": {
+      "rule": "r_eff = lambda * ||g_KF|| / ||g_task|| ~ 0.1, calibrated once on the initial full window (training-only), then frozen for all seeds",
+      "tgn_reference_value": 0.088
+    },
+    "z_v_source": "J_mem(M_v) fixed adapter (TGN identity is its special case)",
+    "witness": "none (main experiment)"
+  },
+  "gamma": {
+    "placement": "one module per layer, shared across the K/V merges and the two COMP/SUM slots",
+    "hidden": 64,
+    "time_dim": 16,
+    "init_scale": 0.02,
+    "zero_init": "only the gate s starts at 0; U/V small random",
+    "parameter_budget": "32 layers x ~25.7k = ~821k < 1M"
+  },
+  "window": {
+    "min_effective_cuts": 128,
+    "collection": "adaptive by effective cut count (dialogues with k>=4), not a mechanical microbatch count",
+    "cadence": "identical task samples and scheduler cadence across the three arms"
+  },
+  "training": {
+    "steps": 1000,
+    "two_pass_replay": "pass1 no-grad statistics forward, pass2 grad replay forward (training only; inference is a single forward)",
+    "seeds": 5,
+    "eval": "matched-cohort depth curves on the clean test split; primary metric = per-token NLL difference"
+  }
+}

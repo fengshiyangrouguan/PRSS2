@@ -12,9 +12,24 @@ import torch.distributed as dist
 from transformers.generation.logits_process import LogitsProcessorList
 from transformers.generation.stopping_criteria import (StoppingCriteriaList,
                                                        validate_stopping_criteria)
-from transformers.generation.utils import (GenerationMixin, GreedySearchDecoderOnlyOutput,
-                                           GreedySearchEncoderDecoderOutput, GreedySearchOutput)
 from transformers.utils import ModelOutput, logging
+# RPBE compat: transformers 5.x removed the GreedySearch* output classes
+# (kept on 4.44 for the cloud runs; unused by the L2 local tests).
+try:
+    from transformers.generation.utils import (
+        GenerationMixin, GreedySearchDecoderOnlyOutput,
+        GreedySearchEncoderDecoderOutput, GreedySearchOutput)
+except ImportError:  # transformers >= 5
+    from transformers.generation.utils import GenerationMixin
+
+    class GreedySearchOutput(ModelOutput):
+        sequences: torch.LongTensor = None
+
+    class GreedySearchDecoderOnlyOutput(GreedySearchOutput):
+        pass
+
+    class GreedySearchEncoderDecoderOutput(GreedySearchOutput):
+        pass
 
 logger = logging.get_logger(__name__)
 

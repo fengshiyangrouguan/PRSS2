@@ -57,6 +57,8 @@ def attach_gamma(model, *, head_dim=None, hidden=64, time_dim=16,
             "Gamma requires n_tok == {} (got comp={}, sum={})"
             .format(N_TOK_LOCK, len(comp), len(sums)))
     modules = []
+    # Follow the model's current device (attach may happen after .cuda()).
+    device = next(base.parameters()).device
     for layer in base.layers:
         attn = layer.self_attn
         if getattr(attn, "gamma", None) is not None:
@@ -64,7 +66,7 @@ def attach_gamma(model, *, head_dim=None, hidden=64, time_dim=16,
         if head_dim is None:
             head_dim = attn.head_dim
         attn.gamma = GammaResidual(head_dim, time_dim=time_dim, hidden=hidden,
-                                   init_scale=init_scale)
+                                   init_scale=init_scale).to(device)
         modules.append(attn.gamma)
     base._gamma_attached = True
     return modules

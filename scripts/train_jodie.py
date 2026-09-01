@@ -95,6 +95,12 @@ def parse_args():
                         "ceil(kf_min_abs / trace_roots), raise it when "
                         "below_threshold_groups > 0 (strict-future masking "
                         "lowers the valid-root rate)")
+    p.add_argument("--kf-estimator", default="exact_replay",
+                   choices=["exact_replay", "lagged", "off"],
+                   help="exact_replay = same-window two-pass exact "
+                        "gradient (default, review P2); lagged = the "
+                        "retired one-window-lag surrogate (diagnostics "
+                        "only); off = KF disabled")
     p.add_argument("--kf-variant", default="full_balancing",
                    choices=["full_balancing", "diagonal", "reconstruction"],
                    help="Table-2 ablation variant (paper spec section 4)")
@@ -262,7 +268,11 @@ def build_components(args, device, dataset):
             p.requires_grad_(True)
         host_dim = int(tgn.embedding_dimension)
         taus = [TAU_TEMPLATE.format(l) for l in range(args.n_layer + 1)]
-        delta_scale = float(np.median(np.diff(np.sort(full.timestamps)))) or 1.0
+        # LOSS_DIAGNOSIS: the fixed-measurement time scale must come from
+        # TRAIN ONLY — using the full stream (train+val+test) leaks the
+        # evaluation splits into the fixed measurement.
+        delta_scale = float(np.median(
+            np.diff(np.sort(train.timestamps)))) or 1.0
         # The root interface (highest layer) has no upward walk and is
         # excluded from the KF windows EXPLICITLY (kf_taus whitelist).
         rpbe_cfg = RPBConfig(
@@ -366,7 +376,8 @@ def main():
         fixed_maps=components["fixed_maps"], rpbe_cfg=components["rpbe_cfg"],
         trace_roots=args.trace_roots,
         trace_mode=args.trace_mode,
-        train_eval_auc=args.train_eval_auc)
+        train_eval_auc=args.train_eval_auc,
+        kf_estimator=args.kf_estimator)
 
     save_json(out / "config.json", {
         "data": args.data,
@@ -388,6 +399,11 @@ def main():
                     "(held-out val early stop, zero-memory replay test)",
         "rpbe": components["rpbe_cfg"].as_dict()
                 if components["rpbe_cfg"] is not None else False,
+        # LOSS_DIAGNOSIS: mark the loss-unit convention so old checkpoints
+        # (pre-K-cancellation) are never mixed with post-fix runs.
+        "rpbe_loss_units": "raw_batch_vjp_sum_with_group_K_cancellation"
+                           if components["rpbe_cfg"] is not None else None,
+        "kf_estimator": args.kf_estimator,
         "cli": vars(args),
     })
 
@@ -422,7 +438,9 @@ def main():
     patience = args.patience if not args.no_early_stop else 10 ** 9
     for epoch in range(start_epoch, args.n_epoch):
         t0 = time.time()
-        train_row = loop.train_epoch(epoch, global_step, train)
+        train_row = loop.train_epoch(
+            epoch, global_step, train,
+            max_batches=args.max_batches if args.max_batches > 0 else None)
         global_step = train_row["global_step"]
 
         val_row = loop.evaluate_split(val, reset=False)

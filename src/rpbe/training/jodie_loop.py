@@ -15,7 +15,8 @@ import torch
 import torch.nn.functional as F
 from sklearn.metrics import average_precision_score, roc_auc_score
 
-from rpbe.loss import KFLaggedWindow
+from rpbe.loss import KFLaggedWindow, KFMomentWindow
+from rpbe.training import checkpoint as ckpt
 from rpbe.training.isolation import assert_clean, rpbe_fingerprint
 
 EPS = 1e-7
@@ -85,7 +86,8 @@ class JodieNodeClassificationLoop:
                  finetune_host=False, selection_metric="auc", adapter=None,
                  cut_builder=None, fixed_maps=None, rpbe_cfg=None,
                  trace_roots=8, trace_mode="evenly_spaced",
-                 train_eval_auc=False, grad_diag=None):
+                 train_eval_auc=False, grad_diag=None,
+                 kf_estimator="exact_replay"):
         self.tgn = tgn
         self.decoder = decoder
         # Representation parameters (host + compressor, everything that can
@@ -138,8 +140,17 @@ class JodieNodeClassificationLoop:
         self.component_on = bool(adapter is not None
                                  and fixed_maps is not None
                                  and rpbe_cfg is not None)
+        # Review: the one-window-lag estimator is retired from production
+        # (parameter-space diagnosis: lagged-exact cosine 0.002-0.007,
+        # held-out virtual step -0.0009 vs exact +0.0418).  The default
+        # is the same-window two-pass exact replay; "lagged" remains for
+        # diagnostics and reproduction only.
+        if kf_estimator not in ("exact_replay", "lagged", "off"):
+            raise ValueError("unknown kf_estimator {}".format(kf_estimator))
+        self.kf_estimator = kf_estimator
         self.kf_on = bool(self.component_on and self.lambda_kf > 0.0
-                          and cut_builder is not None)
+                          and cut_builder is not None
+                          and kf_estimator != "off")
         self.rpbe_on = self.component_on
         if self.rpbe_on and self.trace_mode == "positive_first":
             raise ValueError(
@@ -173,11 +184,26 @@ class JodieNodeClassificationLoop:
             for tau in kf_dims:
                 self._tau_coeff[tau] = rpbe_cfg.alpha(tau) / (
                     self._tau_rank(tau) * alpha_sum)
-        self.kf_window = (KFLaggedWindow(
-            kf_dims, min_ratio=rpbe_cfg.kf_min_ratio,
-            min_abs=rpbe_cfg.kf_min_abs, eps=rpbe_cfg.ridge_eps,
-            fixed_maps=fixed_maps, variant=rpbe_cfg.kf_variant)
-            if self.rpbe_on else None)
+        if self.rpbe_on:
+            if kf_estimator == "exact_replay":
+                # First release: only full_balancing has an exact adjoint
+                # path (close_replay -> latent_z_adjoint).
+                if rpbe_cfg.kf_variant != "full_balancing":
+                    raise ValueError(
+                        "kf_estimator=exact_replay supports only "
+                        "kf_variant=full_balancing for now")
+                self.kf_window = KFMomentWindow(
+                    kf_dims, min_ratio=rpbe_cfg.kf_min_ratio,
+                    min_abs=rpbe_cfg.kf_min_abs, eps=rpbe_cfg.ridge_eps,
+                    fixed_maps=fixed_maps, variant=rpbe_cfg.kf_variant,
+                    autoclose=False)
+            else:
+                self.kf_window = KFLaggedWindow(
+                    kf_dims, min_ratio=rpbe_cfg.kf_min_ratio,
+                    min_abs=rpbe_cfg.kf_min_abs, eps=rpbe_cfg.ridge_eps,
+                    fixed_maps=fixed_maps, variant=rpbe_cfg.kf_variant)
+        else:
+            self.kf_window = None
 
     def _clip(self, params):
         if self.grad_clip <= 0:
@@ -287,6 +313,280 @@ class JodieNodeClassificationLoop:
                     step=global_step, interface=tau)
         return param_version, refreshes
 
+    def _save_group_state(self) -> dict:
+        """Everything the two-pass replay must restore (review P2): host
+        memory + last_update + messages, all RNGs, the adapter occurrence
+        counter and any model buffers (running stats).  Parameters are
+        NOT saved — pass 1 performs no optimizer step."""
+        modules = {"tgn": self.tgn, "adapter": self.adapter,
+                   "compressor": getattr(self.adapter, "compressor", None)}
+        buffers = {}
+        for mname, module in modules.items():
+            if module is None:
+                continue
+            for name, buf in module.named_buffers():
+                buffers["{}.{}".format(mname, name)] = \
+                    buf.detach().clone()
+        return {
+            "memory": (self.tgn.memory.backup_memory()
+                       if self.tgn.use_memory else None),
+            "rng": ckpt._rng_state(),
+            "next_oid": getattr(self.adapter, "_next_oid", 0),
+            "buffers": buffers,
+        }
+
+    def _restore_group_state(self, state: dict) -> None:
+        if self.tgn.use_memory and state["memory"] is not None:
+            self.tgn.memory.restore_memory(state["memory"])
+        ckpt._restore_rng(state["rng"])
+        if hasattr(self.adapter, "_next_oid"):
+            self.adapter._next_oid = state["next_oid"]
+        modules = {"tgn": self.tgn, "adapter": self.adapter,
+                   "compressor": getattr(self.adapter, "compressor", None)}
+        for mname, module in modules.items():
+            if module is None:
+                continue
+            for name, buf in module.named_buffers():
+                buf.copy_(state["buffers"]["{}.{}".format(mname, name)])
+
+    def _batch_surrogate_exact(self, cuts, replay_plan, group_k,
+                               batch_offset):
+        """Pass-2 surrogate: numerically zero, gradient = exact J.
+
+        Matches THIS batch's traced z to its replay gradients by (tau,
+        occurrence_id); ``by_batch[batch_offset]`` is the plan slice for
+        the current batch of the group (pass-1 and pass-2 share RNG and
+        the occurrence counter, so ids agree exactly).
+        ``S = sum_tau c_tau sum_v <sg(g), z> - sg(<g,z>)`` and the
+        auxiliary is ``-lambda * K * S`` (K cancels the common repr
+        grad /= K at group close).  Returns (auxiliary, n_terms,
+        (n_planned, n_matched)).
+        """
+        z_by_oid = {}
+        for cut in cuts:
+            z_by_oid[(cut.tau, cut.occurrence_id)] = cut.z
+        terms = []
+        n_terms = 0
+        n_planned = 0
+        for tau, plan in replay_plan.items():
+            by_batch = plan.get("by_batch") or []
+            if batch_offset >= len(by_batch):
+                continue
+            for oid, g in by_batch[batch_offset]:
+                n_planned += 1
+                z = z_by_oid.get((tau, oid))
+                if z is None:
+                    continue
+                gd = g.detach()
+                terms.append(self._tau_coeff[tau] * (
+                    (gd * z).sum() - (gd * z.detach()).sum()))
+                n_terms += 1
+        if not terms:
+            return torch.zeros((), device=self.device), 0, (n_planned, 0)
+        auxiliary = -self.lambda_kf * float(group_k) * sum(terms)
+        return auxiliary, n_terms, (n_planned, n_terms)
+
+    def _train_epoch_exact_replay(self, epoch: int, global_step: int,
+                                  train: object, max_batches: int = None
+                                  ) -> Dict:
+        """Same-window two-pass exact replay (review P2).
+
+        Pass 1 (no grad): the macro group's batches replay
+        chronologically (memory advancing, decoder forward for RNG
+        parity), cuts accumulate into KFMomentWindow; close_replay()
+        contracts the exact window J onto cut-level z-adjoints.
+
+        Restore: memory/messages, RNG, occurrence counter, buffers.
+
+        Pass 2 (grad): the same batches replay; each batch's traced z
+        matches its replay gradient by (tau, occurrence_id) and the
+        numerically-zero surrogate carries the EXACT J gradient.
+        loss = task - lambda * K * S_b with K cancelling the group-close
+        ``repr_grad /= K``.  The head steps every batch; the
+        representation group steps once at the group end (same cadence
+        as the lambda=0 grouped baseline).
+        """
+        self.reset_memory()
+        self.kf_window.reset()
+        self.tgn.train(self.finetune_host)
+        self.decoder.train()
+
+        if self.rpbe_cfg.kf_group_batches is not None:
+            fixed_group = max(1, int(self.rpbe_cfg.kf_group_batches))
+        else:
+            fixed_group = max(1, math.ceil(
+                self.rpbe_cfg.kf_min_abs / max(1, self.trace_roots)))
+        num_batch = math.ceil(len(train.sources) / self.batch_size)
+        run_batches = num_batch if max_batches is None else min(
+            num_batch, max(0, int(max_batches)))
+
+        total_task = 0.0
+        total_raw = 0.0
+        kf_sum = {}
+        kf_count = {}
+        refreshes = 0
+        aux_batches = 0
+        below_threshold_groups = 0
+        pending_trees = {}
+        threshold = {}
+        param_version = 0
+        total_planned = 0
+        total_matched = 0
+        train_probs, train_labels = [], []
+
+        def _run_one_pass(batch_index, grad_enabled):
+            start = batch_index * self.batch_size
+            stop = min(len(train.sources),
+                       (batch_index + 1) * self.batch_size)
+            sources = train.sources[start:stop]
+            destinations = train.destinations[start:stop]
+            timestamps = train.timestamps[start:stop]
+            edge_idxs = train.edge_idxs[start:stop]
+            labels_np = train.labels[start:stop]
+            trace_rows = select_trace_rows(
+                labels_np, self.trace_roots, self.seed, global_step + (
+                    batch_index - group_start), self.trace_mode)
+            self.adapter.set_trace_source_rows(trace_rows)
+            context = torch.enable_grad() if grad_enabled else torch.no_grad()
+            with context:
+                src_emb, _, _ = self.tgn.compute_temporal_embeddings(
+                    sources, destinations, destinations, timestamps,
+                    edge_idxs, self.n_neighbors)
+                prediction = self.decoder(src_emb)
+            cuts = None
+            if self.adapter.trace is not None:
+                cuts = self.cut_builder.build(
+                    self.adapter.trace, batch_seed=global_step)
+            self.adapter.clear_trace()
+            return prediction, cuts, labels_np
+
+        group_start = 0
+        while group_start < run_batches:
+            group_end = min(group_start + fixed_group, run_batches)
+            group_k = group_end - group_start
+            # ---------------- pass 1: collect, no grad ----------------
+            state = self._save_group_state()
+            with torch.no_grad():
+                for b in range(group_start, group_end):
+                    _, cuts, _ = _run_one_pass(b, grad_enabled=False)
+                    if cuts:
+                        self.kf_window.add(cuts)
+            closed, replay_plan, group_diag = \
+                self.kf_window.close_replay()
+            refreshes += len(closed)
+            for tau, score in closed.items():
+                kf_sum[tau] = kf_sum.get(tau, 0.0) + score
+                kf_count[tau] = kf_count.get(tau, 0) + 1
+                total_raw += score
+            for tau, diag in group_diag.items():
+                if diag.get("below_threshold"):
+                    below_threshold_groups += 1
+                    pending_trees[tau] = diag["M_unique_trees"]
+                    threshold[tau] = diag["threshold"]
+                    self.monitor.alert(
+                        "warning", "kf_below_threshold",
+                        "{} window {} trees < threshold {}; discarded "
+                        "(exact_replay)".format(
+                            tau, diag["M_unique_trees"],
+                            diag["threshold"]),
+                        step=global_step, interface=tau)
+            # -------------------- restore to group start --------------
+            self._restore_group_state(state)
+            # ---------------- pass 2: train, exact surrogate ----------
+            self.repr_optimizer.zero_grad(set_to_none=True)
+            for b in range(group_start, group_end):
+                self.head_optimizer.zero_grad(set_to_none=True)
+                prediction, cuts, labels_np = _run_one_pass(
+                    b, grad_enabled=True)
+                prediction = prediction.sigmoid()
+                labels_t = torch.from_numpy(labels_np).float().to(
+                    self.device)
+                task_loss = F.binary_cross_entropy(prediction, labels_t)
+                auxiliary = torch.zeros((), device=self.device)
+                aligned_planned = 0
+                aligned_matched = 0
+                if cuts and closed:
+                    (auxiliary, n_terms,
+                     (aligned_planned, aligned_matched)) = \
+                        self._batch_surrogate_exact(
+                            cuts, replay_plan, group_k, b - group_start)
+                    if n_terms:
+                        aux_batches += 1
+                # Per-batch gradient diagnostics (the sprint script),
+                # same hook as the single-pass path: r_eff =
+                # |grad(aux)| / |grad(task)| carries lambda and the rank
+                # coefficients already.
+                if self._grad_diag_fn is not None and self.kf_on \
+                        and auxiliary.requires_grad and self.repr_params:
+                    row = self._grad_diag_fn(
+                        self, task_loss, auxiliary, global_step)
+                    self.grad_diag["rows"].append(row)
+                loss = task_loss + auxiliary
+                self.monitor.validate_losses({
+                    "task": float(task_loss.detach()),
+                    "kf_score": total_raw,
+                    "main_total": float(loss.detach()),
+                }, global_step)
+                loss.backward()
+                self._clip(self.head_params)
+                self.head_optimizer.step()
+                if self.tgn.use_memory and \
+                        (self.finetune_host or self.component_on):
+                    self.tgn.memory.detach_memory()
+                total_task += float(task_loss.detach())
+                total_planned += aligned_planned
+                total_matched += aligned_matched
+                train_probs.append(prediction.detach().cpu().numpy())
+                train_labels.append(labels_np)
+                global_step += 1
+            # ---------------- group close: one repr step ---------------
+            for p in self.repr_params:
+                if p.grad is not None:
+                    p.grad.div_(float(max(1, group_k)))
+            self._clip(self.repr_params)
+            self.repr_optimizer.step()
+            param_version += 1
+            group_start = group_end
+
+        train_metrics = metric_bundle(np.concatenate(train_labels),
+                                      np.concatenate(train_probs))
+        train_metrics["online_auc"] = train_metrics.pop("auc")
+        train_metrics["online_ap"] = train_metrics.pop("ap")
+        kf_out = None
+        if kf_count and self.rpbe_cfg is not None:
+            means = {tau: value / kf_count[tau]
+                     for tau, value in kf_sum.items()}
+            kf_out = {
+                "estimator": "same_window_two_pass_exact_replay",
+                "J": means,
+                "J_norm": {tau: value / self._tau_rank(tau)
+                           for tau, value in means.items()},
+                "skipped_types": [],
+                "kf_score": total_raw / max(run_batches, 1),
+                "kf_loss": -self.lambda_kf * total_raw
+                           / max(run_batches, 1),
+                "reference_refreshes": refreshes,
+                "below_threshold_groups": below_threshold_groups,
+                "pending_trees": dict(pending_trees),
+                "threshold": dict(threshold),
+                "group_batches": fixed_group,
+                "aux_batches": aux_batches,
+                "repr_steps": param_version,
+                # Gate 1: pass-1/pass-2 occurrence alignment (must be
+                # 100%: duplicate = missing = 0).
+                "replay_align_planned": total_planned,
+                "replay_align_matched": total_matched,
+                "replay_align_missing": total_planned - total_matched,
+            }
+        return {
+            "train_task_loss": total_task / max(run_batches, 1),
+            "train_kf_score": total_raw / max(run_batches, 1),
+            "kf": kf_out,
+            "train": train_metrics,
+            "n_batches": run_batches,
+            "global_step": global_step,
+        }
+
     # ----------------------------------------------------------------- training
     def train_epoch(self, epoch: int, global_step: int, train: object,
                     max_batches: int = None) -> Dict:
@@ -301,8 +601,11 @@ class JodieNodeClassificationLoop:
         cross-batch graphs.
 
         ``max_batches`` (the sprint diagnostic) stops the epoch after N
-        batches without the epoch-drain close.
+        batches and drains that final, possibly partial macro-group.
         """
+        if self.kf_on and self.kf_estimator == "exact_replay":
+            return self._train_epoch_exact_replay(
+                epoch, global_step, train, max_batches)
         self.reset_memory()
         if self.kf_window is not None:
             self.kf_window.reset(clear_reference=True)   # eighth review C
@@ -340,6 +643,9 @@ class JodieNodeClassificationLoop:
                        "pending_trees": {}, "threshold": {}}
         train_probs, train_labels = [], []
         num_batch = math.ceil(len(train.sources) / self.batch_size)
+        run_batches = num_batch if max_batches is None else min(
+            num_batch, max(0, int(max_batches)))
+        group_target_count = 1
 
         for batch_index in range(num_batch):
             if max_batches is not None and batch_index >= max_batches:
@@ -364,6 +670,8 @@ class JodieNodeClassificationLoop:
                     self.kf_window.begin_group(param_version, epoch)
                 repr_group_active = True
                 group_batch_count = 0
+                group_target_count = min(
+                    fixed_group, max(1, run_batches - batch_index))
 
             trace_rows = []
             if self.kf_on:
@@ -391,6 +699,14 @@ class JodieNodeClassificationLoop:
                      cold) = self._consume_kf(cuts, global_step)
                     cold_types.update(cold)
                     if auxiliary.requires_grad:
+                        # Raw per-batch moment VJPs SUM to the macro-window
+                        # linearization.  _close_repr_group divides every
+                        # accumulated representation gradient by K to average
+                        # the task loss, so multiply this zero-valued
+                        # auxiliary by the actual group K to leave the KF
+                        # window gradient unshrunk.  This is exact even when
+                        # batches have unequal valid-cut weights.
+                        auxiliary = auxiliary * float(group_target_count)
                         aux_batches += 1
                     for tau, score in scores.items():
                         kf_sum[tau] = kf_sum.get(tau, 0.0) + score

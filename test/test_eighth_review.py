@@ -336,6 +336,54 @@ class TestVJPEquivalence(unittest.TestCase):
                            / g_direct.norm().clamp(min=1e-30))
         self.assertLess(err_scaled, 1e-6)
 
+    def test_group_K_cancellation_preserves_unequal_batch_weights(self):
+        # The LOSS_DIAGNOSIS P0 regression: production multiplies each
+        # zero-valued auxiliary by the actual group batch count K and
+        # divides ALL accumulated representation gradients by K at group
+        # close.  Task gradients get the mean; the KF raw VJP sum must
+        # come through UNSHRUNK — exact even when batches carry unequal
+        # valid-cut weights (W_ref/W_batch would reweight them).
+        result, rows, cut_ids = self._window()
+        _, adjoints, _ = kf_adjoint(result, eps=1e-4)
+        # Split the window into 3 batches with UNEQUAL weight sums.
+        chunks = []
+        total_rows = len(rows)
+        ends = [9, 23, total_rows]  # 9, 14, 9 rows -> unequal weights
+        start = 0
+        for end in ends:
+            chunks.append(rows[start:end])
+            start = end
+        K = len(chunks)
+        production_sum = None
+        for chunk in chunks:
+            g = self._vjp_row_grads(chunk, adjoints, result) * float(K)
+            production_sum = g if production_sum is None \
+                else torch.cat([production_sum, g])
+        production_sum = production_sum / float(K)  # common grad /= K
+        z_rows = torch.stack([row.z for row in rows])
+        p_rows = torch.stack([_FakeMaps(8).pv(row.context, row.outcome)
+                              for row in rows])
+        w = torch.tensor([row.weight for row in rows], dtype=torch.float64)
+        _, g_by_cut, diag = latent_z_adjoint(
+            z_rows, p_rows, w, cut_ids, result["mu_z"], result["mu_p"],
+            result["D"], 1e-4)
+        self.assertIsNone(diag["failed"])
+        merged = self._merge_by_cut(rows, production_sum)
+        ref = [g_by_cut[cid] for cid in sorted(g_by_cut)]
+        for a, b in zip(merged, ref):
+            err = float((a.double() - b.double()).norm()
+                        / b.double().norm().clamp(min=1e-30))
+            self.assertLess(err, 1e-5)
+        # The same sum WITHOUT the K cancellation is shrunk by exactly K.
+        raw_sum = torch.cat(
+            [self._vjp_row_grads(c, adjoints, result)
+             for c in chunks]) / float(K)
+        shrunk = self._merge_by_cut(rows, raw_sum)
+        for a, b in zip(shrunk, ref):
+            err = float((a.double() - b.double()).norm()
+                        / b.double().norm().clamp(min=1e-30))
+            self.assertGreater(err, (1.0 - 1.0 / K) * 0.5)
+
     def test_divide_by_wref_breaks_equivalence(self):
         # Acceptance 4 (updated to scheme B): the raw VJP is the exact
         # direct gradient on the same window data — that is the

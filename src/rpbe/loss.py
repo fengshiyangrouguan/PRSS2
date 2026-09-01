@@ -534,12 +534,18 @@ class KFLaggedWindow:
     so a stale reference would mix mature-memory statistics with a
     zero-memory batch).
 
-    The population scaling ``raw_vjp * (W_ref / W_batch)`` is KEPT: the
-    reference adjoint carries 1/D_ref ~ 1/W_ref, and the batch contribution
-    is restored to a population-gradient estimate (the /W_ref "fix" would
-    double-normalize and couple the method to an arbitrary window size).
-    Loss units are normalized by the CALLER via per-interface coefficients
-    (J_norm = sum alpha_tau J_tau / min(d_tau, m) / sum alpha_tau), not here.
+    The raw per-batch VJPs are deliberately left unscaled.  Because every
+    batch is centered with the same reference means, their SUM is exactly the
+    macro-window linearization ``<A_ref, M_current>``.  The caller multiplies
+    the numerically-zero auxiliary by the current macro-group batch count K
+    before backward, which cancels the caller's common ``grad /= K`` at group
+    close.  This preserves the exact additive VJP contract even when batches
+    contain different amounts of valid cut weight; ``W_ref / W_batch`` would
+    instead impose an unintended equal-batch reweighting.
+
+    Loss units are otherwise normalized by the caller via per-interface
+    coefficients (J_norm = sum alpha_tau J_tau / min(d_tau, m) / sum
+    alpha_tau), not here.
     """
 
     def __init__(self, state_dims: Dict[str, int], *, min_ratio: float = 2.0,
@@ -638,18 +644,10 @@ class KFLaggedWindow:
                         zs, ps, weights,
                         reference["mu_z"], reference["mu_p"],
                         reference["adjoints"])
-                    # Macro-window surrogate (review scheme B): the raw
-                    # VJP <A_ref, M_b> is this batch's contribution to the
-                    # whole-window linearization <A_ref, M_window>.  The
-                    # representation parameters are frozen inside the
-                    # macro-group and updated once at its end, so summing
-                    # the per-batch gradients over the group IS the
-                    # window-linearized gradient — no W_ref/W_batch
-                    # rescaling.  (The score is degree-0 homogeneous:
-                    # J(cM) = J(M) and grad_M J(cM) = grad_M J(M)/c, so
-                    # the adjoint's inverse scale carries the batch
-                    # multiplicity; the group sum absorbs it.  See the
-                    # k-fold detached test in test_eighth_review.)
+                    # Raw batch moment VJPs add exactly to the current
+                    # macro-window linearization.  Do not normalize by batch
+                    # weight here: the training loop separately compensates
+                    # its common K-batch gradient average.
                     # Gradient-only surrogate: numerically zero, must not
                     # pollute task-loss logs.
                     surrogates[tau] = raw_vjp.float() \
@@ -848,8 +846,17 @@ class KFMomentWindow:
         self._windows: Dict[str, dict] = {}
 
     def _threshold(self, tau: str) -> float:
-        return max(self.min_ratio * int(self.state_dims[tau]),
-                   float(self.min_abs))
+        # Same gate as KFLaggedWindow: rank of the CCA is bounded by
+        # min(dim Z, dim P); reconstruction uses the state dim on both
+        # sides (U vs Z).  Test stubs without a ``.m`` fall back to the
+        # state dim (the old behaviour).
+        if self.variant == "reconstruction":
+            dim_p = int(self.state_dims[tau])
+        else:
+            dim_p = int(getattr(self.fixed_maps, "m",
+                                self.state_dims[tau]))
+        rank_dim = min(int(self.state_dims[tau]), dim_p)
+        return max(self.min_ratio * rank_dim, float(self.min_abs))
 
     def add(self, rows: List):
         """Accumulate a batch of CutRecord rows.
@@ -901,7 +908,9 @@ class KFMomentWindow:
             win["zs_list"].append(zs.float())
             win["ps_list"].append(ps.float())
             win["weights_list"].append(weights)
-            if len(win["cut_seen"]) < self._threshold(tau):
+            # Review: gate on unique TREES — several cuts of one query
+            # tree share their history and are not independent samples.
+            if len(win["tree_seen"]) < self._threshold(tau):
                 gated.append(tau)
         # ALL non-empty windows close together: the z graphs of different
         # taus share the same per-batch forward graph, so an asynchronous
@@ -1022,8 +1031,10 @@ class KFMomentWindow:
           and sums ``<sg(g), z>`` (no p, no moments, no re-walk);
         * ``diagnostics[tau]`` — the usual matrix diagnostics.
 
-        All nonempty windows close together (same shared-graph argument
-        as the direct path).
+        All windows that REACHED the tree threshold close together (same
+        shared-graph argument as the direct path).  A window below
+        threshold is DISCARDED — no replay gradient is produced for it
+        (review: a 10-tree window must not compute an exact J).
         """
         closed: Dict[str, float] = {}
         replay_plan: Dict[str, dict] = {}
@@ -1032,6 +1043,15 @@ class KFMomentWindow:
                     if win is not None and len(win["cut_seen"]) > 0]
         for tau in nonempty:
             win = self._windows[tau]
+            if len(win["tree_seen"]) < self._threshold(tau):
+                diagnostics[tau] = {
+                    "failed": None,
+                    "below_threshold": True,
+                    "M_unique_trees": int(len(win["tree_seen"])),
+                    "threshold": self._threshold(tau),
+                    "dropped_trees": int(len(win["tree_seen"])),
+                }
+                continue
             z_all = torch.cat(win["zs_list"], dim=0)
             p_all = torch.cat(win["ps_list"], dim=0)
             w = torch.cat(win["weights_list"], dim=0)
@@ -1082,14 +1102,14 @@ class KFMomentWindow:
         return closed, replay_plan, diagnostics
 
     def window_ready(self) -> bool:
-        """All nonempty windows have reached their unique-cut threshold."""
+        """All nonempty windows have reached their unique-TREE threshold."""
         nonempty = [tau for tau, win in self._windows.items()
                     if win is not None and len(win["cut_seen"]) > 0]
         return bool(nonempty) and all(
-            len(self._windows[tau]["cut_seen"]) >= self._threshold(tau)
+            len(self._windows[tau]["tree_seen"]) >= self._threshold(tau)
             for tau in nonempty)
 
-    def reset(self):
+    def reset(self, clear_reference: bool = True):
         """Discard all open windows (used at epoch drain: the accumulated
         z rows' graphs are consumed by the task-only backward, so the
         unfinished window cannot survive into the next epoch)."""

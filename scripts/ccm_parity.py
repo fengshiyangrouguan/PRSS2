@@ -52,6 +52,8 @@ def parse_args():
     p.add_argument("--lr", type=float, default=3e-4)
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--gpu", type=int, default=0)
+    p.add_argument("--relative-embedding", default="skip",
+                   choices=["skip", "base"])
     return p.parse_args()
 
 

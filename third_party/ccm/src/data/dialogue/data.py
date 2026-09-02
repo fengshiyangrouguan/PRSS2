@@ -49,19 +49,28 @@ class DialogueDataset():
         # dead and the HF dataset script cannot fetch it on this host.
         # A local mirror with the official zip layout
         # (ijcnlp_dailydialog/{train,validation,test}/dialogues_*.txt) is
-        # read directly when DIALOG_MIRROR points at it.
+        # read directly when DIALOG_MIRROR points at it.  Each file line
+        # is ONE dialogue whose turns are separated by ``__eou__`` (the
+        # same splitting the official HF builder performs); without the
+        # split every character becomes a "turn" (L6 smoke found 488
+        # single-character turns and a 3.6k-token sequence).
         mirror = os.environ.get("DIALOG_MIRROR", "")
         if mirror and os.path.isdir(mirror):
+            def _read(split, name):
+                out = []
+                with open(os.path.join(mirror, split, name),
+                          encoding="utf-8") as f:
+                    for line in f.read().strip().split("\n"):
+                        out.append([t.strip() for t in
+                                    line.strip().split("__eou__")
+                                    if t.strip()])
+                return out
+
             dataset = {
                 split: {
-                    "dialog": open(
-                        os.path.join(mirror, split,
-                                     "dialogues_{}.txt".format(split)),
-                        encoding="utf-8").read().strip().split("\n"),
-                    "act": open(
-                        os.path.join(mirror, split,
-                                     "dialogues_act_{}.txt".format(split)),
-                        encoding="utf-8").read().strip().split("\n"),
+                    "dialog": _read(split, "dialogues_{}.txt".format(split)),
+                    "act": _read(split,
+                                 "dialogues_act_{}.txt".format(split)),
                 }
                 for split in ("train", "validation", "test")
             }

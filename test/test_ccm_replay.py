@@ -179,31 +179,38 @@ class TestReplayGradients(unittest.TestCase):
         adapter, maps, builder, utter, window = build_rpbe_kit(
             model, z_dim=16, seed=5, min_abs=2)
         # Pass 1: collect 10 cuts (k=6 -> v=3 per sample); threshold =
-        # max(2*min(16,4), 2) = 8.
+        # max(2*min(16,4), 2) = 8.  The pass-1 record keeps
+        # [(meta, occurrence_id)] per batch; pass 2 only re-extracts z
+        # (L6.5 review: no builder/chi/p in pass 2).
+        from scripts.train_ccm import (batch_surrogate, collect_replay_z,
+                                       collect_rows, parse_meta,
+                                       task_ce_sum)
         batches = [make_batch(u_base=100 + 10 * s) for s in range(10)]
-        window_start = {"rng": _rng_state(), "next_oid": builder.next_oid}
+        window_start = {"rng": _rng_state()}
+        cut_records = []
         for s, batch in enumerate(batches):
             state = _rng_state()
             with torch.no_grad():
                 model(input_ids=batch["input_ids"],
                       labels=batch["labels"])
-                from scripts.train_ccm import parse_meta, collect_rows
                 metas = parse_meta(batch, COMP_IDS, SUM_IDS,
                                    sample_id_global=s)
+                bc = []
                 for meta in metas:
                     rows = collect_rows(meta, adapter, builder, utter,
                                         model.get_input_embeddings(),
                                         batch, torch.device("cpu"))
                     if rows:
                         window.add(rows)
+                        bc.append((meta, rows[0].occurrence_id))
                 adapter.clear()
+            cut_records.append(bc)
             _restore_rng(state)
         closed, plan, diag = window.close_replay()
         self.assertIn("mem", closed)
+        resume_rng = _rng_state()  # P0-1: real post-pass-1 stream state
         _restore_rng(window_start["rng"])
-        builder.next_oid = window_start["next_oid"]
         # Pass 2: task + surrogate backward, one optimizer step.
-        from scripts.train_ccm import batch_surrogate, task_ce
         params = [p for p in model.parameters() if p.requires_grad]
         opt = torch.optim.SGD(params, lr=1e-3)
         plan_by_batch = plan["mem"]["by_batch"]
@@ -211,19 +218,16 @@ class TestReplayGradients(unittest.TestCase):
         for s, batch in enumerate(batches):
             model.train()
             out = model(input_ids=batch["input_ids"], labels=batch["labels"])
-            metas = parse_meta(batch, COMP_IDS, SUM_IDS,
-                               sample_id_global=s)
-            z_by_oid = {}
-            for meta in metas:
-                for r in collect_rows(meta, adapter, builder, utter,
-                                      model.get_input_embeddings(),
-                                      batch, torch.device("cpu")):
-                    z_by_oid[r.occurrence_id] = r.z
+            z_by_oid = {oid: collect_replay_z(meta, adapter,
+                                              torch.device("cpu"))
+                        for meta, oid in cut_records[s]}
             adapter.clear()
-            task = task_ce(out, batch["labels"], torch.device("cpu"))
+            task, _ = task_ce_sum(out, batch["labels"],
+                                  torch.device("cpu"))
             aux, _ = batch_surrogate(z_by_oid, plan_by_batch, s, 1.0,
                                      torch.device("cpu"))
-            (task + aux).backward()
+            ((task + aux) / len(batches)).backward()
+        _restore_rng(resume_rng)
         # Every component type carries a nonzero gradient.
         lora_grads = [p.grad for n, p in model.named_parameters()
                       if "lora" in n and p.requires_grad]

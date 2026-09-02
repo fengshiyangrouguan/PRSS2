@@ -28,10 +28,12 @@ exits with the derived lambda.
 """
 
 import argparse
+import hashlib
 import json
 import math
 import os
 import random
+import struct
 import sys
 import time
 from pathlib import Path
@@ -95,6 +97,8 @@ def parse_args():
     # monitoring
     p.add_argument("--log-every", type=int, default=10)
     p.add_argument("--checkpoint-every", type=int, default=250)
+    p.add_argument("--resume-from", default="",
+                   help="resume from an adapter-only checkpoint.pt")
     p.add_argument("--max-pending-mbs", type=int, default=2048,
                    help="degenerate-window guard: pending cap before abort")
     return p.parse_args()
@@ -229,10 +233,30 @@ def run_forward(model, batch, device, grad_enabled):
                          attention_mask=batch["attention_mask"].to(device))
 
 
-def task_ce(out, labels, device):
-    return torch.nn.functional.cross_entropy(
-        out.logits.view(-1, out.logits.shape[-1]),
-        labels.to(device).view(-1), ignore_index=-100)
+def task_ce_sum(out, labels, device):
+    """Sum-reduced CE over valid tokens + the valid token count.
+
+    The token-normalized mean (sum / count) is what the log reports; the
+    raw sum is what enters the backward (L6.5 review: per-microbatch sums
+    are then normalized by the window's microbatch count).
+    """
+    logits = out.logits.view(-1, out.logits.shape[-1])
+    labs = labels.to(device).view(-1)
+    n_valid = int((labs != -100).sum())
+    loss = torch.nn.functional.cross_entropy(
+        logits, labs, ignore_index=-100, reduction="sum")
+    return loss, n_valid
+
+
+def collect_replay_z(meta, adapter, device):
+    """Pass-2 extraction ONLY: z_v at the cut position (gradient-
+    connected).  No builder, no chi, no p — those finished their job at
+    the pass-1 window close (L6.5 review structural fix)."""
+    v = meta["k"] - 3
+    s0_pos = meta["blocks"][v][1]
+    sum_positions = torch.tensor([[s0_pos, s0_pos + 1]],
+                                 dtype=torch.long, device=device)
+    return adapter.extract_z(sum_positions)[0]
 
 
 def collect_rows(meta, adapter, builder, utter_embed, embed_tokens, batch,
@@ -286,6 +310,29 @@ def repr_grad_norm(params):
     return math.sqrt(total) if n else 0.0
 
 
+def trainable_state_dict(model):
+    """LoRA + Gamma + any other trainable params ONLY (the frozen 7B
+    backbone is NOT stored; a full state_dict costs ~13GB per file)."""
+    return {n: p.detach().cpu() for n, p in model.named_parameters()
+            if p.requires_grad}
+
+
+def save_trainable(path, model, **extra):
+    torch.save({"model": trainable_state_dict(model), **extra}, path)
+
+
+def load_trainable(path, model, optimizer, device):
+    payload = torch.load(path, map_location=device, weights_only=False)
+    missing, unexpected = model.load_state_dict(payload["model"],
+                                                strict=False)
+    if unexpected:
+        raise RuntimeError("unexpected keys in checkpoint: {}"
+                           .format(sorted(unexpected)[:5]))
+    if "optimizer" in payload:
+        optimizer.load_state_dict(payload["optimizer"])
+    return payload
+
+
 def main():
     args = parse_args()
     seed_all(args.seed)
@@ -323,7 +370,7 @@ def main():
                                  // cfg.num_attention_heads,
                                  z_dim=args.z_dim, seed=args.rpbe_seed)
         maps = Llmmaps(d_chi=64, d_phi=32, m=args.sketch_dim,
-                       seed=args.rpbe_seed)
+                       seed=args.rpbe_seed).to(device)
         builder = DialogueCutBuilder(maps, z_dim=args.z_dim,
                                      seed=args.rpbe_seed)
         utter_embed = UtteranceEmbed(hidden_dim=cfg.hidden_size, d_chi=64,
@@ -334,7 +381,21 @@ def main():
                                 strict=False, autoclose=False)
 
     params = [p for p in model.parameters() if p.requires_grad]
-    optimizer = torch.optim.AdamW(params, lr=args.lr)
+    # Official CCM protocol (L6.5 review P0-2): AdamW with weight_decay=0,
+    # cosine decay to zero, 3% warmup, and the official Trainer's default
+    # max_grad_norm=1.0.  Same scheduler on all three arms (per-step).
+    optimizer = torch.optim.AdamW(params, lr=args.lr, weight_decay=0.0)
+    total_steps = max(1, int(args.max_steps))
+    warmup_steps = max(1, int(0.03 * total_steps))
+
+    def _lr_lambda(s):
+        if s < warmup_steps:
+            return float(s) / float(warmup_steps)
+        progress = float(s - warmup_steps) / float(
+            max(1, total_steps - warmup_steps))
+        return max(0.0, 0.5 * (1.0 + math.cos(math.pi * progress)))
+
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, _lr_lambda)
     scaler = torch.cuda.amp.GradScaler(enabled=(device.type == "cuda"))
 
     dialog, collator = build_dataset(args, tokenizer)
@@ -364,7 +425,9 @@ def main():
         args.arm, args.seed, threshold, n_items), flush=True)
 
     step = 0
-    total_task = 0.0
+    total_task_sum = 0.0
+    total_tokens = 0
+    total_microbatches = 0
     total_kf = 0.0
     kf_closed = 0
     aux_terms = 0
@@ -372,9 +435,33 @@ def main():
     lambda_kf = args.kf_lambda
     t_start = time.time()
     pending = []
+    cut_records = []
     window_start_state = None
+    # L6.5 gate 1: every arm hashes its (sample_id, k) data stream so the
+    # three arms can be compared bit-for-bit after a run.
+    data_flow_hash = hashlib.sha256()
+    data_flow_len = 0
+    if args.resume_from:
+        payload = load_trainable(args.resume_from, model, optimizer, device)
+        step = int(payload.get("step", 0))
+        lambda_kf = float(payload.get("lambda_kf", args.kf_lambda))
+        if "sample_cursor" in payload:
+            sample_cursor = int(payload["sample_cursor"])
+        if "rng" in payload:
+            from rpbe.training.checkpoint import _restore_rng
+            _restore_rng(payload["rng"])
+        if "scaler" in payload:
+            scaler.load_state_dict(payload["scaler"])
+        if "builder_oid" in payload and builder is not None:
+            builder.next_oid = int(payload["builder_oid"])
+        print("RESUME step={} lambda={} cursor={}".format(
+            step, lambda_kf, sample_cursor), flush=True)
 
     def pass1_one(batch, meta_list):
+        """Incremental pass 1: forward (no grad) + rows into the window.
+        Returns [(meta, occurrence_id)] per cut in this batch (the pass-2
+        replay contract; builder counters stay monotonic)."""
+        batch_cuts = []
         with torch.no_grad():
             run_forward(model, batch, device, grad_enabled=False)
             for meta in meta_list:
@@ -382,94 +469,117 @@ def main():
                                     embed_tokens, batch, device)
                 if rows:
                     window.add(rows)
+                    batch_cuts.append((meta, rows[0].occurrence_id))
             adapter.clear()
+        return batch_cuts
 
-    def pass2_one(batch, meta_list, plan_by_batch, i, lam):
+    def pass2_one(batch, cut_meta, plan_by_batch, i, lam):
+        """Pass-2 replay: task CE (official MEAN per microbatch, divided
+        by the window size below) + exact surrogate.  ``cut_meta`` is the
+        pass-1 [(meta, oid)] record — NO builder/chi/p here (L6.5
+        review: pass 2 only re-extracts the gradient-connected z)."""
         out = run_forward(model, batch, device, grad_enabled=True)
-        task = task_ce(out, batch["labels"], device)
+        task_sum, n_valid = task_ce_sum(out, batch["labels"], device)
+        task_mean = task_sum / max(n_valid, 1)
         aux = torch.zeros((), device=device)
         n_terms = 0
         if plan_by_batch is not None:
             z_by_oid = {}
-            for meta in meta_list:
-                for r in collect_rows(meta, adapter, builder, utter_embed,
-                                      embed_tokens, batch, device):
-                    z_by_oid[r.occurrence_id] = r.z
+            for meta, oid in cut_meta:
+                z_by_oid[oid] = collect_replay_z(meta, adapter, device)
             adapter.clear()
             aux, n_terms = batch_surrogate(z_by_oid, plan_by_batch, i, lam,
                                            device)
-        return task, aux, n_terms
+        return task_mean, task_sum, n_valid, aux, n_terms
 
     def grad_step():
         scaler.unscale_(optimizer)
         torch.nn.utils.clip_grad_norm_(params, args.grad_clip)
         scaler.step(optimizer)
         scaler.update()
+        scheduler.step()
 
     while step < args.max_steps:
         batch, sample_id = next_batch()
+        # Data-stream hash for every arm (parse_meta is pure, no RNG).
+        metas = parse_meta(batch, comp_ids, sum_ids, sample_id)
+        for m in metas:
+            data_flow_hash.update(struct.pack(
+                ">qq", int(m["sample_id"]) % n_items, int(m["k"])))
+            data_flow_len += 1
         if window_start_state is None:
-            window_start_state = {"rng": _rng_state(),
-                                  "next_oid": builder.next_oid
-                                  if builder else 0}
+            # Builder counters are NOT rewound here: pass 2 never touches
+            # the builder, so occurrence ids stay monotonic across the
+            # whole run (L6.5 review P0-1).
+            window_start_state = {"rng": _rng_state()}
         pending.append((batch, sample_id))
         if use_rpbe:
-            # Incremental pass 1: RNG restored after each microbatch
-            # (builder counters stay monotonic).
+            # Incremental pass 1: RNG restored after each microbatch so
+            # the data-sampling stream matches the single-pass arm; the
+            # cut rows and their occurrence ids accumulate monotonically.
             state = {"rng": _rng_state()}
-            metas = parse_meta(batch, comp_ids, sum_ids, sample_id)
-            pass1_one(batch, metas)
+            batch_cuts = pass1_one(batch, metas)
+            cut_records.append(batch_cuts)
             _restore_rng(state["rng"])
             if window.window_ready():
                 closed, plan, diag = window.close_replay()
+                # P0-1 fix: capture the REAL post-pass-1 data-stream RNG
+                # position; pass 2 replays from the window start and the
+                # stream resumes from the captured position afterwards.
+                resume_rng = _rng_state()
                 _restore_rng(window_start_state["rng"])
-                if builder:
-                    builder.next_oid = window_start_state["next_oid"]
                 plan_by_batch = plan.get(MEM_TAU, {}).get("by_batch", [])
                 plan_by_batch = [plan_by_batch[i] if i < len(plan_by_batch)
                                  else [] for i in range(len(pending))]
                 optimizer.zero_grad(set_to_none=True)
+                task_sum = 0.0
+                n_tokens = 0
                 for i, (b, sid) in enumerate(pending):
-                    metas = parse_meta(b, comp_ids, sum_ids, sid)
-                    task, aux, n_terms = pass2_one(
-                        b, metas, plan_by_batch, i,
-                        0.0 if args.arm == "gamma_task_only" else lambda_kf)
-                    loss = task + aux
+                    task_mean, task_raw, n_valid, aux, n_terms = pass2_one(
+                        b, cut_records[i], plan_by_batch, i,
+                        0.0 if args.arm == "gamma_task_only"
+                        else lambda_kf)
+                    # Per-microbatch normalization: the official Trainer
+                    # scales each microbatch MEAN loss by 1/accumulation,
+                    # so the gradient scale is window-length independent
+                    # (L6.5 review P0-2).  The KF surrogate is NOT
+                    # rescaled: it is the exact window-J gradient.
+                    loss = task_mean / float(len(pending)) + aux
                     scaler.scale(loss).backward()
-                    total_task += float(task.detach())
+                    task_sum += float(task_raw.detach())
+                    n_tokens += n_valid
                     aux_terms += n_terms
                 grad_step()
+                _restore_rng(resume_rng)  # data stream continues correctly
+                total_task_sum += task_sum
+                total_tokens += n_tokens
+                total_microbatches += len(pending)
                 total_kf += float(sum(closed.values()))
                 kf_closed += 1
                 if args.calibrate_lambda and kf_closed == 1:
                     # r_eff on this window: separate norm measurements.
                     optimizer.zero_grad(set_to_none=True)
                     _restore_rng(window_start_state["rng"])
-                    builder.next_oid = window_start_state["next_oid"]
                     for b, sid in pending:
-                        metas = parse_meta(b, comp_ids, sum_ids, sid)
                         out = run_forward(model, b, device,
                                           grad_enabled=True)
-                        task = task_ce(out, b["labels"], device)
-                        task.backward()
+                        task, _ = task_ce_sum(out, b["labels"], device)
+                        (task / float(len(pending))).backward()
                     g_task = repr_grad_norm(params)
                     optimizer.zero_grad(set_to_none=True)
                     _restore_rng(window_start_state["rng"])
-                    builder.next_oid = window_start_state["next_oid"]
                     for i, (b, sid) in enumerate(pending):
-                        metas = parse_meta(b, comp_ids, sum_ids, sid)
                         out = run_forward(model, b, device,
                                           grad_enabled=True)
                         z_by_oid = {}
-                        for meta in metas:
-                            for r in collect_rows(
-                                    meta, adapter, builder, utter_embed,
-                                    embed_tokens, b, device):
-                                z_by_oid[r.occurrence_id] = r.z
+                        for meta, oid in cut_records[i]:
+                            z_by_oid[oid] = collect_replay_z(meta, adapter,
+                                                             device)
                         adapter.clear()
                         aux, _ = batch_surrogate(z_by_oid, plan_by_batch,
                                                  i, 1.0, device)
-                        aux.backward()
+                        (aux / float(len(pending))).backward()
+                    _restore_rng(resume_rng)
                     g_kf = repr_grad_norm(params)
                     r_eff = g_kf / max(g_task, 1e-30)
                     derived = 0.1 / max(r_eff, 1e-30)
@@ -484,6 +594,7 @@ def main():
                     return
                 step += 1
                 pending = []
+                cut_records = []
                 window_start_state = None
             elif len(pending) >= args.max_pending_mbs:
                 raise RuntimeError(
@@ -493,42 +604,63 @@ def main():
         else:
             if len(pending) >= args.grad_accum:
                 optimizer.zero_grad(set_to_none=True)
+                task_sum = 0.0
+                n_tokens = 0
                 for b, sid in pending:
                     out = run_forward(model, b, device, grad_enabled=True)
-                    task = task_ce(out, b["labels"], device)
-                    scaler.scale(task).backward()
-                    total_task += float(task.detach())
+                    task_raw, n_valid = task_ce_sum(out, b["labels"],
+                                                    device)
+                    task_mean = task_raw / max(n_valid, 1)
+                    scaler.scale(task_mean / float(len(pending))).backward()
+                    task_sum += float(task_raw.detach())
+                    n_tokens += n_valid
                 grad_step()
+                total_task_sum += task_sum
+                total_tokens += n_tokens
+                total_microbatches += len(pending)
                 step += 1
                 pending = []
         if step and step % args.log_every == 0:
             elapsed = time.time() - t_start
-            row = {"step": step, "task": total_task / step,
+            row = {"step": step,
+                   "task_ce_token": total_task_sum / max(total_tokens, 1),
+                   "task_microbatches": total_microbatches,
+                   "task_valid_tokens": total_tokens,
                    "kf_closed": kf_closed,
                    "kf_score": total_kf / max(kf_closed, 1),
                    "aux_terms": aux_terms, "lambda": lambda_kf,
                    "elapsed": elapsed}
-            print("step={} task={:.4f} kf_closed={} kf_score={:.4f} "
-                  "aux={} sec={:.1f}".format(
-                      step, row["task"], kf_closed, row["kf_score"],
-                      aux_terms, elapsed), flush=True)
+            print("step={} ce_token={:.4f} mbs={} kf_closed={} "
+                  "kf_score={:.4f} aux={} sec={:.1f}".format(
+                      step, row["task_ce_token"], total_microbatches,
+                      kf_closed, row["kf_score"], aux_terms, elapsed),
+                  flush=True)
             with log_path.open("a") as f:
                 f.write(json.dumps(row) + "\n")
         if args.checkpoint_every and step and step % args.checkpoint_every == 0:
-            torch.save({"step": step, "model": model.state_dict(),
-                        "optimizer": optimizer.state_dict()},
-                       out / "checkpoint.pt")
+            save_trainable(out / "checkpoint.pt", model, step=step,
+                           optimizer=optimizer.state_dict(),
+                           scaler=scaler.state_dict(),
+                           builder_oid=builder.next_oid if builder else 0,
+                           lambda_kf=lambda_kf,
+                           sample_cursor=sample_cursor,
+                           rng=_rng_state())
 
-    torch.save({"step": step, "model": model.state_dict()},
-               out / "final.pt")
+    save_trainable(out / "final.pt", model, step=step, lambda_kf=lambda_kf)
     summary = {
         "arm": args.arm, "seed": args.seed, "steps": step,
-        "mean_task_loss": total_task / max(step, 1),
+        # Token-normalized CE: the only cross-arm comparable task number
+        # (L6.5 review; per-microbatch sums vary with the window length).
+        "mean_task_ce_per_token": total_task_sum / max(total_tokens, 1),
+        "task_microbatches": total_microbatches,
+        "task_valid_tokens": total_tokens,
         "kf_closed": kf_closed,
         "mean_kf_score": total_kf / max(kf_closed, 1),
         "aux_terms": aux_terms, "lambda_kf": lambda_kf,
         "paired_seed_hash": paired_seed_hash(args.seed, model)
         if use_rpbe else "n/a",
+        "data_flow_hash": data_flow_hash.hexdigest(),
+        "data_flow_len": data_flow_len,
     }
     save_json(out / "summary.json", summary)
     save_json(out / "_SUCCESS.json", {"status": "complete", "steps": step})

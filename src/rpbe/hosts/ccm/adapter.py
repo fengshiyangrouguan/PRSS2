@@ -38,9 +38,15 @@ class CCMHostAdapter:
         self.n_layers = int(n_layers)
         self.n_heads = int(n_heads)
         self.head_dim = int(head_dim)
+        # The CountSketch index tables (2.1M entries x 3) must live on the
+        # model device: this class is NOT an nn.Module, so nothing moves
+        # them otherwise and every extract_z() would re-upload them from
+        # CPU (L6.5 review performance fix).
+        device = next(base.parameters()).device
         self.j_mem = JMemLift(n_layers=n_layers, n_heads=n_heads,
                               n_slots=n_slots, kv_pairs=kv_pairs,
-                              head_dim=head_dim, z_dim=z_dim, seed=seed)
+                              head_dim=head_dim, z_dim=z_dim,
+                              seed=seed).to(device)
         self.z_dim = int(z_dim)
         self._cache: List[Optional[tuple]] = [None] * self.n_layers
 

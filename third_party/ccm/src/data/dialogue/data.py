@@ -56,9 +56,14 @@ class DialogueDataset():
         # single-character turns and a 3.6k-token sequence).
         mirror = os.environ.get("DIALOG_MIRROR", "")
         if mirror and os.path.isdir(mirror):
-            def _read(split, name):
+            # Official file formats differ per column (L6.5 review):
+            # dialogues are __eou__-separated per line, acts/emotions are
+            # SPACE-separated.  Both are read and the turn counts are
+            # cross-checked (the official loader does the same).
+            def _read_dialog(split):
                 out = []
-                with open(os.path.join(mirror, split, name),
+                with open(os.path.join(mirror, split,
+                                       "dialogues_{}.txt".format(split)),
                           encoding="utf-8") as f:
                     for line in f.read().strip().split("\n"):
                         out.append([t.strip() for t in
@@ -66,14 +71,31 @@ class DialogueDataset():
                                     if t.strip()])
                 return out
 
-            dataset = {
-                split: {
-                    "dialog": _read(split, "dialogues_{}.txt".format(split)),
-                    "act": _read(split,
-                                 "dialogues_act_{}.txt".format(split)),
-                }
-                for split in ("train", "validation", "test")
-            }
+            def _read_act(split):
+                out = []
+                with open(os.path.join(
+                        mirror, split,
+                        "dialogues_act_{}.txt".format(split)),
+                        encoding="utf-8") as f:
+                    for line in f.read().strip().split("\n"):
+                        out.append([a.strip() for a in
+                                    line.strip().split() if a.strip()])
+                return out
+
+            dataset = {}
+            for split in ("train", "validation", "test"):
+                dialogs = _read_dialog(split)
+                acts = _read_act(split)
+                if len(dialogs) != len(acts):
+                    raise ValueError(
+                        "dialog/act row count mismatch in split {}: {} vs {}"
+                        .format(split, len(dialogs), len(acts)))
+                for i, (d, a) in enumerate(zip(dialogs, acts)):
+                    if len(d) != len(a):
+                        raise ValueError(
+                            "dialog/act turn count mismatch at {} row {}: "
+                            "{} vs {}".format(split, i, len(d), len(a)))
+                dataset[split] = {"dialog": dialogs, "act": acts}
         else:
             dataset = datasets.load_dataset("daily_dialog")
         self.trainset = {}

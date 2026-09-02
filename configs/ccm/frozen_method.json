@@ -21,8 +21,8 @@
     "horizon_weights": [0.5, 0.5],
     "lambda_calibration": {
       "rule": "r_eff = lambda * ||g_KF|| / ||g_task|| ~ 0.1, measured on theta_0 (calibration-only run, before ANY optimizer/scheduler step), calibrated once on the initial full window (training-only), then frozen for all seeds",
-      "lambda_kf": null,
-      "lambda_kf_note": "null until the calibration-only run writes its derived_lambda here; after that the trainer reads this number for the ours arm and refuses CLI lambda overrides. gamma_task_only / ccm_merge arms are unaffected."
+      "lambda_kf": 0.000676808965419781,
+      "lambda_kf_note": "committed 2026-09-02 from the calibration-only run on the initial full window (outputs/ccm_accept/calib, r_eff=147.75 on theta_0 -> lambda = 0.1/147.75 = 6.768e-4; theta0_verified, 0 optimizer/scheduler steps). The trainer reads this number for the ours arm and refuses CLI lambda overrides. gamma_task_only / ccm_merge arms are unaffected."
     },
     "z_v_source": "J_mem(M_v) fixed adapter (TGN identity is its special case)",
     "witness": "none (main experiment)"

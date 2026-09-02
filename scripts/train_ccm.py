@@ -438,9 +438,12 @@ def main():
     cut_records = []
     window_start_state = None
     # L6.5 gate 1: every arm hashes its (sample_id, k) data stream so the
-    # three arms can be compared bit-for-bit after a run.
+    # three arms can be compared bit-for-bit after a run; the raw stream
+    # is also written for prefix comparison across unequal window sizes.
     data_flow_hash = hashlib.sha256()
     data_flow_len = 0
+    data_flow_path = out / "data_flow.jsonl"
+    data_flow_path.unlink(missing_ok=True)
     if args.resume_from:
         payload = load_trainable(args.resume_from, model, optimizer, device)
         step = int(payload.get("step", 0))
@@ -507,6 +510,10 @@ def main():
             data_flow_hash.update(struct.pack(
                 ">qq", int(m["sample_id"]) % n_items, int(m["k"])))
             data_flow_len += 1
+        with data_flow_path.open("a") as f:
+            for m in metas:
+                f.write(json.dumps({"sid": int(m["sample_id"]) % n_items,
+                                    "k": int(m["k"])}) + "\n")
         if window_start_state is None:
             # Builder counters are NOT rewound here: pass 2 never touches
             # the builder, so occurrence ids stay monotonic across the

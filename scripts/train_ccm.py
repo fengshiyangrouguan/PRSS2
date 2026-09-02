@@ -598,6 +598,7 @@ def main():
         args.arm, args.seed, threshold, n_items), flush=True)
 
     step = 0
+    last_logged_step = 0  # dedup: log only when step changes (L7 smoke)
     # Review ruling: ``step`` counts global window attempts (HF Trainer
     # global_step, advances even on AMP skips; the frozen 1000-step budget
     # is GLOBAL steps, not applied-update count).  optimizer_steps_executed
@@ -1126,7 +1127,11 @@ def main():
                 if args.max_windows and step >= args.max_windows:
                     break
                 pending = []
-        if step and step % args.log_every == 0:
+        if (step and step != last_logged_step
+                and step % args.log_every == 0):
+            # L7 smoke: without the dedup this block re-prints the same
+            # row on every non-fire loop iteration (~260 rows/window).
+            last_logged_step = step
             elapsed = time.time() - t_start
             row = {"step": step,
                    "optimizer_steps_executed": optimizer_steps_executed,

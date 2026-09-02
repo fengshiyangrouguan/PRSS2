@@ -68,7 +68,12 @@ N_TOK = N_TOK_LOCK  # comp slots; 2 comp + 2 sum = 4 added tokens
 def parse_args():
     p = argparse.ArgumentParser("CCM x RPBE training (plan v2 L5)")
     p.add_argument("--arm", required=True,
-                   choices=["ccm_merge", "gamma_task_only", "ours"])
+                   choices=["ccm_merge", "gamma_task_only", "ours",
+                            "ccm_merge_official"],
+                   help="ccm_merge_official: official fixed-accumulation "
+                        "cadence reproduction arm (frozen cadence is "
+                        "window-matched for the three main arms; the "
+                        "official arm is reported separately)")
     p.add_argument("--model-name-or-path", required=True)
     p.add_argument("--dialog-mirror", required=True,
                    help="DIALOG_MIRROR: ijcnlp_dailydialog layout dir")
@@ -116,6 +121,11 @@ def parse_args():
                    help="resume from an adapter-only checkpoint.pt")
     p.add_argument("--max-pending-mbs", type=int, default=2048,
                    help="degenerate-window guard: pending cap before abort")
+    p.add_argument("--max-windows", type=int, default=0,
+                   help="verification runs: stop after this many closed "
+                        "windows (0 = run to max_steps).  max_steps stays "
+                        "frozen at 1000, so short verification runs use "
+                        "this instead of changing the step budget.")
     return p.parse_args()
 
 
@@ -147,6 +157,14 @@ def enforce_frozen(args):
     1.0) would train a different method than the one reviewed and
     frozen.  Every bound key is checked here; values the CLI does not
     carry are read back for logging only.
+
+    Review ruling #2 extends the binds to the full method vector
+    (lambda_kf, z_dim, gamma_hidden, merge_cadence, max_steps, LoRA rank)
+    and pins the arm/cadence pairing: the ccm_merge_official reproduction
+    arm is the ONLY arm allowed the fixed official cadence, the three main
+    arms must use the machine value "window-matched", and lambda_kf is
+    either null (calibration-only run permitted, anything else refused)
+    or a committed number that overrides the CLI.
     """
     with open(FROZEN_PATH, encoding="utf-8") as f:
         fz = json.load(f)
@@ -157,6 +175,10 @@ def enforce_frozen(args):
         ("--kf-min-cuts", "kf_min_cuts",
          fz["window"]["min_effective_cuts"]),
         ("--grad-clip", "grad_clip", fz["training"]["grad_clip"]),
+        ("--z-dim", "z_dim", fz["rpbe"]["z_v_dim"]),
+        ("--gamma-hidden", "gamma_hidden", fz["gamma"]["hidden"]),
+        ("--lora-r", "lora_r", fz["adapter"]["lora_r"]),
+        ("--max-steps", "max_steps", fz["training"]["steps"]),
     ]
     for flag, name, frozen_val in binds:
         cli_val = getattr(args, name)
@@ -165,6 +187,53 @@ def enforce_frozen(args):
                 "[frozen] {}={} conflicts with frozen_method.json (={}); "
                 "the frozen spec is authoritative — edit the spec file "
                 "to override".format(flag, cli_val, frozen_val))
+    # Arm/cadence pairing: only the official reproduction arm may run
+    # the fixed accumulation cadence; the three main arms share the
+    # adaptive "window-matched" boundary (review P0-2 / ruling #2).
+    if args.arm == "ccm_merge_official":
+        if args.merge_cadence != "official":
+            raise SystemExit(
+                "[frozen] ccm_merge_official must run with "
+                "--merge-cadence official (frozen_method.json "
+                "training.merge_cadence = window-matched applies to the "
+                "three main arms only)")
+    elif args.merge_cadence != "window-matched":
+        raise SystemExit(
+            "[frozen] arm {} must run with the frozen window-matched "
+            "cadence; --merge-cadence official is reserved for "
+            "ccm_merge_official".format(args.arm))
+    # Lambda authority: the calibration-only run writes the derived
+    # lambda into the frozen spec; afterwards the number overrides any
+    # CLI value and re-calibration is refused.
+    lam = fz["rpbe"]["lambda_calibration"]["lambda_kf"]
+    if args.arm == "ours":
+        if lam is None:
+            if not args.calibrate_lambda:
+                raise SystemExit(
+                    "[frozen] rpbe.lambda_calibration.lambda_kf is null — "
+                    "the ours arm may only run the calibration-only pass "
+                    "(--calibrate-lambda).  Commit its derived_lambda "
+                    "into configs/ccm/frozen_method.json before the "
+                    "formal runs.")
+        else:
+            if args.calibrate_lambda:
+                raise SystemExit(
+                    "[frozen] lambda_kf={} is committed in "
+                    "frozen_method.json; re-running --calibrate-lambda "
+                    "would retrain the calibration.  Delete the field "
+                    "first if a recalibration is really intended.".format(
+                        lam))
+            if args.kf_lambda != lam:
+                print("[frozen] CLI --kf-lambda={} overridden by the "
+                      "committed lambda_kf={} "
+                      "(frozen_method.json)".format(args.kf_lambda, lam),
+                      flush=True)
+                args.kf_lambda = lam
+    elif args.calibrate_lambda:
+        raise SystemExit(
+            "[frozen] --calibrate-lambda measures r_eff of the surrogate "
+            "(arm 'ours'); arm '{}' does not train the auxiliary "
+            "term".format(args.arm))
     return fz
 
 
@@ -382,6 +451,17 @@ def repr_grad_norm(params):
     return math.sqrt(total) if n else 0.0
 
 
+def params_digest(params):
+    """sha256 over the trainable weights (CPU copy).  The lambda
+    calibration asserts the digest is unchanged across its measurements
+    so the r_eff values really live on theta_0 (review P0-4)."""
+    h = hashlib.sha256()
+    for p in params:
+        h.update(np.ascontiguousarray(
+            p.detach().cpu().numpy()).tobytes())
+    return h.hexdigest()
+
+
 def trainable_state_dict(model):
     """LoRA + Gamma + any other trainable params ONLY (the frozen 7B
     backbone is NOT stored; a full state_dict costs ~13GB per file)."""
@@ -529,6 +609,11 @@ def main():
     # is also written for prefix comparison across unequal window sizes.
     data_flow_hash = hashlib.sha256()
     data_flow_len = 0
+    # Review (cadence collision): per-window boundary records
+    # w{ordinal}:{n_mb}:{n_cut_mb} hashed into boundary_hash so the three
+    # arms' window boundaries are comparable window by window, not only
+    # through the final data-flow hash.
+    boundary_hash = hashlib.sha256()
     data_flow_path = out / "data_flow.jsonl"
     data_flow_path.unlink(missing_ok=True)
     if args.resume_from:
@@ -660,6 +745,80 @@ def main():
                 # the cuts once k < 4 microbatches interleaved
                 # (aux_terms was 11 over 7 windows instead of 896).
                 g_by_oid = plan.get(MEM_TAU, {}).get("by_oid", {})
+                if args.calibrate_lambda and kf_closed == 0 \
+                        and not args.resume_from:
+                    # Review P0-4 (lambda calibration timing): the
+                    # calibration must run on theta_0 — BEFORE this
+                    # window's optimizer/scheduler step — replaying the
+                    # theta_0 adjoint plan against theta_0 z's.  The
+                    # previous order ran the real pass 2 and grad_step
+                    # first, then measured on theta_1: the surrogate
+                    # became J_z(theta_1)^T dJ/dz|_{theta_0} (mixed
+                    # point) and the task gradient was measured at
+                    # theta_1 too, so the derived lambda was not the
+                    # frozen spec's r_eff calibration value.  Asserts:
+                    # trainable params unchanged and no optimizer /
+                    # scheduler step has fired.
+                    digest0 = params_digest(params)
+                    assert step == 0, \
+                        "lambda calibration must fire before the first " \
+                        "optimizer step (step={})".format(step)
+                    # r_eff on this window: separate norm measurements.
+                    # g_task uses the real training scale (per-microbatch
+                    # MEAN divided by len(pending)); g_kf uses the real
+                    # pass-2 scale (aux NOT divided — review P0-3).
+                    optimizer.zero_grad(set_to_none=True)
+                    _restore_rng(window_start_state["rng"])
+                    for b, sid in pending:
+                        fwd_out = run_forward(model, b, device,
+                                              grad_enabled=True)
+                        task_sum_m, n_valid_m = task_ce_shifted(
+                            fwd_out, b["labels"], device)
+                        (task_sum_m / max(n_valid_m, 1)
+                         / float(len(pending))).backward()
+                    g_task = repr_grad_norm(params)
+                    optimizer.zero_grad(set_to_none=True)
+                    _restore_rng(window_start_state["rng"])
+                    for i, (b, sid) in enumerate(pending):
+                        fwd_out = run_forward(model, b, device,
+                                              grad_enabled=True)
+                        # Same occurrence-id mapping as pass 2 (P0-1):
+                        # only this batch's cuts, resolved via by_oid.
+                        z_by_oid = {}
+                        batch_terms = []
+                        for meta, oid in cut_records[i]:
+                            g = g_by_oid.get(oid)
+                            if g is not None:
+                                z_by_oid[oid] = collect_replay_z(
+                                    meta, adapter, device)
+                                batch_terms.append((oid, g))
+                        adapter.clear()
+                        aux, n_aux = batch_surrogate(
+                            z_by_oid, batch_terms, 1.0, device)
+                        # A microbatch without terms (k < 4) contributes
+                        # nothing; its zero aux has no grad_fn, so skip.
+                        if n_aux:
+                            aux.backward()
+                    _restore_rng(resume_rng)
+                    g_kf = repr_grad_norm(params)
+                    if params_digest(params) != digest0:
+                        raise RuntimeError(
+                            "lambda calibration changed the trainable "
+                            "params — theta_0 violated")
+                    r_eff = g_kf / max(g_task, 1e-30)
+                    derived = 0.1 / max(r_eff, 1e-30)
+                    save_json(out / "calibration.json", {
+                        "g_task": g_task, "g_kf": g_kf, "r_eff": r_eff,
+                        "derived_lambda": derived,
+                        "optimizer_steps": 0, "scheduler_steps": 0,
+                        "rule": "lambda = 0.1 / r_eff (plan L5), "
+                                "measured on theta_0 before any step"})
+                    print(json.dumps({"g_task": g_task, "g_kf": g_kf,
+                                      "r_eff": r_eff,
+                                      "derived_lambda": derived,
+                                      "theta0_verified": True},
+                                     indent=2), flush=True)
+                    return
                 optimizer.zero_grad(set_to_none=True)
                 task_sum = 0.0
                 n_tokens = 0
@@ -705,66 +864,16 @@ def main():
                 total_microbatches += len(pending)
                 total_kf += float(sum(closed.values()))
                 kf_closed += 1
-                if args.calibrate_lambda and kf_closed == 1:
-                    # r_eff on this window: separate norm measurements.
-                    # g_task is measured with the real training scale
-                    # (per-microbatch MEAN divided by len(pending)) and
-                    # g_kf with the real pass-2 scale (aux NOT divided —
-                    # loss = task_mean/len(pending) + aux).  Dividing aux
-                    # here too shrank the measured g_kf by ~266x and
-                    # inflated the derived lambda by the same factor
-                    # (review P0-3).
-                    optimizer.zero_grad(set_to_none=True)
-                    _restore_rng(window_start_state["rng"])
-                    for b, sid in pending:
-                        fwd_out = run_forward(model, b, device,
-                                              grad_enabled=True)
-                        task_sum, n_valid = task_ce_shifted(
-                            fwd_out, b["labels"], device)
-                        # Per-microbatch MEAN (official loss formula),
-                        # then the same /len(pending) as the real pass 2
-                        # so the measured g_task matches training.
-                        (task_sum / max(n_valid, 1)
-                         / float(len(pending))).backward()
-                    g_task = repr_grad_norm(params)
-                    optimizer.zero_grad(set_to_none=True)
-                    _restore_rng(window_start_state["rng"])
-                    for i, (b, sid) in enumerate(pending):
-                        fwd_out = run_forward(model, b, device,
-                                              grad_enabled=True)
-                        # Same occurrence-id mapping as pass 2 (P0-1):
-                        # only this batch's cuts, resolved via by_oid.
-                        z_by_oid = {}
-                        batch_terms = []
-                        for meta, oid in cut_records[i]:
-                            g = g_by_oid.get(oid)
-                            if g is not None:
-                                z_by_oid[oid] = collect_replay_z(
-                                    meta, adapter, device)
-                                batch_terms.append((oid, g))
-                        adapter.clear()
-                        aux, n_aux = batch_surrogate(
-                            z_by_oid, batch_terms, 1.0, device)
-                        # Same scale as pass 2 (aux NOT divided by the
-                        # window size — review P0-3).  A microbatch
-                        # without terms (k < 4) contributes nothing;
-                        # its zero aux has no grad_fn, so skip the call.
-                        if n_aux:
-                            aux.backward()
-                    _restore_rng(resume_rng)
-                    g_kf = repr_grad_norm(params)
-                    r_eff = g_kf / max(g_task, 1e-30)
-                    derived = 0.1 / max(r_eff, 1e-30)
-                    save_json(out / "calibration.json", {
-                        "g_task": g_task, "g_kf": g_kf, "r_eff": r_eff,
-                        "derived_lambda": derived,
-                        "rule": "lambda = 0.1 / r_eff (plan L5)"})
-                    print(json.dumps({"g_task": g_task, "g_kf": g_kf,
-                                      "r_eff": r_eff,
-                                      "derived_lambda": derived},
-                                     indent=2), flush=True)
-                    return
                 step += 1
+                # Per-window boundary record (review): every arm hashes
+                # (window ordinal, n_mb, n_cut_mb) into boundary_hash so
+                # cadence identity is checkable window by window, not
+                # only through the final data-flow hash.
+                n_cut_win = sum(1 for cr in cut_records for _ in cr)
+                boundary_hash.update("w{}:{}:{}:".format(
+                    kf_closed, len(pending), n_cut_win).encode())
+                if args.max_windows and step >= args.max_windows:
+                    break
                 pending = []
                 cut_records = []
                 window_start_state = None
@@ -819,12 +928,18 @@ def main():
                 total_task_sum += task_sum
                 total_tokens += n_tokens
                 total_microbatches += len(pending)
-                if args.merge_cadence == "window-matched":
-                    print("win={} n_mb={} n_cut_mb={} (matched cadence)"
-                          .format(step + 1, len(pending), merge_eff_cuts),
-                          flush=True)
-                    merge_eff_cuts = 0
                 step += 1
+                if args.merge_cadence == "window-matched":
+                    # Same per-window boundary record as the RPBE arms
+                    # (review): (ordinal, n_mb, n_cut_mb) per window.
+                    print("win={} n_mb={} n_cut_mb={} (matched cadence)"
+                          .format(step, len(pending), merge_eff_cuts),
+                          flush=True)
+                    boundary_hash.update("w{}:{}:{}:".format(
+                        step, len(pending), merge_eff_cuts).encode())
+                    merge_eff_cuts = 0
+                if args.max_windows and step >= args.max_windows:
+                    break
                 pending = []
         if step and step % args.log_every == 0:
             elapsed = time.time() - t_start
@@ -867,6 +982,7 @@ def main():
         if use_rpbe else "n/a",
         "data_flow_hash": data_flow_hash.hexdigest(),
         "data_flow_len": data_flow_len,
+        "boundary_hash": boundary_hash.hexdigest(),
     }
     save_json(out / "summary.json", summary)
     save_json(out / "_SUCCESS.json", {"status": "complete", "steps": step})

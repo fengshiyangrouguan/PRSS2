@@ -1,5 +1,5 @@
 {
-  "_comment": "CCM-merge x RPBE frozen method (plan v2 P0-3): machine-readable freeze of the method decisions. The trainer must read values from here (no silent defaults). Sources: Ky-Fan ridge/m from the completed 5-seed TGN experiment; lambda from the r_eff~0.1 calibration rule (plan L5).",
+  "_comment": "CCM-merge x RPBE frozen method (plan v2 P0-3): machine-readable freeze of the method decisions. The trainer must read values from here (no silent defaults) and refuse inconsistent CLI overrides. Sources: Ky-Fan ridge/m from the completed 5-seed TGN experiment; lambda_kf from the r_eff~0.1 calibration rule (plan L5), produced by the calibration-only run and committed HERE before the five seeds run.",
   "frozen_source": "five-seed TGN experiment on Wikipedia (exact_replay, ridge=1e-3, m=64, lambda calibrated to r_eff~0.1 = 0.088)",
   "backbone": {
     "model": "llama-7b (original LLaMA-7B, not LLaMA-2)",
@@ -9,14 +9,20 @@
     "n_tok_lock": 2,
     "torch_compile": "disabled on all three arms"
   },
+  "adapter": {
+    "lora_r": 8,
+    "lora_r_note": "LoRA rank for the trainable adapter (train_ccm historical default; L1 official reproduction skipped by user decision, r=8 fixed for the formal runs)"
+  },
   "rpbe": {
     "ridge_eps": 1e-3,
     "sketch_dim_m": 64,
     "rpbe_map_seed": 0,
+    "z_v_dim": 128,
     "horizon_weights": [0.5, 0.5],
     "lambda_calibration": {
-      "rule": "r_eff = lambda * ||g_KF|| / ||g_task|| ~ 0.1, calibrated once on the initial full window (training-only), then frozen for all seeds",
-      "tgn_reference_value": 0.088
+      "rule": "r_eff = lambda * ||g_KF|| / ||g_task|| ~ 0.1, measured on theta_0 (calibration-only run, before ANY optimizer/scheduler step), calibrated once on the initial full window (training-only), then frozen for all seeds",
+      "lambda_kf": null,
+      "lambda_kf_note": "null until the calibration-only run writes its derived_lambda here; after that the trainer reads this number for the ours arm and refuses CLI lambda overrides. gamma_task_only / ccm_merge arms are unaffected."
     },
     "z_v_source": "J_mem(M_v) fixed adapter (TGN identity is its special case)",
     "witness": "none (main experiment)"
@@ -38,7 +44,8 @@
     "steps": 1000,
     "grad_clip": 1.0,
     "grad_clip_source": "official HF Trainer default (max_grad_norm); train_ccm must refuse an inconsistent override",
-    "merge_cadence": "window-matched: all three arms fire an update on the same adaptive boundary (>= 128 dialogues with k>=4); official 128-microbatch cadence exists only as the ccm_merge_official reproduction reference",
+    "merge_cadence": "window-matched",
+    "merge_cadence_note": "window-matched: all three arms fire an update on the same adaptive boundary (>= min_effective_cuts dialogues with k>=4); the fixed grad_accum cadence exists only for the ccm_merge_official reproduction arm, whose arm name marks it as outside the main result",
     "two_pass_replay": "pass1 no-grad statistics forward, pass2 grad replay forward (training only; inference is a single forward)",
     "seeds": 5,
     "eval": "matched-cohort depth curves on the clean test split; primary metric = per-token NLL difference"

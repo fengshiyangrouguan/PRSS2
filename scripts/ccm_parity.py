@@ -138,8 +138,8 @@ def main():
     scaler_b = torch.cuda.amp.GradScaler(enabled=(device.type == "cuda"))
     optimizer_b.zero_grad(set_to_none=True)
     for b in batches:
-        out = run_forward(model_b, b, device, grad_enabled=True)
-        task_sum, n_valid = task_ce_sum(out, b["labels"], device)
+        fwd_out = run_forward(model_b, b, device, grad_enabled=True)
+        task_sum, n_valid = task_ce_sum(fwd_out, b["labels"], device)
         task_mean = task_sum / max(n_valid, 1)
         scaler_b.scale(task_mean / float(len(batches))).backward()
     scaler_b.unscale_(optimizer_b)

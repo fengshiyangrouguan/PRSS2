@@ -3,17 +3,20 @@
 and the train_ccm single-pass loop (ccm_merge arm).
 
 Same model init, same 128 pre-collated microbatches, same recipe:
-AdamW(weight_decay=0), fp16 autocast + GradScaler, mean-CE / 128
-accumulation, max_grad_norm=1.0.  The LR schedule is pinned CONSTANT
-(full lr) on both sides: replicating the warmup/cosine formula inside a
-single-step parity is a scheduler-phase trap (train_ccm's LambdaLR with
-max_steps=1 pins warmup_steps=max(1,0)=1, so its first optimizer step
-would run at lr=0 while the Trainer arm runs at full lr).  The scheduler
-curve itself is formula-level identical in both paths and verified by
-review; what this gate verifies is the optimizer / scaling / clipping /
-accumulation protocol.  Batch ORDER is irrelevant: the 128 batches are
-pre-collated from one shared RNG stream and Adam starts from zero state,
-so the per-parameter update deltas must match.
+AdamW(weight_decay=0), fp16 autocast + GradScaler, per-microbatch
+mean-CE divided by the accumulation count (accelerate 1.14 does
+`loss = loss / gradient_accumulation_steps` inside Accelerator.backward,
+so the official gradient is the sum of loss_b / 128), max_grad_norm=1.0.
+The LR schedule is pinned CONSTANT (full lr) on both sides: replicating
+the warmup/cosine formula inside a single-step parity is a
+scheduler-phase trap (train_ccm's LambdaLR with max_steps=1 pins
+warmup_steps=max(1,0)=1, so its first optimizer step would run at lr=0
+while the Trainer arm runs at full lr).  The scheduler curve itself is
+formula-level identical in both paths and verified by review; what this
+gate verifies is the optimizer / scaling / clipping / accumulation
+protocol.  Batch ORDER is irrelevant: the 128 batches are pre-collated
+from one shared RNG stream and Adam starts from zero state, so the
+per-parameter update deltas must match.
 
 Usage (cloud):
     python -m scripts.ccm_parity --model-name-or-path /root/autodl-tmp/llama-7b-hf \
@@ -127,10 +130,30 @@ def main():
         data_collator=identity_collator,
     )
     trainer.train()
+    # Probe: did the Trainer's GradScaler see inf/nan (skip) and what
+    # is its growth factor after the step?
+    scaler_a = getattr(trainer, "scaler", None)
+    if scaler_a is not None and device.type == "cuda":
+        print("PROBE armA scaler scale={:.1f} growth={} "
+              "found_inf={}".format(
+                  float(scaler_a.get_scale()),
+                  "nan" if scaler_a._growth_factor != scaler_a._growth_factor
+                  else float(scaler_a._growth_factor),
+                  "nan" if scaler_a._found_inf_per_device
+                  != scaler_a._found_inf_per_device else
+                  {k: bool(v) for k, v in
+                   scaler_a._found_inf_per_device.items()}),
+              flush=True)
     deltas_a = {}
     for n, p in model_a.named_parameters():
         if p.requires_grad:
             deltas_a[n] = (p.detach().float().cpu() - before_a[n])
+    n_nan_a = sum(1 for d in deltas_a.values()
+                  if torch.isnan(d.float()).any())
+    print(f"PROBE armA delta_nan_params={n_nan_a}/"
+          f"{len(deltas_a)} nonzero="
+          f"{sum(1 for d in deltas_a.values() if float(d.abs().max()) > 0)}",
+          flush=True)
 
     # ---- arm B: the train_ccm single-pass loop ----
     seed_all(args.seed)
@@ -148,9 +171,13 @@ def main():
         fwd_out = run_forward(model_b, b, device, grad_enabled=True)
         # Official Trainer loss, replicated exactly: the vendored model
         # shifts logits/labels by one before the CE and reduces with the
-        # MEAN over valid tokens (ccm_llama.py ~line 922); HF
-        # accumulation sums per-microbatch losses with NO division by
-        # the accumulation count.
+        # MEAN over valid tokens (ccm_llama.py ~line 922).  The /128 is
+        # NOT a free choice: accelerate 1.14's Accelerator.backward()
+        # does `loss = loss / gradient_accumulation_steps` before
+        # scaling, so the official gradient is sum of (loss_b / 128).
+        # Omitting it overflows the fp16 backward (caught here: 220/256
+        # nan grads -> GradScaler skips the step) and shifts the update
+        # scale by 128x.
         labels_b = b["labels"].to(device)
         sl = fwd_out.logits[..., :-1, :].contiguous()
         sy = labels_b[..., 1:].contiguous()
@@ -161,15 +188,31 @@ def main():
             ce = torch.nn.functional.cross_entropy(
                 sl.view(-1, sl.shape[-1]), sy.view(-1),
                 ignore_index=-100, reduction="mean")
-        scaler_b.scale(ce).backward()
+        scaler_b.scale(ce / float(len(batches))).backward()
+    if device.type == "cuda":
+        nan_grads = [n for n, p in model_b.named_parameters()
+                     if p.requires_grad and p.grad is not None
+                     and torch.isnan(p.grad.float()).any()]
+        print(f"PROBE armB pre-unscale nan_grad_params={len(nan_grads)} "
+              f"first={nan_grads[:3]}", flush=True)
     scaler_b.unscale_(optimizer_b)
     torch.nn.utils.clip_grad_norm_(params_b, 1.0)
+    scale_before = float(scaler_b.get_scale())
     scaler_b.step(optimizer_b)
     scaler_b.update()
+    scale_after = float(scaler_b.get_scale())
+    print(f"PROBE armB scale {scale_before:.0f} -> {scale_after:.0f} "
+          f"(halved => step skipped on inf/nan)", flush=True)
     deltas_b = {}
     for n, p in model_b.named_parameters():
         if p.requires_grad:
             deltas_b[n] = (p.detach().float().cpu() - before_b[n])
+    n_nan_b = sum(1 for d in deltas_b.values()
+                  if torch.isnan(d.float()).any())
+    print(f"PROBE armB delta_nan_params={n_nan_b}/"
+          f"{len(deltas_b)} nonzero="
+          f"{sum(1 for d in deltas_b.values() if float(d.abs().max()) > 0)}",
+          flush=True)
 
     # ---- comparison ----
     names = sorted(set(deltas_a) & set(deltas_b))

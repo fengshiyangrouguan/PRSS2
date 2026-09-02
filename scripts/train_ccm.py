@@ -645,14 +645,16 @@ def main():
                     fwd_out = run_forward(model, b, device, grad_enabled=True)
                     task_raw, n_valid = task_ce_shifted(
                         fwd_out, b["labels"], device)
-                    # Official Trainer protocol: backprop the per-
-                    # microbatch MEAN loss directly — the official
-                    # gradient_accumulation_steps accumulates losses
-                    # without dividing by the count (L6.5 review P0-2;
-                    # verified against the official Trainer in
-                    # scripts/ccm_parity.py).
+                    # Official Trainer protocol (verified against
+                    # accelerate 1.14 Accelerator.backward + HF 4.44 in
+                    # scripts/ccm_parity.py): the per-microbatch MEAN
+                    # loss is divided by gradient_accumulation_steps
+                    # BEFORE backward — accelerate does
+                    # `loss = loss / self.gradient_accumulation_steps`
+                    # inside backward().  This division also keeps the
+                    # fp16 backward on the safe side of overflow.
                     task_mean = task_raw / max(n_valid, 1)
-                    scaler.scale(task_mean).backward()
+                    scaler.scale(task_mean / float(len(pending))).backward()
                     task_sum += float(task_raw.detach())
                     n_tokens += n_valid
                 grad_step()

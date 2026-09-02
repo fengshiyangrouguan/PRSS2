@@ -458,6 +458,19 @@ def repr_grad_norm(params):
     return math.sqrt(total) if n else 0.0
 
 
+def bad_grad_names(params, k=3):
+    """Names of the first k parameters whose grad is non-finite
+    (CCM_AUX_DIAG diagnostic: which param carries the NaN/Inf)."""
+    bad = []
+    for n, p in params:
+        if p.grad is not None and not bool(
+                torch.isfinite(p.grad.detach()).all()):
+            bad.append(n)
+            if len(bad) >= k:
+                break
+    return bad
+
+
 def params_digest(params):
     """sha256 over the trainable weights (CPU copy).  The lambda
     calibration asserts the digest is unchanged across its measurements
@@ -697,14 +710,42 @@ def main():
             aux, n_terms = batch_surrogate(z_by_oid, batch_terms, lam,
                                            device)
             _pf("surrogate", _t)
+            if os.environ.get("CCM_AUX_DIAG") == "1":
+                # Diagnostic (acceptance zero-update-diff investigation):
+                # is the surrogate gradient actually connected to the
+                # replay forward graph on the GPU/fp16 path?
+                z_req = sum(1 for z in z_by_oid.values()
+                            if z.requires_grad)
+                print("AUXDIAG mb={} n_terms={} lam={} z_req={}/{} "
+                      "aux.requires_grad={} aux_abs={:.3e}".format(
+                          len(batch_terms), n_terms, lam, z_req,
+                          len(z_by_oid), aux.requires_grad,
+                          abs(float(aux))), flush=True)
         return task_mean, task_sum, n_valid, aux, n_terms
 
     def grad_step():
+        if os.environ.get("CCM_AUX_DIAG") == "1":
+            digest_before = params_digest(params)
         scaler.unscale_(optimizer)
+        if os.environ.get("CCM_AUX_DIAG") == "1":
+            # Diagnostic (NaN investigation): after unscale_, is the raw
+            # gradient finite?  If the BAD grads vanish here, the NaN was
+            # fp16 scaled-overflow (GradScaler cold start); if they
+            # persist, the backward graph itself produces non-finite grads.
+            named = [(n, p) for n, p in model.named_parameters()
+                     if p.requires_grad and p.grad is not None]
+            bad = bad_grad_names(named, k=5)
+            norm = repr_grad_norm(params) if not bad else float("nan")
+            print("AUXDIAG unscale norm={:.6f} bad={}".format(
+                norm, bad), flush=True)
         torch.nn.utils.clip_grad_norm_(params, args.grad_clip)
         scaler.step(optimizer)
         scaler.update()
         scheduler.step()
+        if os.environ.get("CCM_AUX_DIAG") == "1":
+            applied = params_digest(params) != digest_before
+            print("AUXDIAG grad_step applied={} scale_now={:.0f}".format(
+                applied, scaler.get_scale()), flush=True)
 
     while step < args.max_steps:
         batch, sample_id = next_batch()
@@ -864,6 +905,13 @@ def main():
                     _t = time.perf_counter()
                     scaler.scale(loss).backward()
                     _pf("pass2_bwd", _t)
+                    if os.environ.get("CCM_AUX_DIAG") == "1":
+                        named = [(n, p) for n, p in model.named_parameters()
+                                 if p.requires_grad and p.grad is not None]
+                        bad = bad_grad_names(named, k=2)
+                        if bad:
+                            print("AUXDIAG mb={} BAD after bwd: {}"
+                                  .format(i, bad), flush=True)
                     task_sum += float(task_raw.detach())
                     n_tokens += n_valid
                     aux_terms += n_terms
@@ -872,6 +920,15 @@ def main():
                         "not every cut was replayed exactly once: "
                         "replayed={} cuts={}".format(
                             aux_terms - aux_before, n_cut_win))
+                if os.environ.get("CCM_AUX_DIAG") == "1":
+                    # Scaled by the fp16 scaler at this point; the ratio
+                    # task-only vs +aux is what matters.
+                    named = [(n, p) for n, p in model.named_parameters()
+                             if p.requires_grad]
+                    print("AUXDIAG win-grads norm={:.6f} (scaled) "
+                          "scale={:.0f} bad={}".format(
+                              repr_grad_norm(params), scaler.get_scale(),
+                              bad_grad_names(named, k=3)), flush=True)
                 _t = time.perf_counter()
                 grad_step()
                 _pf("grad_step", _t)

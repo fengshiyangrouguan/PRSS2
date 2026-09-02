@@ -1,0 +1,111 @@
+{
+  "note": "Gate 4 步时判定的全部原始证据。per-step 序列取自云端 run 日志（/root/autodl-tmp/outputs/ccm_gate2/{ours,v1b_ours,v3_ours,prof_ours,ccm_merge}/，本会话逐行记录）；版本树用 git archive + scp 部署（云端无 git repo）。同机同时段串行执行，无并发。",
+  "measured_on": "Autodl nma1 单卡 A800-80GB，DailyDialog seed 0，3 臂同任务样本同 cadence",
+  "step_time_definition": "warm-up 后连续 >=5 个 closed steps（steps 2-6）的 per-step mean，单位 s",
+  "versions": {
+    "V1_410560a_gate_run": {
+      "desc": "410560a（skip-pass1 修复后），ccm_gate 首轮（约 13:08 执行）",
+      "arm": "ours",
+      "loss_semantics": "unshifted",
+      "steps_2_6_mean_s": 85.7,
+      "per_step_s": null
+    },
+    "V1b_410560a_rerun": {
+      "desc": "410560a 重复执行（约 16:0x，与 V3 相邻时段），控制机器漂移",
+      "arm": "ours",
+      "loss_semantics": "unshifted",
+      "steps_2_6_mean_s": 92.5,
+      "per_step_s": [103.5, 90.1, 93.2, 93.7, 94.1, 91.6, 79.2]
+    },
+    "V3_4b5d2f4": {
+      "desc": "4b5d2f4（Γ scan 改 SUM-row gather + 寄存器递推的 performance commit）",
+      "arm": "ours",
+      "loss_semantics": "unshifted",
+      "steps_2_6_mean_s": 99.3,
+      "per_step_s": [114.1, 99.1, 101.3, 99.2, 98.2, 98.8, 88.0]
+    },
+    "V2_HEAD_e69fba5": {
+      "desc": "e69fba5（HEAD，gate2 定案：÷accumulation 官方语义 + shifted mean CE）",
+      "arm": "ours",
+      "loss_semantics": "shifted (official)",
+      "steps_2_6_mean_s": 101.5,
+      "per_step_s": null
+    },
+    "merge_gate_run": {
+      "desc": "ccm_merge 官方臂，与 V1 同轮（410560a 时代代码）",
+      "arm": "ccm_merge",
+      "steps_mean_s": 18.4
+    },
+    "merge_gate2_run": {
+      "desc": "ccm_merge 官方臂，与 HEAD 同轮（e69fba5 时代代码）",
+      "arm": "ccm_merge",
+      "steps_mean_s": 18.8
+    }
+  },
+  "machine_drift_analysis": {
+    "V1_vs_V1b_same_code": "85.7 -> 92.5（同一 410560a，隔约 3h 重跑）：机器漂移约 +8%，真实存在",
+    "V1b_vs_V3_adjacent": "92.5 -> 99.3（相邻时段、同条件、唯一差异 = 4b5d2f4）：净回退约 +7.4%，超出漂移量",
+    "conclusion": "漂移 ±8% 下，4b5d2f4 的 gather-scan 重构仍构成净回退；但与 5x 总差距相比是次量级因素"
+  },
+  "window_threshold_truth": {
+    "rule": "KFMomentWindow._threshold = max(min_ratio * rank_dim, min_abs)；rank_dim = min(z_dim=128, m=64) = 64",
+    "config": "min_ratio=2.0, kf_min_cuts(min_abs)=8",
+    "effective_threshold_trees": 128.0,
+    "config_json_reports": "threshold: 128.0（窗口按 unique trees 门控，非按 cut 条数）",
+    "kf_min_cuts_8": "从未生效（128 > 8）：先前以为的 8-cut 门槛是误读",
+    "cut_rate": {
+      "total_packs_7_steps": 1865,
+      "k_lt_4": 969,
+      "k_ge_4": 896,
+      "effective_cut_rate": 0.48
+    },
+    "per_step_packs": "ours ~266 packs/step（1865/7）；merge 128 packs/step（896/7）= 2.07x data"
+  },
+  "compute_units_two_pass": {
+    "ours_per_step_units": "pass1 fwd 仅 k>=4（~128 mb）x1 + pass2 fwd x1 + pass2 bwd x1 对全部 ~266 mb = 128 + 266 + 266 = 660",
+    "merge_per_step_units": "128 mb x (fwd + bwd) = 256",
+    "ratio": 2.57,
+    "conclusion": "即使每 mb 成本与 merge 相同，两遍 replay + 48% cut rate 的 compute units 已固化为 2.57x —— 1.5x 目标在结构上不可达"
+  },
+  "probe_breakdown_CCM_PROFILE": {
+    "desc": "prof_ours run（HEAD + CCM_PROFILE=1，3 个 closed windows，每窗口 wall ~100s，task_microbatches 796）",
+    "per_window_s": {
+      "pass1_fwd": 18.5,
+      "pass2_fwd": 35.1,
+      "pass2_bwd": 44.7,
+      "collect_rows_window_add_close_replay_collect_z_surrogate_grad_step": "合计约 1.0",
+      "wall": "约 100"
+    },
+    "per_mb_cost": {
+      "ours_fwd": "~0.13-0.145 s/mb（pass1 128 mb/18.5s；pass2 265 mb/35.1s）",
+      "ours_bwd": "~0.17 s/mb（265 mb/44.7s）",
+      "merge_fwd_plus_bwd_total": "~0.144 s/mb（18.4s / 128 mb，fwd+bwd 合计）",
+      "read": "ours 单次 forward 即接近 merge 整步 fwd+bwd 的摊薄成本 —— 模型 forward 路径（Γ 逐轮递归 scan + mem_callback 逐层提取）本身约 2x merge，是第二倍率因子",
+      "root_cause_note": "merge 臂不运行 RPBE：Γ scan 与 SUM K/V 提取 callback 只附加在 ours/gamma_task_only 臂"
+    },
+    "model_bottleneck": "100% 瓶颈是模型 fwd/bwd（RPBE 端 collect/surrogate/adjoint 合计 ~1s/窗口，可忽略）"
+  },
+  "plan_v2_claim_recheck": {
+    "plan_v2_stated": "训练开销约 1.33x，仍满足 <=1.5x",
+    "implied_assumption": "窗口 ~100% 有效 cut（cut rate 100%）→ pass1 数据量 = pass2 数据量 → total = 1.33x（两遍中一遍只 fwd）",
+    "measured_reality": "48% cut rate → pass2 承担 2.07x merge data 且全部 fwd+bwd；pass1 另加 1x data 的 fwd-only",
+    "structural_floor": "即使 Γ 附加成本归零，~660/256 = 2.57x 不可低于 1.5x",
+    "remaining_levers": {
+      "window_threshold_audit": "min_ratio 2.0 -> 1.0 → 64 unique trees → 窗口更早关闭、每窗口 data 下降（~135 mb/step 估计）——但窗口变小伤 Welford 统计（C_ZZ 更噪），且估算仍在 ~2.6x 量级；计划 v2/9209d78 未批准 min_ratio 变更（不在 frozen_method.json）",
+      "model_level_speedup": "SDPA/flash-attention / 图重写等模型级加速（不动 RPBE math），对三臂同等受益，压缩的是 2x 倍率因子中的一部分",
+      "metric_recalibration": "ours 1 step 信息量 ≈ merge 2 steps（两遍消费 + 265 条监督行 vs 128）：1.5x 步时标准与信息论对账需要重新审视"
+    },
+    "arbitration_offered_options": [
+      "1. 回滚 4b5d2f4（净回退 ~7%，恢复 410560a 步时）",
+      "2. 窗口门槛审计（min_ratio 2.0 -> 1.0，64 trees；需规格批准，Welford 统计质量风险）",
+      "3. SDPA/flash 模型级加速（三臂共同受益）",
+      "4. 重校 1.5x 指标本身（ours 1 step 信息当量 2 steps）"
+    ]
+  },
+  "data_flow_hashes": {
+    "ours": "93e167935ab5 (len 1865)",
+    "gamma_task_only": "93e167935ab5 (len 1865) —— 与 ours 一致：Γ 不改变数据流",
+    "ccm_merge": "4e871a32b375 (len 896)",
+    "note": "ours == gamma_task_only != merge：任务样本/状态流在 RPBE 两臂间逐字节一致，差异只在监督信号"
+  }
+}

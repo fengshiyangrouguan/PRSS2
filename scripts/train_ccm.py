@@ -599,11 +599,16 @@ def main():
 
     step = 0
     # Review ruling: ``step`` counts global window attempts (HF Trainer
-    # global_step, advances even on AMP skips); these two count actual
-    # optimizer executions and AMP overflow skips separately so the paper
-    # can state "N actual optimizer updates" unambiguously.
-    optimizer_steps_applied = 0
+    # global_step, advances even on AMP skips; the frozen 1000-step budget
+    # is GLOBAL steps, not applied-update count).  optimizer_steps_executed
+    # counts optimizer.step() invocations (an lr=0 warmup-first execution
+    # counts too — "executed", not "applied"); amp_skipped_steps counts
+    # GradScaler overflow skips; scheduler_steps counts scheduler.step()
+    # calls and must equal optimizer_steps_executed (Trainer 4.44.2: LR
+    # advances only on a real step).
+    optimizer_steps_executed = 0
     amp_skipped_steps = 0
+    scheduler_steps = 0
     total_task_sum = 0.0
     total_tokens = 0
     total_microbatches = 0
@@ -638,10 +643,13 @@ def main():
     # Review (cadence collision): per-window boundary records
     # w{ordinal}:{n_mb}:{n_cut_mb} hashed into boundary_hash so the three
     # arms' window boundaries are comparable window by window, not only
-    # through the final data-flow hash.
+    # through the final data-flow hash.  boundary_records keeps the raw
+    # window strings so a resumed run can rebuild boundary_hash from
+    # scratch (sha256 state is not serializable); data_flow.jsonl plays
+    # the same role for data_flow_hash.
     boundary_hash = hashlib.sha256()
+    boundary_records = []
     data_flow_path = out / "data_flow.jsonl"
-    data_flow_path.unlink(missing_ok=True)
     if args.resume_from:
         payload = load_trainable(args.resume_from, model, optimizer, device)
         step = int(payload.get("step", 0))
@@ -658,14 +666,58 @@ def main():
             scheduler.load_state_dict(payload["scheduler"])
         if "builder_oid" in payload and builder is not None:
             builder.next_oid = int(payload["builder_oid"])
-        if "optimizer_steps_applied" in payload:
-            optimizer_steps_applied = int(payload["optimizer_steps_applied"])
+        # Counters (review ruling: full resume of the aggregate counters
+        # so a resumed run's final summary covers the WHOLE run, not just
+        # the post-resume part).
+        if "optimizer_steps_executed" in payload:
+            optimizer_steps_executed = int(payload["optimizer_steps_executed"])
         if "amp_skipped_steps" in payload:
             amp_skipped_steps = int(payload["amp_skipped_steps"])
-        print("RESUME step={} lambda={} cursor={} applied={} skips={}"
+        if "scheduler_steps" in payload:
+            scheduler_steps = int(payload["scheduler_steps"])
+        if "total_task_sum" in payload:
+            total_task_sum = float(payload["total_task_sum"])
+        if "total_tokens" in payload:
+            total_tokens = int(payload["total_tokens"])
+        if "total_microbatches" in payload:
+            total_microbatches = int(payload["total_microbatches"])
+        if "total_kf" in payload:
+            total_kf = float(payload["total_kf"])
+        if "kf_closed" in payload:
+            kf_closed = int(payload["kf_closed"])
+        if "aux_terms" in payload:
+            aux_terms = int(payload["aux_terms"])
+        if "boundary_records" in payload:
+            boundary_records = list(payload["boundary_records"])
+        # Rebuild the stream hashes from the on-disk records.  The jsonl
+        # is kept (append mode) across resume; a fresh run truncates it.
+        for rec in boundary_records:
+            boundary_hash.update(str(rec).encode())
+        if data_flow_path.exists():
+            for line in data_flow_path.open():
+                row = json.loads(line)
+                data_flow_hash.update(struct.pack(
+                    ">qq", int(row["sid"]) % n_items, int(row["k"])))
+                data_flow_len += 1
+            if data_flow_len != int(payload.get("data_flow_len",
+                                                data_flow_len)):
+                raise RuntimeError(
+                    "resume: data_flow.jsonl rows ({}) != checkpoint "
+                    "data_flow_len ({})".format(
+                        data_flow_len, payload.get("data_flow_len")))
+        elif payload.get("data_flow_len", 0):
+            raise RuntimeError(
+                "resume: data_flow.jsonl missing but checkpoint recorded "
+                "{} rows".format(payload.get("data_flow_len")))
+        print("RESUME step={} lambda={} cursor={} executed={} skips={} "
+              "sched={} ce_sum={:.2f} tokens={} aux={} boundary={}"
               .format(step, lambda_kf, sample_cursor,
-                      optimizer_steps_applied, amp_skipped_steps),
+                      optimizer_steps_executed, amp_skipped_steps,
+                      scheduler_steps, total_task_sum, total_tokens,
+                      aux_terms, len(boundary_records)),
               flush=True)
+    else:
+        data_flow_path.unlink(missing_ok=True)
 
     def pass1_one(batch, meta_list):
         """Incremental pass 1: forward (no grad) + rows into the window.
@@ -743,6 +795,8 @@ def main():
         # The skip is detected by the scale backoff (the same signal
         # Accelerator uses), not by params_digest — a digest compare
         # cannot tell "optimizer ran with lr=0" from "optimizer skipped".
+        nonlocal optimizer_steps_executed, amp_skipped_steps
+        nonlocal scheduler_steps
         scale_before = float(scaler.get_scale())
         if os.environ.get("CCM_AUX_DIAG") == "1":
             digest_before = params_digest(params)
@@ -763,13 +817,25 @@ def main():
         scaler.update()
         amp_skipped = (scaler.is_enabled()
                        and float(scaler.get_scale()) < scale_before)
+        optimizer_steps_executed += 1
         if not amp_skipped:
             scheduler.step()
+            scheduler_steps += 1
+        else:
+            amp_skipped_steps += 1
+        # Review ruling: the independent scheduler counter must stay glued
+        # to the real-execution counter (Trainer 4.44.2): every optimizer
+        # execution advances either the scheduler or the skip counter.
+        assert optimizer_steps_executed == scheduler_steps + amp_skipped_steps, (
+            "step counters diverged: executed={} sched={} skips={}".format(
+                optimizer_steps_executed, scheduler_steps,
+                amp_skipped_steps))
         if os.environ.get("CCM_AUX_DIAG") == "1":
-            applied = params_digest(params) != digest_before
-            print("AUXDIAG grad_step applied={} amp_skipped={} "
+            digest_changed = params_digest(params) != digest_before
+            print("AUXDIAG grad_step digest_changed={} amp_skipped={} "
                   "scale_now={:.0f}".format(
-                      applied, amp_skipped, scaler.get_scale()), flush=True)
+                      digest_changed, amp_skipped, scaler.get_scale()),
+                  flush=True)
         return not amp_skipped
 
     while step < args.max_steps:
@@ -955,10 +1021,7 @@ def main():
                               repr_grad_norm(params), scaler.get_scale(),
                               bad_grad_names(named, k=3)), flush=True)
                 _t = time.perf_counter()
-                if grad_step():
-                    optimizer_steps_applied += 1
-                else:
-                    amp_skipped_steps += 1
+                grad_step()  # counters live inside grad_step (nonlocal)
                 _pf("grad_step", _t)
                 if profile:
                     n_cut = sum(1 for cr in cut_records for _ in cr)
@@ -990,6 +1053,8 @@ def main():
                 # computed before pass 2 (audit #3 replay integrity).
                 boundary_hash.update("w{}:{}:{}:".format(
                     kf_closed, len(pending), n_cut_win).encode())
+                boundary_records.append("w{}:{}:{}:".format(
+                    kf_closed, len(pending), n_cut_win))
                 if args.max_windows and step >= args.max_windows:
                     break
                 pending = []
@@ -1042,10 +1107,7 @@ def main():
                     scaler.scale(task_mean / float(len(pending))).backward()
                     task_sum += float(task_raw.detach())
                     n_tokens += n_valid
-                if grad_step():
-                    optimizer_steps_applied += 1
-                else:
-                    amp_skipped_steps += 1
+                grad_step()  # counters live inside grad_step (nonlocal)
                 total_task_sum += task_sum
                 total_tokens += n_tokens
                 total_microbatches += len(pending)
@@ -1058,6 +1120,8 @@ def main():
                           flush=True)
                     boundary_hash.update("w{}:{}:{}:".format(
                         step, len(pending), merge_eff_cuts).encode())
+                    boundary_records.append("w{}:{}:{}:".format(
+                        step, len(pending), merge_eff_cuts))
                     merge_eff_cuts = 0
                 if args.max_windows and step >= args.max_windows:
                     break
@@ -1065,8 +1129,9 @@ def main():
         if step and step % args.log_every == 0:
             elapsed = time.time() - t_start
             row = {"step": step,
-                   "optimizer_steps_applied": optimizer_steps_applied,
+                   "optimizer_steps_executed": optimizer_steps_executed,
                    "amp_skipped_steps": amp_skipped_steps,
+                   "scheduler_steps": scheduler_steps,
                    "task_ce_token": total_task_sum / max(total_tokens, 1),
                    "task_microbatches": total_microbatches,
                    "task_valid_tokens": total_tokens,
@@ -1074,11 +1139,12 @@ def main():
                    "kf_score": total_kf / max(kf_closed, 1),
                    "aux_terms": aux_terms, "lambda": lambda_kf,
                    "elapsed": elapsed}
-            print("step={} applied={} skips={} ce_token={:.4f} mbs={} "
-                  "kf_closed={} kf_score={:.4f} aux={} sec={:.1f}".format(
-                      step, optimizer_steps_applied, amp_skipped_steps,
-                      row["task_ce_token"], total_microbatches,
-                      kf_closed, row["kf_score"], aux_terms, elapsed),
+            print("step={} executed={} skips={} sched={} ce_token={:.4f} "
+                  "mbs={} kf_closed={} kf_score={:.4f} aux={} sec={:.1f}"
+                  .format(step, optimizer_steps_executed,
+                          amp_skipped_steps, scheduler_steps,
+                          row["task_ce_token"], total_microbatches,
+                          kf_closed, row["kf_score"], aux_terms, elapsed),
                   flush=True)
             with log_path.open("a") as f:
                 f.write(json.dumps(row) + "\n")
@@ -1091,21 +1157,37 @@ def main():
                            lambda_kf=lambda_kf,
                            sample_cursor=sample_cursor,
                            rng=_rng_state(),
-                           optimizer_steps_applied=optimizer_steps_applied,
-                           amp_skipped_steps=amp_skipped_steps)
+                           optimizer_steps_executed=optimizer_steps_executed,
+                           amp_skipped_steps=amp_skipped_steps,
+                           scheduler_steps=scheduler_steps,
+                           # Review ruling (resume aggregate audit): the
+                           # final summary of a resumed run must cover the
+                           # whole run, so the accumulated statistics and
+                           # the raw boundary records are checkpointed.
+                           total_task_sum=total_task_sum,
+                           total_tokens=total_tokens,
+                           total_microbatches=total_microbatches,
+                           total_kf=total_kf,
+                           kf_closed=kf_closed,
+                           aux_terms=aux_terms,
+                           data_flow_len=data_flow_len,
+                           boundary_records=boundary_records)
 
     save_trainable(out / "final.pt", model, step=step, lambda_kf=lambda_kf)
     summary = {
         "arm": args.arm, "seed": args.seed,
         # Review ruling: "steps" is the global window-attempt counter
         # (HF Trainer global_step semantics: advances on AMP skips too);
-        # optimizer_steps_applied counts real optimizer executions and
-        # scheduler_steps must equal it (scheduler advances only on a
-        # real step, Trainer 4.44.2 protocol).
+        # the frozen 1000-step budget is THIS counter (1000 global steps),
+        # not "1000 non-zero-LR updates".  optimizer_steps_executed counts
+        # optimizer.step() invocations (includes the lr=0 warmup-first
+        # execution), amp_skipped_steps the GradScaler overflows, and
+        # scheduler_steps is an INDEPENDENT counter that must equal
+        # executed - skips (Trainer 4.44.2 protocol, asserted per step).
         "steps": step,
-        "optimizer_steps_applied": optimizer_steps_applied,
+        "optimizer_steps_executed": optimizer_steps_executed,
         "amp_skipped_steps": amp_skipped_steps,
-        "scheduler_steps": optimizer_steps_applied,
+        "scheduler_steps": scheduler_steps,
         "amp_scale": float(scaler.get_scale()),
         # Token-normalized CE: the only cross-arm comparable task number
         # (L6.5 review; per-microbatch sums vary with the window length).
@@ -1123,10 +1205,12 @@ def main():
     }
     save_json(out / "summary.json", summary)
     save_json(out / "_SUCCESS.json", {"status": "complete", "steps": step,
-                                      "optimizer_steps_applied":
-                                      optimizer_steps_applied,
+                                      "optimizer_steps_executed":
+                                      optimizer_steps_executed,
                                       "amp_skipped_steps":
-                                      amp_skipped_steps})
+                                      amp_skipped_steps,
+                                      "scheduler_steps":
+                                      scheduler_steps})
     print(json.dumps(summary, indent=2), flush=True)
 
 

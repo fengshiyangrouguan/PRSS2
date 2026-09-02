@@ -42,6 +42,7 @@
   },
   "training": {
     "steps": 1000,
+    "steps_note": "1000 GLOBAL/window steps (HF Trainer global_step semantics: the counter advances even on GradScaler overflow skips; the LR advances only on real optimizer executions). The paper claims '1000 global steps', NOT '1000 non-zero-LR updates'; optimizer_steps_executed / amp_skipped_steps / scheduler_steps are recorded per run.",
     "grad_clip": 1.0,
     "grad_clip_source": "official HF Trainer default (max_grad_norm); train_ccm must refuse an inconsistent override",
     "merge_cadence": "window-matched",

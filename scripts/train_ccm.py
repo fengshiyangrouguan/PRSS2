@@ -450,6 +450,15 @@ def main():
     below_threshold = 0
     lambda_kf = args.kf_lambda
     t_start = time.time()
+    t_win_start = t_start
+    # CCM_PROFILE=1: per-window breakdown of pass1/collect/pass2/bwd
+    # wall time (diagnostic for the L6.5 step-time gate).
+    profile = os.environ.get("CCM_PROFILE") == "1"
+    PROF = {}
+
+    def _pf(key, t0):
+        PROF[key] = PROF.get(key, 0.0) + time.perf_counter() - t0
+
     pending = []
     cut_records = []
     window_start_state = None
@@ -481,12 +490,18 @@ def main():
         replay contract; builder counters stay monotonic)."""
         batch_cuts = []
         with torch.no_grad():
+            _t = time.perf_counter()
             run_forward(model, batch, device, grad_enabled=False)
+            _pf("pass1_fwd", _t)
             for meta in meta_list:
+                _t = time.perf_counter()
                 rows = collect_rows(meta, adapter, builder, utter_embed,
                                     embed_tokens, batch, device)
+                _pf("collect_rows", _t)
                 if rows:
+                    _t = time.perf_counter()
                     window.add(rows)
+                    _pf("window_add", _t)
                     batch_cuts.append((meta, rows[0].occurrence_id))
             adapter.clear()
         return batch_cuts
@@ -496,18 +511,24 @@ def main():
         by the window size below) + exact surrogate.  ``cut_meta`` is the
         pass-1 [(meta, oid)] record — NO builder/chi/p here (L6.5
         review: pass 2 only re-extracts the gradient-connected z)."""
+        _t = time.perf_counter()
         out = run_forward(model, batch, device, grad_enabled=True)
+        _pf("pass2_fwd", _t)
         task_sum, n_valid = task_ce_shifted(out, batch["labels"], device)
         task_mean = task_sum / max(n_valid, 1)
         aux = torch.zeros((), device=device)
         n_terms = 0
         if plan_by_batch is not None:
             z_by_oid = {}
+            _t = time.perf_counter()
             for meta, oid in cut_meta:
                 z_by_oid[oid] = collect_replay_z(meta, adapter, device)
             adapter.clear()
+            _pf("collect_z", _t)
+            _t = time.perf_counter()
             aux, n_terms = batch_surrogate(z_by_oid, plan_by_batch, i, lam,
                                            device)
+            _pf("surrogate", _t)
         return task_mean, task_sum, n_valid, aux, n_terms
 
     def grad_step():
@@ -552,7 +573,9 @@ def main():
             cut_records.append(batch_cuts)
             _restore_rng(state["rng"])
             if window.window_ready():
+                _t = time.perf_counter()
                 closed, plan, diag = window.close_replay()
+                _pf("close_replay", _t)
                 # P0-1 fix: capture the REAL post-pass-1 data-stream RNG
                 # position; pass 2 replays from the window start and the
                 # stream resumes from the captured position afterwards.
@@ -575,11 +598,31 @@ def main():
                     # (L6.5 review P0-2).  The KF surrogate is NOT
                     # rescaled: it is the exact window-J gradient.
                     loss = task_mean / float(len(pending)) + aux
+                    _t = time.perf_counter()
                     scaler.scale(loss).backward()
+                    _pf("pass2_bwd", _t)
                     task_sum += float(task_raw.detach())
                     n_tokens += n_valid
                     aux_terms += n_terms
+                _t = time.perf_counter()
                 grad_step()
+                _pf("grad_step", _t)
+                if profile:
+                    n_cut = sum(1 for cr in cut_records for _ in cr)
+                    parts = ["profile win={} n_mb={} n_cut_mb={}:".format(
+                        kf_closed + 1, len(pending), n_cut)]
+                    for key in ("pass1_fwd", "collect_rows", "window_add",
+                                "close_replay", "pass2_fwd", "collect_z",
+                                "surrogate", "pass2_bwd", "grad_step"):
+                        if PROF.get(key, 0.0) > 0:
+                            parts.append("{}={:.1f}s".format(
+                                key, PROF[key]))
+                    parts.append("wall={:.1f}s".format(
+                        time.time() - t_win_start))
+                    print(" ".join(parts), flush=True)
+                    for key in PROF:
+                        PROF[key] = 0.0
+                    t_win_start = time.time()
                 _restore_rng(resume_rng)  # data stream continues correctly
                 total_task_sum += task_sum
                 total_tokens += n_tokens

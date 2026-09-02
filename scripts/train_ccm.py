@@ -598,6 +598,12 @@ def main():
         args.arm, args.seed, threshold, n_items), flush=True)
 
     step = 0
+    # Review ruling: ``step`` counts global window attempts (HF Trainer
+    # global_step, advances even on AMP skips); these two count actual
+    # optimizer executions and AMP overflow skips separately so the paper
+    # can state "N actual optimizer updates" unambiguously.
+    optimizer_steps_applied = 0
+    amp_skipped_steps = 0
     total_task_sum = 0.0
     total_tokens = 0
     total_microbatches = 0
@@ -652,8 +658,14 @@ def main():
             scheduler.load_state_dict(payload["scheduler"])
         if "builder_oid" in payload and builder is not None:
             builder.next_oid = int(payload["builder_oid"])
-        print("RESUME step={} lambda={} cursor={}".format(
-            step, lambda_kf, sample_cursor), flush=True)
+        if "optimizer_steps_applied" in payload:
+            optimizer_steps_applied = int(payload["optimizer_steps_applied"])
+        if "amp_skipped_steps" in payload:
+            amp_skipped_steps = int(payload["amp_skipped_steps"])
+        print("RESUME step={} lambda={} cursor={} applied={} skips={}"
+              .format(step, lambda_kf, sample_cursor,
+                      optimizer_steps_applied, amp_skipped_steps),
+              flush=True)
 
     def pass1_one(batch, meta_list):
         """Incremental pass 1: forward (no grad) + rows into the window.
@@ -724,6 +736,14 @@ def main():
         return task_mean, task_sum, n_valid, aux, n_terms
 
     def grad_step():
+        # Review ruling (2026-09-02, L6.5 CONDITIONAL PASS pending item):
+        # HF Trainer 4.44.2 advances the scheduler ONLY when the optimizer
+        # step actually ran; an AMP overflow skip (GradScaler backs the
+        # scale off and discards the update) must NOT change the LR.
+        # The skip is detected by the scale backoff (the same signal
+        # Accelerator uses), not by params_digest — a digest compare
+        # cannot tell "optimizer ran with lr=0" from "optimizer skipped".
+        scale_before = float(scaler.get_scale())
         if os.environ.get("CCM_AUX_DIAG") == "1":
             digest_before = params_digest(params)
         scaler.unscale_(optimizer)
@@ -741,11 +761,16 @@ def main():
         torch.nn.utils.clip_grad_norm_(params, args.grad_clip)
         scaler.step(optimizer)
         scaler.update()
-        scheduler.step()
+        amp_skipped = (scaler.is_enabled()
+                       and float(scaler.get_scale()) < scale_before)
+        if not amp_skipped:
+            scheduler.step()
         if os.environ.get("CCM_AUX_DIAG") == "1":
             applied = params_digest(params) != digest_before
-            print("AUXDIAG grad_step applied={} scale_now={:.0f}".format(
-                applied, scaler.get_scale()), flush=True)
+            print("AUXDIAG grad_step applied={} amp_skipped={} "
+                  "scale_now={:.0f}".format(
+                      applied, amp_skipped, scaler.get_scale()), flush=True)
+        return not amp_skipped
 
     while step < args.max_steps:
         batch, sample_id = next_batch()
@@ -930,7 +955,10 @@ def main():
                               repr_grad_norm(params), scaler.get_scale(),
                               bad_grad_names(named, k=3)), flush=True)
                 _t = time.perf_counter()
-                grad_step()
+                if grad_step():
+                    optimizer_steps_applied += 1
+                else:
+                    amp_skipped_steps += 1
                 _pf("grad_step", _t)
                 if profile:
                     n_cut = sum(1 for cr in cut_records for _ in cr)
@@ -1014,7 +1042,10 @@ def main():
                     scaler.scale(task_mean / float(len(pending))).backward()
                     task_sum += float(task_raw.detach())
                     n_tokens += n_valid
-                grad_step()
+                if grad_step():
+                    optimizer_steps_applied += 1
+                else:
+                    amp_skipped_steps += 1
                 total_task_sum += task_sum
                 total_tokens += n_tokens
                 total_microbatches += len(pending)
@@ -1034,6 +1065,8 @@ def main():
         if step and step % args.log_every == 0:
             elapsed = time.time() - t_start
             row = {"step": step,
+                   "optimizer_steps_applied": optimizer_steps_applied,
+                   "amp_skipped_steps": amp_skipped_steps,
                    "task_ce_token": total_task_sum / max(total_tokens, 1),
                    "task_microbatches": total_microbatches,
                    "task_valid_tokens": total_tokens,
@@ -1041,9 +1074,10 @@ def main():
                    "kf_score": total_kf / max(kf_closed, 1),
                    "aux_terms": aux_terms, "lambda": lambda_kf,
                    "elapsed": elapsed}
-            print("step={} ce_token={:.4f} mbs={} kf_closed={} "
-                  "kf_score={:.4f} aux={} sec={:.1f}".format(
-                      step, row["task_ce_token"], total_microbatches,
+            print("step={} applied={} skips={} ce_token={:.4f} mbs={} "
+                  "kf_closed={} kf_score={:.4f} aux={} sec={:.1f}".format(
+                      step, optimizer_steps_applied, amp_skipped_steps,
+                      row["task_ce_token"], total_microbatches,
                       kf_closed, row["kf_score"], aux_terms, elapsed),
                   flush=True)
             with log_path.open("a") as f:
@@ -1056,11 +1090,23 @@ def main():
                            builder_oid=builder.next_oid if builder else 0,
                            lambda_kf=lambda_kf,
                            sample_cursor=sample_cursor,
-                           rng=_rng_state())
+                           rng=_rng_state(),
+                           optimizer_steps_applied=optimizer_steps_applied,
+                           amp_skipped_steps=amp_skipped_steps)
 
     save_trainable(out / "final.pt", model, step=step, lambda_kf=lambda_kf)
     summary = {
-        "arm": args.arm, "seed": args.seed, "steps": step,
+        "arm": args.arm, "seed": args.seed,
+        # Review ruling: "steps" is the global window-attempt counter
+        # (HF Trainer global_step semantics: advances on AMP skips too);
+        # optimizer_steps_applied counts real optimizer executions and
+        # scheduler_steps must equal it (scheduler advances only on a
+        # real step, Trainer 4.44.2 protocol).
+        "steps": step,
+        "optimizer_steps_applied": optimizer_steps_applied,
+        "amp_skipped_steps": amp_skipped_steps,
+        "scheduler_steps": optimizer_steps_applied,
+        "amp_scale": float(scaler.get_scale()),
         # Token-normalized CE: the only cross-arm comparable task number
         # (L6.5 review; per-microbatch sums vary with the window length).
         "mean_task_ce_per_token": total_task_sum / max(total_tokens, 1),
@@ -1076,7 +1122,11 @@ def main():
         "boundary_hash": boundary_hash.hexdigest(),
     }
     save_json(out / "summary.json", summary)
-    save_json(out / "_SUCCESS.json", {"status": "complete", "steps": step})
+    save_json(out / "_SUCCESS.json", {"status": "complete", "steps": step,
+                                      "optimizer_steps_applied":
+                                      optimizer_steps_applied,
+                                      "amp_skipped_steps":
+                                      amp_skipped_steps})
     print(json.dumps(summary, indent=2), flush=True)
 
 

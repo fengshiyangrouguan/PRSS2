@@ -451,7 +451,6 @@ def main():
         if "sample_cursor" in payload:
             sample_cursor = int(payload["sample_cursor"])
         if "rng" in payload:
-            from rpbe.training.checkpoint import _restore_rng
             _restore_rng(payload["rng"])
         if "scaler" in payload:
             scaler.load_state_dict(payload["scaler"])
@@ -524,8 +523,16 @@ def main():
             # Incremental pass 1: RNG restored after each microbatch so
             # the data-sampling stream matches the single-pass arm; the
             # cut rows and their occurrence ids accumulate monotonically.
+            # Microbatches with NO possible cut (k < 4) skip the pass-1
+            # forward entirely: no row can come from them, and with zero
+            # dropout the forward consumes no RNG, so the replay stream
+            # is unchanged (L6.5 perf: DailyDialog's effective-cut rate
+            # is ~50%, halving the pass-1 cost).
             state = {"rng": _rng_state()}
-            batch_cuts = pass1_one(batch, metas)
+            if any(m["ok"] and m["k"] >= 4 for m in metas):
+                batch_cuts = pass1_one(batch, metas)
+            else:
+                batch_cuts = []
             cut_records.append(batch_cuts)
             _restore_rng(state["rng"])
             if window.window_ready():
@@ -568,16 +575,16 @@ def main():
                     optimizer.zero_grad(set_to_none=True)
                     _restore_rng(window_start_state["rng"])
                     for b, sid in pending:
-                        out = run_forward(model, b, device,
-                                          grad_enabled=True)
-                        task, _ = task_ce_sum(out, b["labels"], device)
+                        fwd_out = run_forward(model, b, device,
+                                              grad_enabled=True)
+                        task, _ = task_ce_sum(fwd_out, b["labels"], device)
                         (task / float(len(pending))).backward()
                     g_task = repr_grad_norm(params)
                     optimizer.zero_grad(set_to_none=True)
                     _restore_rng(window_start_state["rng"])
                     for i, (b, sid) in enumerate(pending):
-                        out = run_forward(model, b, device,
-                                          grad_enabled=True)
+                        fwd_out = run_forward(model, b, device,
+                                              grad_enabled=True)
                         z_by_oid = {}
                         for meta, oid in cut_records[i]:
                             z_by_oid[oid] = collect_replay_z(meta, adapter,
@@ -614,8 +621,8 @@ def main():
                 task_sum = 0.0
                 n_tokens = 0
                 for b, sid in pending:
-                    out = run_forward(model, b, device, grad_enabled=True)
-                    task_raw, n_valid = task_ce_sum(out, b["labels"],
+                    fwd_out = run_forward(model, b, device, grad_enabled=True)
+                    task_raw, n_valid = task_ce_sum(fwd_out, b["labels"],
                                                     device)
                     task_mean = task_raw / max(n_valid, 1)
                     scaler.scale(task_mean / float(len(pending))).backward()

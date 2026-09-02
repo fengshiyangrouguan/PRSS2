@@ -205,6 +205,13 @@ def enforce_frozen(args):
     # Lambda authority: the calibration-only run writes the derived
     # lambda into the frozen spec; afterwards the number overrides any
     # CLI value and re-calibration is refused.
+    # Calibration measures r_eff on theta_0 — resuming first would run
+    # several optimizer steps, so the calibration branch would be skipped
+    # and the run would silently continue as normal training (audit #3).
+    if args.calibrate_lambda and args.resume_from:
+        raise SystemExit(
+            "[frozen] lambda calibration must start from fresh theta_0; "
+            "--calibrate-lambda and --resume-from are mutually exclusive")
     lam = fz["rpbe"]["lambda_calibration"]["lambda_kf"]
     if args.arm == "ours":
         if lam is None:
@@ -626,6 +633,10 @@ def main():
             _restore_rng(payload["rng"])
         if "scaler" in payload:
             scaler.load_state_dict(payload["scaler"])
+        if "scheduler" in payload:
+            # Audit #3: without the scheduler state a resumed 1000-step
+            # run restarts the LR phase (warmup + cosine) from zero.
+            scheduler.load_state_dict(payload["scheduler"])
         if "builder_oid" in payload and builder is not None:
             builder.next_oid = int(payload["builder_oid"])
         print("RESUME step={} lambda={} cursor={}".format(
@@ -745,6 +756,19 @@ def main():
                 # the cuts once k < 4 microbatches interleaved
                 # (aux_terms was 11 over 7 windows instead of 896).
                 g_by_oid = plan.get(MEM_TAU, {}).get("by_oid", {})
+                # Audit #3: plan completeness — every cut pass 1 recorded
+                # must carry a window gradient.  Without this assert a
+                # numeric window failure (strict=False returns an empty
+                # by_oid) would silently decay ours toward
+                # gamma_task_only for the REST of the run — the 11/896
+                # class of bug, now fail-fast on every window (checked
+                # for the calibration window too).
+                n_cut_win = sum(1 for cr in cut_records for _ in cr)
+                if len(g_by_oid) != n_cut_win:
+                    raise RuntimeError(
+                        "RPBE replay incomplete: plan={} cuts={} diag={}"
+                        .format(len(g_by_oid), n_cut_win,
+                                diag.get(MEM_TAU)))
                 if args.calibrate_lambda and kf_closed == 0 \
                         and not args.resume_from:
                     # Review P0-4 (lambda calibration timing): the
@@ -819,6 +843,10 @@ def main():
                                       "theta0_verified": True},
                                      indent=2), flush=True)
                     return
+                # Audit #3: pass 2 must replay every planned cut exactly
+                # once (n_cut_win and the plan-completeness check ran
+                # above, before the calibration branch).
+                aux_before = aux_terms
                 optimizer.zero_grad(set_to_none=True)
                 task_sum = 0.0
                 n_tokens = 0
@@ -839,6 +867,11 @@ def main():
                     task_sum += float(task_raw.detach())
                     n_tokens += n_valid
                     aux_terms += n_terms
+                if aux_terms - aux_before != n_cut_win:
+                    raise RuntimeError(
+                        "not every cut was replayed exactly once: "
+                        "replayed={} cuts={}".format(
+                            aux_terms - aux_before, n_cut_win))
                 _t = time.perf_counter()
                 grad_step()
                 _pf("grad_step", _t)
@@ -868,8 +901,8 @@ def main():
                 # Per-window boundary record (review): every arm hashes
                 # (window ordinal, n_mb, n_cut_mb) into boundary_hash so
                 # cadence identity is checkable window by window, not
-                # only through the final data-flow hash.
-                n_cut_win = sum(1 for cr in cut_records for _ in cr)
+                # only through the final data-flow hash.  n_cut_win was
+                # computed before pass 2 (audit #3 replay integrity).
                 boundary_hash.update("w{}:{}:{}:".format(
                     kf_closed, len(pending), n_cut_win).encode())
                 if args.max_windows and step >= args.max_windows:
@@ -962,6 +995,7 @@ def main():
             save_trainable(out / "checkpoint.pt", model, step=step,
                            optimizer=optimizer.state_dict(),
                            scaler=scaler.state_dict(),
+                           scheduler=scheduler.state_dict(),
                            builder_oid=builder.next_oid if builder else 0,
                            lambda_kf=lambda_kf,
                            sample_cursor=sample_cursor,

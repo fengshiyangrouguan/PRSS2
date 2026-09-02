@@ -36,6 +36,9 @@
   },
   "training": {
     "steps": 1000,
+    "grad_clip": 1.0,
+    "grad_clip_source": "official HF Trainer default (max_grad_norm); train_ccm must refuse an inconsistent override",
+    "merge_cadence": "window-matched: all three arms fire an update on the same adaptive boundary (>= 128 dialogues with k>=4); official 128-microbatch cadence exists only as the ccm_merge_official reproduction reference",
     "two_pass_replay": "pass1 no-grad statistics forward, pass2 grad replay forward (training only; inference is a single forward)",
     "seeds": 5,
     "eval": "matched-cohort depth curves on the clean test split; primary metric = per-token NLL difference"

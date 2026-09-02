@@ -210,11 +210,16 @@ class TestReplayGradients(unittest.TestCase):
         self.assertIn("mem", closed)
         resume_rng = _rng_state()  # P0-1: real post-pass-1 stream state
         _restore_rng(window_start["rng"])
-        # Pass 2: task + surrogate backward, one optimizer step.
+        # Pass 2: task + surrogate backward, one optimizer step.  The
+        # window plan is consumed through OCCURRENCE IDS (review P0-1:
+        # by_batch is aligned to the cut-producing batches only); the
+        # surrogate follows the real training scale — task divided by
+        # the window size, aux NOT divided (review P0-3).
         params = [p for p in model.parameters() if p.requires_grad]
         opt = torch.optim.SGD(params, lr=1e-3)
-        plan_by_batch = plan["mem"]["by_batch"]
+        g_by_oid = plan["mem"]["by_oid"]
         opt.zero_grad(set_to_none=True)
+        n_aux_terms = 0
         for s, batch in enumerate(batches):
             model.train()
             out = model(input_ids=batch["input_ids"], labels=batch["labels"])
@@ -224,9 +229,15 @@ class TestReplayGradients(unittest.TestCase):
             adapter.clear()
             task, _ = task_ce_shifted(out, batch["labels"],
                                       torch.device("cpu"))
-            aux, _ = batch_surrogate(z_by_oid, plan_by_batch, s, 1.0,
+            terms = [(oid, g_by_oid[oid]) for _, oid in cut_records[s]
+                     if oid in g_by_oid]
+            n_aux_terms += len(terms)
+            aux, _ = batch_surrogate(z_by_oid, terms, 1.0,
                                      torch.device("cpu"))
-            ((task + aux) / len(batches)).backward()
+            (task / len(batches) + aux).backward()
+        # Every effective cut in the window carried a gradient and was
+        # replayed exactly once (aux_terms == effective cuts).
+        self.assertEqual(n_aux_terms, len(batches))
         _restore_rng(resume_rng)
         # Every component type carries a nonzero gradient.
         lora_grads = [p.grad for n, p in model.named_parameters()
@@ -248,6 +259,129 @@ class TestReplayGradients(unittest.TestCase):
                                 / "frozen_method.json", encoding="utf-8"))
         self.assertEqual(frozen["backbone"]["torch_compile"],
                          "disabled on all three arms")
+
+
+class TestInterleavedK3Alignment(unittest.TestCase):
+    """Review P0-1 regression: k < 4 microbatches interleaved into the
+    window must not shift the replay plan.
+
+    The legacy consumption aligned ``plan[tau]["by_batch"]`` — which is
+    indexed by CUT-PRODUCING batches only — with the full pending list,
+    so the first interleaved k=3 microbatch shifted every later cut off
+    its gradient (measured on the gate runs: aux_terms=11 over 7 windows
+    instead of 896; ours silently decaying toward gamma_task_only).
+    """
+
+    # make_batch(n_turns) -> k = n_turns + 1 (one COMP/SUM block per
+    # turn): n_turns=2 -> k=3 (no cut), n_turns=5 -> k=6 (cut at v=3).
+    # Threshold with z_dim=16/m=4/min_abs=4 = max(2*4, 4) = 8 trees.
+
+    def _grad_snapshot(self, turns_seq, seed):
+        """One full two-pass window over ``turns_seq`` = [(n_turns,
+        u_base, sample_id), ...]; returns (grads_by_name, n_aux_terms)
+        for an AUX-ONLY backward at lambda=1.  sample_id is caller-
+        controlled so two streams can share identical cut identities
+        while interleaving k=3 batches differently."""
+        from scripts.train_ccm import (batch_surrogate, collect_replay_z,
+                                       collect_rows, parse_meta)
+        torch.manual_seed(seed)
+        model = make_model()
+        adapter, maps, builder, utter, window = build_rpbe_kit(
+            model, z_dim=16, seed=5, min_abs=4)
+        batches = [make_batch(n_turns=t, u_base=base)
+                   for t, base, _sid in turns_seq]
+        cut_records = []
+        n_cuts = 0
+        for idx, batch in enumerate(batches):
+            state = _rng_state()
+            with torch.no_grad():
+                model(input_ids=batch["input_ids"],
+                      labels=batch["labels"])
+                metas = parse_meta(batch, COMP_IDS, SUM_IDS,
+                                   sample_id_global=turns_seq[idx][2])
+                bc = []
+                for meta in metas:
+                    if not (meta["ok"] and meta["k"] >= 4):
+                        continue
+                    rows = collect_rows(meta, adapter, builder, utter,
+                                        model.get_input_embeddings(),
+                                        batch, torch.device("cpu"))
+                    if rows:
+                        window.add(rows)
+                        bc.append((meta, rows[0].occurrence_id))
+                        n_cuts += 1
+                adapter.clear()
+            cut_records.append(bc)
+            _restore_rng(state)
+        closed, plan, diag = window.close_replay()
+        g_by_oid = plan["mem"]["by_oid"]
+        self.assertTrue(g_by_oid, "window did not close "
+                        "(closed={} trees={})".format(
+                            closed, diag["mem"].get("M_unique_trees")))
+        params = [p for p in model.parameters() if p.requires_grad]
+        for p in params:
+            p.grad = None
+        n_terms = 0
+        for i, batch in enumerate(batches):
+            model.train()
+            out = model(input_ids=batch["input_ids"],
+                        labels=batch["labels"])
+            z_by_oid = {oid: collect_replay_z(meta, adapter,
+                                              torch.device("cpu"))
+                        for meta, oid in cut_records[i]}
+            adapter.clear()
+            terms = [(oid, g_by_oid[oid]) for _, oid in cut_records[i]
+                     if oid in g_by_oid]
+            n_terms += len(terms)
+            aux, n_aux = batch_surrogate(z_by_oid, terms, 1.0,
+                                         torch.device("cpu"))
+            if n_aux:  # no-terms batches (k < 4) contribute a bare zero
+                aux.backward()
+        grads = {n: p.grad.detach().clone()
+                 for n, p in model.named_parameters()
+                 if p.requires_grad and p.grad is not None}
+        return grads, n_terms, n_cuts
+
+    def test_aux_terms_equals_effective_cuts_interleaved(self):
+        # k = [6, 6, 3, 6, 6, 3, ...]: 8 cuts + 4 k=3 interleaves.
+        seq = []
+        cut_sid = 0
+        for s in range(8):
+            seq.append((5, 100 + 10 * s, cut_sid))
+            cut_sid += 1
+            if s % 2 == 1:
+                seq.append((2, 900 + s, 100 + s))
+        grads, n_terms, n_cuts = self._grad_snapshot(seq, seed=11)
+        self.assertEqual(n_cuts, 8)
+        self.assertEqual(n_terms, n_cuts,   # aux_terms == effective cuts
+                         "interleaved k=3 batches must not drop terms")
+        self.assertTrue(any(float(g.abs().sum()) > 0 for g in grads.values()),
+                        "aux gradient must be nonzero at lambda=1")
+
+    def test_k3_insertion_does_not_change_aux_grads(self):
+        # The SAME 8 cuts, once alone and once with k=3 batches inserted
+        # between them.  Cut identities (sample_id) are identical, so the
+        # window rows are identical and the RPBE gradient must be
+        # bit-comparable — inserting or deleting k=3 batches changes
+        # nothing about the auxiliary loss.
+        alone = [(5, 100 + 10 * s, s) for s in range(8)]
+        interleaved = []
+        cut_sid = 0
+        for s in range(8):
+            interleaved.append((5, 100 + 10 * s, cut_sid))
+            cut_sid += 1
+            if s % 2 == 1:
+                interleaved.append((2, 900 + s, 100 + s))
+        ga, n_a, _c = self._grad_snapshot(alone, seed=11)
+        gb, n_b, _c = self._grad_snapshot(interleaved, seed=11)
+        self.assertEqual(n_a, 8)
+        self.assertEqual(n_b, 8)
+        self.assertEqual(set(ga), set(gb))
+        for name in ga:
+            self.assertTrue(torch.allclose(ga[name], gb[name],
+                                           rtol=1e-4, atol=1e-7),
+                            "aux gradient of {} changed when k=3 batches "
+                            "were interleaved".format(name))
 
 
 if __name__ == "__main__":

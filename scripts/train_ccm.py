@@ -77,10 +77,25 @@ def parse_args():
     p.add_argument("--gpu", type=int, default=0)
     p.add_argument("--max-steps", type=int, default=1000)
     p.add_argument("--grad-accum", type=int, default=128,
-                   help="microbatch per official step (ccm_merge arm)")
+                   help="microbatch per update in --merge-cadence official "
+                        "(official-reproduction arm only)")
+    p.add_argument("--merge-cadence", default="window-matched",
+                   choices=["window-matched", "official"],
+                   help="window-matched: the ccm_merge arm fires an update "
+                        "on the same adaptive boundary as the RPBE arms "
+                        "(>= min-effective-cuts dialogues with k>=4), so "
+                        "task exposure and scheduler cadence are identical "
+                        "across the three arms (frozen_method.json "
+                        "cadence; review P0-2).  official: fixed "
+                        "grad-accum microbatch cadence for the "
+                        "ccm_merge_official reproduction reference.")
     p.add_argument("--lr", type=float, default=3e-4)
     p.add_argument("--lora-r", type=int, default=8)
-    p.add_argument("--grad-clip", type=float, default=5.0)
+    p.add_argument("--grad-clip", type=float, default=1.0,
+                   help="max_grad_norm (official Trainer default 1.0; "
+                        "frozen_method.json training.grad_clip is "
+                        "authoritative and an explicit override is "
+                        "refused)")
     p.add_argument("--relative-embedding", default="skip",
                    choices=["skip", "base"])
     # RPBE
@@ -117,6 +132,40 @@ def save_json(path, obj):
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w") as f:
         json.dump(obj, f, indent=2, allow_nan=True)
+
+
+FROZEN_PATH = Path(__file__).resolve().parents[1] / "configs" / "ccm" \
+    / "frozen_method.json"
+
+
+def enforce_frozen(args):
+    """The frozen method spec is authoritative (review P0-3 tail).
+
+    The trainer entry point MUST read configs/ccm/frozen_method.json and
+    refuse an inconsistent CLI override — a silent drift (e.g. a leftover
+    grad_clip=5.0 default while the reported protocol is the official
+    1.0) would train a different method than the one reviewed and
+    frozen.  Every bound key is checked here; values the CLI does not
+    carry are read back for logging only.
+    """
+    with open(FROZEN_PATH, encoding="utf-8") as f:
+        fz = json.load(f)
+    binds = [
+        ("--ridge-eps", "ridge_eps", fz["rpbe"]["ridge_eps"]),
+        ("--sketch-dim", "sketch_dim", fz["rpbe"]["sketch_dim_m"]),
+        ("--rpbe-seed", "rpbe_seed", fz["rpbe"]["rpbe_map_seed"]),
+        ("--kf-min-cuts", "kf_min_cuts",
+         fz["window"]["min_effective_cuts"]),
+        ("--grad-clip", "grad_clip", fz["training"]["grad_clip"]),
+    ]
+    for flag, name, frozen_val in binds:
+        cli_val = getattr(args, name)
+        if cli_val != frozen_val:
+            raise SystemExit(
+                "[frozen] {}={} conflicts with frozen_method.json (={}); "
+                "the frozen spec is authoritative — edit the spec file "
+                "to override".format(flag, cli_val, frozen_val))
+    return fz
 
 
 def build_tokenizer(args):
@@ -299,13 +348,20 @@ def collect_rows(meta, adapter, builder, utter_embed, embed_tokens, batch,
     return builder.build(dm, z, chi1[0], chi2[0])
 
 
-def batch_surrogate(z_rows_by_oid, plan_by_batch, batch_offset, lam, device):
+def batch_surrogate(z_rows_by_oid, batch_terms, lam, device):
     """Numerically zero surrogate; gradient = exact window J (plan L5).
 
     K = 1 here (one optimizer step per closed window), so the auxiliary
-    is simply -lambda * sum_v (<sg(g_v), z_v> - sg(<g_v, z_v>))."""
+    is simply -lambda * sum_v (<sg(g_v), z_v> - sg(<g_v, z_v>)).
+
+    ``batch_terms`` is ``[(occurrence_id, g), ...]`` for ONE replay batch
+    only — the caller resolves which of the window's gradients belong to
+    this batch through occurrence ids (review P0-1: never slice the
+    window plan by batch position; the plan covers only the
+    cut-producing batches while the pending list mixes in k < 4
+    microbatches)."""
     terms = []
-    for oid, g in plan_by_batch[batch_offset]:
+    for oid, g in batch_terms:
         z = z_rows_by_oid.get(oid)
         if z is None:
             continue
@@ -351,6 +407,7 @@ def load_trainable(path, model, optimizer, device):
 
 def main():
     args = parse_args()
+    enforce_frozen(args)  # review P0-3: frozen spec is authoritative
     seed_all(args.seed)
     device = torch.device(f"cuda:{args.gpu}" if torch.cuda.is_available()
                           else "cpu")
@@ -462,6 +519,11 @@ def main():
     pending = []
     cut_records = []
     window_start_state = None
+    # Review P0-2: the ccm_merge arm counts effective cuts (dialogues
+    # with k >= 4) in the same stream and fires its update on the same
+    # boundary as the RPBE windows, so all three arms see the same task
+    # samples at the same scheduler step.
+    merge_eff_cuts = 0
     # L6.5 gate 1: every arm hashes its (sample_id, k) data stream so the
     # three arms can be compared bit-for-bit after a run; the raw stream
     # is also written for prefix comparison across unequal window sizes.
@@ -506,11 +568,17 @@ def main():
             adapter.clear()
         return batch_cuts
 
-    def pass2_one(batch, cut_meta, plan_by_batch, i, lam):
+    def pass2_one(batch, cut_meta, g_by_oid, lam):
         """Pass-2 replay: task CE (official MEAN per microbatch, divided
         by the window size below) + exact surrogate.  ``cut_meta`` is the
         pass-1 [(meta, oid)] record — NO builder/chi/p here (L6.5
-        review: pass 2 only re-extracts the gradient-connected z)."""
+        review: pass 2 only re-extracts the gradient-connected z).
+
+        Gradients are mapped through OCCURRENCE IDs (review P0-1): this
+        batch's cuts carry their pass-1 occurrence ids; a cut is replayed
+        iff its id is in the window plan's ``by_oid``.  Batch positions
+        are never used to slice the plan (k < 4 microbatches interleave
+        and the plan covers only cut-producing batches)."""
         _t = time.perf_counter()
         out = run_forward(model, batch, device, grad_enabled=True)
         _pf("pass2_fwd", _t)
@@ -518,15 +586,19 @@ def main():
         task_mean = task_sum / max(n_valid, 1)
         aux = torch.zeros((), device=device)
         n_terms = 0
-        if plan_by_batch is not None:
+        if g_by_oid:
             z_by_oid = {}
+            batch_terms = []
             _t = time.perf_counter()
             for meta, oid in cut_meta:
-                z_by_oid[oid] = collect_replay_z(meta, adapter, device)
+                g = g_by_oid.get(oid)
+                if g is not None:
+                    z_by_oid[oid] = collect_replay_z(meta, adapter, device)
+                    batch_terms.append((oid, g))
             adapter.clear()
             _pf("collect_z", _t)
             _t = time.perf_counter()
-            aux, n_terms = batch_surrogate(z_by_oid, plan_by_batch, i, lam,
+            aux, n_terms = batch_surrogate(z_by_oid, batch_terms, lam,
                                            device)
             _pf("surrogate", _t)
         return task_mean, task_sum, n_valid, aux, n_terms
@@ -581,15 +653,19 @@ def main():
                 # stream resumes from the captured position afterwards.
                 resume_rng = _rng_state()
                 _restore_rng(window_start_state["rng"])
-                plan_by_batch = plan.get(MEM_TAU, {}).get("by_batch", [])
-                plan_by_batch = [plan_by_batch[i] if i < len(plan_by_batch)
-                                 else [] for i in range(len(pending))]
+                # Review P0-1: consume the window gradients through the
+                # occurrence-id index.  The legacy per-batch slice was
+                # aligned to the CUT-PRODUCING batches only, so indexing
+                # it with the pending position silently dropped ~99% of
+                # the cuts once k < 4 microbatches interleaved
+                # (aux_terms was 11 over 7 windows instead of 896).
+                g_by_oid = plan.get(MEM_TAU, {}).get("by_oid", {})
                 optimizer.zero_grad(set_to_none=True)
                 task_sum = 0.0
                 n_tokens = 0
                 for i, (b, sid) in enumerate(pending):
                     task_mean, task_raw, n_valid, aux, n_terms = pass2_one(
-                        b, cut_records[i], plan_by_batch, i,
+                        b, cut_records[i], g_by_oid,
                         0.0 if args.arm == "gamma_task_only"
                         else lambda_kf)
                     # Per-microbatch normalization: the official Trainer
@@ -631,6 +707,13 @@ def main():
                 kf_closed += 1
                 if args.calibrate_lambda and kf_closed == 1:
                     # r_eff on this window: separate norm measurements.
+                    # g_task is measured with the real training scale
+                    # (per-microbatch MEAN divided by len(pending)) and
+                    # g_kf with the real pass-2 scale (aux NOT divided —
+                    # loss = task_mean/len(pending) + aux).  Dividing aux
+                    # here too shrank the measured g_kf by ~266x and
+                    # inflated the derived lambda by the same factor
+                    # (review P0-3).
                     optimizer.zero_grad(set_to_none=True)
                     _restore_rng(window_start_state["rng"])
                     for b, sid in pending:
@@ -649,14 +732,25 @@ def main():
                     for i, (b, sid) in enumerate(pending):
                         fwd_out = run_forward(model, b, device,
                                               grad_enabled=True)
+                        # Same occurrence-id mapping as pass 2 (P0-1):
+                        # only this batch's cuts, resolved via by_oid.
                         z_by_oid = {}
+                        batch_terms = []
                         for meta, oid in cut_records[i]:
-                            z_by_oid[oid] = collect_replay_z(meta, adapter,
-                                                             device)
+                            g = g_by_oid.get(oid)
+                            if g is not None:
+                                z_by_oid[oid] = collect_replay_z(
+                                    meta, adapter, device)
+                                batch_terms.append((oid, g))
                         adapter.clear()
-                        aux, _ = batch_surrogate(z_by_oid, plan_by_batch,
-                                                 i, 1.0, device)
-                        (aux / float(len(pending))).backward()
+                        aux, n_aux = batch_surrogate(
+                            z_by_oid, batch_terms, 1.0, device)
+                        # Same scale as pass 2 (aux NOT divided by the
+                        # window size — review P0-3).  A microbatch
+                        # without terms (k < 4) contributes nothing;
+                        # its zero aux has no grad_fn, so skip the call.
+                        if n_aux:
+                            aux.backward()
                     _restore_rng(resume_rng)
                     g_kf = repr_grad_norm(params)
                     r_eff = g_kf / max(g_task, 1e-30)
@@ -680,7 +774,25 @@ def main():
                     "than {} effective cuts".format(
                         len(pending), args.kf_min_cuts))
         else:
-            if len(pending) >= args.grad_accum:
+            # Review P0-2: the official arm runs on the same dialogue
+            # stream and fires on the same adaptive boundary (accumulated
+            # effective cuts) as the RPBE arms.  Previously it stepped
+            # every grad_accum=128 microbatches while ours/gamma stepped
+            # every ~266 (one 128-cut window), so after 1000 steps the
+            # first two arms had consumed ~2.07x the task data of
+            # ccm_merge — a silent breach of the frozen cadence
+            # requirement.  window-matched restores identical task
+            # exposure; --merge-cadence official keeps the fixed cadence
+            # for the ccm_merge_official reproduction reference only.
+            eff = sum(1 for m in metas
+                      if m["ok"] and m["k"] >= 4)
+            if args.merge_cadence == "window-matched":
+                merge_eff_cuts += eff
+            fire = (args.merge_cadence == "window-matched"
+                    and merge_eff_cuts >= args.kf_min_cuts) \
+                or (args.merge_cadence == "official"
+                    and len(pending) >= args.grad_accum)
+            if fire:
                 optimizer.zero_grad(set_to_none=True)
                 task_sum = 0.0
                 n_tokens = 0
@@ -691,11 +803,14 @@ def main():
                     # Official Trainer protocol (verified against
                     # accelerate 1.14 Accelerator.backward + HF 4.44 in
                     # scripts/ccm_parity.py): the per-microbatch MEAN
-                    # loss is divided by gradient_accumulation_steps
-                    # BEFORE backward — accelerate does
+                    # loss is divided by the window size BEFORE backward
+                    # — accelerate does
                     # `loss = loss / self.gradient_accumulation_steps`
-                    # inside backward().  This division also keeps the
-                    # fp16 backward on the safe side of overflow.
+                    # inside backward().  Normalizing by len(pending)
+                    # makes the task gradient scale independent of the
+                    # window length, identical across all three arms.
+                    # This division also keeps the fp16 backward on the
+                    # safe side of overflow.
                     task_mean = task_raw / max(n_valid, 1)
                     scaler.scale(task_mean / float(len(pending))).backward()
                     task_sum += float(task_raw.detach())
@@ -704,6 +819,11 @@ def main():
                 total_task_sum += task_sum
                 total_tokens += n_tokens
                 total_microbatches += len(pending)
+                if args.merge_cadence == "window-matched":
+                    print("win={} n_mb={} n_cut_mb={} (matched cadence)"
+                          .format(step + 1, len(pending), merge_eff_cuts),
+                          flush=True)
+                    merge_eff_cuts = 0
                 step += 1
                 pending = []
         if step and step % args.log_every == 0:

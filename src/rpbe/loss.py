@@ -1032,8 +1032,12 @@ class KFMomentWindow:
         * ``closed[tau]`` — the REAL window score ``F(S_W)`` (the number
           to log, never the surrogate);
         * ``replay_plan[tau]["by_batch"][b]`` — ``[(occurrence_id, g), ...]``
-          for batch ``b`` of the window: pass 2 only indexes the traced z
-          and sums ``<sg(g), z>`` (no p, no moments, no re-walk);
+          for cut-producing batch ``b`` of the window (kept for the
+          legacy jodie path);
+        * ``replay_plan[tau]["by_oid"]`` — ``{occurrence_id: g}`` for the
+          WHOLE window: pass 2 maps its traced z through occurrence ids
+          (review P0-1), never through batch positions, and sums
+          ``<sg(g), z>`` (no p, no moments, no re-walk);
         * ``diagnostics[tau]`` — the usual matrix diagnostics.
 
         All windows that REACHED the tree threshold close together (same
@@ -1068,7 +1072,7 @@ class KFMomentWindow:
                 r["mu_z"], r["mu_p"], r["D"], self.eps, self.strict)
             if j is None:
                 closed[tau] = 0.0
-                replay_plan[tau] = {"by_batch": [[]]}
+                replay_plan[tau] = {"by_batch": [[]], "by_oid": {}}
                 diagnostics[tau] = {"failed": score_diag["failed"],
                                     "W": r["W"], "D_cut": r["D"],
                                     "M_unique": int(len(win["cut_seen"])),
@@ -1082,8 +1086,14 @@ class KFMomentWindow:
                 # per cut: the horizon rows of a cut share cut_id, so the
                 # merged gradient must be emitted ONCE (emitting it per
                 # row would replay it 2-3 times and distort the KF weight
-                # by depth — seventh review).
+                # by depth — seventh review).  ``by_oid`` indexes the same
+                # gradients by occurrence_id (review P0-1: pass 2 must map
+                # gradients through occurrence ids, never through batch
+                # positions — ``by_batch`` only covers the cut-producing
+                # batches, so position alignment is wrong as soon as a
+                # k < 4 microbatch interleaves).
                 by_batch = []
+                by_oid = {}
                 pos = 0
                 for cnt in win["batch_cut_counts"]:
                     batch_rows = []
@@ -1094,11 +1104,14 @@ class KFMomentWindow:
                         emitted.add(cid)
                         g = g_by_cut.get(cid)
                         if g is not None:
-                            batch_rows.append((cid[1], g.float()))
+                            g_flat = g.float()
+                            batch_rows.append((cid[1], g_flat))
+                            by_oid[cid[1]] = g_flat
                     by_batch.append(batch_rows)
                     pos += cnt
                 closed[tau] = float(j)
-                replay_plan[tau] = {"by_batch": by_batch}
+                replay_plan[tau] = {"by_batch": by_batch,
+                                    "by_oid": by_oid}
                 diagnostics[tau] = self._diagnostics(
                     win, czz, czp, cpp, torch.tensor(j, dtype=torch.float64),
                     0.0, score_diag)

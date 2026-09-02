@@ -184,7 +184,7 @@ class TestReplayGradients(unittest.TestCase):
         # (L6.5 review: no builder/chi/p in pass 2).
         from scripts.train_ccm import (batch_surrogate, collect_replay_z,
                                        collect_rows, parse_meta,
-                                       task_ce_sum)
+                                       task_ce_shifted)
         batches = [make_batch(u_base=100 + 10 * s) for s in range(10)]
         window_start = {"rng": _rng_state()}
         cut_records = []
@@ -222,8 +222,8 @@ class TestReplayGradients(unittest.TestCase):
                                               torch.device("cpu"))
                         for meta, oid in cut_records[s]}
             adapter.clear()
-            task, _ = task_ce_sum(out, batch["labels"],
-                                  torch.device("cpu"))
+            task, _ = task_ce_shifted(out, batch["labels"],
+                                      torch.device("cpu"))
             aux, _ = batch_surrogate(z_by_oid, plan_by_batch, s, 1.0,
                                      torch.device("cpu"))
             ((task + aux) / len(batches)).backward()

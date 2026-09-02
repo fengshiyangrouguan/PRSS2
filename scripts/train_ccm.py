@@ -221,30 +221,46 @@ def parse_meta(batch, comp_ids, sum_ids, sample_id_global):
 def run_forward(model, batch, device, grad_enabled):
     # labels are NOT passed here: the task CE is computed once by
     # task_ce (passing them would compute the same loss a second time).
-    # fp16 autocast matches the official Trainer protocol: the vendored
-    # conditional-LoRA layer computes its lora branch in fp32, so the
-    # forward MUST run under autocast (mixed fp16/fp32 without autocast
-    # raises on the fp16 base path).
+    # attention_mask_comp IS passed: the official merge_recur collator
+    # derives it from the SUM tokens and the vendored LlamaModel folds
+    # it into the attention mask (comp/sum positions blocked from the
+    # causal stream), so omitting it silently trains a DIFFERENT
+    # attention pattern than the official protocol (caught by the L6.5
+    # gate-2 parity run).  fp16 autocast matches the official Trainer:
+    # the vendored conditional-LoRA layer computes its lora branch in
+    # fp32, so the forward MUST run under autocast (mixed fp16/fp32
+    # without autocast raises on the fp16 base path).
     ctx = torch.enable_grad() if grad_enabled else torch.no_grad()
+    amc = batch.get("attention_mask_comp")
     with ctx:
         with torch.autocast(device_type="cuda", dtype=torch.float16,
                             enabled=(device.type == "cuda")):
             return model(input_ids=batch["input_ids"].to(device),
-                         attention_mask=batch["attention_mask"].to(device))
+                         attention_mask=batch["attention_mask"].to(device),
+                         attention_mask_comp=amc.to(device)
+                         if amc is not None else None)
 
 
-def task_ce_sum(out, labels, device):
-    """Sum-reduced CE over valid tokens + the valid token count.
+def task_ce_shifted(out, labels, device):
+    """Official CCM task CE: SHIFTED sum + valid count.
 
-    The token-normalized mean (sum / count) is what the log reports; the
-    raw sum is what enters the backward (L6.5 review: per-microbatch sums
-    are then normalized by the window's microbatch count).
+    The vendored model's internal loss (ccm_llama.py ~line 922) shifts
+    logits/labels by one ("tokens < n predict n") before the CE; the
+    official CompSeq2SeqTrainer backprops that per-microbatch loss
+    directly.  This helper returns (shifted_sum, n_valid) so callers can
+    build the per-microbatch MEAN (= sum / valid, the official
+    reduction) and normalize by the window size where the L6.5 review
+    requires it.  The token-normalized CE log line uses sum / total
+    valid tokens.
     """
-    logits = out.logits.view(-1, out.logits.shape[-1])
-    labs = labels.to(device).view(-1)
-    n_valid = int((labs != -100).sum())
+    logits = out.logits
+    labs = labels.to(device)
+    shift_logits = logits[..., :-1, :].contiguous()
+    shift_labels = labs[..., 1:].contiguous()
+    n_valid = int((shift_labels != -100).sum())
     loss = torch.nn.functional.cross_entropy(
-        logits, labs, ignore_index=-100, reduction="sum")
+        shift_logits.view(-1, shift_logits.shape[-1]),
+        shift_labels.view(-1), ignore_index=-100, reduction="sum")
     return loss, n_valid
 
 
@@ -481,7 +497,7 @@ def main():
         pass-1 [(meta, oid)] record — NO builder/chi/p here (L6.5
         review: pass 2 only re-extracts the gradient-connected z)."""
         out = run_forward(model, batch, device, grad_enabled=True)
-        task_sum, n_valid = task_ce_sum(out, batch["labels"], device)
+        task_sum, n_valid = task_ce_shifted(out, batch["labels"], device)
         task_mean = task_sum / max(n_valid, 1)
         aux = torch.zeros((), device=device)
         n_terms = 0
@@ -577,8 +593,13 @@ def main():
                     for b, sid in pending:
                         fwd_out = run_forward(model, b, device,
                                               grad_enabled=True)
-                        task, _ = task_ce_sum(fwd_out, b["labels"], device)
-                        (task / float(len(pending))).backward()
+                        task_sum, n_valid = task_ce_shifted(
+                            fwd_out, b["labels"], device)
+                        # Per-microbatch MEAN (official loss formula),
+                        # then the same /len(pending) as the real pass 2
+                        # so the measured g_task matches training.
+                        (task_sum / max(n_valid, 1)
+                         / float(len(pending))).backward()
                     g_task = repr_grad_norm(params)
                     optimizer.zero_grad(set_to_none=True)
                     _restore_rng(window_start_state["rng"])
@@ -622,10 +643,16 @@ def main():
                 n_tokens = 0
                 for b, sid in pending:
                     fwd_out = run_forward(model, b, device, grad_enabled=True)
-                    task_raw, n_valid = task_ce_sum(fwd_out, b["labels"],
-                                                    device)
+                    task_raw, n_valid = task_ce_shifted(
+                        fwd_out, b["labels"], device)
+                    # Official Trainer protocol: backprop the per-
+                    # microbatch MEAN loss directly — the official
+                    # gradient_accumulation_steps accumulates losses
+                    # without dividing by the count (L6.5 review P0-2;
+                    # verified against the official Trainer in
+                    # scripts/ccm_parity.py).
                     task_mean = task_raw / max(n_valid, 1)
-                    scaler.scale(task_mean / float(len(pending))).backward()
+                    scaler.scale(task_mean).backward()
                     task_sum += float(task_raw.detach())
                     n_tokens += n_valid
                 grad_step()

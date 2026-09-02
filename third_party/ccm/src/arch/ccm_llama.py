@@ -119,9 +119,8 @@ class LlamaAttention(nn.Module):
         comp_mask: Optional[torch.Tensor] = None,
         sum_mask: Optional[torch.Tensor] = None,
         sum_attn_mask: Optional[torch.Tensor] = None,
-        sum_prev_attn_mask: Optional[torch.Tensor] = None,
-        sum_prev_sum_mask: Optional[torch.Tensor] = None,
-        sum_count: Optional[torch.Tensor] = None,
+        sum_row_pos: Optional[torch.Tensor] = None,
+        sum_row_valid: Optional[torch.Tensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
         max_id: Optional[int] = None,
@@ -175,16 +174,33 @@ class LlamaAttention(nn.Module):
 
             #####################################################
             ##### RPBE modification (L2): Gamma residual ######
-            # Gather the previous-turn memory mean and the current COMP
-            # K/V from the ORIGINAL (unmerged) states, before the mean
-            # swap below.  cur = t*base - (t-1)*prev is the exact h_t.
+            # Gather the SUM rows ONCE ([B, H, T, 2, D]); the previous
+            # memory mean is base_{t-1} (the running mean one turn back,
+            # free by index shift), and cur = t*base - (t-1)*prev is the
+            # exact h_t.  This replaces the per-turn mask matmuls of the
+            # first L2 version (strictly equivalent; L6.5 perf).
             if self.gamma is not None:
-                prev_mask = sum_prev_attn_mask.to(key_states.dtype)
-                key_prev = torch.matmul(prev_mask.unsqueeze(1), key_states)
-                value_prev = torch.matmul(prev_mask.unsqueeze(1), value_states)
-                t = sum_count.to(key_states.dtype).unsqueeze(1).unsqueeze(-1)
-                key_cur = t * key_comp_avg - (t - 1) * key_prev
-                value_cur = t * value_comp_avg - (t - 1) * value_prev
+                bsz, n_heads, seq_len, head_dim = key_states.shape
+                t_max = int(sum_row_pos.shape[1])
+                n_rows = t_max * 2
+                idx = sum_row_pos.reshape(bsz, n_rows).unsqueeze(1)
+                idx = idx.expand(bsz, n_heads, n_rows)
+                idx = idx.unsqueeze(-1).expand(-1, -1, -1, head_dim)
+                k_sum = torch.gather(key_states, 2, idx)
+                v_sum = torch.gather(value_states, 2, idx)
+                k_base = torch.gather(key_comp_avg, 2, idx).reshape(
+                    bsz, n_heads, t_max, 2, head_dim)
+                v_base = torch.gather(value_comp_avg, 2, idx).reshape(
+                    bsz, n_heads, t_max, 2, head_dim)
+                t = torch.arange(1, t_max + 1,
+                                 device=key_states.device).float()
+                t = t.view(1, 1, t_max, 1, 1)
+                prev_shift = torch.zeros_like(k_base)
+                prev_shift[:, :, 1:, :, :] = k_base[:, :, :-1, :, :]
+                k_cur = t * k_base - (t - 1) * prev_shift
+                prev_shift = torch.zeros_like(v_base)
+                prev_shift[:, :, 1:, :, :] = v_base[:, :, :-1, :, :]
+                v_cur = t * v_base - (t - 1) * prev_shift
             #####################################################
 
             key_states = no_sum_mask * key_states + key_comp_avg
@@ -193,34 +209,45 @@ class LlamaAttention(nn.Module):
             #####################################################
             ##### RPBE modification (L2): Gamma recurrence scan ######
             # M_t = mean(h_1..h_t) + R_theta(M_{t-1}, h_t, t).  The
-            # previous FULL memory is the mean plus the residual of the
-            # previous same-slot SUM, selected by the mask built in
-            # get_comp_sum_mask (utterance lengths vary, so a fixed
-            # stride would be wrong).  The per-turn loop resolves the
-            # recurrence exactly (eager mode; the three arms run with
-            # torch.compile disabled, plan L2).
+            # per-turn loop runs on the gathered SUM rows only (one
+            # [B, H, 2, D] call per turn per layer), carrying the
+            # previous turn's residual in a register; turn-1 rows keep
+            # the pure mean.  Eager mode; torch.compile disabled on all
+            # three arms (plan L2).
             if self.gamma is not None:
-                prev_sum_mask = sum_prev_sum_mask.to(key_states.dtype)
-                res_k = torch.zeros_like(key_states)
-                res_v = torch.zeros_like(value_states)
-                t_max = int(sum_count.max())
+                res_prev_k = torch.zeros(bsz, n_heads, 2, head_dim,
+                                         dtype=key_states.dtype,
+                                         device=key_states.device)
+                res_prev_v = torch.zeros_like(res_prev_k)
+                res_all_k = torch.zeros_like(k_base)
+                res_all_v = torch.zeros_like(v_base)
+                valid = sum_row_valid.to(key_states.dtype).unsqueeze(1)
+                valid = valid.unsqueeze(-1)  # [B, 1, T, 2, 1]
                 for t_i in range(2, t_max + 1):
-                    # Residual of the previous same-slot SUM (the mask
-                    # row is empty for turn-1 rows, so they read zero).
-                    res_k_prev = torch.matmul(prev_sum_mask.unsqueeze(1),
-                                              res_k)
-                    res_v_prev = torch.matmul(prev_sum_mask.unsqueeze(1),
-                                              res_v)
-                    rows_t = (sum_count == t_i).to(key_states.dtype)
-                    rows_t = rows_t.unsqueeze(0).unsqueeze(-1)
-                    res_k = res_k + self.gamma(key_prev + res_k_prev,
-                                               key_cur, sum_count) * rows_t
-                    res_v = res_v + self.gamma(value_prev + res_v_prev,
-                                               value_cur, sum_count) * rows_t
-                # Residuals are nonzero only at SUM rows with t >= 2;
-                # while the gate s == 0 this whole block adds exactly 0.
-                key_states = key_states + res_k
-                value_states = value_states + res_v
+                    tt = torch.full((bsz, 1), t_i, dtype=torch.float32,
+                                    device=key_states.device)
+                    # M_{t-1} = base of the PREVIOUS turn (index t_i-2)
+                    # plus that turn's residual register.
+                    res_t_k = self.gamma(
+                        k_base[:, :, t_i - 2] + res_prev_k,
+                        k_cur[:, :, t_i - 1], tt) * valid[:, :, t_i - 1]
+                    res_t_v = self.gamma(
+                        v_base[:, :, t_i - 2] + res_prev_v,
+                        v_cur[:, :, t_i - 1], tt) * valid[:, :, t_i - 1]
+                    res_prev_k = res_t_k
+                    res_prev_v = res_t_v
+                    res_all_k[:, :, t_i - 1] = res_t_k
+                    res_all_v[:, :, t_i - 1] = res_t_v
+                # Scatter the per-turn residuals back onto the SUM rows
+                # (invalid positions add exactly zero at row 0; per-batch
+                # because index_add's 1-D index cannot vary per batch).
+                for b in range(bsz):
+                    key_states[b] = key_states[b].index_add(
+                        1, sum_row_pos[b].reshape(-1),
+                        res_all_k[b].reshape(n_heads, -1, head_dim))
+                    value_states[b] = value_states[b].index_add(
+                        1, sum_row_pos[b].reshape(-1),
+                        res_all_v[b].reshape(n_heads, -1, head_dim))
             #####################################################
 
             #####################################################
@@ -229,7 +256,7 @@ class LlamaAttention(nn.Module):
             # cache concatenation); the callback keeps the SUM rows.
             if self.mem_callback is not None:
                 self.mem_callback(key_states, value_states, sum_mask,
-                                  sum_count)
+                                  sum_row_pos)
             #####################################################
         #####################################################
 
@@ -298,9 +325,8 @@ class LlamaDecoderLayer(nn.Module):
         comp_mask: Optional[torch.Tensor] = None,
         sum_mask: Optional[torch.Tensor] = None,
         sum_attn_mask: Optional[torch.Tensor] = None,
-        sum_prev_attn_mask: Optional[torch.Tensor] = None,
-        sum_prev_sum_mask: Optional[torch.Tensor] = None,
-        sum_count: Optional[torch.Tensor] = None,
+        sum_row_pos: Optional[torch.Tensor] = None,
+        sum_row_valid: Optional[torch.Tensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
         max_id: Optional[int] = None,
@@ -332,9 +358,8 @@ class LlamaDecoderLayer(nn.Module):
             comp_mask=comp_mask,
             sum_mask=sum_mask,
             sum_attn_mask=sum_attn_mask,
-            sum_prev_attn_mask=sum_prev_attn_mask,
-            sum_prev_sum_mask=sum_prev_sum_mask,
-            sum_count=sum_count,
+            sum_row_pos=sum_row_pos,
+            sum_row_valid=sum_row_valid,
             attention_mask=attention_mask,
             position_ids=position_ids,
             max_id=max_id,
@@ -461,15 +486,12 @@ class LlamaModelCCM(LlamaPreTrainedModel):
             comp_mask [batch_size, seq_len]: 1 for comp/sum token, 0 for others
             sum_mask [batch_size, seq_len]: 1 for sum token, 0 for others
             sum_attn_mask [batch_size, seq_len, seq_len]: A matrix for merging comp_tokens before sum_tokens
-            sum_prev_attn_mask [batch_size, seq_len, seq_len]: (RPBE L2, only
-                when _gamma_attached) same-slot COMPs strictly before the
-                SUM's own turn block, normalized by (t-1); 0 rows where t=1.
-            sum_prev_sum_mask [batch_size, seq_len, seq_len]: (RPBE L2, only
-                when _gamma_attached) per-row selector of the previous
-                same-slot SUM position (exactly one 1 per row with t>=2).
-            sum_count [batch_size, seq_len]: (RPBE L2, only when
-                _gamma_attached) per-row turn count t (number of same-slot
-                COMPs at positions <= the row).
+            sum_row_pos [batch_size, T_max, 2]: (RPBE L2, only when
+                _gamma_attached) sequence position of each turn's (S0, S1)
+                pair in turn order; 0 where a batch row has fewer turns.
+            sum_row_valid [batch_size, T_max, 2]: (RPBE L2) 1 for valid
+                positions of sum_row_pos (L6.5: replaces the per-turn
+                mask matmuls with gathers + register recurrence).
         """
         comp_mask = None
         if self.comp_token is not None:
@@ -477,9 +499,8 @@ class LlamaModelCCM(LlamaPreTrainedModel):
 
         sum_attn_mask = None
         sum_mask = None
-        sum_prev_attn_mask = None
-        sum_prev_sum_mask = None
-        sum_count = None
+        sum_row_pos = None
+        sum_row_valid = None
         if self.sum_token is not None:
             # batchsize x seq_len
             sum_mask = get_comp_mask(input_ids, self.sum_token).to(input_ids.device)
@@ -492,15 +513,6 @@ class LlamaModelCCM(LlamaPreTrainedModel):
                 batch_size, seq_len = input_ids.shape
                 sum_attn_mask = torch.zeros((batch_size, seq_len, seq_len),
                                             device=input_ids.device).float()
-                if self._gamma_attached:
-                    sum_prev_attn_mask = torch.zeros((batch_size, seq_len, seq_len),
-                                                     device=input_ids.device).float()
-                    sum_prev_sum_mask = torch.zeros((batch_size, seq_len, seq_len),
-                                                    device=input_ids.device).float()
-                    sum_count = torch.zeros((batch_size, seq_len),
-                                            device=input_ids.device).float()
-                    pos = torch.arange(seq_len, device=input_ids.device)
-                    n_tok = len(self.comp_token)
 
                 for k in range(len(self.comp_token)):
                     comp_loc_k = input_ids == self.comp_token[k]
@@ -508,43 +520,42 @@ class LlamaModelCCM(LlamaPreTrainedModel):
                     attn_k = sum_loc_k.unsqueeze(2) & comp_loc_k.unsqueeze(1)
                     sum_attn_mask += attn_k.float()
 
-                    #####################################################
-                    ##### RPBE modification (L2): Gamma recurrence inputs #####
-                    if self._gamma_attached:
-                        tril_k = torch.tril(attn_k.float())
-                        sum_count += tril_k.sum(-1)
-                        # Previous-turn memory mean: same-slot COMPs
-                        # strictly before the SUM's own turn block.  Block
-                        # layout is [C0..C_{n-1}, S0..S_{n-1}], so the
-                        # same-slot COMP sits exactly n_tok positions
-                        # before its SUM.
-                        prev_attn_k = attn_k & (pos[None, :]
-                                                <= pos[:, None] - n_tok - k - 1)
-                        sum_prev_attn_mask += prev_attn_k.float()
-                        # Previous same-slot SUM selector: row i points at
-                        # the same-slot SUM whose turn ordinal is one less
-                        # (works for variable utterance lengths).
-                        ord_k = sum_loc_k.long().cumsum(-1)
-                        sum_prev_sum_mask += (
-                            sum_loc_k.unsqueeze(2) & sum_loc_k.unsqueeze(1)
-                            & (ord_k.unsqueeze(1) == ord_k.unsqueeze(2) - 1)
-                        ).float()
-                    #####################################################
-
                 sum_attn_mask = torch.tril(sum_attn_mask)
 
                 sum_attn_mask = sum_attn_mask / torch.clamp(sum_attn_mask.sum(-1, keepdim=True),
                                                             min=0.1)
+
+                #####################################################
+                ##### RPBE modification (L2/L6.5): Gamma row index ######
                 if self._gamma_attached:
-                    # Rows with t=1 have sum 0 -> normalized to 0/0.1 = 0.
-                    sum_prev_attn_mask = sum_prev_attn_mask / torch.clamp(
-                        sum_prev_attn_mask.sum(-1, keepdim=True), min=0.1)
+                    # Per-slot SUM positions in turn order -> [B, T, 2].
+                    per_slot = []
+                    t_max = 0
+                    for k in range(len(self.sum_token)):
+                        loc = (input_ids == self.sum_token[k]).nonzero()
+                        by_batch = {}
+                        for b, p in loc.tolist():
+                            by_batch.setdefault(int(b), []).append(int(p))
+                        per_slot.append(by_batch)
+                        t_max = max(t_max, max(
+                            (len(v) for v in by_batch.values()), default=0))
+                    sum_row_pos = torch.zeros(batch_size, t_max, 2,
+                                              dtype=torch.long,
+                                              device=input_ids.device)
+                    sum_row_valid = torch.zeros(batch_size, t_max, 2,
+                                                dtype=torch.bool,
+                                                device=input_ids.device)
+                    for k, by_batch in enumerate(per_slot):
+                        for b, ps in by_batch.items():
+                            for t_i, p in enumerate(ps):
+                                sum_row_pos[b, t_i, k] = p
+                                sum_row_valid[b, t_i, k] = True
+                #####################################################
 
                 # For conditional LoRA and positional embedding
                 comp_mask = comp_mask + sum_mask
 
-        return comp_mask, sum_mask, sum_attn_mask, sum_prev_attn_mask, \
-            sum_prev_sum_mask, sum_count
+        return comp_mask, sum_mask, sum_attn_mask, sum_row_pos, sum_row_valid
 
     def forward(
         self,
@@ -562,8 +573,8 @@ class LlamaModelCCM(LlamaPreTrainedModel):
     ) -> Union[Tuple, BaseModelOutputWithPast]:
         #####################################################
         ##### Modified: Get compression masks for conditional inference and memory update #####
-        comp_mask, sum_mask, sum_attn_mask, sum_prev_attn_mask, \
-            sum_prev_sum_mask, sum_count = self.get_comp_sum_mask(input_ids)
+        comp_mask, sum_mask, sum_attn_mask, sum_row_pos, sum_row_valid = \
+            self.get_comp_sum_mask(input_ids)
         #####################################################
 
         output_attentions = (output_attentions
@@ -684,9 +695,8 @@ class LlamaModelCCM(LlamaPreTrainedModel):
                     comp_mask,
                     sum_mask,
                     sum_attn_mask,
-                    sum_prev_attn_mask,
-                    sum_prev_sum_mask,
-                    sum_count,
+                    sum_row_pos,
+                    sum_row_valid,
                     attention_mask,
                     position_ids,
                     max_id,
@@ -698,9 +708,8 @@ class LlamaModelCCM(LlamaPreTrainedModel):
                     comp_mask=comp_mask,
                     sum_mask=sum_mask,
                     sum_attn_mask=sum_attn_mask,
-                    sum_prev_attn_mask=sum_prev_attn_mask,
-                    sum_prev_sum_mask=sum_prev_sum_mask,
-                    sum_count=sum_count,
+                    sum_row_pos=sum_row_pos,
+                    sum_row_valid=sum_row_valid,
                     attention_mask=attention_mask,
                     position_ids=position_ids,
                     max_id=max_id,

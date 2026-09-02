@@ -115,55 +115,47 @@ class TestGammaZeroInit(unittest.TestCase):
 
 
 class TestGammaMasks(unittest.TestCase):
-    """Mask-level construction checks (previous-turn mean + SUM selector)."""
+    """Mask-level construction checks (SUM row index table)."""
 
     def setUp(self):
         torch.manual_seed(0)
         self.model = make_model()
         attach_gamma(self.model, hidden=16)
         self.ids = make_merge_input(3)
-        (self.comp_mask, self.sum_mask, self.sum_attn, self.sum_prev,
-         self.sum_prev_sum, self.sum_count) = \
+        (self.comp_mask, self.sum_mask, self.sum_attn,
+         self.sum_row_pos, self.sum_row_valid) = \
             self.model.model.get_comp_sum_mask(self.ids)
 
-    def test_turn_counts(self):
+    def test_row_positions(self):
         rows = sum_rows(3)
-        for t, (s0, s1) in enumerate(rows, start=1):
-            self.assertEqual(float(self.sum_count[0, s0]), float(t))
-            self.assertEqual(float(self.sum_count[0, s1]), float(t))
-        # Non-SUM rows carry zero counts.
-        self.assertEqual(float(self.sum_count[0, 0]), 0.0)
+        self.assertEqual(tuple(self.sum_row_pos.shape), (1, 3, 2))
+        for t, (s0, s1) in enumerate(rows):
+            self.assertEqual(int(self.sum_row_pos[0, t, 0]), s0)
+            self.assertEqual(int(self.sum_row_pos[0, t, 1]), s1)
+        self.assertTrue(bool(self.sum_row_valid.all()))
 
-    def test_prev_mean_columns(self):
-        rows = sum_rows(3)
-        # Turn 3 S0: same-slot COMPs of turns 1-2 only (own-turn C0 at
-        # s0-2 is excluded).
-        s0, s1 = rows[2]
-        self.assertEqual(self.sum_prev[0, s0].nonzero().flatten().tolist(),
-                         [rows[0][0] - 2, rows[1][0] - 2])
-        self.assertEqual(self.sum_prev[0, s1].nonzero().flatten().tolist(),
-                         [rows[0][1] - 2, rows[1][1] - 2])
-        # Turn 1 has no previous mean.
-        self.assertEqual(float(self.sum_prev[0, rows[0][0]].sum()), 0.0)
-        # Normalized rows: every valid row sums to 1.
-        for s0, s1 in rows[1:]:
-            self.assertAlmostEqual(float(self.sum_prev[0, s0].sum()), 1.0,
-                                   places=6)
-            self.assertAlmostEqual(float(self.sum_prev[0, s1].sum()), 1.0,
-                                   places=6)
-
-    def test_prev_sum_selector(self):
-        rows = sum_rows(3)
-        # Each row >= turn 2 selects exactly the previous same-slot SUM.
-        self.assertEqual(self.sum_prev_sum[0, rows[1][0]].nonzero()
-                         .flatten().tolist(), [rows[0][0]])
-        self.assertEqual(self.sum_prev_sum[0, rows[1][1]].nonzero()
-                         .flatten().tolist(), [rows[0][1]])
-        self.assertEqual(self.sum_prev_sum[0, rows[2][0]].nonzero()
-                         .flatten().tolist(), [rows[1][0]])
-        # Turn-1 rows select nothing.
-        self.assertEqual(float(self.sum_prev_sum[0, rows[0][0]].sum()), 0.0)
-        self.assertEqual(float(self.sum_prev_sum[0, rows[0][1]].sum()), 0.0)
+    def test_uneven_batch_rows(self):
+        # A two-row batch with different turn counts: the shorter row
+        # gets invalid slots (position 0) beyond its turns.
+        short = make_merge_input(2, u_len=2)
+        L = self.ids.shape[1]
+        pad = L - short.shape[1]
+        short_padded = torch.cat(
+            [torch.zeros(1, pad, dtype=short.dtype), short], dim=1)
+        ids2 = torch.cat([self.ids, short_padded], dim=0)
+        (c2, s2, a2, pos2, valid2) = \
+            self.model.model.get_comp_sum_mask(ids2)
+        self.assertEqual(tuple(pos2.shape), (2, 3, 2))
+        self.assertTrue(bool(valid2[0].all()))
+        self.assertTrue(bool(valid2[1, 0].all())
+                        and bool(valid2[1, 1].all()))
+        self.assertFalse(bool(valid2[1, 2].any()))
+        self.assertEqual(int(pos2[1, 2, 0]), 0)
+        # Short-row SUM positions match make_merge_input(2) shifted by
+        # the left padding.
+        rows_short = sum_rows(2, u_len=2)
+        self.assertEqual(int(pos2[1, 0, 0]), rows_short[0][0] + pad)
+        self.assertEqual(int(pos2[1, 1, 1]), rows_short[1][1] + pad)
 
     def test_official_mask_unchanged(self):
         # The official (normalized tril) mask rows sum to 1 exactly where
@@ -174,34 +166,52 @@ class TestGammaMasks(unittest.TestCase):
 
 
 class TestGammaRecurrence(unittest.TestCase):
-    """The vectorized scan equals a manual per-turn gold recurrence."""
+    """The gather-based scan equals a manual per-turn gold recurrence."""
 
     def test_scan_matches_gold_loop(self):
         torch.manual_seed(7)
         model = make_model()
         attach_gamma(model, hidden=16)
         ids = make_merge_input(3)
-        masks = model.model.get_comp_sum_mask(ids)
-        comp_mask, sum_mask, sum_attn, sum_prev, sum_prev_sum, sum_count = masks
+        (comp_mask, sum_mask, sum_attn,
+         sum_row_pos, sum_row_valid) = model.model.get_comp_sum_mask(ids)
         gamma = model.model.layers[0].self_attn.gamma
         with torch.no_grad():
             gamma.s.copy_(torch.tensor(0.37))
             B, L = ids.shape
             H, D = 2, model.model.layers[0].self_attn.head_dim
+            T = int(sum_row_pos.shape[1])
             K = torch.randn(B, H, L, D)
-            # Vectorized scan (mirrors the vendored merge block).
+            # Gather-based scan (mirrors the vendored merge block).
             base = torch.matmul(sum_attn.unsqueeze(1), K)
-            prev = torch.matmul(sum_prev.unsqueeze(1), K)
-            t = sum_count.unsqueeze(1).unsqueeze(-1)
-            cur = t * base - (t - 1) * prev
-            res = torch.zeros_like(K)
-            for t_i in range(2, int(sum_count.max()) + 1):
-                res_prev = torch.matmul(sum_prev_sum.unsqueeze(1), res)
-                rows_t = (sum_count == t_i).float().unsqueeze(0).unsqueeze(-1)
-                res = res + gamma(prev + res_prev, cur, sum_count) * rows_t
-            merged = K + res
-            # Manual gold: per SUM row in turn order, M_{t-1} carries the
-            # previous same-slot SUM's own residual.
+            n_rows = T * 2
+            idx = sum_row_pos.reshape(B, n_rows).unsqueeze(1)
+            idx = idx.expand(B, H, n_rows).unsqueeze(-1).expand(
+                -1, -1, -1, D)
+            k_base = torch.gather(base, 2, idx).reshape(B, H, T, 2, D)
+            t = torch.arange(1, T + 1).float().view(1, 1, T, 1, 1)
+            prev_shift = torch.zeros_like(k_base)
+            prev_shift[:, :, 1:, :, :] = k_base[:, :, :-1, :, :]
+            k_cur = t * k_base - (t - 1) * prev_shift
+            valid = sum_row_valid.float().unsqueeze(1).unsqueeze(-1)
+            res_prev = torch.zeros(B, H, 2, D)
+            res_all = torch.zeros_like(k_base)
+            for t_i in range(2, T + 1):
+                tt = torch.full((B, 1), float(t_i))
+                # M_{t-1} = previous turn's base (index t_i-2) + residual.
+                res_t = gamma(k_base[:, :, t_i - 2] + res_prev,
+                              k_cur[:, :, t_i - 1], tt)
+                res_t = res_t * valid[:, :, t_i - 1]
+                res_prev = res_t
+                res_all[:, :, t_i - 1] = res_t
+            res_full = torch.zeros_like(K)
+            for b in range(B):
+                res_full[b] = res_full[b].index_add(
+                    1, sum_row_pos[b].reshape(-1),
+                    res_all[b].reshape(H, -1, D))
+            merged = K + res_full
+            # Manual gold: per turn, M_{t-1} = base of the previous
+            # same-slot SUM plus its residual (register recurrence).
             def apply_row(m_prev, cur_row, t_i):
                 # [H, D] -> gamma([1, H, 1, D], [1, H, 1, D], [[t_i]])
                 x = m_prev.unsqueeze(0).unsqueeze(2)
@@ -210,15 +220,17 @@ class TestGammaRecurrence(unittest.TestCase):
 
             gold = torch.zeros_like(K)
             rows = sum_rows(3)
-            order = [p for pair in rows for p in pair]  # S0,S1 per turn
-            for i in order:
-                t_i = int(sum_count[0, i])
-                if t_i < 2:
-                    continue
-                prev_sum_row = sum_prev_sum[0, i].nonzero()
-                m_prev = prev[0, :, i] if not len(prev_sum_row) else \
-                    prev[0, :, i] + gold[0, :, int(prev_sum_row[0])]
-                gold[0, :, i] = apply_row(m_prev, cur[0, :, i], t_i)
+            gold_prev = torch.zeros(2, H, D)  # per-slot register state
+            for t_i in range(2, T + 1):
+                for slot in (0, 1):
+                    i = rows[t_i - 1][slot]
+                    j_prev = rows[t_i - 2][slot]
+                    m_prev = base[0, :, j_prev] + gold_prev[slot]
+                    cur_row = (float(t_i) * base[0, :, i]
+                               - float(t_i - 1) * base[0, :, j_prev])
+                    res_row = apply_row(m_prev, cur_row, t_i)
+                    gold_prev[slot] = res_row
+                    gold[0, :, i] = res_row
             self.assertTrue(torch.allclose(merged, K + gold, rtol=1e-5,
                                            atol=1e-6))
 
@@ -241,9 +253,11 @@ class TestGammaLongRecurrence(unittest.TestCase):
             out = ours(input_ids=ids).logits
         self.assertTrue(torch.isfinite(out).all())
         self.assertFalse(torch.allclose(ref, out, rtol=0, atol=1e-9))
-        # All 20 turns are counted.
-        _, _, _, _, _, sum_count = ours.model.get_comp_sum_mask(ids)
-        self.assertEqual(int(sum_count.max()), 20)
+        # All 20 turns are indexed.
+        _, _, _, row_pos, row_valid = \
+            ours.model.get_comp_sum_mask(ids)
+        self.assertEqual(tuple(row_pos.shape), (1, 20, 2))
+        self.assertTrue(bool(row_valid.all()))
         # The pure-mean (s=0) path still matches the official model.
         with torch.no_grad():
             for layer in ours.model.layers:

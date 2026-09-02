@@ -81,8 +81,10 @@ class GammaResidual(nn.Module):
         Returns:
             Residual [B, H, L, D]; exactly zero while the gate s == 0.
         """
-        feat = time_features(t, self.time_freqs).unsqueeze(1)  # [B, 1, L, T]
-        feat = feat.expand(-1, prev.size(1), -1, -1)           # [B, H, L, T]
+        feat = time_features(t, self.time_freqs).unsqueeze(1)  # [B, 1, L_t, T]
+        # The time axis broadcasts to the row axis (L_t may be 1 when the
+        # scan calls gamma per turn on the gathered SUM rows).
+        feat = feat.expand(-1, prev.size(1), prev.size(2), -1)
         x = torch.cat([prev, cur, feat], dim=-1)
         return self.s * self.U(torch.tanh(self.V(x)))
 

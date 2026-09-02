@@ -51,9 +51,9 @@ class CCMHostAdapter:
         self._cache: List[Optional[tuple]] = [None] * self.n_layers
 
         def make_cb(index):
-            def cb(key_states, value_states, sum_mask, sum_count):
+            def cb(key_states, value_states, sum_mask, sum_row_pos):
                 self._cache[index] = (key_states, value_states, sum_mask,
-                                      sum_count)
+                                      sum_row_pos)
             return cb
 
         for i, layer in enumerate(base.layers):

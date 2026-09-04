@@ -74,19 +74,36 @@ def build_collator(dialog, tokenizer, comp_args, comp_type, sum_recur):
         label_pad_token_id=-100)
 
 
+def _hash_dialogs(dialogs):
+    import hashlib
+    h = hashlib.sha256()
+    for d in dialogs:
+        for t in d:
+            h.update(bytes(t))
+    return h.hexdigest()
+
+
 def eval_split(model, collator, dialogs, device, limit, name,
                use_ccm=True):
     """One condition over bucketed dialogues -> per-bucket NLL.
 
     use_ccm=False forwards the raw LLaMA path (no attention_mask_comp
     kwarg); the uncompressed constructions carry no comp tokens so the
-    plain forward is exact."""
+    plain forward is exact.
+
+    P0 (review ruling): the official _concat_dialog mutates the
+    utterance token lists in place (token_ += ...), so every dialogue
+    handed to the collator must be a DEEP copy, and the source dialogs
+    must be bit-identical before and after the whole evaluation.
+    """
+    h_before = _hash_dialogs(dialogs)
     per_bucket = {}
     for b in sorted(TURN_BUCKETS):
         items = [d for d in dialogs if bucket_of(d) == b]
         if limit:
             items = items[:limit]
-        items = [{"dialog": d, "act": [], "is_train": False}
+        items = [{"dialog": [list(t) for t in d], "act": [],
+                  "is_train": False}
                  for d in items]
         total = 0.0
         n_tok = 0
@@ -108,6 +125,10 @@ def eval_split(model, collator, dialogs, device, limit, name,
                          "dialogues": len(items)}
         print("{} {}: nll={:.4f} ({} tok, {} dlg)".format(
             name, b, nll, n_tok, len(items)), flush=True)
+    h_after = _hash_dialogs(dialogs)
+    assert h_before == h_after, (
+        "P0 violation: eval dialogs mutated during {} evaluation".format(
+            name))
     return per_bucket
 
 
@@ -166,9 +187,11 @@ def eval_truncated(model, collator, dialogs, device, limit, name,
     t-th turn only (sample_dialog predicts dialog[-1]).  The sample set
     is identical across time steps up to the len >= t filter (matching
     the official Table 23 note)."""
+    h_before = _hash_dialogs(dialogs)
     per_t = {}
     for t in TIME_STEPS:
-        items = [{"dialog": d[:t], "act": [], "is_train": False}
+        items = [{"dialog": [list(u) for u in d[:t]],
+                  "act": [], "is_train": False}
                  for d in dialogs if len(d) >= t]
         if limit:
             items = items[:limit]
@@ -192,6 +215,10 @@ def eval_truncated(model, collator, dialogs, device, limit, name,
                          "dialogues": len(items)}
         print("{} t={}: nll={:.4f} ({} tok, {} dlg)".format(
             name, t, nll, n_tok, len(items)), flush=True)
+    h_after = _hash_dialogs(dialogs)
+    assert h_before == h_after, (
+        "P0 violation: eval dialogs mutated during {} evaluation".format(
+            name))
     return per_t
 
 

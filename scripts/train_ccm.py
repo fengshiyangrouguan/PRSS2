@@ -112,6 +112,12 @@ def parse_args():
     p.add_argument("--z-dim", type=int, default=128)
     p.add_argument("--rpbe-seed", type=int, default=0)
     p.add_argument("--gamma-hidden", type=int, default=64)
+    p.add_argument("--foundation", default="",
+                   help="path to an official Step-1 default-LoRA adapter "
+                        "dir (e.g. llama-7b-no); its weights are MERGED "
+                        "into the base model before training — the "
+                        "official two-stage protocol.  Empty = train "
+                        "from theta_0 on the raw LLaMA (single-stage).")
     p.add_argument("--calibrate-lambda", action="store_true",
                    help="measure r_eff on the first closed window and exit")
     # monitoring
@@ -517,6 +523,15 @@ def main():
 
     tokenizer = build_tokenizer(args)
     model = build_model(args, device)
+    if args.foundation:
+        # Official two-stage protocol: merge the Step-1 default LoRA
+        # (llama-7b-no) into the base weights BEFORE attaching our
+        # conditional LoRA / Gamma.  The official merge path adds
+        # (B @ A) * scaling to the frozen params directly and needs no
+        # LoRA structure on the model.
+        from src.model import load_lora_weight
+        load_lora_weight(args.foundation, model, merge=True)
+        print("[foundation] merged {}".format(args.foundation), flush=True)
     model = wrap_lora(model, args.lora_r)
     # The PEFT wrap can replace the CausalLM wrapper; re-assert the
     # comp/sum token registration on the wrapped object.

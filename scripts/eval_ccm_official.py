@@ -3,19 +3,23 @@
 ruling): data construction, collator, and the PPL metric all come from
 the UNMODIFIED official code (DialogueDataset.eval_dataset /
 DataCollatorForDialogue_LLAMA / CompSeq2SeqTrainer.evaluate_perp).
-Only the model is swapped:
+Only the model is swapped.
 
-  --official-adapter <dir>   load an official adapter through the
-                             official load path (llama-7b-no foundation
-                             LoRA or a released compression adapter).
-  --our-ckpt <file>          load OUR trained arm (LoRA + Gamma).
+Runs as a hydra application exactly like the official train.py (the
+config_path is resolved relative to the vendored src directory, so we
+chdir there first).  Usage:
 
-The official eval_dataset buckets are turn_3/4/6/10/14 (released
-protocol, pooled val+test); evaluate_perp returns the official
-perplexity = exp(token-normalized log-likelihood, EOS excluded).
+  # official adapter (foundation LoRA or released compression adapter)
+  python scripts/eval_ccm_official.py +dialog=llama-7b \\
+      model.model_name_or_path=/path/llama-7b-hf \\
+      training.eval_path=/path/to/adapter training.do_train=false \\
+      wandb.log=false
+
+  # OUR trained arm (LoRA + Gamma), same official evaluator
+  OUR_CKPT=/path/final.pt python scripts/eval_ccm_official.py \\
+      +dialog=llama-7b model.model_name_or_path=/path/llama-7b-hf \\
+      training.do_train=false wandb.log=false
 """
-import argparse
-import json
 import os
 import sys
 from pathlib import Path
@@ -30,78 +34,71 @@ os.environ["DIALOG_MIRROR"] = os.environ.get(
     "DIALOG_MIRROR",
     "/root/autodl-tmp/dailydialog_mirror/ijcnlp_dailydialog")
 
-import torch
-from hydra import initialize, compose
+# hydra 1.3/1.4 resolves config_path relative to THIS SCRIPT's
+# directory, not the cwd; point at the vendored config tree with a
+# relative path.
+import hydra  # noqa: E402
+import torch  # noqa: E402
 
-import train_ccm as tc
-
-
-def build_official_args(model_name_or_path, attn_type="merge_recur",
-                        num_comp_tokens=2, official_adapter="",
-                        load_path=""):
-    overrides = [
-        "+dialog=llama-7b",
-        "model.model_name_or_path={}".format(model_name_or_path),
-        "training.comp.attn_type={}".format(attn_type),
-        "training.comp.num_comp_tokens={}".format(num_comp_tokens),
-        "training.comp.comp_type=online",
-        "training.eval_path={}".format(official_adapter),
-        "training.load_path={}".format(load_path),
-        "training.do_train=false",
-        "training.do_eval=true",
-        "wandb.log=false",
-        "training.output_dir=/tmp/ccm_official_eval",
-    ]
-    with initialize(config_path=str(CCM / "src" / "config"),
-                    version_base="1.1"):
-        cfg = compose(config_name="config", overrides=overrides)
-    from src.arguments import global_setup
-    return global_setup(cfg)
+import train_ccm as tc  # noqa: E402
+# module-level import: registers the hydra ConfigStore entry
+# "base_config" BEFORE the @hydra.main decorator resolves the config.
+from src.arguments import global_setup  # noqa: E402
 
 
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--model-name-or-path",
-                    default="/root/autodl-tmp/llama-7b-hf")
-    ap.add_argument("--official-adapter", default="")
-    ap.add_argument("--our-ckpt", default="")
-    ap.add_argument("--out", default="eval_official.json")
-    a = ap.parse_args()
-
-    args = build_official_args(
-        a.model_name_or_path,
-        official_adapter=a.official_adapter)
+@hydra.main(config_path="../third_party/ccm/src/config",
+            config_name="config", version_base="1.1")
+def main(args) -> None:
+    args = global_setup(args)
     args.training.fp16 = True
     args.training.fp16_full_eval = True
-    args.training.do_eval = True
     args.training.do_train = False
+    args.training.do_eval = True
 
     from src.model import load_model, load_pretrained
+    # The official foundation adapter (llama-7b-no, Step-1 default LoRA)
+    # is a MERGED model: it goes through training.load_path, which the
+    # official load_model merges into the base weights (merge=True).
+    # Only the compression adapters go through training.eval_path.
     model, tokenizer = load_model(args)
-    if a.official_adapter:
+
+    our_ckpt = os.environ.get("OUR_CKPT", "")
+    if args.training.eval_path != '':
         load_pretrained(args.training.eval_path, model,
                         lora=args.training.peft)
         print("official adapter loaded via official path: {}"
-              .format(a.official_adapter), flush=True)
-    elif a.our_ckpt:
-        # Model swap: rebuild through our pipeline (same official arch,
-        # conditional LoRA, Gamma) and restore our trainable state.
-        our_args = tc.parse_args().parse_args([])
-        our_args.arm = "ours"
-        our_args.model_name_or_path = a.model_name_or_path
-        our_args.relative_embedding = "skip"
-        our_args.lora_r = 8
-        our_args.gamma_hidden = 64
-        model = tc.build_model(our_args, torch.device("cuda", 0))
+              .format(args.training.eval_path), flush=True)
+    elif our_ckpt:
+        # Build-mode swap: construct OUR model object exactly as in
+        # training (same arch/config/conditional-LoRA/Gamma pipeline)
+        # and hand it to the OFFICIAL data+collator+metric.  The
+        # official load_model result is discarded.
+        import types
+        del model
+        torch.cuda.empty_cache()
+        our_args = types.SimpleNamespace(
+            arm="ours",
+            model_name_or_path=args.model.model_name_or_path,
+            relative_embedding="skip",
+            lora_r=8, gamma_hidden=64)
+        device = torch.device("cuda", 0)
+        model = tc.build_model(our_args, device)
         model = tc.wrap_lora(model, our_args.lora_r)
         model.update_comp_token(
             [32000 + k for k in range(tc.N_TOK)],
             [32000 + tc.N_TOK + k for k in range(tc.N_TOK)])
-        tc.attach_gamma(model, hidden=our_args.gamma_hidden)
+        _gammas = tc.attach_gamma(model, hidden=our_args.gamma_hidden)
+        # Gamma modules are plain attribute assignments (not registered
+        # submodules), so model.to(fp16) does NOT traverse them and the
+        # official evaluate_perp path (fp16, no autocast) would hit a
+        # dtype mismatch.  Cast them explicitly.
+        for _g in _gammas:
+            _g.half()
         dummy = torch.optim.AdamW(
             [p for p in model.parameters() if p.requires_grad], lr=1e-3)
-        tc.load_trainable(a.our_ckpt, model, dummy, torch.device("cuda", 0))
-        print("our checkpoint loaded: {}".format(a.our_ckpt), flush=True)
+        tc.load_trainable(our_ckpt, model, dummy, device)
+        print("our checkpoint loaded (build mode): {}".format(our_ckpt),
+              flush=True)
 
     from src.data.load import load_dataset_metric_collator
     _, eval_dataset, _, collator = load_dataset_metric_collator(
@@ -126,9 +123,11 @@ def main():
         print("{}: perplexity={:.4f} loss={:.4f}".format(
             eval_name, metrics["perplexity"], metrics["loss"]), flush=True)
 
-    with open(a.out, "w") as f:
+    import json
+    out = os.environ.get("EVAL_OUT", "eval_official.json")
+    with open(out, "w") as f:
         json.dump(results, f, indent=2)
-    print("official evaluator done -> {}".format(a.out), flush=True)
+    print("official evaluator done -> {}".format(out), flush=True)
 
 
 if __name__ == "__main__":

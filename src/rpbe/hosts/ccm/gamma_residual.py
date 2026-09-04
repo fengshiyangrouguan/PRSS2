@@ -38,8 +38,13 @@ def time_features(t: torch.Tensor, freqs: torch.Tensor) -> torch.Tensor:
     Returns:
         [*t.shape, 2 * TIME_FREQS] with sin/cos pairs per frequency.
     """
-    t = t.float()
-    ang = t.unsqueeze(-1) * freqs.to(device=t.device, dtype=t.dtype)
+    # Follow the model dtype: under training autocast the freqs buffer is
+    # fp32 and this matches the old t.float() behavior; under a plain
+    # fp16 forward (official evaluate_perp has no autocast) t must stay
+    # fp16 or the concatenated feature promotes to fp32 and the fp16
+    # Linear raises a dtype mismatch.
+    t = t.to(dtype=freqs.dtype)
+    ang = t.unsqueeze(-1) * freqs.to(device=t.device)
     return torch.cat([torch.sin(ang), torch.cos(ang)], dim=-1)
 
 
@@ -85,7 +90,12 @@ class GammaResidual(nn.Module):
         # The time axis broadcasts to the row axis (L_t may be 1 when the
         # scan calls gamma per turn on the gathered SUM rows).
         feat = feat.expand(-1, prev.size(1), prev.size(2), -1)
-        x = torch.cat([prev, cur, feat], dim=-1)
+        # Defensive cast: the official merge path carries fp32
+        # intermediates (turn counters etc.), and the plain-fp16
+        # evaluate_perp path has no autocast to align them.
+        wd = self.V.weight.dtype
+        x = torch.cat([prev.to(dtype=wd), cur.to(dtype=wd),
+                       feat.to(dtype=wd)], dim=-1)
         return self.s * self.U(torch.tanh(self.V(x)))
 
     def n_params(self) -> int:

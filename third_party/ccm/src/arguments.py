@@ -251,6 +251,12 @@ class DataTrainingArguments:
         default="dialog",
         metadata={"help": "The name of the dataset to use (via the datasets library)."},
     )
+    clean_split: bool = field(
+        default=False,
+        metadata={"help": ("RPBE: use the official train/validation/test split "
+                           "(validation feeds the eval buckets) instead of the "
+                           "pooled val+test.")},
+    )
     max_length: Optional[int] = field(default=1024)
     max_example_length: Optional[int] = field(default=256)
     k: Optional[int] = field(default=16)

@@ -61,9 +61,11 @@ class EmbodiedCutRow:
     cut_id: tuple
     horizon: int
     z: torch.Tensor                # [4096] detached
-    context: dict                  # {horizon, delta_s, instruction_hash, vision_feat}
-    outcome: torch.Tensor          # [112] normalized action chunk
+    context: dict                  # {horizon, delta_s, instruction, vision_feat}
+    outcome: torch.Tensor          # [112] normalized action chunk (replaced by
+                                   # the fixed map P at window-add time)
     weight: float
+    param_version: int = 0         # LoRA+Gamma version at merge write time
 
 
 class PendingMergeQueue:
@@ -78,11 +80,18 @@ class PendingMergeQueue:
         self.horizon_weights = horizon_weights
         self.n_censored = 0          # merges whose Y2 never matured
         self.n_missing_y1 = 0
+        self.ep_merge_count: Dict[int, int] = {}   # review ruling: per-episode
+                                                   # merge counts for weights
 
     def register(self, rec: MergeRecord) -> None:
         key = (rec.episode_id, rec.merge_id)
         assert key not in self.pending, f"duplicate merge {key}"
         self.pending[key] = PendingMerge(rec=rec)
+        self.ep_merge_count[rec.episode_id] = (
+            self.ep_merge_count.get(rec.episode_id, 0) + 1)
+
+    def n_merges_for(self, episode_id: int) -> int:
+        return self.ep_merge_count.get(episode_id, 1)
 
     def offer(self, episode_id: int, decision_idx: int,
               context: dict, outcome: torch.Tensor) -> List[EmbodiedCutRow]:
@@ -110,12 +119,15 @@ class PendingMergeQueue:
                 pm.c2 = context
         return []
 
-    def drain_episode(self, episode_id: int, n_merges: int) -> List[EmbodiedCutRow]:
+    def drain_episode(self, episode_id: int,
+                      n_merges: Optional[int] = None) -> List[EmbodiedCutRow]:
         """Episode end: only merges with BOTH futures become rows.
 
         tree_weight = 1/n_merges (per-episode merge count), split by
         HORIZON_OMEGA.  Merges with any missing future are censored
         (counted, dropped)."""
+        if n_merges is None:
+            n_merges = self.n_merges_for(episode_id)
         rows: List[EmbodiedCutRow] = []
         for key, pm in list(self.pending.items()):
             if pm.rec.episode_id != episode_id:
@@ -140,13 +152,18 @@ class PendingMergeQueue:
         base = tree_weight / self.omega_sum
         rows = []
         for h, (y, c) in enumerate(((pm.y1, pm.c1), (pm.y2, pm.c2)), start=1):
+            ctx = dict(c or {})
+            # review ruling B3: horizon / delta_s must reflect THIS row
+            ctx["horizon"] = h
+            ctx["delta_s"] = float(h)
             rows.append(EmbodiedCutRow(
                 cut_id=rec.cut_id(),
                 horizon=h,
                 z=rec.merged_state,
-                context=c or {"horizon": h, "delta_s": h},
+                context=ctx,
                 outcome=y,
                 weight=base * self.horizon_weights[h - 1],
+                param_version=rec.param_version,
             ))
         return rows
 

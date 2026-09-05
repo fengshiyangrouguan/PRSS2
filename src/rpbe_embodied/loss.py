@@ -189,6 +189,14 @@ class EmbodiedRPBEWindow:
     def add(self, rows: List[EmbodiedCutRow]) -> None:
         assert not self.closed
         for r in rows:
+            # review ruling B5: a statistics window must never mix merge
+            # states written by different parameter versions; the trainer
+            # closes windows at every repr boundary, this is fail-fast
+            if self.rows:
+                existing_v = next(iter(self.rows.values())).param_version
+                assert r.param_version == existing_v, (
+                    f"window mixes param versions {existing_v} and "
+                    f"{r.param_version}")
             key = r.cut_id + (r.horizon,)
             self.rows[key] = r   # row_id dedup: distinct horizons both stay
 
@@ -197,10 +205,16 @@ class EmbodiedRPBEWindow:
         return len({r.cut_id for r in self.rows.values()})
 
     def ready(self) -> bool:
+        # review ruling B5: the gate is exactly min_abs (the min_ratio * m
+        # product made --kf-min-abs misleading; that coupling is removed)
+        return self.n_unique_cuts >= self.min_abs
+
+    def discard(self) -> int:
+        """Drop an underfull window (review ruling B5: windows never span
+        parameter versions; the trainer discards them at repr boundaries)."""
         n = self.n_unique_cuts
-        m_ref = max(64, 1)  # sketch dim m; gate = max(min_ratio * m, min_abs)
-        threshold = max(self.min_ratio * m_ref, self.min_abs)
-        return n >= threshold
+        self.closed = True
+        return n
 
     def close(self) -> Tuple[float, Dict[tuple, torch.Tensor], dict]:
         """Assemble thin rows -> adjoint -> (j_float, g_by_cut, diagnostics)."""

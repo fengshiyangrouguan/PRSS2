@@ -180,11 +180,19 @@ def main() -> None:
             collate_fn=collator, drop_last=True)
         print("val episodes:", len(val_dataset), flush=True)
 
-    def run_eval(step: int) -> None:
-        """Val-split action loss over min(40, len) batches; banks reset
-        before/after so val episodes never pollute the training bank."""
+    def run_eval(step: int) -> float:
+        """Val-split action loss over min(40, len) batches.
+
+        Review ruling B6: full save/restore of the training memory state
+        (banks, provenance, id counters, stream cursor) so validation can
+        never truncate a training episode or desync the id numbering.
+        Returns the mean val loss (inf on failure)."""
+        import copy
+        bank = vla.cog_mem_bank
+        saved = (copy.deepcopy(bank.bank), copy.deepcopy(bank.prov),
+                 bank.next_node_id, bank.next_merge_id, bank.eid_stream)
         vla.eval()
-        vla.cog_mem_bank.reset()
+        bank.reset()
         vla.per_mem_bank.reset()
         losses = []
         n_batches = 0
@@ -213,13 +221,17 @@ def main() -> None:
                     )
                 losses.append(loss.item())
                 n_batches += 1
-        vla.cog_mem_bank.reset()
+        # restore the full training memory state (B6)
+        bank.bank, bank.prov, bank.next_node_id, bank.next_merge_id, \
+            bank.eid_stream = saved
         vla.per_mem_bank.reset()
         vla.train()
         if losses:
             mean = sum(losses) / len(losses)
             print(f"[eval @ {step}] val action loss {mean:.4f} "
                   f"({len(losses)} batches)", flush=True)
+            return mean
+        return float("inf")
 
     # --- optimizers: opt_task every block; opt_repr at repr boundaries ---
     task_modules = [vla.cog_mem_bank, vla.per_mem_bank, vla.per_compr,
@@ -232,6 +244,16 @@ def main() -> None:
                    if p.requires_grad and id(p) not in repr_ids]
     opt_task = torch.optim.AdamW(task_params, lr=args.lr)
     opt_repr = torch.optim.AdamW(repr_params, lr=args.lr)
+    # cosine decay with warmup (review ruling: warmup/cosine were declared
+    # but never implemented)
+    def lr_lambda(step):
+        if step < args.warmup_steps:
+            return step / max(1, args.warmup_steps)
+        progress = (step - args.warmup_steps) / max(
+            1, args.max_steps - args.warmup_steps)
+        return 0.5 * (1.0 + math.cos(math.pi * progress))
+    sched_task = torch.optim.lr_scheduler.LambdaLR(opt_task, lr_lambda)
+    sched_repr = torch.optim.lr_scheduler.LambdaLR(opt_repr, lr_lambda)
     print(f"task params: {sum(p.numel() for p in task_params)/1e6:.2f}M | "
           f"repr params: {sum(p.numel() for p in repr_params)/1e6:.2f}M",
           flush=True)
@@ -298,13 +320,68 @@ def main() -> None:
         nonlocal_ep_counter = 0
         for eid in eids:
             if last_eid is not None and eid != last_eid:
-                rows = queue.drain_episode(
-                    last_eid, n_merges=max(1, bank.next_merge_id))
+                # per-episode merge count (review ruling: was passing the
+                # cumulative next_merge_id, which distorted tree weights)
+                rows = queue.drain_episode(last_eid)
                 if window is not None and rows:
+                    # B3: the fixed map replaces the raw 112D outcome; the
+                    # window statistics run on P = psi(C, Y) in R^64
+                    for r in rows:
+                        r.outcome = maps.pv(r.context, r.outcome)
                     window.add(rows)
                 nonlocal_ep_counter += 1
             last_eid = eid
         episodes_since_boundary += nonlocal_ep_counter
+
+    def _ckpt_dict():
+        """Checkpoint payload (B7): flat trainable increments + full
+        metadata so a resume can rebuild the exact arm configuration."""
+        return {
+            "model": {n: p.detach().cpu()
+                      for n, p in vla.named_parameters()
+                      if p.requires_grad},
+            "lora_config": {"r": lora_config.r,
+                            "lora_alpha": lora_config.lora_alpha,
+                            "lora_dropout": lora_config.lora_dropout},
+            "arm": args.arm,
+            "step": step,
+            "param_version": vla.cog_mem_bank.param_version,
+            "mem_length": args.mem_length,
+            "lambda_rpbe": args.lambda_rpbe,
+            "seed": args.seed,
+            "task_filter": args.task_filter,
+            "best_val": best_val,
+        }
+
+    best_val = float("inf")
+    if args.resume_from:
+        ck = torch.load(args.resume_from, map_location="cpu",
+                        weights_only=False)
+        named = dict(vla.named_parameters())
+        missing, unexpected = [], []
+        for n, t in ck["model"].items():
+            if n in named and named[n].requires_grad:
+                named[n].data.copy_(t.to(named[n].dtype))
+            else:
+                unexpected.append(n)
+        step = ck.get("step", 0)
+        best_val = ck.get("best_val", float("inf"))
+        vla.cog_mem_bank.param_version = ck.get("param_version", 0)
+        print(f"resumed from {args.resume_from} @ step {step} "
+              f"(unexpected keys: {len(unexpected)})", flush=True)
+        # fast-forward the data stream so the batch sequence matches the
+        # checkpoint exactly (HDF5 stream is deterministic per seed)
+        n_rows = step * args.batch_size
+        it = iter(train_loader)
+        consumed = 0
+        while consumed < n_rows:
+            try:
+                b = next(it)
+                consumed += len(b["input_ids"])
+            except StopIteration:
+                raise RuntimeError(
+                    "resume step beyond dataset epoch boundary")
+        train_loader = it
 
     while step < args.max_steps:
         for batch in train_loader:
@@ -316,6 +393,19 @@ def main() -> None:
                                 for k, v in pixel_values.items()}
             else:
                 pixel_values = pixel_values.to("cuda", dtype=torch.bfloat16)
+
+            # B4a: snapshot ALL current merged-entry leaves (with their
+            # (eid, node_id)) BEFORE backward; leaves that get re-merged or
+            # cleared this batch are still read from the snapshot after
+            # backward (refresh_leafs rebuilds clones every step, so any
+            # leaf not in this batch's graph has grad None).
+            leaf_snapshot = []
+            if vla.gamma is not None:
+                for eid, entries in vla.cog_mem_bank.bank.items():
+                    prov = vla.cog_mem_bank.prov.get(eid, [])
+                    for (_, f), meta in zip(entries, prov):
+                        if meta[4] and f.requires_grad:
+                            leaf_snapshot.append((f, eid, meta[0]))
 
             with torch.autocast("cuda", dtype=torch.bfloat16, enabled=True):
                 loss, _ = vla(
@@ -333,16 +423,14 @@ def main() -> None:
             (loss / args.grad_accum).backward()
             step += 1
 
-            # task cotangents from merged-entry leaves (plan §25)
+            # task cotangents from the leaf snapshot (plan §25, B4a)
             if vla.gamma is not None:
-                for eid, entries in vla.cog_mem_bank.bank.items():
-                    prov = vla.cog_mem_bank.prov.get(eid, [])
-                    for (_, f), meta in zip(entries, prov):
-                        if meta[4] and f.requires_grad and f.grad is not None:
-                            key = (eid, meta[0])
-                            g = f.grad.detach().clone().reshape(-1)
-                            task_cotangents[key] = (task_cotangents.get(
-                                key, torch.zeros_like(g)) + g)
+                for f, eid, node_id in leaf_snapshot:
+                    if f.grad is not None:
+                        key = (eid, node_id)
+                        g = f.grad.detach().clone().reshape(-1)
+                        task_cotangents[key] = (task_cotangents.get(
+                            key, torch.zeros_like(g)) + g)
                 vla.cog_mem_bank.refresh_leafs()
 
             if step % args.grad_accum == 0:
@@ -350,6 +438,7 @@ def main() -> None:
                     [p for p in task_params], args.grad_clip)
                 opt_task.step()
                 opt_task.zero_grad()
+                sched_task.step()
 
             if vla.gamma is not None and args.arm != "avg":
                 feed_merges_and_futures(batch)
@@ -368,69 +457,71 @@ def main() -> None:
                 print(f"step {step}/{args.max_steps} | loss {loss.item():.4f} "
                       f"{aux}{diag} | {dt/60:.1f} min", flush=True)
 
-            # repr macro boundary (SHARED clock across arms, review ruling 3)
-            if (vla.gamma is not None and episodes_since_boundary
-                    >= args.repr_boundary_episodes):
-                # 1) close RPBE window if ready (gamma-rpbe only); then
-                # start a FRESH window (single-close lifecycle)
-                if window is not None and window.ready():
-                    j, g_by_cut, diag = window.close()
-                    if g_by_cut:
-                        # remap cut_id (eid, merge_id, "cog") -> (eid, node_id)
-                        for k, g in g_by_cut.items():
-                            eid, mid, _ = k
-                            nid = merge_id_map.get((eid, mid))
-                            if nid is not None:
-                                key = (eid, nid)
-                                rpbe_cotangents[key] = g
-                        rpbe_pending_loss.append(j)
-                    print(f"[window close] J={j:.4f} "
-                          f"cuts={diag.get('n_unique_cuts')} "
-                          f"episodes={diag.get('n_unique_episodes')} "
-                          f"censored={queue.n_censored}", flush=True)
+            # repr macro boundary (SHARED clock across ALL arms, B2:
+            # the gamma check was removed -- avg's LoRA steps here too)
+            if episodes_since_boundary >= args.repr_boundary_episodes:
+                # B5: close the statistics window at every repr boundary so
+                # it never mixes parameter versions; underfull windows are
+                # discarded with a counter (fail-fast via window.add assert)
+                if window is not None and window.n_unique_cuts > 0:
+                    if window.ready():
+                        j, g_by_cut, diag = window.close()
+                        if g_by_cut:
+                            for k, g in g_by_cut.items():
+                                eid, mid, _ = k
+                                nid = merge_id_map.get((eid, mid))
+                                if nid is not None:
+                                    rpbe_cotangents[(eid, nid)] = g
+                            rpbe_pending_loss.append(j)
+                        print(f"[window close] J={j:.4f} "
+                              f"cuts={diag.get('n_unique_cuts')} "
+                              f"episodes={diag.get('n_unique_episodes')} "
+                              f"censored={queue.n_censored}", flush=True)
+                    else:
+                        n_discard = window.discard()
+                        print(f"[window discard] underfull "
+                              f"({n_discard} cuts < {rpbe_cfg.kf_min_abs})",
+                              flush=True)
                     window = EmbodiedRPBEWindow(
                         variant=rpbe_cfg.kf_variant, eps=rpbe_cfg.ridge_eps,
                         min_abs=rpbe_cfg.kf_min_abs)
-                # 2) replay Gamma against task (+ rpbe) cotangents
-                keys = list(task_cotangents.keys())
-                if keys and vla.gamma is not None:
-                    # (m_a, m_b) live in MergeRecords; all merges are in
-                    # merge_registry (survives queue drain)
-                    replay_keys = [k for k in keys if k in merge_registry]
-                    if replay_keys:
+                # B4b: task and RPBE replay INDEPENDENTLY (each uses its
+                # own key set; no intersection with the other's keys)
+                if vla.gamma is not None:
+                    # task replay
+                    keys = [k for k in task_cotangents if k in merge_registry]
+                    if keys:
                         m_a = torch.stack(
-                            [merge_registry[k].left_state
-                             for k in replay_keys]
+                            [merge_registry[k].left_state for k in keys]
                         ).to("cuda", dtype=torch.bfloat16)
                         m_b = torch.stack(
-                            [merge_registry[k].right_state
-                             for k in replay_keys]
+                            [merge_registry[k].right_state for k in keys]
                         ).to("cuda", dtype=torch.bfloat16)
                         l_task = gamma_replay_loss(
-                            vla.gamma, m_a, m_b, task_cotangents, replay_keys)
-                        l_total = l_task
-                        if rpbe_cotangents and args.lambda_rpbe > 0:
-                            rpbe_keys = [k for k in replay_keys
-                                         if k in rpbe_cotangents]
-                            if rpbe_keys:
-                                m_a_r = torch.stack(
-                                    [merge_registry[k].left_state
-                                     for k in rpbe_keys]
-                                ).to("cuda", dtype=torch.bfloat16)
-                                m_b_r = torch.stack(
-                                    [merge_registry[k].right_state
-                                     for k in rpbe_keys]
-                                ).to("cuda", dtype=torch.bfloat16)
-                                l_rpbe = gamma_replay_loss(
-                                    vla.gamma, m_a_r, m_b_r, rpbe_cotangents,
-                                    rpbe_keys)
-                                l_total = l_total - args.lambda_rpbe * l_rpbe
-                        l_total.backward()
-                        print(f"[repr step] task replay {l_task.item():.4f} "
-                              f"total {l_total.item():.4f}", flush=True)
+                            vla.gamma, m_a, m_b, task_cotangents, keys)
+                        l_task.backward()
+                        print(f"[repr step] task replay {l_task.item():.4f}",
+                              flush=True)
+                    # rpbe replay (independent key set)
+                    rkeys = [k for k in rpbe_cotangents
+                             if k in merge_registry]
+                    if rkeys and args.lambda_rpbe > 0:
+                        m_a_r = torch.stack(
+                            [merge_registry[k].left_state for k in rkeys]
+                        ).to("cuda", dtype=torch.bfloat16)
+                        m_b_r = torch.stack(
+                            [merge_registry[k].right_state for k in rkeys]
+                        ).to("cuda", dtype=torch.bfloat16)
+                        l_rpbe = gamma_replay_loss(
+                            vla.gamma, m_a_r, m_b_r, rpbe_cotangents, rkeys)
+                        (args.lambda_rpbe * l_rpbe).backward()
+                        print(f"[repr step] rpbe replay "
+                              f"{args.lambda_rpbe * l_rpbe.item():.4f}",
+                              flush=True)
                 torch.nn.utils.clip_grad_norm_(repr_params, args.grad_clip)
                 opt_repr.step()
                 opt_repr.zero_grad()
+                sched_repr.step()
                 vla.cog_mem_bank.param_version += 1
                 task_cotangents = {}
                 rpbe_cotangents = {}
@@ -440,20 +531,15 @@ def main() -> None:
                 episodes_since_boundary = 0
 
             if step % args.eval_every == 0 and args.eval_every > 0:
-                run_eval(step)
+                val_loss = run_eval(step)
+                # B7: best-val selection with a dedicated checkpoint
+                if val_loss < best_val:
+                    best_val = val_loss
+                    torch.save(_ckpt_dict(), run_dir / "best.pt")
+                    print(f"[best @ {step}] val {val_loss:.4f}", flush=True)
 
             if step % args.checkpoint_every == 0:
-                ckpt = {
-                    "model": {n: p.detach().cpu()
-                              for n, p in vla.named_parameters()
-                              if p.requires_grad},
-                    "lora_config": {"r": lora_config.r,
-                                    "lora_alpha": lora_config.lora_alpha,
-                                    "lora_dropout": lora_config.lora_dropout},
-                    "step": step,
-                    "param_version": vla.cog_mem_bank.param_version,
-                }
-                torch.save(ckpt, run_dir / "checkpoint.pt")
+                torch.save(_ckpt_dict(), run_dir / "checkpoint.pt")
                 print(f"checkpoint saved @ {step}", flush=True)
 
     torch.save({

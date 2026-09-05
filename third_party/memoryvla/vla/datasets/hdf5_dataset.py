@@ -90,13 +90,16 @@ class HDF5BatchTransform:
         input_ids, labels = torch.tensor(input_ids), torch.tensor(labels)
         pixel_values = self.image_transform(img)
 
-        # official BOUNDS_Q99 normalization (numpy replica)
+        # official BOUNDS_Q99 normalization (numpy replica, WITH the
+        # [-1, 1] clip -- review ruling: the clip changes the training
+        # target and the downstream RFF inputs)
         a = row["actions"].astype(np.float32)                 # [K, 7]
         a = np.where(
             self.action_mask,
             2.0 * (a - self.action_q01) / (self.action_q99 - self.action_q01 + NORM_EPS) - 1.0,
             np.zeros_like(a),
         )
+        a = np.clip(a, -1.0, 1.0)
         actions = torch.tensor(a, dtype=torch.float32)
 
         # Mask prompt tokens before the first <EOS-ish> token id 2

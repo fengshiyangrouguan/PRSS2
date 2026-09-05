@@ -539,16 +539,6 @@ class MemoryVLA(nn.Module):
             C_out=self.per_token_size,
         )
 
-        # Gamma merger (trainable when use_rpbe_gamma; alpha=0 zero-init
-        # makes the training start EXACTLY the official AvgMerge)
-        if use_rpbe_gamma:
-            from vla.gamma_merger import GammaMerger
-            self.gamma = GammaMerger(
-                dim=self.cog_token_size, rank=gamma_rank,
-                alpha_init=gamma_alpha_init)
-        else:
-            self.gamma = None
-
         self.cog_mem_bank = CogMemBank(
             dataloader_type=self.dataloader_type,
             group_size=self.group_size,
@@ -559,7 +549,7 @@ class MemoryVLA(nn.Module):
             fusion_type=self.fusion_type,
             consolidate_type=self.consolidate_type,
             update_fused=self.update_fused,
-            gamma=self.gamma,
+            gamma=None,
             record_merges=rpbe_merge_records,
             capture_task_grad=rpbe_task_grad,
         )
@@ -584,6 +574,21 @@ class MemoryVLA(nn.Module):
             use_per_attn=True,
             per_token_size=per_token_size,
         )
+
+        # Gamma merger (review ruling B1/B2): created AFTER all shared
+        # modules so shared init is identical across arms; init uses a
+        # LOCAL generator (rpbe_seed-derived) and never consumes the
+        # global RNG stream.  alpha=1 + U=0 keeps the training start
+        # EXACTLY the official AvgMerge while the learning path is open.
+        if use_rpbe_gamma:
+            from vla.gamma_merger import GammaMerger
+            self.gamma = GammaMerger(
+                dim=self.cog_token_size, rank=gamma_rank,
+                alpha_init=gamma_alpha_init,
+                seed=kwargs.get("rpbe_seed", 0))
+            self.cog_mem_bank.gamma = self.gamma
+        else:
+            self.gamma = None
 
         self.all_module_keys = []
         self._trainable_module_keys = []

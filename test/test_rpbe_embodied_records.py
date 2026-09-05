@@ -53,13 +53,26 @@ class TestPendingMergeQueue(unittest.TestCase):
 
     def test_drain_weights(self):
         q = PendingMergeQueue()
+        # 4 merges registered in the episode -> per-episode count = 4
+        for mid in range(4):
+            q.register(_mk_merge(0, mid, tau=3 + mid))
+            q.offer(0, 4 + mid, {}, torch.randn(112))
+            q.offer(0, 5 + mid, {}, torch.randn(112))
+        rows = q.drain_episode(0)                   # tree_weight = 1/4
+        self.assertEqual(len(rows), 8)              # 4 merges x 2 horizons
+        for r in rows:
+            self.assertAlmostEqual(r.weight, 0.25 * 0.5, places=6)
+
+    def test_param_version_propagates(self):
+        q = PendingMergeQueue()
         q.register(_mk_merge(0, 0, tau=3))
         q.offer(0, 4, {}, torch.randn(112))
         q.offer(0, 5, {}, torch.randn(112))
-        rows = q.drain_episode(0, n_merges=4)       # tree_weight = 1/4
-        self.assertEqual(len(rows), 2)
-        for r in rows:
-            self.assertAlmostEqual(r.weight, 0.25 * 0.5, places=6)
+        rows = q.drain_episode(0)
+        self.assertEqual(rows[0].param_version, 0)
+        # context horizon must reflect the row's horizon (B3)
+        self.assertEqual(rows[0].context["horizon"], 1)
+        self.assertEqual(rows[1].context["horizon"], 2)
 
 
 class TestEmbodiedFixedMaps(unittest.TestCase):

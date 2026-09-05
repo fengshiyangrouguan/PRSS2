@@ -54,7 +54,7 @@ TGN（图时序）与 CCM（对话 LLM）两个跨域实验已建立 RPBE 方法
 
 ### B. MemoryVLA vendored 改动（最小 diff，本机 `third_party/memoryvla/` ↔ 服务器 `/root/autodl-tmp/vla/` 同步）
 
-1. **新文件 `vla/gamma_merger.py`**：`GammaMerger(dim=4096, rank=64, alpha_init=0.0)`——`m_avg + α·U·MLP([P·m_a; P·m_b])`；P 随机（std=dim^-0.5）、MLP 末层与 U 零初始化、α 可训练标量从 0 起 → **起点严格 = 官方 AvgMerge**（§5）。参数量 ~575K。
+1. **新文件 `vla/gamma_merger.py`**：`GammaMerger(dim=4096, rank=64, alpha_init=1.0)`——`m_avg + α·U·MLP([P·m_a; P·m_b])`；P 随机（std=dim^-0.5）、MLP **全随机**（local generator，不吃全局 RNG）、**U 零初始化**、α=1 → **起点严格 = 官方 AvgMerge**（1·0·h=0）且学习路径畅通（审阅裁决 B1：α=0 或 MLP 末层零初始化会把全部梯度封死）。参数量 ~575K。
 2. **`vla/memory_vla.py`（唯一宿主修改点）**：
    - `CogMemBank.__init__` 增 `gamma=None / record_merges=False / capture_task_grad=False` + provenance 并行结构（`prov` dict、`next_merge_id`、`merge_log`）——**retrieval/gate/selector 代码一行不改**。
    - `_consolidate_with_token_merge`：selector（adjacent-cosine argmax）不动；`fused_feat = self.gamma(feat_i.detach(), feat_j.detach()) if self.gamma else 0.5*(feat_i+feat_j)`（**仍在 @torch.no_grad() 内，detach/no_grad 全保留**——§24 禁令）；capture 模式写入 bank 时 `requires_grad_(True)` 成 detached leaf；record 模式发 MergeRecord。

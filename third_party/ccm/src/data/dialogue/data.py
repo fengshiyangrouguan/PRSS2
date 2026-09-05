@@ -25,7 +25,13 @@ def path_name(model_name):
 class DialogueDataset():
 
     def __init__(self, tokenizer, comp_token=[], online=True, add_comp_token=True,
-                 clean_split=False):
+                 clean_split=False, eval_source="val"):
+        # RPBE (review 2026-09-05): eval_source in {"val", "test"} selects
+        # which OFFICIAL split feeds the five turn buckets.  Previously the
+        # buckets were always built from valset even with clean_split=True.
+        assert eval_source in ("val", "test")
+        if eval_source == "test":
+            assert clean_split, "eval_source='test' requires clean_split=True (a testset only exists then)" 
         self.tokenizer = tokenizer
         self.model_name = tokenizer.name_or_path.split('/')[-1]
         self.path = path_name(self.model_name)
@@ -140,12 +146,14 @@ class DialogueDataset():
         if clean_split:
             self.testset['is_train'] = [False] * len(self.testset['dialog'])
 
+        _eval_src = self.valset if eval_source == "val" else self.testset
         self.train_dataset = Dataset.from_dict(self.trainset, split='train')
         self.eval_dataset = DatasetDict({
             f'turn_{k}':
-                Dataset.from_dict(self._subsample(self.valset, n_turn=k), split=f'eval_{k-2}')
+                Dataset.from_dict(self._subsample(_eval_src, n_turn=k), split=f'{eval_source}_{k-2}')
             for k in [i + 2 for i in [1, 2, 4, 8, 12]]
         })
+        print("eval_dataset source:", eval_source)
 
         print(self.train_dataset)
         print(self.eval_dataset)

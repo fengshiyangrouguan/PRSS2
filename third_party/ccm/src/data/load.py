@@ -1,3 +1,4 @@
+import os
 from datasets import DatasetDict, load_dataset, concatenate_datasets
 from .utils import nested_select, test_collator
 from . import lamp, metaicl, dialogue
@@ -141,6 +142,8 @@ def load_dataset_metric_collator(args, model, tokenizer):
             comp_token=comp_token,
             online=online,
             add_comp_token=args.training.comp.add_comp_token,
+            clean_split=args.data.clean_split,
+            eval_source=os.environ.get("EVAL_SOURCE", "val"),
         )
         train_dataset = dialog.train_dataset
         eval_dataset = dialog.eval_dataset

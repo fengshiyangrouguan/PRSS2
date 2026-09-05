@@ -14,14 +14,17 @@
     "lora_r_note": "LoRA rank for the trainable adapter (train_ccm historical default; L1 official reproduction skipped by user decision, r=8 fixed for the formal runs)"
   },
   "rpbe": {
-    "ridge_eps": 1e-3,
+    "ridge_eps": 0.001,
     "sketch_dim_m": 64,
     "rpbe_map_seed": 0,
     "z_v_dim": 128,
-    "horizon_weights": [0.5, 0.5],
+    "horizon_weights": [
+      0.5,
+      0.5
+    ],
     "lambda_calibration": {
       "rule": "r_eff = lambda * ||g_KF|| / ||g_task|| ~ 0.1, measured on theta_0 (calibration-only run, before ANY optimizer/scheduler step), calibrated once on the initial full window (training-only), then frozen for all seeds",
-      "lambda_kf": 0.0020304568527918782,
+      "lambda_kf": 0.0020304568527918783,
       "lambda_kf_note": "TEMPORARY lambda-scan value (r_eff=0.3 = 0.3/147.75 = 2.030e-3), set 2026-09-04 for the seed0 ours-l03 scan arm. The committed 0.1 value was 6.768e-4 (r_eff=147.75 on theta_0, outputs/ccm_accept/calib). Scan protocol: same theta_0 rule, linear in lambda, taskonly arm is the shared control (lambda-independent). Revert to 6.768e-4 (or commit the scan winner) after the scan decision."
     },
     "z_v_source": "J_mem(M_v) fixed adapter (TGN identity is its special case)",
@@ -41,14 +44,17 @@
     "cadence": "identical task samples and scheduler cadence across the three arms"
   },
   "training": {
-    "steps": 1000,
-    "steps_note": "1000 GLOBAL/window steps (HF Trainer global_step semantics: the counter advances even on GradScaler overflow skips; the LR advances only on real optimizer executions). The paper claims '1000 global steps', NOT '1000 non-zero-LR updates'; optimizer_steps_executed / amp_skipped_steps / scheduler_steps are recorded per run.",
+    "steps": 500,
+    "steps_note": "500 GLOBAL/window steps for the fine-grained curve run (e50, user ruling 2026-09-05): checkpoint every 50 steps as immutable snapshot files, each evaluated by the official evaluator. Previous: 1000 (per-paper claim); the 500-750 overfit observation motivated the 50-step curve.",
     "grad_clip": 1.0,
     "grad_clip_source": "official HF Trainer default (max_grad_norm); train_ccm must refuse an inconsistent override",
     "merge_cadence": "window-matched",
     "merge_cadence_note": "window-matched: all three arms fire an update on the same adaptive boundary (>= min_effective_cuts dialogues with k>=4); the fixed grad_accum cadence exists only for the ccm_merge_official reproduction arm, whose arm name marks it as outside the main result",
     "two_pass_replay": "pass1 no-grad statistics forward, pass2 grad replay forward (training only; inference is a single forward)",
     "seeds": 5,
-    "eval": "matched-cohort depth curves on the clean test split; primary metric = per-token NLL difference"
+    "eval": "matched-cohort depth curves on the clean test split; primary metric = per-token NLL difference",
+    "checkpoint_every": 50,
+    "schedule_total_steps": 1000,
+    "schedule_note": "Keep the ORIGINAL 1000-step warmup/cosine LR schedule (warmup=30, cosine over 1000) while the e50 pilot stops at 500 — review ruling 2026-09-05: a 500-step schedule would NOT be the first half of the 1000-step run."
   }
 }

@@ -80,9 +80,18 @@ def main(args) -> None:
             arm="ours",
             model_name_or_path=args.model.model_name_or_path,
             relative_embedding="skip",
-            lora_r=8, gamma_hidden=64)
+            lora_r=8, gamma_hidden=64,
+            foundation=os.environ.get("FOUNDATION", ""))
         device = torch.device("cuda", 0)
         model = tc.build_model(our_args, device)
+        if our_args.foundation:
+            # two-stage protocol arms: the official Step-1 default LoRA
+            # (llama-7b-no) was MERGED into the base weights before
+            # training; the trainable checkpoint does not contain it.
+            from src.model import load_lora_weight
+            load_lora_weight(our_args.foundation, model, merge=True)
+            print("[foundation] merged {}".format(our_args.foundation),
+                  flush=True)
         model = tc.wrap_lora(model, our_args.lora_r)
         model.update_comp_token(
             [32000 + k for k in range(tc.N_TOK)],
@@ -96,9 +105,36 @@ def main(args) -> None:
             _g.half()
         dummy = torch.optim.AdamW(
             [p for p in model.parameters() if p.requires_grad], lr=1e-3)
-        tc.load_trainable(our_ckpt, model, dummy, device)
-        print("our checkpoint loaded (build mode): {}".format(our_ckpt),
-              flush=True)
+        if our_ckpt == "INIT":
+            # step-0 baseline: keep randomly initialized trainable
+            # params (conditional LoRA B=0, zero-init Gamma = official
+            # avg merge). Quantifies what training itself gains.
+            print("[step0] random trainable init kept (no checkpoint)",
+                  flush=True)
+        else:
+            payload = tc.load_trainable(our_ckpt, model, dummy, device)
+            # Review ruling 2026-09-05 (exact model reconstruction):
+            # restore the frozen COMP/SUM rows if the checkpoint carries
+            # them (post-fix checkpoints do; pre-fix ones only have
+            # LoRA+Gamma and their rows cannot be recovered exactly).
+            if "new_token_rows" in payload:
+                n = 2 * tc.N_TOK
+                model.get_input_embeddings().weight[-n:] = \
+                    payload["new_token_rows"]["input_embed_rows"].to(device)
+                model.lm_head.weight[-n:] = \
+                    payload["new_token_rows"]["lm_head_rows"].to(device)
+                print("[eval] new_token_rows restored", flush=True)
+            else:
+                # review 2026-09-05: refuse pre-fix checkpoints outright —
+                # their COMP/SUM rows were never saved, so the rebuilt
+                # model differs from the trained one and any PPL from it
+                # is not trustworthy for selection.
+                raise RuntimeError(
+                    "checkpoint predates new_token_rows save; exact model "
+                    "reconstruction impossible — retrain with the fixed "
+                    "save path (review ruling)")
+            print("our checkpoint loaded (build mode): {}".format(our_ckpt),
+                  flush=True)
 
     from src.data.load import load_dataset_metric_collator
     _, eval_dataset, _, collator = load_dataset_metric_collator(

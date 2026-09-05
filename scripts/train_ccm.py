@@ -81,6 +81,8 @@ def parse_args():
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--gpu", type=int, default=0)
     p.add_argument("--max-steps", type=int, default=1000)
+    p.add_argument("--schedule-total-steps", type=int, default=None,
+                   help="LR schedule length (warmup+cosine); defaults to max_steps. The e50 pilot keeps 1000 to preserve the original schedule while stopping at 500.")
     p.add_argument("--grad-accum", type=int, default=128,
                    help="microbatch per update in --merge-cadence official "
                         "(official-reproduction arm only)")
@@ -185,6 +187,8 @@ def enforce_frozen(args):
         ("--gamma-hidden", "gamma_hidden", fz["gamma"]["hidden"]),
         ("--lora-r", "lora_r", fz["adapter"]["lora_r"]),
         ("--max-steps", "max_steps", fz["training"]["steps"]),
+        ("--schedule-total-steps", "schedule_total_steps",
+         fz["training"].get("schedule_total_steps", fz["training"]["steps"])),
     ]
     for flag, name, frozen_val in binds:
         cli_val = getattr(args, name)
@@ -422,7 +426,8 @@ def collect_rows(meta, adapter, builder, utter_embed, embed_tokens, batch,
                        ids[spans[v + 1][0]:spans[v + 1][1]]
                        .unsqueeze(0).to(device), tag=0)
     chi2 = utter_embed(embed_tokens,
-                       ids[spans[v + 1][1]:].unsqueeze(0).to(device), tag=1)
+                       ids[spans[v + 2][0]:spans[v + 2][1]]
+                       .unsqueeze(0).to(device), tag=1)
     dm = DialogueMeta(sample_id=int(meta["sample_id"]), k=int(meta["k"]),
                       sum_positions=[(p + 2, p + 3) for (p, _s)
                                      in meta["blocks"]],
@@ -495,8 +500,24 @@ def trainable_state_dict(model):
             if p.requires_grad}
 
 
+def new_token_rows(model):
+    """The COMP/SUM rows appended by resize_token_embeddings are frozen
+    (never in trainable_state_dict) BUT their concrete random values
+    affect inference through the comp-token embedding lookup.  Save
+    them explicitly so the eval-side build can restore the exact rows
+    (review ruling 2026-09-05: eval must reconstruct the SAME model)."""
+    emb = model.get_input_embeddings()
+    lm = model.lm_head
+    n = 2 * N_TOK
+    return {
+        "input_embed_rows": emb.weight[-n:].detach().cpu(),
+        "lm_head_rows": lm.weight[-n:].detach().cpu(),
+    }
+
+
 def save_trainable(path, model, **extra):
-    torch.save({"model": trainable_state_dict(model), **extra}, path)
+    torch.save({"model": trainable_state_dict(model),
+                "new_token_rows": new_token_rows(model), **extra}, path)
 
 
 def load_trainable(path, model, optimizer, device):
@@ -573,7 +594,9 @@ def main():
     # cosine decay to zero, 3% warmup, and the official Trainer's default
     # max_grad_norm=1.0.  Same scheduler on all three arms (per-step).
     optimizer = torch.optim.AdamW(params, lr=args.lr, weight_decay=0.0)
-    total_steps = max(1, int(args.max_steps))
+    total_steps = max(1, int(args.schedule_total_steps
+                            if args.schedule_total_steps is not None
+                            else args.max_steps))
     warmup_steps = max(1, int(0.03 * total_steps))
 
     def _lr_lambda(s):
@@ -614,6 +637,7 @@ def main():
 
     step = 0
     last_logged_step = 0  # dedup: log only when step changes (L7 smoke)
+    last_saved_step = -1
     # Review ruling: ``step`` counts global window attempts (HF Trainer
     # global_step, advances even on AMP skips; the frozen 1000-step budget
     # is GLOBAL steps, not applied-update count).  optimizer_steps_executed
@@ -1168,8 +1192,13 @@ def main():
                   flush=True)
             with log_path.open("a") as f:
                 f.write(json.dumps(row) + "\n")
-        if args.checkpoint_every and step and step % args.checkpoint_every == 0:
-            save_trainable(out / "checkpoint.pt", model, step=step,
+        if (args.checkpoint_every and step and step % args.checkpoint_every == 0
+                and step != last_saved_step):
+            # per-N-step immutable snapshot (eval-safe: no overwrite race);
+            # save exactly once per step (review 2026-09-05: the old guard
+            # re-saved on every remaining microbatch of the window)
+            last_saved_step = step
+            save_trainable(out / f"checkpoint_step{step}.pt", model, step=step,
                            optimizer=optimizer.state_dict(),
                            scaler=scaler.state_dict(),
                            scheduler=scheduler.state_dict(),
@@ -1180,10 +1209,6 @@ def main():
                            optimizer_steps_executed=optimizer_steps_executed,
                            amp_skipped_steps=amp_skipped_steps,
                            scheduler_steps=scheduler_steps,
-                           # Review ruling (resume aggregate audit): the
-                           # final summary of a resumed run must cover the
-                           # whole run, so the accumulated statistics and
-                           # the raw boundary records are checkpointed.
                            total_task_sum=total_task_sum,
                            total_tokens=total_tokens,
                            total_microbatches=total_microbatches,
@@ -1192,7 +1217,6 @@ def main():
                            aux_terms=aux_terms,
                            data_flow_len=data_flow_len,
                            boundary_records=boundary_records)
-
     save_trainable(out / "final.pt", model, step=step, lambda_kf=lambda_kf)
     summary = {
         "arm": args.arm, "seed": args.seed,

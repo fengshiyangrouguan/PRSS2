@@ -1,6 +1,7 @@
 """Leakage-safe cut-builder factory for the JODIE line."""
 
-from rpbe.records import JodieCutBuilder, JodieFutureIndex
+from rpbe.records import (JodieCutBuilder, JodieFutureIndex,
+                          SUPERVISION_PRODUCTION)
 
 
 def build_cut_builder(dataset, *, stage: str, cfg, seed: int = 0,
@@ -19,4 +20,7 @@ def build_cut_builder(dataset, *, stage: str, cfg, seed: int = 0,
     return JodieCutBuilder(future_index, stage=stage,
                            cuts_per_tau=getattr(cfg, "cuts_per_tau", 32),
                            seed=int(seed),
-                           n_observations=getattr(cfg, "n_observations", 2))
+                           n_observations=getattr(cfg, "n_observations", 2),
+                           supervision_mode=getattr(
+                               cfg, "supervision_mode",
+                               SUPERVISION_PRODUCTION))

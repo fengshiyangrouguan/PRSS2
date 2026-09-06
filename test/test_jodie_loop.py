@@ -122,7 +122,7 @@ class TestLoopSmoke(unittest.TestCase):
                               timestamps[80:], edge_idxs[80:], labels[80:])
         self.stream_times = timestamps
 
-    def _make_loop(self, rpbe=False):
+    def _make_loop(self, rpbe=False, supervision_mode="production"):
         tgn = self.tgn
         from rpbe.hosts.official_tgn import MLP
         decoder = MLP(dim=8, drop=0.1).to(self.device)
@@ -134,7 +134,8 @@ class TestLoopSmoke(unittest.TestCase):
                 state_dims={"tjo:layer0": 8, "tjo:layer1": 8, "tjo:layer2": 8},
                 own_dims={"tjo:layer0": 8, "tjo:layer1": 8, "tjo:layer2": 8},
                 width_D=16, m=64, kf_min_abs=4, kf_min_ratio=0.5,
-                rpbe_seed=0, delta_t_scale=1.0)
+                rpbe_seed=0, delta_t_scale=1.0,
+                supervision_mode=supervision_mode)
             rpbe_cfg = cfg
             compressor = RecursiveCompressor(cfg).to(self.device)
             repr_params += [p for p in compressor.parameters()]
@@ -143,7 +144,9 @@ class TestLoopSmoke(unittest.TestCase):
             fixed_maps = FixedMaps(cfg).to(self.device)
             cut_builder = JodieCutBuilder(
                 JodieFutureIndex(self.train),
-                stage=NODE_CLASS, seed=0)
+                stage=NODE_CLASS, seed=0,
+                n_observations=2,
+                supervision_mode=supervision_mode)
         seen = set()
         repr_params = [p for p in repr_params
                        if not (id(p) in seen or seen.add(id(p)))]
@@ -184,6 +187,80 @@ class TestLoopSmoke(unittest.TestCase):
         self.assertIn("auc", val_row)
         # Evaluation must not have built any trace.
         self.assertIsNone(loop.adapter.trace)
+
+    def test_structural_arms_train_finite_kf(self):
+        """Each structural arm runs one epoch with a finite KF score and no
+        evaluation leakage.  Uses a ROTATING stream (nodes recur every cycle)
+        so the Y1- and Y2-valid intersection cut set is dense enough to fill
+        a KF window."""
+        n_nodes, n_cyc = 6, 60
+        n = n_nodes * n_cyc
+        srcs = np.asarray([i % n_nodes for i in range(n)],
+                          dtype=np.int64)
+        dsts = np.asarray([(i + 1) % n_nodes for i in range(n)],
+                          dtype=np.int64)
+        tms = np.arange(1, n + 1, dtype=np.float64)
+        eis = np.arange(1, n + 1, dtype=np.int64)
+        lab = (np.arange(n) % 3 == 0).astype(np.float64)
+        # A tiny TGN needs real node/edge features to be constructed; reuse
+        # the vendor builder on the rotating stream.
+        from test_jodie_vendor import make_tgn as _MT
+        node_features = np.zeros((n_nodes + 1, 8), dtype=np.float32)
+        edge_features = np.zeros((n + 1, 8), dtype=np.float32)
+        dense_train = JodieData(srcs[:n // 2], dsts[:n // 2],
+                                tms[:n // 2], eis[:n // 2], lab[:n // 2])
+        dense_val = JodieData(srcs[n // 2:], dsts[n // 2:], tms[n // 2:],
+                              eis[n // 2:], lab[n // 2:])
+        from rpbe.hosts.official_tgn import MLP
+        for mode in ("1obs", "2obs_aligned", "2obs_mispaired"):
+            with self.subTest(mode=mode):
+                tgn, device = _MT(
+                    node_features, edge_features, srcs, dsts, tms, eis,
+                    device=torch.device("cpu"), n_layers=2, n_heads=2,
+                    n_neighbors=4, memory_dimension=8, message_dimension=8)
+                decoder = MLP(dim=8, drop=0.1).to(device)
+                head_params = list(decoder.parameters())
+                cfg = RPBConfig(
+                    state_dims={"tjo:layer0": 8, "tjo:layer1": 8,
+                                "tjo:layer2": 8},
+                    own_dims={"tjo:layer0": 8, "tjo:layer1": 8,
+                              "tjo:layer2": 8},
+                    width_D=16, m=64, kf_min_abs=4, kf_min_ratio=0.5,
+                    rpbe_seed=0, delta_t_scale=1.0,
+                    supervision_mode=mode)
+                compressor = RecursiveCompressor(cfg).to(device)
+                adapter = install_adapter(tgn)
+                adapter.compressor = compressor
+                # tgn.parameters() already recurses through embedding_module
+                # (the adapter), which now owns the compressor.
+                repr_params = [p for p in tgn.parameters()
+                               if p.requires_grad]
+                fixed_maps = FixedMaps(cfg).to(device)
+                cut_builder = JodieCutBuilder(
+                    JodieFutureIndex(dense_train), stage=NODE_CLASS, seed=0,
+                    n_observations=2, supervision_mode=mode)
+                head_optimizer = torch.optim.Adam(head_params, lr=3e-4)
+                repr_optimizer = torch.optim.Adam(repr_params, lr=3e-4)
+                loop = JodieNodeClassificationLoop(
+                    tgn=tgn, decoder=decoder,
+                    repr_optimizer=repr_optimizer,
+                    head_optimizer=head_optimizer, device=device,
+                    batch_size=24, n_neighbors=4, grad_clip=5.0,
+                    monitor=_FakeMonitor(), seed=0, finetune_host=True,
+                    adapter=adapter, cut_builder=cut_builder,
+                    fixed_maps=fixed_maps, rpbe_cfg=cfg, trace_roots=8)
+                row = loop.train_epoch(0, 0, dense_train)
+                self.assertTrue(np.isfinite(row["train_kf_score"]),
+                                "{} kf_score not finite".format(mode))
+                self.assertIsNotNone(row["kf"],
+                                     "{} kf is None (no window closed)"
+                                     .format(mode))
+                self.assertTrue(np.isfinite(row["kf"]["kf_loss"]),
+                                "{} kf_loss not finite".format(mode))
+                val_row = loop.evaluate_split(dense_val, reset=False)
+                self.assertIn("auc", val_row)
+                self.assertIsNone(loop.adapter.trace,
+                                  "{} leaked a trace into eval".format(mode))
 
 
 if __name__ == "__main__":

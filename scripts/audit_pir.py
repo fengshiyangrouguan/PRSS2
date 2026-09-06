@@ -137,6 +137,9 @@ def main():
     import scripts.train_jodie as tj
     ns = argparse.Namespace(**cli)
     ns.data_dir = args.data_dir
+    # Backward compatibility: checkpoints trained before the --supervision-mode
+    # flag existed store a config.json whose ``cli`` block lacks it.
+    ns.supervision_mode = getattr(ns, "supervision_mode", "production")
     components = tj.build_components(ns, device, dataset)
     tgn = components["tgn"]
     best = torch.load(out / "best.pt", map_location=device, weights_only=False)
@@ -167,6 +170,8 @@ def main():
     samples = []
     num_batch = math.ceil(len(train.sources) / cli.get("bs", 200))
     max_batches = args.max_batches or num_batch
+    if tgn.use_memory:
+        tgn.memory.__init_memory__()
     with torch.no_grad():
         for k in range(0, min(max_batches, num_batch)):
             s = k * cli.get("bs", 200)

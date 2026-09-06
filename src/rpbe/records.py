@@ -14,6 +14,7 @@ therefore performs no tree walk and no second model query.
 """
 
 import math
+from collections import Counter
 
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
@@ -26,6 +27,68 @@ NODE_CLASS = "node_class"
 
 HORIZON_OMEGA = (0.5, 0.5)
 MAX_HORIZONS = 2
+
+
+def _fixed_bipartite_derangement(times_from, times_to, seed_int):
+    """One derangement of the horizon-2 EVENTS among a bucket of cuts.
+
+    We need a permutation ``pi`` of the bucket's cut indices such that for
+    every source cut ``s``, the target cut ``pi(s) != s`` AND the target
+    cut's own Y2 event is a STRICTLY-LATER future of the source cut
+    (``target.Y2.time > source.cut.time``).  This is a bipartite perfect
+    matching between "receivers" (cuts, on the left) and "donors"
+    (their Y2 events, on the right); a cut may receive any donor's Y2 whose
+    event time is strictly after the receiver's cut time, except it must not
+    receive its own event (that would keep the pairing unchanged).
+
+    Existence is not guaranteed for an arbitrary bucket; callers must drop
+    (in ALL arms) any bucket for which no such matching exists, so the three
+    structural arms keep an identical cut set.  Returns a list of donor
+    indices (``receiver i gets donors[perm[i]]``) or None when no perfect
+    matching exists.
+
+    Implementation: a greedy augmenting-path (Kuhn) maximum matching over the
+    legal edges, biased by a deterministic per-(bucket, seed) order so the
+    result is reproducible across the two passes of exact replay.  On an
+    equal-sized bipartite graph a maximum matching of size n is perfect.
+    """
+    n = len(times_from)
+    rs = np.random.RandomState(int(seed_int))
+    order = rs.permutation(n)
+    # legal donor set per receiver: donor j's Y2 strictly later than
+    # receiver i's cut time, and donor != receiver.
+    adj = []
+    for i in range(n):
+        ci = times_from[i]
+        row = [j for j in order
+               if j != i and times_to[j] > ci]
+        adj.append(row)
+    # Kuhn's algorithm: match donors to receivers.
+    match_donor = [-1] * n      # donor -> receiver
+    match_receiver = [-1] * n   # receiver -> donor
+
+    def try_augment(i, seen):
+        for j in adj[i]:
+            if j in seen:
+                continue
+            seen.add(j)
+            if match_donor[j] == -1 or try_augment(match_donor[j], seen):
+                match_donor[j] = i
+                match_receiver[i] = j
+                return True
+        return False
+
+    matched = 0
+    recv_order = sorted(range(n), key=lambda i: rs.rand())
+    for i in recv_order:
+        if match_receiver[i] == -1:
+            if try_augment(i, set()):
+                matched += 1
+    if matched < n:
+        return None
+    return [match_receiver[i] for i in range(n)]
+
+
 
 # Structural-supervision modes (paper Part III).  ``production`` reproduces
 # the historical behaviour exactly (``n_observations`` decides how many future
@@ -419,6 +482,7 @@ class JodieCutBuilder:
         overlap = stats.setdefault("overlap_groups", {})
         outcome_use = stats.setdefault("outcome_use", {})
         dropped_singletons = stats.setdefault("dropped_singleton_buckets", 0)
+        dropped_match = 0
 
         if len(set(trace.root_rows)) != len(trace.root_rows):
             raise ValueError("trace.root_rows must be unique")
@@ -473,19 +537,41 @@ class JodieCutBuilder:
                 dropped_singletons += len(idxs)
                 continue
             surviving.update(idxs)
+        # A bucket whose cuts cannot be put on a constrained perfect
+        # derangement of Y2 (every assignment legal, every Y2 moved) must
+        # also be dropped from EVERY arm — otherwise the mispaired arm would
+        # either break the Y2 marginal or share cuts with the other arms
+        # only by keeping some pairings fixed.  The feasibility depends only
+        # on the bucket contents (cut times vs own Y2 times), never on the
+        # arm, so it is computed once and applied identically to all three
+        # arms.
+        by_index_full = {i: u for i, u in enumerate(units)}
+        for idxs in buckets.values():
+            ids = sorted(i for i in idxs if i in surviving)
+            if len(ids) < 2:
+                continue
+            bucket_seed = 0
+            for i in ids:
+                bucket_seed = (bucket_seed * 31 + i) % (2 ** 31)
+            times_from = [by_index_full[i][2].time for i in ids]
+            times_to = [by_index_full[i][4].time for i in ids]
+            perm = _fixed_bipartite_derangement(
+                times_from, times_to,
+                (self.seed * 104729) ^ int(batch_seed) ^ bucket_seed)
+            if perm is None:
+                dropped_match += len(ids)
+                for i in ids:
+                    surviving.discard(i)
         by_index = {i: u for i, u in enumerate(units) if i in surviving}
-        units = by_index                     # original index -> unit tuple
+        units = by_index
 
         # ------------------------------------------------------------------ pass 2
-        # Y2 derangement for the mispaired arm.  We permute the horizon-2
-        # EVENT (identity: counterpart, outcome, outcome_id) among cuts of the
-        # same (tau, role2, coarse-time) bucket, but a deranged Y2 must still
-        # be a LEGAL future of the receiving cut (event.time > cut.time).  A
-        # receiving cut whose bucket-rotation target is not strictly later
-        # keeps its own Y2 (counted in ``mispaired_kept``), so every emitted
-        # row stays a legal future while the Y2 marginal is preserved.
-        y2_for_unit = {}      # surviving unit index -> ObservedOutcome (Y2)
-        kept = 0
+        # Y2 mispairing for the mispaired arm only: reuse the (deterministic)
+        # constrained perfect matching of each surviving bucket.  Every
+        # surviving cut receives a DIFFERENT cut's Y2 that is a strictly
+        # later legal future, so the aligned and mispaired arms share the
+        # Y2 multiset exactly and no pairing is left unchanged.
+        y2_for_unit = {}
         if self.supervision_mode == SUPERVISION_2OBS_MISPAIRED:
             for idxs in buckets.values():
                 ids = sorted(i for i in idxs if i in surviving)
@@ -494,19 +580,20 @@ class JodieCutBuilder:
                 bucket_seed = 0
                 for i in ids:
                     bucket_seed = (bucket_seed * 31 + i) % (2 ** 31)
-                rs = np.random.RandomState(
+                times_from = [by_index_full[i][2].time for i in ids]
+                times_to = [by_index_full[i][4].time for i in ids]
+                perm = _fixed_bipartite_derangement(
+                    times_from, times_to,
                     (self.seed * 104729) ^ int(batch_seed) ^ bucket_seed)
-                n = len(ids)
-                order = sorted(ids, key=lambda i: by_index[i][1][1])
-                rot = int(rs.randint(1, n))
-                rotated = order[rot:] + order[:rot]
-                for src, dst in zip(order, rotated):
-                    if by_index[dst][4].time > by_index[src][2].time:
-                        y2_for_unit[src] = by_index[dst][4]
-                    else:
-                        kept += 1
-        stats["mispaired_kept_legal"] = stats.get(
-            "mispaired_kept_legal", 0) + kept
+                # A surviving bucket always has a matching (checked above);
+                # perm is therefore never None here.
+                assert perm is not None
+                for pos, i in enumerate(ids):
+                    j = ids[perm[pos]]
+                    assert j != i
+                    y2_for_unit[i] = by_index_full[j][4]
+        stats["mispaired_bucket_dropped"] = stats.get(
+            "mispaired_bucket_dropped", 0) + dropped_match
 
         # ------------------------------------------------------------------ rows
         tree_cut_counts = {}

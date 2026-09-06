@@ -70,6 +70,14 @@ def make_trace():
     return CompactCutTrace(root_rows=roots, cuts=cuts)
 
 
+def a1_time(cid, by_cut):
+    """Cut/query as-of time of the receiving cut."""
+    rows = by_cut.get(cid)
+    if not rows:
+        raise KeyError(cid)
+    return rows[0].time
+
+
 def summarize(rows):
     """Map horizon rows by cut_id, keeping outcome ids and horizon order."""
     by_cut = {}
@@ -140,32 +148,55 @@ class TestStructuralCutSet(unittest.TestCase):
             self.assertAlmostEqual(w, 1.0, places=6)
 
     def test_mispaired_keeps_multisets_but_changes_pairing(self):
+        from collections import Counter
         aligned = self._builder(SUPERVISION_2OBS_ALIGNED).build(
             self.trace, batch_seed=7)
         misp = self._builder(SUPERVISION_2OBS_MISPAIRED).build(
             self.trace, batch_seed=7)
         a_by = summarize(aligned)
         m_by = summarize(misp)
-        # Same cut set (guarded above); same Y1/Y2 multisets.
+        # Same cut set; same Y2 MULTISET (Counter, i.e. marginal preserved
+        # exactly — the review gate).
+        a_y2 = Counter(r.outcome_id for r in aligned if r.horizon == 2)
+        m_y2 = Counter(r.outcome_id for r in misp if r.horizon == 2)
+        self.assertEqual(a_y2, m_y2,
+                         "mispaired arm must preserve the Y2 multiset exactly")
         self.assertEqual(
-            sorted(r.outcome_id for r in aligned),
-            sorted(r.outcome_id for r in misp))
-        # Y1 per cut identical (only the second observation is mispaired).
+            Counter(r.outcome_id for r in aligned if r.horizon == 1),
+            Counter(r.outcome_id for r in misp if r.horizon == 1))
+        # Y1 per cut identical.
         for cid in a_by:
             a1 = next(r for r in a_by[cid] if r.horizon == 1)
             m1 = next(r for r in m_by[cid] if r.horizon == 1)
             self.assertEqual(a1.outcome_id, m1.outcome_id)
             self.assertEqual(a1.outcome_time, m1.outcome_time)
-        # At least one cut's Y2 pairing changed.
-        changed = 0
+        # EVERY surviving cut's Y2 pairing must change (unchanged_fraction 0)
+        # and every assigned Y2 must be a strictly-later legal future of its
+        # receiving cut.
+        unchanged = 0
         for cid in a_by:
             a2 = next((r for r in a_by[cid] if r.horizon == 2), None)
             m2 = next((r for r in m_by[cid] if r.horizon == 2), None)
-            if a2 is not None and m2 is not None and \
-                    a2.outcome_id != m2.outcome_id:
-                changed += 1
-        self.assertGreater(changed, 0,
-                           "mispaired arm must change at least one Y2 pairing")
+            self.assertIsNotNone(a2)
+            self.assertIsNotNone(m2)
+            self.assertGreater(m2.outcome_time, a1_time(cid, a_by),
+                               "mispaired Y2 must be a legal future of its "
+                               "receiving cut")
+            if a2.outcome_id == m2.outcome_id:
+                unchanged += 1
+        self.assertEqual(unchanged, 0,
+                         "mispaired arm must change EVERY Y2 pairing "
+                         "({} unchanged)".format(unchanged))
+
+    def test_aligned_cut_set_equals_mispaired_after_bucket_drops(self):
+        """Buckets without a feasible derangement drop from BOTH arms, so the
+        aligned and mispaired cut sets remain identical."""
+        aligned = self._builder(SUPERVISION_2OBS_ALIGNED).build(
+            self.trace, batch_seed=7)
+        misp = self._builder(SUPERVISION_2OBS_MISPAIRED).build(
+            self.trace, batch_seed=7)
+        self.assertEqual(
+            set(summarize(aligned).keys()), set(summarize(misp).keys()))
 
     def test_mispaired_derangement_is_deterministic(self):
         b1 = self._builder(SUPERVISION_2OBS_MISPAIRED)

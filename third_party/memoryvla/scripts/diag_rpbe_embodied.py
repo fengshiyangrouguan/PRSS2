@@ -100,9 +100,50 @@ def main():
     r_effs = []
     step = 0
 
+    # WARMUP: the DiT final layer is zero-initialized (official DiT
+    # convention), so condition/leaf gradients are identically zero until
+    # the first optimizer steps move it off zero.  Run a few task steps
+    # BEFORE measuring r_eff.
+    warm_opt = torch.optim.AdamW(
+        [p for p in vla.parameters() if p.requires_grad], lr=1e-4)
+    warm_batches = 0
+    for batch in loader:
+        if warm_batches >= 20:
+            break
+        pv = batch["pixel_values"]
+        if isinstance(pv, dict):
+            pv = {k: v.to("cuda", dtype=torch.bfloat16) for k, v in pv.items()}
+        with torch.autocast("cuda", dtype=torch.bfloat16, enabled=True):
+            loss, _ = vla(input_ids=batch["input_ids"].to("cuda"),
+                          attention_mask=batch["attention_mask"].to("cuda"),
+                          actions=batch["actions"].to("cuda", dtype=torch.bfloat16),
+                          action_masks=batch["action_masks"].to("cuda"),
+                          pixel_values=pv, labels=batch["labels"].to("cuda"),
+                          timesteps=batch["timesteps"],
+                          episode_ids=batch["episode_ids"],
+                          output_hidden_states=True, repeated_diffusion_steps=4)
+        loss.backward()
+        warm_opt.step(); warm_opt.zero_grad()
+        vla.cog_mem_bank.refresh_leafs()
+        warm_batches += 1
+    vla.cog_mem_bank.reset()
+    vla.per_mem_bank.reset()
+    queue.reset()
+    print(f"[warmup] {warm_batches} steps done; DiT final layer "
+          f"{vla.action_model.net.final_layer.linear.weight.abs().sum().item():.4f}",
+          flush=True)
+
     while len(r_effs) < args.n_windows and step < 4000:
         for batch in loader:
+            if step >= 4000:            # the loader is infinite; the guard
+                break                   # must live INSIDE the for loop
             step += 1
+            if step % 100 == 0:
+                print(f"[diag] step {step} queue {len(queue.pending)} "
+                      f"window_cuts {window.n_unique_cuts} "
+                      f"censored {queue.n_censored} "
+                      f"merges_log {len(vla.cog_mem_bank.merge_log)}",
+                      flush=True)
             eids = [int(e) for e in batch["episode_ids"]]
             # forward (leaf snapshot before)
             leaf_snapshot = []
@@ -111,6 +152,23 @@ def main():
                 for (_, f), meta in zip(entries, prov):
                     if meta[4] and f.requires_grad:
                         leaf_snapshot.append((f, e, meta[0]))
+            if step % 30 == 0:
+                bank = vla.cog_mem_bank.bank
+                prov = vla.cog_mem_bank.prov
+                detail = []
+                for e, entries in bank.items():
+                    metas = prov.get(e, [])
+                    detail.append(
+                        [ (f.requires_grad, metas[j][4] if j < len(metas) else '?')
+                          for j, (_, f) in enumerate(entries)])
+                print(f"[dbg6] n_leafs {len(leaf_snapshot)} "
+                      f"bank_detail {detail} "
+                      f"capture {vla.cog_mem_bank.capture_task_grad}",
+                      flush=True)
+            if step <= 12:
+                print(f"[dbg7] batch eids {[int(x) for x in batch['episode_ids']]} "
+                      f"timesteps {[int(x) for x in batch['timesteps']]}",
+                      flush=True)
             pv = batch["pixel_values"]
             if isinstance(pv, dict):
                 pv = {k: v.to("cuda", dtype=torch.bfloat16)
@@ -126,12 +184,19 @@ def main():
                     episode_ids=batch["episode_ids"],
                     output_hidden_states=True, repeated_diffusion_steps=4)
             loss.backward()
+            n_nonfinite = 0
             for f, e, node_id in leaf_snapshot:
                 if f.grad is not None:
                     g = f.grad.detach().clone().reshape(-1)
+                    if not torch.isfinite(g).all():
+                        n_nonfinite += 1
+                        continue          # bf16 overflow guard
                     task_cotangents[(e, node_id)] = (
                         task_cotangents.get(
                             (e, node_id), torch.zeros_like(g)) + g)
+            if n_nonfinite:
+                print(f"[dbg] skipped {n_nonfinite} non-finite leaf grads",
+                      flush=True)
             vla.cog_mem_bank.refresh_leafs()
             vla.zero_grad()
 
@@ -168,7 +233,32 @@ def main():
                     if nid is not None:
                         rpbe_cotangents[(e, nid)] = g
                 # --- r_eff measurement ---
+                print(f"[dbg] task_cot {len(task_cotangents)} "
+                      f"rpbe_cot {len(rpbe_cotangents)} "
+                      f"registry {len(merge_registry)} "
+                      f"id_map {len(merge_id_map)}", flush=True)
+                if task_cotangents:
+                    k0 = next(iter(task_cotangents))
+                    print(f"[dbg4] cot norm {task_cotangents[k0].norm().item():.4e} "
+                          f"dtype {task_cotangents[k0].dtype}", flush=True)
+                    if k0 in merge_registry:
+                        ls = merge_registry[k0].left_state
+                        print(f"[dbg5] left_state norm {ls.float().norm().item():.4e} "
+                              f"dtype {ls.dtype}", flush=True)
+                if task_cotangents:
+                    k0 = next(iter(task_cotangents))
+                    print(f"[dbg4] cot norm {task_cotangents[k0].norm().item():.4e} "
+                          f"dtype {task_cotangents[k0].dtype} "
+                          f"finite {torch.isfinite(task_cotangents[k0]).all().item()}",
+                          flush=True)
+                    if k0 in merge_registry:
+                        ls = merge_registry[k0].left_state
+                        print(f"[dbg5] left_state norm {ls.float().norm().item():.4e} "
+                              f"dtype {ls.dtype}", flush=True)
                 tkeys = [k for k in task_cotangents if k in merge_registry]
+                rkeys = [k for k in rpbe_cotangents if k in merge_registry]
+                print(f"[dbg2] tkeys {len(tkeys)} rkeys {len(rkeys)}",
+                      flush=True)
                 rkeys = [k for k in rpbe_cotangents if k in merge_registry]
                 vla.zero_grad()
                 if tkeys:
@@ -184,6 +274,11 @@ def main():
                         p.grad.norm() for p in vla.gamma.parameters()
                         if p.grad is not None])
                     g_task_norm = g_norms.norm().item()
+                    print(f"[dbg3] task norm {g_task_norm:.6e} "
+                          f"n_grads {len(g_norms)} "
+                          f"U_sum {vla.gamma.proj_out.weight.grad.abs().sum().item():.3e} "
+                          f"alpha_g {vla.gamma.alpha.grad.item():.3e}",
+                          flush=True)
                 else:
                     g_task_norm = float("inf")
                 vla.zero_grad()

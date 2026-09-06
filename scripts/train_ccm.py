@@ -932,6 +932,20 @@ def main():
                 _t = time.perf_counter()
                 closed, plan, diag = window.close_replay()
                 _pf("close_replay", _t)
+                # Review round 5 (CCA saturation audit): persist the
+                # dialogue-grouped shuffle diagnostic per window.
+                _d = diag.get(MEM_TAU, {}) if isinstance(diag, dict) else {}
+                with (out / "window_diag.jsonl").open("a") as _f:
+                    _f.write(json.dumps({
+                        "step": int(step),
+                        "M_unique": _d.get("M_unique"),
+                        "M_rows": _d.get("M_rows"),
+                        "M_unique_trees": _d.get("M_unique_trees"),
+                        "J_real_minus_shuffled":
+                            _d.get("J_real_minus_shuffled"),
+                        "J_shuffled_mean": _d.get("J_shuffled"),
+                        "J_shuffled_n": _d.get("J_shuffled_n"),
+                    }) + "\n")
                 # P0-1 fix: capture the REAL post-pass-1 data-stream RNG
                 # position; pass 2 replays from the window start and the
                 # stream resumes from the captured position afterwards.

@@ -118,6 +118,10 @@ def parse_args():
                    help="separate representation-group learning rate "
                         "(defaults to --lr); the macro schedule updates "
                         "these params ~32x less often than the head")
+    p.add_argument("--kf-fail-below-threshold", action="store_true",
+                   help="abort the run if any macro group closes a window "
+                        "below the KF tree threshold (fail-fast for the "
+                        "structural ablations; default off)")
     p.add_argument("--ridge-eps", type=float, default=1e-4)
     p.add_argument("--rpbe-seed", type=int, default=0)
     p.add_argument("--trace-roots", type=int, default=32)
@@ -386,7 +390,8 @@ def main():
         trace_roots=args.trace_roots,
         trace_mode=args.trace_mode,
         train_eval_auc=args.train_eval_auc,
-        kf_estimator=args.kf_estimator)
+        kf_estimator=args.kf_estimator,
+        kf_fail_below_threshold=args.kf_fail_below_threshold)
 
     save_json(out / "config.json", {
         "data": args.data,

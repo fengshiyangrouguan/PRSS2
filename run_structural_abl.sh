@@ -46,6 +46,7 @@ run_one() {
     --rpbe --kf-lambda 0.088 --kf-estimator exact_replay \
     --supervision-mode $arm --n-observations 2 \
     --kf-group-batches 56 --kf-min-abs 896 \
+    --kf-fail-below-threshold \
     --repr-lr 1e-3 --ridge-eps 1e-3 --sketch-dim 64 \
     -d wikipedia --data-dir old/processed_tgn_data \
     --pretrained-checkpoint outputs/t2_pretrain/best.pt \

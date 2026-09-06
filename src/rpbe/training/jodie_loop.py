@@ -87,7 +87,8 @@ class JodieNodeClassificationLoop:
                  cut_builder=None, fixed_maps=None, rpbe_cfg=None,
                  trace_roots=8, trace_mode="evenly_spaced",
                  train_eval_auc=False, grad_diag=None,
-                 kf_estimator="exact_replay"):
+                 kf_estimator="exact_replay",
+                 kf_fail_below_threshold=False):
         self.tgn = tgn
         self.decoder = decoder
         # Representation parameters (host + compressor, everything that can
@@ -148,6 +149,7 @@ class JodieNodeClassificationLoop:
         if kf_estimator not in ("exact_replay", "lagged", "off"):
             raise ValueError("unknown kf_estimator {}".format(kf_estimator))
         self.kf_estimator = kf_estimator
+        self.kf_fail_below_threshold = bool(kf_fail_below_threshold)
         self.kf_on = bool(self.component_on and self.lambda_kf > 0.0
                           and cut_builder is not None
                           and kf_estimator != "off")
@@ -483,12 +485,15 @@ class JodieNodeClassificationLoop:
                     below_threshold_groups += 1
                     pending_trees[tau] = diag["M_unique_trees"]
                     threshold[tau] = diag["threshold"]
+                    msg = ("{} window {} trees < threshold {}; discarded "
+                           "(exact_replay)".format(
+                               tau, diag["M_unique_trees"],
+                               diag["threshold"]))
+                    if self.kf_fail_below_threshold:
+                        raise RuntimeError(
+                            "kf_below_threshold fail-fast: " + msg)
                     self.monitor.alert(
-                        "warning", "kf_below_threshold",
-                        "{} window {} trees < threshold {}; discarded "
-                        "(exact_replay)".format(
-                            tau, diag["M_unique_trees"],
-                            diag["threshold"]),
+                        "warning", "kf_below_threshold", msg,
                         step=global_step, interface=tau)
             # -------------------- restore to group start --------------
             self._restore_group_state(state)

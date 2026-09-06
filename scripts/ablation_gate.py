@@ -37,6 +37,7 @@ Usage:
 import argparse
 import hashlib
 import json
+import math
 import os
 import sys
 from pathlib import Path
@@ -119,31 +120,6 @@ def _build(args, device, dataset, supervision_mode):
     return tj.build_components(ns, device, dataset)
 
 
-def _collect_trace_cuts(adapter, tgn, train, n_batches, bs, n_degree, seed,
-                        trace_roots):
-    """Walk ``n_batches``; return the mode-independent raw CutCandidates."""
-    if tgn.use_memory:
-        tgn.memory.__init_memory__()
-    cuts = []
-    for k in range(n_batches):
-        s = k * bs
-        e = min(len(train.sources), (k + 1) * bs)
-        if e - s <= 0:
-            break
-        tr = select_trace_rows(np.zeros(e - s), trace_roots, seed, k,
-                               "evenly_spaced")
-        adapter.set_trace_source_rows(tr)
-        with torch.no_grad():
-            tgn.compute_temporal_embeddings(
-                train.sources[s:e], train.destinations[s:e],
-                train.destinations[s:e], train.timestamps[s:e],
-                train.edge_idxs[s:e], n_degree)
-        if adapter.trace and adapter.trace.cuts:
-            cuts.extend(adapter.trace.cuts)
-        adapter.clear_trace()
-    return cuts
-
-
 def main():
     args = parse_args()
     device = torch.device(
@@ -161,40 +137,64 @@ def main():
 
     # ------------------------------------------------------------------ hash
     print("=== data-stream hash gates ===", flush=True)
-    components = _build(args, device, dataset, "1obs")   # mode-independent trace
+    components = _build(args, device, dataset, "1obs")
     adapter = components["adapter"]
     tgn = components["tgn"]
-    raw = _collect_trace_cuts(adapter, tgn, train, args.hash_batches, 200, 5,
-                              args.seed, args.trace_roots)
-    print("raw trace cuts collected:", len(raw), flush=True)
+    if tgn.use_memory:
+        tgn.memory.__init_memory__()
+    # Walk per batch like the real exact-replay pass 1: each batch selects its
+    # own roots (batch-local row indices), the adapter emits one trace, and
+    # every arm's builder consumes that same batch trace with the SAME
+    # batch_seed (= the training global_step), so tree_ids stay distinct and
+    # the arms see byte-identical root/tree structure.
+    per_batch_traces = []
+    n_batch = min(args.hash_batches,
+                  math.ceil(len(train.sources) / 200))
+    for k in range(n_batch):
+        s = k * 200
+        e = min(len(train.sources), (k + 1) * 200)
+        if e - s <= 0:
+            break
+        tr = select_trace_rows(np.zeros(e - s), args.trace_roots, args.seed,
+                               k, "evenly_spaced")
+        adapter.set_trace_source_rows(tr)
+        with torch.no_grad():
+            tgn.compute_temporal_embeddings(
+                train.sources[s:e], train.destinations[s:e],
+                train.destinations[s:e], train.timestamps[s:e],
+                train.edge_idxs[s:e], 5)
+        trace = adapter.trace
+        if trace is not None and trace.cuts:
+            per_batch_traces.append((trace, k))
+        adapter.clear_trace()
+    print("batches with traces:", len(per_batch_traces), flush=True)
     idx = JodieFutureIndex(train)
     builders = {arm: JodieCutBuilder(idx, stage=NODE_CLASS, seed=args.seed,
                                      n_observations=2,
                                      supervision_mode=arm)
                 for arm in ARMS}
-    # feed the same trace object to each builder
-    from rpbe.state import CompactCutTrace
-    trace_obj = CompactCutTrace(
-        root_rows=sorted({int(c.root_row) for c in raw}), cuts=raw)
     per_arm_rows = {}
     for arm in ARMS:
-        rows = builders[arm].build(trace_obj, batch_seed=0)
-        cut_ids = sorted(r.cut_id for r in rows)
+        arm_rows = []
+        for trace, k in per_batch_traces:
+            arm_rows.extend(builders[arm].build(trace, batch_seed=k))
+        rows = arm_rows
+        cut_set = sorted({r.cut_id for r in rows})
         y1 = sorted(r.outcome_id for r in rows if r.horizon == 1)
         y2 = sorted(r.outcome_id for r in rows if r.horizon == 2)
         n_y2 = len(y2)
         n_y1 = len(y1)
         per_arm_rows[arm] = rows
         report["arms"][arm] = {
-            "cut_set_hash": _h16(cut_ids),
+            "cut_set_hash": _h16(cut_set),
             "y1_hash": _h16(y1),
             "y2_hash": _h16(y2),
-            "n_cuts": len(set(cut_ids)),
+            "n_cuts": len(cut_set),
             "n_y1": n_y1,
             "n_y2": n_y2,
         }
         print("  {} cuts={} y1={} y2={}".format(
-            arm, len(set(cut_ids)), n_y1, n_y2), flush=True)
+            arm, len(cut_set), n_y1, n_y2), flush=True)
 
     cs = {report["arms"][a]["cut_set_hash"] for a in ARMS}
     y1h = {report["arms"][a]["y1_hash"] for a in ARMS}
@@ -232,7 +232,7 @@ def main():
                     .format(unchanged))
     if illegal != 0:
         fail.append("mispaired {} illegal (non-future) Y2".format(illegal))
-    del components, adapter, tgn, raw
+    del components, adapter, tgn
 
     # ------------------------------------------------------------------ train
     print("=== training-group gate (1 macro-group per arm) ===", flush=True)

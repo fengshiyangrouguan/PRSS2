@@ -581,11 +581,16 @@ class MemoryVLA(nn.Module):
         # global RNG stream.  alpha=1 + U=0 keeps the training start
         # EXACTLY the official AvgMerge while the learning path is open.
         if use_rpbe_gamma:
+            # save/restore the global RNG around Gamma construction: the
+            # nn.Linear default inits inside GammaMerger would otherwise
+            # shift the RNG stream and break shared init across arms (E2)
+            rng_state = torch.get_rng_state()
             from vla.gamma_merger import GammaMerger
             self.gamma = GammaMerger(
                 dim=self.cog_token_size, rank=gamma_rank,
                 alpha_init=gamma_alpha_init,
                 seed=kwargs.get("rpbe_seed", 0))
+            torch.set_rng_state(rng_state)
             self.cog_mem_bank.gamma = self.gamma
         else:
             self.gamma = None

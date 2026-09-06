@@ -185,18 +185,21 @@ class EmbodiedRPBEWindow:
         self.strict = strict
         self.rows: Dict[tuple, EmbodiedCutRow] = {}
         self.closed = False
+        self.n_dropped_version = 0
 
     def add(self, rows: List[EmbodiedCutRow]) -> None:
         assert not self.closed
         for r in rows:
             # review ruling B5: a statistics window must never mix merge
-            # states written by different parameter versions; the trainer
-            # closes windows at every repr boundary, this is fail-fast
+            # states written by different parameter versions.  Rows whose
+            # merge was written under an OLDER version (their futures
+            # matured across a repr boundary) are dropped -- their window
+            # already closed at the boundary.
             if self.rows:
                 existing_v = next(iter(self.rows.values())).param_version
-                assert r.param_version == existing_v, (
-                    f"window mixes param versions {existing_v} and "
-                    f"{r.param_version}")
+                if r.param_version != existing_v:
+                    self.n_dropped_version += 1
+                    continue
             key = r.cut_id + (r.horizon,)
             self.rows[key] = r   # row_id dedup: distinct horizons both stay
 

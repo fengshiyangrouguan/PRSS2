@@ -246,6 +246,12 @@ def _audit_root_task(samples_sel, d, args):
         sc = StandardScaler().fit(x_feat[tr])
         xs_tr = sc.transform(x_feat[tr])
         xs_te = sc.transform(x_feat[te])
+        if len(np.unique(y_arr[tr])) < 2:
+            # Root labels are extremely sparse (wikipedia test has 44
+            # positives / 23621); a per-root split can land on a train fold
+            # with a single class.  Report NaN instead of crashing (Part
+            # II.9: do not resample a natural-distribution metric).
+            return float("nan"), float("nan"), float("nan")
         clf = LogisticRegression(C=1.0, max_iter=2000).fit(xs_tr, y_arr[tr])
         p_te = clf.predict_proba(xs_te)[:, 1]
         auc = float(roc_auc_score(y_arr[te], p_te)) \
@@ -281,6 +287,10 @@ def main():
     full, train, _, _ = dataset.splits()
     ns = argparse.Namespace(**cli)
     ns.data_dir = args.data_dir
+    # Backward compatibility: checkpoints trained before these CLI flags
+    # existed store a config.json whose ``cli`` block lacks them.
+    ns.supervision_mode = getattr(ns, "supervision_mode",
+                                  "production")
     components = tj.build_components(ns, device, dataset)
     tgn = components["tgn"]
     best = torch.load(out / "best.pt", map_location=device, weights_only=False)
@@ -306,6 +316,8 @@ def main():
 
     # ---------------------------------------------------------- collection
     samples = []
+    if tgn.use_memory:
+        tgn.memory.__init_memory__()
     n_batches = math.ceil(len(train.sources) / bs)
     max_batches = args.max_batches or n_batches
     with torch.no_grad():

@@ -24,8 +24,8 @@
     ],
     "lambda_calibration": {
       "rule": "r_eff = lambda * ||g_KF|| / ||g_task|| ~ 0.1, measured on theta_0 (calibration-only run, before ANY optimizer/scheduler step), calibrated once on the initial full window (training-only), then frozen for all seeds",
-      "lambda_kf": 0.0006768,
-      "lambda_kf_note": "LAMBDA SCAN (review round 3 item 6): the 0.1 arm runs with the pre-registered r_eff=0.1 value 6.768e-4 (= 0.1/147.75). The 0.3 arm used 2.0304568527918782e-3. Comparison happens ONLY on validation; the frozen value is decided after the scan."
+      "lambda_kf": 0.0016233961264756035,
+      "lambda_kf_note": "CONDITIONAL-2Obs calibration (review round 5, 2026-09-06): lambda = 0.1 / r_eff measured on theta_0 with the restored conditional P construction (chi(C)xphi(Y), u_k consumed). r_eff(lambda=1) ~ 61.6. Marginal-P pilots (obsolete for the main result, kept as ablation): 2.030e-3 (0.3 arm), 6.768e-4 (0.1 arm)."
     },
     "z_v_source": "J_mem(M_v) fixed adapter (TGN identity is its special case)",
     "witness": "none (main experiment)"

@@ -24,6 +24,12 @@ from transformers.models.llama.modeling_llama import (
 )
 
 
+import os as _os
+_CCM_AUDIT_GAMMA = _os.environ.get("CCM_AUDIT_GAMMA", "") == "1"
+_CCM_AUDIT_FP32_DIFF = _os.environ.get("CCM_AUDIT_FP32_DIFF", "") == "1"
+_AUDIT_BUFFER = []
+
+
 def _make_causal_mask(input_ids_shape: torch.Size, dtype: torch.dtype,
                       device: torch.device,
                       past_key_values_length: int = 0) -> torch.Tensor:
@@ -74,7 +80,8 @@ class LinearMask(nn.Linear):
 class LlamaAttention(nn.Module):
     """Multi-headed attention from 'Attention Is All You Need' paper"""
 
-    def __init__(self, config: LlamaConfig):
+    def __init__(self, config: LlamaConfig, layer_idx: int = -1):
+        self.layer_idx = layer_idx
         super().__init__()
         self.config = config
         self.hidden_size = config.hidden_size
@@ -197,10 +204,20 @@ class LlamaAttention(nn.Module):
                 t = t.view(1, 1, t_max, 1, 1)
                 prev_shift = torch.zeros_like(k_base)
                 prev_shift[:, :, 1:, :, :] = k_base[:, :, :-1, :, :]
-                k_cur = t * k_base - (t - 1) * prev_shift
+                if _CCM_AUDIT_FP32_DIFF:
+                    k_cur = (t.float() * k_base.float()
+                             - (t - 1).float() * prev_shift.float()
+                             ).to(k_base.dtype)
+                else:
+                    k_cur = t * k_base - (t - 1) * prev_shift
                 prev_shift = torch.zeros_like(v_base)
                 prev_shift[:, :, 1:, :, :] = v_base[:, :, :-1, :, :]
-                v_cur = t * v_base - (t - 1) * prev_shift
+                if _CCM_AUDIT_FP32_DIFF:
+                    v_cur = (t.float() * v_base.float()
+                             - (t - 1).float() * prev_shift.float()
+                             ).to(v_base.dtype)
+                else:
+                    v_cur = t * v_base - (t - 1) * prev_shift
             #####################################################
 
             key_states = no_sum_mask * key_states + key_comp_avg
@@ -234,6 +251,21 @@ class LlamaAttention(nn.Module):
                     res_t_v = self.gamma(
                         v_base[:, :, t_i - 2] + res_prev_v,
                         v_cur[:, :, t_i - 1], tt) * valid[:, :, t_i - 1]
+                    if _CCM_AUDIT_GAMMA:
+                        kb = k_base[0, :, t_i - 2]   # [H, 2, D]
+                        vb = v_base[0, :, t_i - 2]
+                        rk = res_t_k[0]              # [H, 2, D]
+                        rv = res_t_v[0]
+                        for _h in range(n_heads):
+                            for _s in range(2):
+                                _AUDIT_BUFFER.append({
+                                    "layer": self.layer_idx, "t": int(t_i),
+                                    "head": _h, "slot": _s,
+                                    "res_k": float(rk[_h, _s].float().norm()),
+                                    "base_k": float(kb[_h, _s].float().norm()),
+                                    "res_v": float(rv[_h, _s].float().norm()),
+                                    "base_v": float(vb[_h, _s].float().norm()),
+                                })
                     res_prev_k = res_t_k
                     res_prev_v = res_t_v
                     res_all_k[:, :, t_i - 1] = res_t_k
@@ -311,10 +343,11 @@ class LlamaAttention(nn.Module):
 
 class LlamaDecoderLayer(nn.Module):
 
-    def __init__(self, config: LlamaConfig):
+    def __init__(self, config: LlamaConfig, layer_idx: int = -1):
+        self.layer_idx = layer_idx
         super().__init__()
         self.hidden_size = config.hidden_size
-        self.self_attn = LlamaAttention(config=config)
+        self.self_attn = LlamaAttention(config=config, layer_idx=self.layer_idx)
         self.mlp = LlamaMLP(config)
         self.input_layernorm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -431,7 +464,8 @@ class LlamaModelCCM(LlamaPreTrainedModel):
 
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
         self.layers = nn.ModuleList(
-            [LlamaDecoderLayer(config) for _ in range(config.num_hidden_layers)])
+            [LlamaDecoderLayer(config, layer_idx=i)
+             for i in range(config.num_hidden_layers)])
         self.norm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
         self.gradient_checkpointing = False

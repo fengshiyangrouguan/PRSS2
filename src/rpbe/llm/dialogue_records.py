@@ -54,9 +54,6 @@ class Llmmaps(nn.Module):
         self.d_chi = int(d_chi)
         self.d_phi = int(d_phi)
         self.m = int(m)
-        self.register_buffer("phi_table", _fixed_binary((2, d_phi),
-                                                         seed + 20),
-                             persistent=True)
         full_dim = (1 + d_chi) * d_phi
         rows = torch.arange(full_dim)
         cols = rows % m
@@ -76,20 +73,20 @@ class Llmmaps(nn.Module):
         self.register_buffer(
             "scale", torch.tensor((m / full_dim) ** 0.5), persistent=True)
 
-    def pv(self, chi: torch.Tensor, horizon: int) -> torch.Tensor:
-        """p_h = Sketch([1; chi] (x) phi_h); chi [d_chi] or [B, d_chi]
-        (output shape follows the input rank)."""
-        if int(horizon) not in (1, 2):
-            raise ValueError("horizon must be 1 or 2, got {}".format(horizon))
+    def pv(self, chi: torch.Tensor, phi: torch.Tensor) -> torch.Tensor:
+        """CONDITIONAL measurement (review round 5): p =
+        Sketch([1; chi] (x) phi) where chi is the CONTEXT measurement and
+        phi is the FUTURE measurement; chi [d_chi] or [B, d_chi], phi
+        [d_phi] (output shape follows chi's rank)."""
         single = chi.dim() == 1
         if single:
             chi = chi.unsqueeze(0)
+        if phi.dim() == 1:
+            phi = phi.unsqueeze(0)
         with torch.no_grad():
-            phi = self.phi_table[int(horizon) - 1].to(dtype=chi.dtype,
-                                                      device=chi.device)
             body = torch.cat([torch.ones(chi.shape[0], 1, dtype=chi.dtype,
                                          device=chi.device), chi], dim=1)
-            prod = torch.einsum("bd,f->bdf", body, phi).reshape(
+            prod = torch.einsum("bd,bf->bdf", body, phi).reshape(
                 chi.shape[0], -1)
             cols = self.sketch_cols.to(chi.device)
             rows = self.sketch_rows.to(chi.device)
@@ -136,6 +133,7 @@ class DialogueCutBuilder:
 
     def build(self, meta: DialogueMeta, z_v: torch.Tensor,
               chi_1: torch.Tensor, chi_2: torch.Tensor,
+              phi_1: torch.Tensor, phi_2: torch.Tensor,
               stats: Optional[dict] = None) -> List[CutRecord]:
         """One cut (v = k - 3) -> two horizon rows sharing the cut_id.
 
@@ -155,9 +153,12 @@ class DialogueCutBuilder:
         rows: List[CutRecord] = []
         for horizon in (1, 2):
             chi = chi_1 if horizon == 1 else chi_2
+            phi = phi_1 if horizon == 1 else phi_2
             if chi.dim() == 2:
                 chi = chi[0]
-            p = self.maps.pv(chi, horizon)
+            if phi.dim() == 2:
+                phi = phi[0]
+            p = self.maps.pv(chi, phi)
             rows.append(CutRecord(
                 tree_id=int(meta.sample_id),
                 occurrence_id=cut_occurrence,

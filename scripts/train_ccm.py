@@ -410,9 +410,16 @@ def collect_replay_z(meta, adapter, device):
     return adapter.extract_z(sum_positions)[0]
 
 
-def collect_rows(meta, adapter, builder, utter_embed, embed_tokens, batch,
-                 device):
-    """Extract z_v + chi and build the two horizon rows for one sample."""
+def collect_rows(meta, adapter, builder, utter_embed, phi_embed,
+                 embed_tokens, batch, device):
+    """CONDITIONAL 2Obs (review round 5, restoring plan Test D):
+
+      obs1: C = u_{v+1},              Y = u_{v+2}        (both in prompt)
+      obs2: C = (u_{v+1}, u_{v+2}, one-update), Y = u_k (labels, EOS out)
+
+    z_v is the memory at v = k - 3; the two rows share cut_id and enter
+    the same Ky Fan window with weights 0.5/0.5.  chi/phi are frozen
+    input-embedding sketches (no extra LLaMA forward, no grad flow)."""
     if not meta["ok"] or meta["k"] < 4:
         return []
     v = meta["k"] - 3
@@ -422,17 +429,22 @@ def collect_rows(meta, adapter, builder, utter_embed, embed_tokens, batch,
     z = adapter.extract_z(sum_positions)  # [1, z_dim]
     spans = meta["utterance_spans"]
     ids = batch["input_ids"][meta["row"]]
-    chi1 = utter_embed(embed_tokens,
-                       ids[spans[v + 1][0]:spans[v + 1][1]]
-                       .unsqueeze(0).to(device), tag=0)
-    chi2 = utter_embed(embed_tokens,
-                       ids[spans[v + 2][0]:spans[v + 2][1]]
-                       .unsqueeze(0).to(device), tag=1)
+    labs = batch["labels"][meta["row"]]
+    u_v1 = ids[spans[v + 1][0]:spans[v + 1][1]].unsqueeze(0).to(device)
+    u_v2 = ids[spans[v + 2][0]:spans[v + 2][1]].unsqueeze(0).to(device)
+    chi1 = utter_embed(embed_tokens, u_v1, tag=0)
+    phi1 = phi_embed(embed_tokens, u_v2, tag=0)
+    chi2 = utter_embed.combine(embed_tokens, u_v1, u_v2, tag=1)
+    # u_k = the target utterance: valid label tokens minus the EOS
+    valid_pos = (labs != -100).nonzero(as_tuple=False).flatten()
+    uk_pos = valid_pos[:-1] if len(valid_pos) > 1 else valid_pos
+    phi2 = phi_embed(embed_tokens, ids[uk_pos].unsqueeze(0).to(device),
+                     tag=1)
     dm = DialogueMeta(sample_id=int(meta["sample_id"]), k=int(meta["k"]),
                       sum_positions=[(p + 2, p + 3) for (p, _s)
                                      in meta["blocks"]],
                       utterance_spans=list(meta["utterance_spans"]))
-    return builder.build(dm, z, chi1[0], chi2[0])
+    return builder.build(dm, z, chi1[0], chi2[0], phi1[0], phi2[0])
 
 
 def batch_surrogate(z_rows_by_oid, batch_terms, lam, device):
@@ -583,7 +595,10 @@ def main():
         builder = DialogueCutBuilder(maps, z_dim=args.z_dim,
                                      seed=args.rpbe_seed)
         utter_embed = UtteranceEmbed(hidden_dim=cfg.hidden_size, d_chi=64,
-                                     seed=args.rpbe_seed).to(device)
+                                     seed=args.rpbe_seed,
+                                     combine_dim=1).to(device)
+        phi_embed = UtteranceEmbed(hidden_dim=cfg.hidden_size, d_chi=32,
+                                   seed=args.rpbe_seed + 100).to(device)
         window = KFMomentWindow({MEM_TAU: args.z_dim}, min_ratio=2.0,
                                 min_abs=args.kf_min_cuts,
                                 eps=args.ridge_eps, fixed_maps=maps,
@@ -771,6 +786,7 @@ def main():
             for meta in meta_list:
                 _t = time.perf_counter()
                 rows = collect_rows(meta, adapter, builder, utter_embed,
+                                     phi_embed,
                                     embed_tokens, batch, device)
                 _pf("collect_rows", _t)
                 if rows:

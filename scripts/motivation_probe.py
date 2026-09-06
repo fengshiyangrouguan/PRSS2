@@ -101,6 +101,63 @@ def fit_ridge_multi(x_tr, y_tr):
     return scaler, model
 
 
+def build_event_target_spec(rpbe_seed, d_cat=24, d_rff=24, dtype=np.float64):
+    """Deterministic target maps for the Y1 *event identity* (Part II
+    target).  These are INDEPENDENT of the training measurement maps (a
+    different seed stream), so the target never shares coordinates with the
+    context feature C — sharing would let q_C already see the target
+    structure and deflate A_d.
+
+    Returns a dict of numpy arrays:
+      counter_table [num_bins, d_cat]   +-1   hashed counterpart identity
+      role_table    [2, d_cat]          +-1   direction of the future event
+      outcome_table [2, d_cat]          +-1   future event label (0/1)
+      rff_w [d_rff], rff_b [d_rff]           cos(delta_t * w + b)
+      horizon_table [2, d_cat]               Y1 vs Y2 slot marker
+    The per-event signature concatenates them, so each distinct real future
+    event carries a non-trivial fixed target even when the 0/1 label is
+    sparse.
+    """
+    g = np.random.RandomState(int(rpbe_seed) * 1009 + 7)
+    n_bins = 4096
+
+    def _pm1(shape):
+        return (g.randint(0, 2, size=shape) * 2 - 1).astype(dtype)
+
+    return {
+        "counter_table": _pm1((n_bins, d_cat)),
+        "role_table": _pm1((2, d_cat)),
+        "outcome_table": _pm1((2, d_cat)),
+        "horizon_table": _pm1((2, d_cat)),
+        "rff_w": g.randn(d_rff).astype(dtype),
+        "rff_b": (g.rand(d_rff) * 2 * np.pi).astype(dtype),
+        "d_cat": d_cat,
+        "d_rff": d_rff,
+    }
+
+
+def event_signature(spec, event, delta_t_scale):
+    """Fixed target signature of one observed future event.
+
+    ``event`` is an ``rpbe.records.ObservedOutcome``.  Concatenates hashed
+    counterpart, role, outcome, a Y1/Y2 slot marker and an RFF of the (scaled)
+    time-to-event.  Deterministic; used only as the probe regression target.
+    """
+    d_cat, d_rff = spec["d_cat"], spec["d_rff"]
+    cp = int(event.counterpart) % 4096
+    role = 1 if int(event.role) > 0 else 0
+    out = 1 if float(event.outcome) > 0.5 else 0
+    t = np.concatenate([
+        spec["counter_table"][cp],
+        spec["role_table"][role],
+        spec["outcome_table"][out],
+        spec["horizon_table"][0],
+        np.cos(float(event.time) / float(delta_t_scale)
+               * spec["rff_w"] + spec["rff_b"]),
+    ])
+    return t
+
+
 def _audit_one_depth(samples_sel, d, args, z_override=None,
                      y_field="T", y_override=None):
     """Fit q_C/q_U/q_Z at one depth and report A/K/PUR + cluster-bootstrap
@@ -313,6 +370,10 @@ def main():
     n_layers = cli.get("n_layer", 2)
     bs = cli.get("bs", 200)
     n_degree = cli.get("n_degree", 5)
+    # Fixed, measurement-independent Y1 event-identity target (Part II).
+    delta_scale = float(cli.get("delta_t_scale", 1e6)) or 1.0
+    tgt = build_event_target_spec(int(cli.get("rpbe_seed", 0)), dtype=np.float32)
+    tgt_dim = tgt["d_cat"] * 4 + tgt["d_rff"]
 
     # ---------------------------------------------------------- collection
     samples = []
@@ -369,8 +430,7 @@ def main():
                         "Z": cut.z.detach().cpu().numpy(),
                         "C": c_vec.detach().cpu().numpy(),
                         "F": label,
-                        "T": fixed_maps.future_vector(
-                            float(y1[0].outcome)).detach().cpu().numpy(),
+                        "T": event_signature(tgt, y1[0], delta_scale),
                     })
             adapter.clear_trace()
     if not samples:

@@ -45,30 +45,41 @@ for line in open(DF_PATH):
 total = sum(sid_count.values())
 print("total samples: {}".format(total))
 
-# exactly-15 dialogues
-s15 = [i for i, L in enumerate(lens) if L == 15]
-n_s15 = len(s15)
-samp15 = sum(sid_count[i] for i in s15)
-k15_hits = sum(sid_k[i].get(15, 0) for i in s15)
-print("\n== exactly-15-turn dialogues ==")
-print("  dialogues: {}".format(n_s15))
+# REVIEW ROUND 4 FIX: data_flow logs parse_meta k = random_prefix - 1.
+# A full-length 15-turn prefix appears as logged k=14; dialogues longer
+# than 15 turns ALSO provide 15-turn-prefix samples (logged k=14) and
+# must be counted.
+s15plus = [i for i, L in enumerate(lens) if L >= 15]
+n_s15plus = len(s15plus)
+samp15plus = sum(sid_count[i] for i in s15plus)
+full15_hits = sum(sid_k[i].get(14, 0) for i in s15plus)
+print("\n== >=15-turn dialogues (log k=14 == full 15-turn prefix) ==")
+print("  dialogues: {}".format(n_s15plus))
 print("  times sampled: {} ({:.2f}% of all samples)".format(
-    samp15, 100.0 * samp15 / total))
-print("  times sampled with k==15: {} -> {:.2f}% of their samples "
-      "(theoretical 1/13 = {:.2f}%)".format(
-          k15_hits, 100.0 * k15_hits / max(samp15, 1), 100.0 / 13))
+    samp15plus, 100.0 * samp15plus / total))
+print("  full 15-turn-prefix samples (log k=14): {} -> {:.2f}% of their "
+      "samples".format(full15_hits,
+                       100.0 * full15_hits / max(samp15plus, 1)))
+# exactly-15 dialogues subset (review's original 1/13 framing)
+s15 = [i for i, L in enumerate(lens) if L == 15]
+samp15 = sum(sid_count[i] for i in s15)
+k14_exact = sum(sid_k[i].get(14, 0) for i in s15)
+print("  exactly-15 subset: {} dialogues, {} samples, {} full-prefix hits "
+      "({:.2f}%, theory 1/13 = {:.2f}%)".format(
+          len(s15), samp15, k14_exact,
+          100.0 * k14_exact / max(samp15, 1), 100.0 / 13))
 
-# deep-chain exposure: k >= 13 on dialogues long enough to allow it
+# deep-chain exposure (log k >= 13 == prefix >= 14)
 deep = sum(k_count.get(k, 0) for k in k_count if k >= 13)
-print("\n== deep-chain exposure (k>=13) ==")
-print("  samples with k>=13: {} ({:.2f}% of total)".format(
-    deep, 100.0 * deep / total))
-print("  k distribution tail:")
+print("\n== deep-chain exposure (log k>=13, i.e. prefix>=14) ==")
+print("  samples: {} ({:.2f}% of total)".format(deep,
+                                                100.0 * deep / total))
+print("  log-k distribution tail:")
 for k in sorted(k_count)[-8:]:
-    print("    k={}: {} ({:.2f}%)".format(k, k_count[k],
-                                         100.0 * k_count[k] / total))
+    print("    logk={}: {} ({:.2f}%)".format(k, k_count[k],
+                                             100.0 * k_count[k] / total))
 
-# per-dialogue worst coverage: 15-turn dialogues never sampled with k>=14
-never_deep = [i for i in s15 if max(sid_k[i], default=0) < 14]
-print("  15-turn dialogues never sampled at k>=14: {}/{}".format(
-    len(never_deep), n_s15))
+# coverage: >=15-turn dialogues never sampled with a >=14-turn prefix
+never_deep = [i for i in s15plus if max(sid_k[i], default=0) < 13]
+print("  >=15-turn dialogues never sampled at prefix>=14 (logk>=13): "
+      "{}/{}".format(len(never_deep), n_s15plus))

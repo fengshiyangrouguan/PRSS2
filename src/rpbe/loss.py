@@ -26,6 +26,7 @@ Numerical contract (after the cloud crash review, 2026-08-27):
 import math
 from typing import Dict, List, Optional, Tuple
 
+import numpy as np
 import torch
 
 
@@ -983,18 +984,38 @@ class KFMomentWindow:
                 wsum_by_cut[cid] = wsum_by_cut.get(cid, 0.0) + wv
             W2_cut = float(sum(v * v for v in wsum_by_cut.values()))
             D = W - W2_cut / W
-            # Shuffled score: permute the SAMPLE pairing of P (column
-            # permutations are trace-invariant and would prove nothing);
-            # weights travel with their rows.
-            perm = torch.randperm(int(m_rows), generator=torch.Generator(
-                device="cpu").manual_seed(int(m_rows * 7919) % (2 ** 31)))
+            # DIALOGUE-GROUPED shuffle (review round 5): the two horizon
+            # rows of one cut move TOGETHER to another dialogue's z;
+            # horizon pairing and weights stay attached.  Repeated
+            # shuffles give a distribution, not a single draw.
             wc = w.reshape(-1, 1)
+            n_shuffles = 16
+            rng_gen = torch.Generator(device="cpu").manual_seed(7919)
+            unique_cuts = list(dict.fromkeys(win["cut_ids_list"]))
+            row_groups = {}
+            for _i, _cid in enumerate(win["cut_ids_list"]):
+                row_groups.setdefault(_cid, []).append(_i)
             mu_z = (z_all * wc).sum(0, keepdim=True) / W
-            mu_p = (p_all[perm] * wc[perm]).sum(0, keepdim=True) / W
             zc = (z_all - mu_z).double()
-            pc = (p_all[perm] - mu_p).double()
-            czzs, cpps, czps, _ = _covs(zc, pc, D, w=w[perm])
-            j_shuffled, _ = _score_from_covs(czzs, czps, cpps, self.eps)
+            j_shuff_list = []
+            for _s in range(n_shuffles):
+                perm = torch.randperm(len(unique_cuts), generator=rng_gen)
+                remap = {_cid: int(perm[_i])
+                         for _i, _cid in enumerate(unique_cuts)}
+                new_p = p_all.clone()
+                for _cid, _rows in row_groups.items():
+                    _target = unique_cuts[remap[_cid]]
+                    _trows = row_groups[_target]
+                    for _a, _b in zip(_rows, _trows):
+                        new_p[_a] = p_all[_b]
+                _mu_p = (new_p * wc).sum(0, keepdim=True) / W
+                _pc = (new_p - _mu_p).double()
+                _czzs, _cpps, _czps, _ = _covs(zc, _pc, D, w=w)
+                _js, _ = _score_from_covs(_czzs, _czps, _cpps, self.eps)
+                if _js is not None:
+                    j_shuff_list.append(float(_js))
+            j_shuffled = (float(np.mean(j_shuff_list))
+                          if j_shuff_list else float("nan"))
             d = {"M_unique": int(len(win["cut_seen"])),
                  "M_rows": int(m_rows),
                  "M_unique_trees": int(len(win["tree_seen"])),
@@ -1002,12 +1023,11 @@ class KFMomentWindow:
                  "D": float(D),
                  "w_eff_cut": (W * W / W2_cut) if W2_cut > 0.0
                  else float("nan"),
-                 "J_shuffled": (float(j_shuffled) if j_shuffled is not None
-                                else float("nan")),
+                 "J_shuffled": j_shuffled,
+                 "J_shuffled_list": j_shuff_list,
+                 "J_shuffled_n": len(j_shuff_list),
                  "J_real_minus_shuffled":
-                     (float(j.detach())
-                      - (float(j_shuffled) if j_shuffled is not None
-                         else float("nan"))),
+                     (float(j.detach()) - j_shuffled),
                  "symmetry_error": sym_err,
                  "joint_min_eig": _joint_min_eig(czz, czp, cpp),
                  "failed": score_diag["failed"]}

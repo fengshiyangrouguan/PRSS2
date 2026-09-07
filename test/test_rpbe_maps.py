@@ -164,5 +164,64 @@ class TestPsiBehavior(unittest.TestCase):
                                     b.pv_batch(contexts, outcomes)))
 
 
+class TestDenseFuture(unittest.TestCase):
+    """The dense future mode (cfg.dense_future): phi_Y must distinguish real
+    next-hop events that share outcome=0 but differ in counterpart / role /
+    time — the review-verdict fix for the vacuous mispaired ablation."""
+
+    def _dense_maps(self, seed=0):
+        return FixedMaps(make_cfg(seed=seed, dense_future=True))
+
+    def test_dense_flag_auto_selects_mode(self):
+        fm = self._dense_maps()
+        ctx = base_context(counterpart=5, role=0, delta_t=100.0)
+        # pv default should route to dense (auto-resolved from cfg).
+        p = fm.pv(ctx, 0.0)
+        self.assertEqual(p.shape, (fm.m,))
+        self.assertTrue(torch.isfinite(p).all())
+
+    def test_outcome0_but_different_event_differs(self):
+        """Two events both outcome=0 but different counterpart/time must give
+        different dense p (under joint/old they would be identical)."""
+        fm = self._dense_maps()
+        # same role, same outcome 0, different counterpart and delta_t
+        ctx_a = base_context(counterpart=101, role=0, delta_t=100.0)
+        ctx_b = base_context(counterpart=202, role=0, delta_t=500.0)
+        self.assertFalse(torch.equal(fm.pv(ctx_a, 0.0), fm.pv(ctx_b, 0.0)),
+                         "dense phi_Y must distinguish real events sharing "
+                         "outcome=0")
+
+    def test_dense_differs_from_joint_same_outcome(self):
+        """Even the same event's dense p must differ from the outcome-only
+        joint p (the content now carries the event identity)."""
+        fm_d = FixedMaps(make_cfg(seed=0, dense_future=True))
+        fm_j = FixedMaps(make_cfg(seed=0, dense_future=False))
+        ctx = base_context(counterpart=77, role=0, delta_t=1234.0)
+        self.assertFalse(torch.equal(fm_d.pv(ctx, 0.0), fm_j.pv(ctx, 0.0)))
+
+    def test_default_joint_unchanged_without_flag(self):
+        """dense_future=False keeps the historical joint p bit-for-bit."""
+        fm_j = FixedMaps(make_cfg(seed=0, dense_future=False))
+        ctx = base_context()
+        p = fm_j.pv(ctx, 0.0)
+        self.assertEqual(p.shape, (fm_j.m,))
+
+    def test_pv_batch_matches_pv_dense(self):
+        fm = self._dense_maps()
+        contexts = [base_context(counterpart=10 * (i + 1), role=i % 2,
+                                 delta_t=1000.0 * (i + 1))
+                    for i in range(6)]
+        outcomes = [0.0] * 6
+        batch = fm.pv_batch(contexts, outcomes)
+        for i, (c, y) in enumerate(zip(contexts, outcomes)):
+            self.assertTrue(torch.equal(batch[i], fm.pv(c, y)),
+                            "dense pv_batch row {} diverges".format(i))
+
+    def test_fingerprint_covers_dense_buffers(self):
+        fm = self._dense_maps(seed=3)
+        fp = fm.isolation_fingerprint()
+        self.assertIn("sha256", fp)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -101,6 +101,38 @@ class FixedMaps(nn.Module):
         self.register_buffer("sketch_signs", signs, persistent=True)
         self._sketch_full_dim = full_dim
 
+        # Dense future (review verdict, Part II): when cfg.dense_future, phi_Y
+        # encodes the real next-hop event (hashed counterpart + role +
+        # outcome + RFF of time-to-event) instead of only the sparse 0/1
+        # outcome.  Tables are INDEPENDENT of the context tables (different
+        # seed offsets) so Y and C are not collinear.  The output stays d_f
+        # dimensional (the CountSketch geometry is unchanged): split d_f into
+        # a counterpart/role/outcome part and a delta_t RFF part.
+        if bool(getattr(cfg, "dense_future", False)):
+            # d_f split into counterpart / role+outcome / delta_t blocks whose
+            # lengths sum exactly to d_f (the CountSketch geometry is fixed).
+            d_rff = max(4, int(self.d_f * 0.3))
+            rem = self.d_f - d_rff
+            d_cp = max(4, rem // 2)
+            d_ro = rem - d_cp
+            self.d_cp = d_cp
+            self.d_ro = d_ro
+            self.d_rff_y = d_rff
+            assert d_cp + d_ro + d_rff == self.d_f, \
+                "dense blocks must sum to d_f"
+            self.register_buffer("dense_cp_table", _fixed_binary(
+                (self.num_counter_bins, d_cp), seed + 20), persistent=True)
+            self.register_buffer("dense_ro_table", _fixed_binary(
+                (4, d_ro), seed + 21), persistent=True)  # row: 2*role+outcome
+            self.register_buffer("dense_rff_w", torch.randn(
+                (1, d_rff),
+                generator=torch.Generator().manual_seed(seed + 22)),
+                persistent=True)
+            self.register_buffer("dense_rff_b", torch.rand(
+                (d_rff,),
+                generator=torch.Generator().manual_seed(seed + 23)) * 6.2832,
+                persistent=True)
+
     # ------------------------------------------------------------- primitives
     def _path_vector(self, path, dtype, device) -> torch.Tensor:
         """Fixed PathSketch of the upward walk: sum over steps of
@@ -169,6 +201,31 @@ class FixedMaps(nn.Module):
             raise ValueError("unknown future_mode {}".format(mode))
         return f.to(self.rff_w.dtype)  # [d_f]
 
+    def dense_future_vector(self, context, outcome: float) -> torch.Tensor:
+        """phi_Y for the REAL next-hop event (dense; review verdict).
+
+        Signature = concat[ dense_cp[counterpart % bins],      # counterpart id
+                            dense_ro[2*role + outcome],         # role+outcome
+                            cos(delta_t/scale * W + b) ]        # time-to-event
+        in a fixed d_f split.  Two distinct real events differ in at least
+        one of (counterpart, role, outcome, delta_t), so phi_Y differs with
+        probability ~1 even when both have outcome=0 — the mispaired swap is
+        no longer vacuous.  Requires cfg.dense_future.
+        """
+        if not bool(getattr(self.cfg, "dense_future", False)):
+            raise ValueError("dense_future_vector requires cfg.dense_future")
+        cp = int(context["counterpart"]) % self.num_counter_bins
+        role = 1 if int(context["role"]) > 0 else 0
+        out = 1 if float(outcome) > 0.5 else 0
+        ro = 2 * role + out
+        dt = float(context["delta_t"]) / self._delta_t_scale
+        t = torch.tensor(dt, dtype=self.rff_w.dtype,
+                         device=self.rff_w.device).reshape(1, 1)
+        part_cp = self.dense_cp_table[cp].to(self.rff_w.dtype)
+        part_ro = self.dense_ro_table[ro].to(self.rff_w.dtype)
+        part_dt = torch.cos(t @ self.dense_rff_w + self.dense_rff_b)[0]
+        return torch.cat([part_cp, part_ro, part_dt], dim=-1)  # [d_f]
+
     def psi(self, context, outcome: float) -> torch.Tensor:
         """sketch([1; phi_C] (x) phi_Y) -> [m]; no gradient."""
         self._pv_calls += 1
@@ -183,11 +240,24 @@ class FixedMaps(nn.Module):
                            prod[self.sketch_indices[0]] * self.sketch_signs)
             return out
 
+    def _resolve_mode(self, future_mode: str) -> str:
+        """Default the future mode to the dense event signature when the
+        config asks for it (review verdict: outcome-only phi_Y is vacuous
+        under mispairing on ~0.14% positives)."""
+        if future_mode == "joint" and bool(
+                getattr(self.cfg, "dense_future", False)):
+            return "dense"
+        return future_mode
+
     def pv(self, context, outcome: float, future_mode: str = "joint") -> torch.Tensor:
         """One joint-test row for one cut."""
+        future_mode = self._resolve_mode(future_mode)
         with torch.no_grad():
             c = self.context_vector(context)
-            f = self.future_vector(outcome, mode=future_mode)
+            if future_mode == "dense":
+                f = self.dense_future_vector(context, outcome)
+            else:
+                f = self.future_vector(outcome, mode=future_mode)
             body = torch.cat([torch.ones(1, dtype=c.dtype, device=c.device),
                               c[0]])
             prod = torch.outer(body, f).reshape(-1)
@@ -221,6 +291,7 @@ class FixedMaps(nn.Module):
         if n == 0:
             return torch.zeros((0, self.m), dtype=self.rff_w.dtype,
                                device=self.rff_w.device)
+        future_mode = self._resolve_mode(future_mode)
         dev = self.rff_w.device
         key = tuple((int(c["horizon"]), float(c["delta_t"]),
                      int(c["counterpart"]), int(c["role"]),
@@ -274,6 +345,19 @@ class FixedMaps(nn.Module):
                                  dtype=torch.long, device=dev)
             if future_mode == "joint":
                 f_vec = self.future_table[y_idx].to(rff.dtype)       # [N, d_f]
+            elif future_mode == "dense":
+                # Real next-hop event signature (review verdict): hashed
+                # counterpart + role/outcome + RFF(delta_t), in a fixed d_f
+                # split.  Vectorized analog of dense_future_vector.
+                # ``deltas`` is [N, 1] (already scaled by delta_t_scale).
+                dt_y = torch.cos(deltas @ self.dense_rff_w
+                                 + self.dense_rff_b)              # [N, d_rff]
+                ro = (2 * roles + y_idx).to(dev)                  # [N]
+                part_cp = self.dense_cp_table[partners].to(rff.dtype)
+                part_ro = self.dense_ro_table[ro].to(rff.dtype)
+                part_dt = dt_y.to(rff.dtype)
+                f_vec = torch.cat([part_cp, part_ro, part_dt],
+                                  dim=1)                         # [N, d_f]
             elif future_mode == "context_common":
                 f_vec = 0.5 * (self.future_table[0] + self.future_table[1]) \
                     .to(rff.dtype).unsqueeze(0).expand(n, -1)
@@ -359,6 +443,13 @@ class FixedMaps(nn.Module):
             buf = getattr(self, name)
             h.update(buf.detach().cpu().reshape(-1).contiguous()
                      .numpy().tobytes())
+        if bool(getattr(self.cfg, "dense_future", False)):
+            for name in ("dense_cp_table", "dense_ro_table",
+                         "dense_rff_w", "dense_rff_b"):
+                buf = getattr(self, name)
+                h.update(buf.detach().cpu().reshape(-1).contiguous()
+                         .numpy().tobytes())
         return {"seed": int(self.cfg.rpbe_seed),
                 "delta_t_scale": self._delta_t_scale,
+                "dense_future": bool(getattr(self.cfg, "dense_future", False)),
                 "sha256": h.hexdigest()}

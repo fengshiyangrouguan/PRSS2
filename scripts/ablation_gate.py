@@ -116,6 +116,7 @@ def _build(args, device, dataset, supervision_mode):
         trace_mode="evenly_spaced", train_eval_auc=False,
         no_early_stop=False, max_batches=0, grad_clip=5.0,
         monitor_every=50, checkpoint_every=0, resume_from="",
+        dense_future=getattr(args, "dense_future", False),
         no_fail_on_monitor_error=False, max_train=0, max_val=0, max_test=0)
     return tj.build_components(ns, device, dataset)
 

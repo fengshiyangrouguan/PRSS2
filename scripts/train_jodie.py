@@ -106,6 +106,12 @@ def parse_args():
                    help="Table-2 ablation variant (paper spec section 4)")
     p.add_argument("--n-observations", type=int, default=2, choices=[1, 2],
                    help="1 = Y1 only; 2 = two-observation pullback")
+    p.add_argument("--dense-future", action="store_true",
+                   help="encode phi_Y as the real next-hop event identity "
+                        "(hashed counterpart + role + RFF(time-to-event)) "
+                        "instead of only the sparse 0/1 outcome; the "
+                        "mispaired ablation is vacuous on outcome-only "
+                        "signatures (review verdict)")
     p.add_argument("--supervision-mode", default=SUPERVISION_PRODUCTION,
                    choices=["production", "1obs", "2obs_aligned",
                             "2obs_mispaired"],
@@ -299,6 +305,7 @@ def build_components(args, device, dataset):
             kf_variant=args.kf_variant,
             n_observations=args.n_observations,
             supervision_mode=args.supervision_mode,
+            dense_future=getattr(args, "dense_future", False),
             kf_taus=list(taus[:-1]),
             rpbe_seed=args.rpbe_seed)
         compressor = RecursiveCompressor(rpbe_cfg).to(device)

@@ -54,6 +54,15 @@ class RPBConfig:
     # ablation arms on the shared Y1+Y2-valid cut set.
     supervision_mode: str = SUPERVISION_PRODUCTION
     rpbe_seed: int = 0                   # fixed-measurement seed (independent of host)
+    # Dense future supervision (review verdict, Part II fix): the default
+    # phi_Y encodes only the sparse 0/1 outcome, so a mispaired swap that
+    # keeps outcome=0 leaves phi_Y (and the whole joint test) unchanged —
+    # the mispaired ablation is vacuous on ~0.14%-positive node labels.
+    # When True, phi_Y additionally encodes the real next-hop event identity:
+    # hashed counterpart, role, and an RFF of the time-to-event, using
+    # INDEPENDENT fixed tables (seed offset), so different real events yield
+    # different phi_Y with probability ~1 even under outcome=0.
+    dense_future: bool = False
 
     def __post_init__(self):
         self.state_dims = dict(self.state_dims)
@@ -119,4 +128,5 @@ class RPBConfig:
             "n_observations": self.n_observations,
             "supervision_mode": self.supervision_mode,
             "rpbe_seed": self.rpbe_seed,
+            "dense_future": self.dense_future,
         }

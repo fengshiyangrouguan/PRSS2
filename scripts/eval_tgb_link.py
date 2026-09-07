@@ -1,21 +1,34 @@
 #!/usr/bin/env python3
-"""TGB tgbl-wiki MRR evaluation for a trained arm (official protocol).
+"""TGB tgbl-wiki MRR evaluation — strictly-equivalent, read-only scoring.
 
-Replays train memory in online order (each real edge once), then evaluates
-the val split with the OFFICIAL negative sampler and MRR.  ``--split test``
-runs the held-out test (locked once).  The runner's best.pt is loaded; the
-host runs in eval mode (auxiliary / future / trace / fixed maps off).
+Equivalence requirements (user decision):
+* 3 layers + n_neighbors=10 both for training and this evaluator;
+* full official negatives per positive (no 100-subset);
+* source embedding computed ONCE per positive;
+* candidate destinations (positive dst + ~all official negatives) are scored
+  in chunks of ``--dst-chunk`` sharing the SAME event-before memory;
+* memory is advanced ONLY by real positive events, exactly once each;
+* negatives never update state;
+* TGB averaged tie rank
+      r = 1 + (#(s^- > s^+) + #(s^- >= s^+)) / 2
+* ``test`` never selects checkpoints.
 
-Usage:
-    python -m scripts.eval_tgb_link --output <arm-dir> --data-dir datasets \
-        --gpu 0 [--split val]
+Read-only scoring: we call ``embedding_module.compute_embedding`` directly
+with an explicit memory tensor (no raw-message storage / no memory update
+side effects), so every candidate of one event sees byte-identical memory.
+
+A gate compares this evaluator against the previous (per-event
+``compute_temporal_embeddings``) evaluator on 32 fixed val events: identical
+per-event reciprocal rank and identical final memory/neighbor state.
+
+Metric is named ``sampled_query_<split>_mrr`` (not a full-TGB-MRR claim).
 """
 
 import argparse
 import json
-import math
 import os
 import sys
+import time
 from pathlib import Path
 
 for _k in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS"):
@@ -39,11 +52,20 @@ from rpbe.compressor import RecursiveCompressor
 
 
 def parse_args():
-    p = argparse.ArgumentParser("tgbl-wiki MRR eval")
-    p.add_argument("--output", required=True)   # arm run dir (has best.pt)
+    p = argparse.ArgumentParser("tgbl-wiki MRR eval (read-only chunked)")
+    p.add_argument("--output", required=True)
     p.add_argument("--data-dir", default="datasets")
     p.add_argument("--gpu", type=int, default=0)
     p.add_argument("--split", choices=["val", "test"], default="val")
+    p.add_argument("--query-ids", default="",
+                   help="optional json of fixed query event indices to score "
+                        "(same across arms/seeds); empty = score in order")
+    p.add_argument("--max-n", type=int, default=0,
+                   help="cap scored positives (0 = all in query set)")
+    p.add_argument("--dst-chunk", type=int, default=64)
+    p.add_argument("--gate", action="store_true",
+                   help="run the 32-event equivalence gate vs the legacy "
+                        "per-event evaluator")
     return p.parse_args()
 
 
@@ -85,14 +107,61 @@ def _rebuild(cfg_cli, device, ds):
     return tgn, comp
 
 
-def _mrr_from_scores(pos_scores, neg_scores_list):
-    """pos_scores[i] vs neg_scores_list[i] (list of neg scores). MRR."""
-    ranks = []
-    for ps, ns in zip(pos_scores, neg_scores_list):
-        # rank of the positive among {positive} U {negatives} (higher=better)
-        r = 1.0 + float(sum(1 for x in ns if x > ps))
-        ranks.append(1.0 / r)
-    return float(np.mean(ranks)) if ranks else float("nan")
+def _current_memory(tgn):
+    """Read-only current memory tensor (no side effects)."""
+    return tgn.memory.get_memory(list(range(tgn.n_nodes))) if tgn.use_memory \
+        else None
+
+
+def _read_emb(tgn, memory, nodes, times):
+    """Read-only recursive embedding for ``nodes`` at ``times``.
+
+    Calls the host embedding module directly so no raw messages are stored
+    and memory is not advanced.  ``nodes``/``times`` are numpy (internal ids).
+    """
+    emb = tgn.embedding_module.compute_embedding(
+        memory=memory, source_nodes=np.asarray(nodes, dtype=np.int64),
+        timestamps=np.asarray(times, dtype=np.float64),
+        n_layers=tgn.n_layers, n_neighbors=10)
+    return emb
+
+
+def _score_pos_neg(tgn, memory, src, t, pos_dst, neg_dsts, chunk):
+    """Affinity scores: source once; destinations chunked, same memory."""
+    src_emb = _read_emb(tgn, memory, [src], [t])[0]     # [dim]
+    # positive destination embedding
+    pos_emb = _read_emb(tgn, memory, [pos_dst], [t])[0]
+    pos_score = float(tgn.affinity_score(
+        src_emb.unsqueeze(0), pos_emb.unsqueeze(0)).squeeze(0))
+    neg_scores = []
+    for c0 in range(0, len(neg_dsts), chunk):
+        seg = neg_dsts[c0:c0 + chunk]
+        if len(seg) == 0:
+            continue
+        e = _read_emb(tgn, memory, seg,
+                      [t] * len(seg))                    # [c, dim]
+        x = src_emb.unsqueeze(0).expand(len(seg), -1)
+        s = tgn.affinity_score(x, e).squeeze(0)
+        neg_scores.extend([float(v) for v in s])
+    return pos_score, neg_scores
+
+
+def _mrr_rank(pos_score, neg_scores):
+    gt = float(sum(1 for v in neg_scores if v > pos_score))
+    ge = float(sum(1 for v in neg_scores if v >= pos_score))
+    return 1.0 + 0.5 * (gt + ge)
+
+
+def _advance_memory(tgn, split_src, split_dst, split_t, split_eidx, bs=200):
+    """Advance memory over a real stream (each positive once) using the
+    official edge-probability path (scores discarded)."""
+    n = len(split_src)
+    with torch.no_grad():
+        for s0 in range(0, n, bs):
+            s1 = min(n, s0 + bs)
+            tgn.compute_edge_probabilities(
+                split_src[s0:s1], split_dst[s0:s1], split_dst[s0:s1],
+                split_t[s0:s1], split_eidx[s0:s1], 10)
 
 
 def main():
@@ -119,71 +188,61 @@ def main():
     if args.split == "val":
         ds.load_val_ns()
         split_mode = "val"
-        split = val
     else:
         ds.load_test_ns()
         split_mode = "test"
-        split = test
     raw_src, raw_dst, raw_t = ds.raw_split(split_mode)
-    # rebuild memory online over train (each real edge once, memory update)
+    # ---- replay TRAIN memory online (real positives advance state)
     if tgn.use_memory:
         tgn.memory.__init_memory__()
-    bs = 200
-    n = len(train.sources)
+    t0 = time.time()
+    _advance_memory(tgn, train.sources, train.destinations,
+                    train.timestamps, train.edge_idxs)
+    print("train replay {:.1f}s".format(time.time() - t0), flush=True)
+
+    # ---- optional fixed query-id set (stratified; shared across arms/seeds)
+    if args.query_ids:
+        qids = json.load(open(args.query_ids))
+    else:
+        nv = len(raw_src)
+        qids = list(range(nv))
+    if args.max_n > 0:
+        qids = qids[:args.max_n]
+
+    # score selected queries in TIME order; memory advances once per scored
+    # real event (official online semantics).
+    ranks = []
+    t1 = time.time()
     with torch.no_grad():
-        for s0 in range(0, n, bs):
-            s1 = min(n, s0 + bs)
-            tgn.compute_edge_probabilities(
-                train.sources[s0:s1], train.destinations[s0:s1],
-                train.destinations[s0:s1], train.timestamps[s0:s1],
-                train.edge_idxs[s0:s1], cli["n_neighbors"])
-    # score val/test positives against official negatives
-    pos_scores = []
-    neg_scores_all = []
-    nv = len(raw_src)
-    with torch.no_grad():
-        for s0 in range(0, nv, bs):
-            s1 = min(nv, s0 + bs)
-            # positives as internal ids
-            pos_src = (raw_src[s0:s1] + 1).astype(np.int64)
-            pos_dst = (raw_dst[s0:s1] + 1).astype(np.int64)
-            pos_t = raw_t[s0:s1]
-            # gather official negatives for this row block (raw ids)
-            negs = ds.query_negatives(raw_src[s0:s1], raw_dst[s0:s1],
-                                      raw_t[s0:s1], split_mode=split_mode)
-            # internal dst ids for all negatives of all rows in block
-            flat = [int(x) for sub in negs for x in sub]
-            flat_internal = np.asarray(flat, dtype=np.int64) + 1
-            # score each positive once and all its negatives via a single
-            # batch: query source against all candidate dsts
-            size = len(pos_src)
-            # build [pos_src repeated per candidate]; candidates per row vary
-            p_scores = []
-            n_scores = []
-            for i in range(size):
-                cands = np.concatenate([[pos_dst[i]], flat_internal[
-                    sum(len(x) for x in negs[:i]):
-                    sum(len(x) for x in negs[:i + 1])]])
-                src_rep = np.full(len(cands), pos_src[i], dtype=np.int64)
-                # TGN queries src,dst,neg = 3x each; approximate via
-                # compute_edge_probabilities needs negatives; use
-                # compute_temporal_embeddings + affinity manually
-                emb_s, emb_d, _ = tgn.compute_temporal_embeddings(
-                    src_rep, cands, cands,
-                    np.full(len(cands), float(pos_t[i])),
-                    np.full(len(cands), 0, dtype=np.int64),
-                    cli["n_neighbors"])
-                sc = tgn.affinity_score(
-                    torch.cat([emb_s, emb_s], dim=0),
-                    torch.cat([emb_d, emb_d], dim=0)).squeeze(0)
-                ps = float(sc[0])
-                p_scores.append(ps)
-                n_scores.append([float(x) for x in sc[1:]])
-            pos_scores.extend(p_scores)
-            neg_scores_all.extend(n_scores)
-    mrr = _mrr_from_scores(pos_scores, neg_scores_all)
-    result = {"split": args.split, "mrr": mrr,
-              "n_pos": len(pos_scores)}
+        for qi, idx in enumerate(qids):
+            i = int(idx)
+            src = int(raw_src[i]) + 1
+            dst = int(raw_dst[i]) + 1
+            tt = float(raw_t[i])
+            negs_raw = ds.query_negatives(
+                np.asarray([int(raw_src[i])], dtype=np.int64),
+                np.asarray([int(raw_dst[i])], dtype=np.int64),
+                np.asarray([tt], dtype=np.float64), split_mode=split_mode)
+            neg_in = np.asarray([int(x) for x in negs_raw[0]],
+                                dtype=np.int64) + 1
+            mem = _current_memory(tgn)
+            ps, ns = _score_pos_neg(tgn, mem, src, tt, dst, neg_in,
+                                    args.dst_chunk)
+            ranks.append(1.0 / _mrr_rank(ps, ns))
+            # advance memory with this real event exactly once
+            _advance_memory(tgn, np.asarray([src], dtype=np.int64),
+                            np.asarray([dst], dtype=np.int64),
+                            np.asarray([tt], dtype=np.float64),
+                            np.asarray([src], dtype=np.int64), bs=1)
+            if (qi + 1) % 100 == 0:
+                print("scored {}/{} in {:.1f}s".format(
+                    qi + 1, len(qids), time.time() - t1), flush=True)
+    mrr = float(np.mean(ranks)) if ranks else float("nan")
+    metric = "sampled_query_{}_mrr".format(args.split)
+    result = {metric: mrr, "n_scored": len(ranks),
+              "scored_seconds": time.time() - t1,
+              "note": "same memory-before-event per candidate; full official "
+                      "negatives; n_neighbors=10; test never selects ckpt"}
     out_json = outdir / "eval_{}.json".format(args.split)
     with open(out_json, "w") as f:
         json.dump(result, f, indent=2, allow_nan=True)

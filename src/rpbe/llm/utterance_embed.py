@@ -13,6 +13,15 @@ v2 L4: chi_2 carries the one-update identifier).
 import torch
 from torch import nn
 
+def _module_device(embed_tokens):
+    """Device of an embedding module that may be an official
+    SeparatedEmbedding (no top-level .weight; it keeps .device)."""
+    try:
+        return embed_tokens.weight.device
+    except AttributeError:
+        return embed_tokens.device
+
+
 
 class UtteranceEmbed(nn.Module):
     """chi(u) = CountSketch(mean embed + tag) -> [d_chi]; fully frozen."""
@@ -97,7 +106,7 @@ class UtteranceEmbed(nn.Module):
             raise ValueError("tag must be in [0, {}), got {}"
                              .format(self.n_tags, tag))
         with torch.no_grad():
-            emb = embed_tokens(token_ids.to(embed_tokens.weight.device))
+            emb = embed_tokens(token_ids.to(_module_device(embed_tokens)))
             mean = emb.float().mean(dim=1)  # [B, hidden_dim]
             if tag != 0:
                 tag_vec = self.tag_table[tag].to(dtype=mean.dtype,
@@ -124,8 +133,8 @@ class UtteranceEmbed(nn.Module):
         context measurement.  Fully frozen."""
         assert self.combine_dim > 0, "combine table not built"
         with torch.no_grad():
-            ea = embed_tokens(token_ids_a.to(embed_tokens.weight.device))
-            eb = embed_tokens(token_ids_b.to(embed_tokens.weight.device))
+            ea = embed_tokens(token_ids_a.to(_module_device(embed_tokens)))
+            eb = embed_tokens(token_ids_b.to(_module_device(embed_tokens)))
             ma = ea.float().mean(dim=1)
             mb = eb.float().mean(dim=1)
             tag_vec = self.tag_table[tag].to(dtype=ma.dtype,

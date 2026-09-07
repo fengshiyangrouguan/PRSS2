@@ -116,18 +116,41 @@ def paired_seed_hash(base_seed: int, model, *, extra_components=()) -> str:
             h.update(p.detach().float().cpu().reshape(-1).contiguous()
                      .numpy().tobytes())
     # COMP/SUM embedding rows participate even when frozen (closure 5).
+    # LOCAL FIX (r7 official host): the official Step-1 host wraps
+    # embed_tokens in a SeparatedEmbedding (no top-level .weight; rows
+    # with id >= n_vocab live in .comp_embeddings) and leaves lm_head at
+    # the base 32000 rows, so comp tokens have no output rows there
+    # (equivalent to the legacy head-is-None case).  Row access is
+    # routed per structure; the legacy resized host hashes identically
+    # to before.
+    def _row_lookup(module):
+        if hasattr(module, "comp_embeddings"):
+            _b = module.embeddings.weight
+            _e = module.comp_embeddings.weight
+            _nv = module.n_vocab
+            return lambda t: _e[t - _nv] if t >= _nv else _b[t]
+        _w = module.weight
+        return lambda t: _w[t]
+
     base = _base_model(model)
-    emb = base.embed_tokens.weight.detach().float().cpu()
+    emb_lookup = _row_lookup(base.embed_tokens)
     head = getattr(model, "lm_head", None)
-    head_w = head.weight.detach().float().cpu() if head is not None else None
+    head_lookup = _row_lookup(head) if head is not None else None
     for token in (list(getattr(model, "comp_token", None) or [])
                   + list(getattr(model, "sum_token", None) or [])):
-        h.update(b"embed_row:%d" % int(token))
-        h.update(emb[int(token)].reshape(-1).contiguous().numpy().tobytes())
-        if head_w is not None:
-            h.update(b"head_row:%d" % int(token))
-            h.update(head_w[int(token)].reshape(-1).contiguous()
-                     .numpy().tobytes())
+        t = int(token)
+        h.update(b"embed_row:%d" % t)
+        row = emb_lookup(t).detach().float().cpu().reshape(-1)
+        h.update(row.contiguous().numpy().tobytes())
+        if head_lookup is not None:
+            try:
+                head_row = head_lookup(t)
+            except IndexError:
+                head_row = None
+            if head_row is not None:
+                h.update(b"head_row:%d" % t)
+                h.update(head_row.detach().float().cpu().reshape(-1)
+                         .contiguous().numpy().tobytes())
     for name, data in extra_components:
         h.update(name.encode())
         h.update(bytes(data))

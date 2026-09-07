@@ -9,10 +9,11 @@ Gamma attaches a small learned residual on top of that mean:
 
     M_t = mean(h_1..h_t) + R_theta(M_{t-1}, h_t, t)
 
-with R_theta(x) = s . U tanh(V [prev; cur; time(t)]).  Safe zero-init:
-U/V are small random and only the scalar gate ``s`` starts at zero, so the
-merged memory starts as the exact official arithmetic mean (Test A) while
-``s`` still receives gradient at the first optimizer step (closure 6).
+with R_theta(x) = U tanh(V [prev; cur; time(t)]).  Zero-output projection
+init (Review round 7, user ruling 2026-09-07): U starts at exactly zero
+(no scalar gate), so the merged memory starts as the exact official
+arithmetic mean bit-for-bit (step0 identity gate PASS) while every U/V
+parameter still receives gradient from the first optimizer step.
 
 The time encoding is a fixed log-spaced sinusoid with no learned
 parameters, so the recurrence supports any turn count k (training random
@@ -49,7 +50,13 @@ def time_features(t: torch.Tensor, freqs: torch.Tensor) -> torch.Tensor:
 
 
 class GammaResidual(nn.Module):
-    """R_theta(prev, cur, t) = s * U tanh(V [prev; cur; time(t)]).
+    """R_theta(prev, cur, t) = U tanh(V [prev; cur; time(t)]).
+
+    Review round 7: ZERO-OUTPUT projection init — U starts at exactly
+    zero, so step 0 reproduces the official merge bit-for-bit AND every
+    parameter of U/V receives gradient from the very first step (the
+    old scalar gate s=0 left U/V with zero gradient at step 0 and only
+    ~32 trainable scalars moving early on).
 
     One instance is shared across the K and V merges and across the two
     COMP/SUM slots of its layer.  With head_dim=128, hidden=64,
@@ -66,12 +73,11 @@ class GammaResidual(nn.Module):
         self.time_dim = int(time_dim)
         self.V = nn.Linear(2 * self.head_dim + self.time_dim, hidden)
         self.U = nn.Linear(hidden, self.head_dim, bias=False)
-        self.s = nn.Parameter(torch.zeros(()))
-        # U/V small random; only the gate s is zero-initialized.
+        # U ZERO-initialized (zero-output projection); V small random.
         with torch.no_grad():
             nn.init.normal_(self.V.weight, mean=0.0, std=init_scale)
             nn.init.normal_(self.V.bias, mean=0.0, std=init_scale)
-            nn.init.normal_(self.U.weight, mean=0.0, std=init_scale)
+            nn.init.zeros_(self.U.weight)
         freqs = 2.0 * math.pi / torch.pow(2.0, torch.arange(TIME_FREQS)).float()
         self.register_buffer("time_freqs", freqs, persistent=False)
 
@@ -84,7 +90,8 @@ class GammaResidual(nn.Module):
             t: per-position turn counts, [B, L] (any integer dtype).
 
         Returns:
-            Residual [B, H, L, D]; exactly zero while the gate s == 0.
+            Residual [B, H, L, D]; exactly zero at init because the
+            zero-output projection U == 0 (Review round 7 init).
         """
         feat = time_features(t, self.time_freqs).unsqueeze(1)  # [B, 1, L_t, T]
         # The time axis broadcasts to the row axis (L_t may be 1 when the
@@ -96,7 +103,7 @@ class GammaResidual(nn.Module):
         wd = self.V.weight.dtype
         x = torch.cat([prev.to(dtype=wd), cur.to(dtype=wd),
                        feat.to(dtype=wd)], dim=-1)
-        return self.s * self.U(torch.tanh(self.V(x)))
+        return self.U(torch.tanh(self.V(x)))
 
     def n_params(self) -> int:
         return sum(p.numel() for p in self.parameters())

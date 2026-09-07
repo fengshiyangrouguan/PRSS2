@@ -35,8 +35,9 @@
     "hidden": 64,
     "time_dim": 16,
     "init_scale": 0.02,
-    "zero_init": "only the gate s starts at 0; U/V small random",
-    "parameter_budget": "32 layers x ~25.7k = ~821k < 1M"
+    "zero_init": "U0=0 zero-output projection init (Review round 7 / user ruling 2026-09-07): R = U tanh(V [prev;cur;time(t)]) with U.weight exactly 0 and V small random (init_scale). Step 0 residual is bit-for-bit zero AND every U/V parameter receives gradient from the first step. The old scalar gate s (s=0 init) is REMOVED — it left U/V with zero gradient at step 0.",
+    "parameter_budget": "32 layers x ~25.7k = ~821k < 1M",
+    "init_note": "See src/rpbe/hosts/ccm/gamma_residual.py class docstring; code aligned 2026-09-07 11:36, spec synced 2026-09-07."
   },
   "window": {
     "min_effective_cuts": 128,
@@ -44,8 +45,8 @@
     "cadence": "identical task samples and scheduler cadence across the three arms"
   },
   "training": {
-    "steps": 500,
-    "steps_note": "500 GLOBAL/window steps for the fine-grained curve run (e50, user ruling 2026-09-05): checkpoint every 50 steps as immutable snapshot files, each evaluated by the official evaluator. Previous: 1000 (per-paper claim); the 500-750 overfit observation motivated the 50-step curve.",
+    "steps": 300,
+    "steps_note": "300 GLOBAL/window steps for the round-7 official-host arms (user ruling 2026-09-07): task-only-cont / ours-cont from the official merge-adapter start, lr 3e-5, checkpoint every 50. Prior: 500 (e50 curve); previous 1000 (per-paper claim).",
     "grad_clip": 1.0,
     "grad_clip_source": "official HF Trainer default (max_grad_norm); train_ccm must refuse an inconsistent override",
     "merge_cadence": "window-matched",

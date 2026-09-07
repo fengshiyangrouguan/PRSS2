@@ -114,6 +114,14 @@ def parse_args():
     p.add_argument("--z-dim", type=int, default=128)
     p.add_argument("--rpbe-seed", type=int, default=0)
     p.add_argument("--gamma-hidden", type=int, default=64)
+    p.add_argument("--official-host", action="store_true",
+                   help="review round 7: build the REAL official host — "
+                        "SeparatedEmbedding + trainable COMP/SUM embeddings "
+                        "+ the released Step-2 compression adapter on top of "
+                        "the Step-1 foundation merge (no resize+freeze).")
+    p.add_argument("--official-adapter", default="",
+                   help="path to the released Step-2 compression adapter "
+                        "(llama-7b-no-online-merge_recur-ntok2)")
     p.add_argument("--foundation", default="",
                    help="path to an official Step-1 default-LoRA adapter "
                         "dir (e.g. llama-7b-no); its weights are MERGED "
@@ -286,6 +294,51 @@ def build_model(args, device):
     return model.to(device)
 
 
+def build_official_host(args, device):
+    """Review round 7: the REAL official host.  The Step-1 default LoRA
+    is merged into the base weights; the 4 COMP/SUM tokens live in a
+    SeparatedEmbedding whose comp_embeddings are TRAINABLE (the official
+    protocol trains them); the released Step-2 compression adapter is
+    loaded through the official conditional-LoRA (peft_custom) wrapper.
+    Everything is frozen except comp_embeddings + the adapter LoRA
+    params."""
+    from transformers.models.llama.configuration_llama import LlamaConfig
+    from src.arch.ccm_llama import LlamaForCausalLM_CCM
+    from src.model import load_lora_weight, peft_custom
+    from src.utils import SeparatedEmbedding
+    from peft import LoraConfig
+    config = LlamaConfig.from_pretrained(args.model_name_or_path)
+    config.comp_relative_embedding = args.relative_embedding
+    # fp32 throughout (review round 7): the official separate-embed path
+    # keeps comp_embeddings in fp32, and mixing fp16 weights with fp32
+    # embed outputs breaks the peft conditional-LoRA forward.
+    model = LlamaForCausalLM_CCM.from_pretrained(
+        args.model_name_or_path, config=config, torch_dtype=torch.float32)
+    model = model.to(device)
+    load_lora_weight(args.foundation, model, merge=True)
+    model.update_comp_token([32000 + k for k in range(N_TOK)],
+                            [32000 + N_TOK + k for k in range(N_TOK)])
+    model.model.embed_tokens = SeparatedEmbedding(model.model.embed_tokens,
+                                                  2 * N_TOK)
+    # fp32 already (model is fp32)
+    adapter_dir = args.official_adapter
+    lora_cfg = LoraConfig().from_pretrained(adapter_dir)
+    model = peft_custom.get_peft_model(model, lora_cfg)
+    load_lora_weight(adapter_dir, model, merge=False)
+    for _p in model.parameters():
+        _p.requires_grad_(False)
+    # peft wraps one level deeper: PeftModel -> base Llama -> LlamaModel
+    model.base_model.model.model.embed_tokens.comp_embeddings.weight \
+        .requires_grad_(True)
+    for _n, _p in model.named_parameters():
+        if "lora_" in _n:
+            _p.requires_grad_(True)
+    model._official_host = True
+    print("[official-host] SeparatedEmbedding + trainable comp embeddings "
+          "+ Step-2 adapter loaded", flush=True)
+    return model
+
+
 def wrap_lora(model, r):
     from rpbe.hosts.ccm.ccm_patch import wrap_lora as _wrap
     return _wrap(model, r=int(r))
@@ -367,9 +420,16 @@ def run_forward(model, batch, device, grad_enabled):
     # without autocast raises on the fp16 base path).
     ctx = torch.enable_grad() if grad_enabled else torch.no_grad()
     amc = batch.get("attention_mask_comp")
+    # LOCAL FIX (r7 official host): the official host is built fp32
+    # throughout (build_official_host), so autocast is disabled there --
+    # under autocast the merge_recur residual scatter (ccm_llama.py
+    # index_add onto key_states) mixes fp32 key_states with fp16
+    # res_all buffers and raises.  Autocast remains for the legacy fp16
+    # resize host (its fp16 base path requires the mixed-mode forward).
+    _official = bool(getattr(model, "_official_host", False))
     with ctx:
         with torch.autocast(device_type="cuda", dtype=torch.float16,
-                            enabled=(device.type == "cuda")):
+                            enabled=(device.type == "cuda" and not _official)):
             return model(input_ids=batch["input_ids"].to(device),
                          attention_mask=batch["attention_mask"].to(device),
                          attention_mask_comp=amc.to(device)
@@ -517,7 +577,13 @@ def new_token_rows(model):
     (never in trainable_state_dict) BUT their concrete random values
     affect inference through the comp-token embedding lookup.  Save
     them explicitly so the eval-side build can restore the exact rows
-    (review ruling 2026-09-05: eval must reconstruct the SAME model)."""
+    (review ruling 2026-09-05: eval must reconstruct the SAME model).
+
+    Legacy resize path only: the --official-host path keeps COMP/SUM in
+    a SeparatedEmbedding whose comp_embeddings are TRAINABLE and are
+    already part of trainable_state_dict."""
+    if getattr(model, "_official_host", False):
+        return None
     emb = model.get_input_embeddings()
     lm = model.lm_head
     n = 2 * N_TOK
@@ -528,8 +594,12 @@ def new_token_rows(model):
 
 
 def save_trainable(path, model, **extra):
-    torch.save({"model": trainable_state_dict(model),
-                "new_token_rows": new_token_rows(model), **extra}, path)
+    payload = {"model": trainable_state_dict(model)}
+    _ntr = new_token_rows(model)
+    if _ntr is not None:
+        payload["new_token_rows"] = _ntr
+    payload.update(extra)
+    torch.save(payload, path)
 
 
 def load_trainable(path, model, optimizer, device):
@@ -555,8 +625,11 @@ def main():
     log_path = out / "log.jsonl"
 
     tokenizer = build_tokenizer(args)
-    model = build_model(args, device)
-    if args.foundation:
+    if args.official_host:
+        model = build_official_host(args, device)
+    else:
+        model = build_model(args, device)
+    if args.foundation and not args.official_host:
         # Official two-stage protocol: merge the Step-1 default LoRA
         # (llama-7b-no) into the base weights BEFORE attaching our
         # conditional LoRA / Gamma.  The official merge path adds
@@ -565,11 +638,12 @@ def main():
         from src.model import load_lora_weight
         load_lora_weight(args.foundation, model, merge=True)
         print("[foundation] merged {}".format(args.foundation), flush=True)
-    model = wrap_lora(model, args.lora_r)
-    # The PEFT wrap can replace the CausalLM wrapper; re-assert the
-    # comp/sum token registration on the wrapped object.
-    model.update_comp_token([32000 + k for k in range(N_TOK)],
-                            [32000 + N_TOK + k for k in range(N_TOK)])
+    if not args.official_host:
+        model = wrap_lora(model, args.lora_r)
+        # The PEFT wrap can replace the CausalLM wrapper; re-assert the
+        # comp/sum token registration on the wrapped object.
+        model.update_comp_token([32000 + k for k in range(N_TOK)],
+                                [32000 + N_TOK + k for k in range(N_TOK)])
     use_rpbe = args.arm in ("ours", "gamma_task_only")
     if use_rpbe:
         attach_gamma(model, hidden=args.gamma_hidden)
@@ -622,7 +696,9 @@ def main():
         return max(0.0, 0.5 * (1.0 + math.cos(math.pi * progress)))
 
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, _lr_lambda)
-    scaler = torch.cuda.amp.GradScaler(enabled=(device.type == "cuda"))
+    scaler = torch.cuda.amp.GradScaler(
+        enabled=(device.type == "cuda"
+                 and not getattr(model, "_official_host", False)))
 
     dialog, collator = build_dataset(args, tokenizer)
     comp_ids = tokenizer.comp_token_id

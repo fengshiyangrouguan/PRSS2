@@ -267,7 +267,11 @@ class DialogueDataset():
         context = []
 
         for i in range(n):
-            token_ = dialog[i]
+            # LOCAL FIX (gate_r7): copy the row -- official code extends the
+            # shared dialog row in place (token_ += sum_token mutates the
+            # dataset row), so any reuse of one collator+dialogs across
+            # multiple evaluate passes silently grows every context row.
+            token_ = list(dialog[i])
 
             if self.online:
                 token_ += self.comp_token

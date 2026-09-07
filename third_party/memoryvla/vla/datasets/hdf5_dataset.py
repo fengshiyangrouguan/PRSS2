@@ -1,20 +1,31 @@
 """
 hdf5_dataset.py
 
-LIBERO-Mem HDF5 DecisionStream dataset (RPBE-VLA). Implements the plan's
-Task 2 semantics on top of the official LIBERO-Mem HDF5 format:
+LIBERO-Mem HDF5 dense-stream dataset (RPBE-VLA). Reproduces the OFFICIAL
+MemoryVLA / OpenVLA dense sliding-window training protocol on top of the
+LIBERO-Mem HDF5 format:
 
-  * decision stride K = future_action_window_size + 1 = 16
-  * timesteps are DECISION indices (0, 1, 2, ...) -- aligned with
-    MemoryVLA.predict_action's cur_timestep semantics
-  * supervision per decision d = actions[d*K : (d+1)*K] ([K, 7])
-  * tail decisions whose chunk would run past the episode end are dropped
-    (with a counter), mirroring truncation at inference
-  * episode_ids filled per row so CogMemBank 'stream' semantics hold
+  * prediction length K = future_action_window_size + 1 = 16
+  * training stride = 1: for EVERY physical frame t we emit
+        image[t] -> actions[t : t+16] ,  timestep = t
+    so a 276-frame demo yields 276 samples (official dense sliding window,
+    NOT the old n_decisions = T//16 / k = d*16 sparse adapter).
+  * rows within an episode are strictly in-frame order; episodes are
+    re-shuffled per epoch deterministically (num_workers=0).
+  * tail <16 frames: pad with official-style NEUTRAL actions (6-dim zero
+    action, gripper = last seen state) and a correct action_mask that flags
+    which of the 16 target steps are real vs padding.
 
-Split convention (2026-09-05 review ruling A): official val was never
-released; we use demo_1..demo_80 as train and demo_81..demo_100 as val,
-a deterministic convention shared by all seeds.
+Gripper protocol (official libero_dataset_transform):
+  env/data gripper  -1 = open ,  +1 = close
+  model gripper       1 = open ,   0 = close
+  conversion:  g_model = 1.0 - clip(g_env, 0, 1)
+The gripper channel is NOT BOUNDS_Q99-normalized: it stays {0,1} in model
+space (mask[6] == False), matching memory_vla.predict_action's <0.5
+threshold which is defined on the official {0,1} labels.
+
+Split convention: train = demo_1..80, val = demo_81..100 (no official val
+release).  Action statistics computed on the TRAIN split only.
 
 This module deliberately does NOT import vla.datasets.datasets (the TF /
 RLDS chain), so it works without tensorflow.
@@ -40,6 +51,19 @@ from prismatic.util.data_utils import PaddedCollatorForActionPrediction
 
 IGNORE_INDEX = -100
 
+# official LIBERO-Mem convention: 100 released demos per task; split 80/20
+TRAIN_DEMO_RANGE = (1, 80)   # inclusive
+VAL_DEMO_RANGE = (81, 100)   # inclusive
+
+# BOUNDS_Q99 epsilon used by the official RLDS pipeline
+NORM_EPS = 1e-8
+
+
+def env_to_model_gripper(g_env):
+    """Official gripper relabel: data/env -1=open,+1=close -> model 1=open,
+    0=close (g_model = 1 - clip(g_env, 0, 1))."""
+    return 1.0 - np.clip(np.asarray(g_env, dtype=np.float32), 0.0, 1.0)
+
 
 class HDF5Collator(PaddedCollatorForActionPrediction):
     """Official action-prediction collator + pass-through of the per-row
@@ -50,19 +74,13 @@ class HDF5Collator(PaddedCollatorForActionPrediction):
         out["instruction"] = [inst["instruction"] for inst in instances]
         return out
 
-# official LIBERO-Mem convention: 100 released demos per task; split 80/20
-TRAIN_DEMO_RANGE = (1, 80)   # inclusive
-VAL_DEMO_RANGE = (81, 100)   # inclusive
-
-# BOUNDS_Q99 epsilon used by the official RLDS pipeline
-NORM_EPS = 1e-8
-
 
 @dataclass
 class HDF5BatchTransform:
-    """Row transform replicating RLDSBatchTransform prompt/label logic,
-    with the action BOUNDS_Q99 normalization done in numpy (official
-    recipe from vla/datasets/rlds/utils/data_utils.py)."""
+    """Row transform replicating RLDSBatchTransform prompt/label logic with
+    official BOUNDS_Q99 normalization on the 6 continuous dims.  The gripper
+    (dim 6) and any q01==q99 dim (e.g. rotation==0 here) are NOT normalized:
+    mask False keeps their raw model-space value."""
     base_tokenizer: PreTrainedTokenizerBase
     image_transform: ImageTransform
     prompt_builder_fn: Any
@@ -70,7 +88,7 @@ class HDF5BatchTransform:
     action_q99: np.ndarray      # [7]
     action_mask: np.ndarray     # [7] bool: True where q01 != q99
     predict_stop_token: bool = True
-    decision_stride: int = 16
+    action_window: int = 16
 
     def __call__(self, row: Dict[str, Any]) -> Dict[str, Any]:
         img = Image.fromarray(row["agentview_rgb"])            # uint8 HWC
@@ -90,17 +108,18 @@ class HDF5BatchTransform:
         input_ids, labels = torch.tensor(input_ids), torch.tensor(labels)
         pixel_values = self.image_transform(img)
 
-        # official BOUNDS_Q99 normalization (numpy replica, WITH the
-        # [-1, 1] clip -- review ruling: the clip changes the training
-        # target and the downstream RFF inputs)
-        a = row["actions"].astype(np.float32)                 # [K, 7]
-        a = np.where(
-            self.action_mask,
-            2.0 * (a - self.action_q01) / (self.action_q99 - self.action_q01 + NORM_EPS) - 1.0,
-            np.zeros_like(a),
+        # actions already in MODEL space (gripper {0,1}); shape [K, 7]
+        a = np.asarray(row["actions"], dtype=np.float32)
+        # BOUNDS_Q99 normalization on masked dims only; unmasked (gripper /
+        # zero-range) dims keep their raw value (NOT zeroed -- official).
+        norm = np.where(
+            self.action_mask[None, :],
+            2.0 * (a - self.action_q01[None, :])
+            / (self.action_q99[None, :] - self.action_q01[None, :] + NORM_EPS) - 1.0,
+            a,
         )
-        a = np.clip(a, -1.0, 1.0)
-        actions = torch.tensor(a, dtype=torch.float32)
+        norm = np.clip(norm, -1.0, 1.0)
+        actions = torch.tensor(norm, dtype=torch.float32)
 
         # Mask prompt tokens before the first <EOS-ish> token id 2
         eos_positions = torch.where(input_ids == 2)[0]
@@ -109,8 +128,6 @@ class HDF5BatchTransform:
         if not self.predict_stop_token:
             labels[-1] = IGNORE_INDEX
 
-        action_masks = torch.ones(self.decision_stride, dtype=torch.bool)
-
         return dict(
             pixel_values=pixel_values,
             input_ids=input_ids,
@@ -118,8 +135,9 @@ class HDF5BatchTransform:
             dataset_name=row["task_name"],
             instruction=row["instruction"],
             actions=actions,
-            action_masks=action_masks,
-            timesteps=np.array([row["decision_idx"]], dtype=np.int64),
+            action_masks=torch.from_numpy(np.asarray(
+                row["valid_mask"], dtype=bool)),
+            timesteps=np.array([row["t"]], dtype=np.int64),
             episode_ids=np.array([row["episode_idx"]], dtype=np.int64),
         )
 
@@ -130,7 +148,7 @@ def scan_episodes(
     """Scan h5 files + metainfo.json -> episode manifest.
 
     Returns (episodes, demo_range_by_task).  Each episode:
-      {task_name, h5_path, demo_key, instruction, T, frame_range}
+      {task_name, h5_path, demo_key, instruction, T}
     Split rule: train = demo_1..demo_80, val = demo_81..demo_100.
     """
     lo, hi = TRAIN_DEMO_RANGE if split == "train" else VAL_DEMO_RANGE
@@ -150,8 +168,6 @@ def scan_episodes(
         demo_keys = [f"demo_{i}" for i in range(lo, hi + 1)]
         missing = [k for k in demo_keys if k not in task_meta]
         if missing:
-            # official release is missing a few demos per task (e.g. T3 lacks
-            # demo_48 and demo_81 in BOTH hdf5 and metainfo) -- skip, do not raise
             print(f"[scan] task {task_name}: {len(missing)} demos missing from "
                   f"metainfo, skipping: {missing}", flush=True)
             demo_keys = [k for k in demo_keys if k not in missing]
@@ -177,39 +193,45 @@ def scan_episodes(
     return episodes, demo_range_by_task
 
 
-def compute_action_stats(
-    episodes: List[Dict[str, Any]], decision_stride: int,
-) -> Dict[str, np.ndarray]:
-    """BOUNDS_Q99 statistics over full-action windows of the given episodes
-    (frame-level actions, matching the official statistics convention)."""
+def compute_action_stats(episodes: List[Dict[str, Any]]) -> Dict[str, np.ndarray]:
+    """BOUNDS_Q99 statistics over ALL frame-level actions of the given
+    episodes (no truncation to multiples of 16).  Gripper is relabeled to
+    model space {0,1} BEFORE stats.  Dims that are constant (e.g. rotation
+    ==0 in this task) yield q01==q99 and are auto-masked out.  The gripper
+    dim (6) is FORCED mask False: it stays raw {0,1} in model space and is
+    never BOUNDS-normalized (official {0,1} protocol, predict_action <0.5
+    threshold is defined on it)."""
     all_actions: List[np.ndarray] = []
     for ep in episodes:
         with h5py.File(ep["h5_path"], "r") as f:
             a = f["data"][ep["demo_key"]]["actions"][:].astype(np.float32)
-        n_win = a.shape[0] // decision_stride
-        if n_win == 0:
-            continue
-        all_actions.append(a[: n_win * decision_stride].reshape(-1, decision_stride, 7))
-    cat = np.concatenate(all_actions, axis=0)            # [N, K, 7]
-    cat = cat.reshape(-1, 7)                              # frame level
+        a = a.copy()
+        a[:, 6] = env_to_model_gripper(a[:, 6])
+        all_actions.append(a)
+    cat = np.concatenate(all_actions, axis=0)            # [N, 7] frame level
     q01 = np.percentile(cat, 1, axis=0).astype(np.float32)
     q99 = np.percentile(cat, 99, axis=0).astype(np.float32)
     mask = (q01 != q99)
+    mask[6] = False          # gripper stays {0,1}, never normalized
     return {"q01": q01, "q99": q99, "mask": mask}
 
 
-class HDF5DecisionStreamDataset(IterableDataset):
-    """One decision per row; episodes streamed in shuffled order (train)."""
+class HDF5DenseDataset(IterableDataset):
+    """One row per PHYSICAL frame (dense sliding window).  Episodes are
+    re-shuffled per epoch; within an episode rows stay in strict frame order.
+    num_workers MUST be 0 so CogMemBank 'stream' semantics hold."""
 
     def __init__(
         self,
         data_root: Path,
         split: str,
         batch_transform: HDF5BatchTransform,
-        decision_stride: int = 16,
+        q01: np.ndarray,
+        q99: np.ndarray,
+        mask: np.ndarray,
+        action_window: int = 16,
         seed: int = 0,
         repeat: bool = True,
-        episode_shuffle: bool = True,
         task_filter: Optional[str] = None,
     ) -> None:
         super().__init__()
@@ -217,49 +239,85 @@ class HDF5DecisionStreamDataset(IterableDataset):
         self.data_root = Path(data_root)
         self.split = split
         self.batch_transform = batch_transform
-        self.decision_stride = decision_stride
+        self.action_window = action_window
+        self.q01 = np.asarray(q01, dtype=np.float32)
+        self.q99 = np.asarray(q99, dtype=np.float32)
+        self.mask = np.asarray(mask, dtype=bool)
         self.seed = seed
         self.repeat = repeat
-        self.episode_shuffle = episode_shuffle
 
         self.episodes, _ = scan_episodes(self.data_root, split,
                                          task_filter=task_filter)
-        self.n_dropped_tail = 0
+        # preload each episode's raw actions (model space) once per epoch lazily
+        self._cache = {}
 
     def __len__(self) -> int:
         return len(self.episodes)
 
+    def _load(self, idx):
+        if idx not in self._cache:
+            ep = self.episodes[idx]
+            with h5py.File(ep["h5_path"], "r") as f:
+                a = f["data"][ep["demo_key"]]["actions"][:].astype(np.float32)
+                rgb = np.asarray(f["data"][ep["demo_key"]]["obs"]["agentview_rgb"])
+            a = a.copy()
+            a[:, 6] = env_to_model_gripper(a[:, 6])     # {0,1}
+            self._cache[idx] = (ep, a, rgb)
+        return self._cache[idx]
+
     def __iter__(self) -> Iterator[Dict[str, Any]]:
         worker_info = torch.utils.data.get_worker_info()
         order = list(range(len(self.episodes)))
-        if self.episode_shuffle and self.split == "train":
+        if self.split == "train":
             rng = np.random.default_rng(self.seed + (worker_info.id if worker_info else 0))
             rng.shuffle(order)
 
         while True:
+            self._cache = {}    # fresh cache each epoch
             for idx in order:
-                ep = self.episodes[idx]
-                with h5py.File(ep["h5_path"], "r") as f:
-                    actions = f["data"][ep["demo_key"]]["actions"]
-                    rgb = f["data"][ep["demo_key"]]["obs"]["agentview_rgb"]
-                    T = actions.shape[0]
-                    n_decisions = T // self.decision_stride
-                    for d in range(n_decisions):
-                        k = d * self.decision_stride
-                        row = dict(
-                            agentview_rgb=np.asarray(rgb[k]),
-                            actions=np.asarray(actions[k: k + self.decision_stride]),
-                            instruction=ep["instruction"],
-                            task_name=ep["task_name"],
-                            decision_idx=d,
-                            episode_idx=idx,
-                        )
-                        yield self.batch_transform(row)
-                # tail frames beyond the last full decision are dropped,
-                # mirroring inference truncation (count them once per pass)
-                tail = T - n_decisions * self.decision_stride
-                if tail > 0:
-                    self.n_dropped_tail += 1
+                ep, a, rgb = self._load(idx)
+                T = a.shape[0]
+                K = self.action_window
+                # neutral tail action (model space): continuous dims = their
+                # norm-zero value = q01-midpoint only if masked; unmasked
+                # dims already q01==q99 so their 'neutral' is meaningless; we
+                # fill continuous masked dims with 0 in NORMALIZED space by
+                # letting transform see a flag?  Instead we build the neutral
+                # as the raw action equal to the BOUNDS midpoint (maps to 0).
+                tail = T - 0  # frames available beyond t
+                # For each physical frame t emit a K-step window.
+                for t in range(T):
+                    n_avail = T - t
+                    if n_avail >= K:
+                        chunk = a[t:t + K]
+                        valid = np.ones(K, dtype=bool)
+                    else:
+                        # neutral padding for the missing tail
+                        chunk = np.zeros((K, 7), dtype=np.float32)
+                        chunk[:n_avail] = a[t:T]
+                        # neutral continuous value = midpoint of q01/q99 for
+                        # masked dims (normalized -> 0); for gripper keep last
+                        # known state (model space).
+                        last_g = a[T - 1, 6]
+                        for j in range(n_avail, K):
+                            chunk[j, 6] = last_g
+                            for d in range(6):
+                                if self.mask[d]:
+                                    chunk[j, d] = 0.5 * (self.q01[d] + self.q99[d])
+                                else:
+                                    chunk[j, d] = 0.0
+                        valid = np.zeros(K, dtype=bool)
+                        valid[:n_avail] = True
+                    row = dict(
+                        agentview_rgb=rgb[t],
+                        actions=chunk,
+                        valid_mask=valid,
+                        instruction=ep["instruction"],
+                        task_name=ep["task_name"],
+                        t=t,
+                        episode_idx=idx,
+                    )
+                    yield self.batch_transform(row)
             if not self.repeat:
                 return
 
@@ -279,12 +337,11 @@ def get_hdf5_decision_stream_dataset_and_collator(
     """Build dataset + action stats + collator for a single split.
 
     Action statistics are computed on the TRAIN split only (both splits
-    share the same normalization, as in the official pipeline).
-    """
-    decision_stride = future_action_window_size + 1
+    share the same normalization, as in the official pipeline)."""
+    action_window = future_action_window_size + 1
     train_episodes, _ = scan_episodes(Path(data_root), "train",
                                       task_filter=task_filter)
-    stats = compute_action_stats(train_episodes, decision_stride)
+    stats = compute_action_stats(train_episodes)
 
     transform = HDF5BatchTransform(
         base_tokenizer=tokenizer,
@@ -293,14 +350,17 @@ def get_hdf5_decision_stream_dataset_and_collator(
         action_q01=stats["q01"],
         action_q99=stats["q99"],
         action_mask=stats["mask"],
-        decision_stride=decision_stride,
+        action_window=action_window,
     )
 
-    dataset = HDF5DecisionStreamDataset(
+    dataset = HDF5DenseDataset(
         data_root=Path(data_root),
         split=split,
         batch_transform=transform,
-        decision_stride=decision_stride,
+        q01=stats["q01"],
+        q99=stats["q99"],
+        mask=stats["mask"],
+        action_window=action_window,
         seed=seed,
         task_filter=task_filter,
     )

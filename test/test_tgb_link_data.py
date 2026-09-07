@@ -38,6 +38,13 @@ def _skip_if_no_data():
 
 
 class TestTGBLinkData(unittest.TestCase):
+    def setUp(self):
+        try:
+            import tgb  # noqa: F401
+            import torch_geometric  # noqa: F401
+        except Exception as exc:  # pragma: no cover - env dependent
+            self.skipTest("py-tgb / pyg not installed: {}".format(exc))
+
     def test_wiki_scale_and_masks(self):
         ds = TGBLinkDataset(root="datasets")
         c = ds.sanity_check()

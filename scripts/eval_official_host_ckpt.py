@@ -68,9 +68,17 @@ def main():
     print("EVAL_DONE", flush=True)
     for L in [1, 2, 4, 8, 13]:
         print("L={:>2}: {:.6f}".format(L, out[L]), flush=True)
+    # Review round 8 (paired statistics): persist the per-dialogue
+    # records so the paired report can compute d_i = NLL_task,i -
+    # NLL_ours,i on the SAME dialogues.
+    recs_out = [{"dialogue": int(r["dialogue"]), "L": int(r["L"]),
+                 "loss_sum": float(r["loss_sum"]),
+                 "token_count": int(r["token_count"]),
+                 "nll": float(r["nll"])} for r in recs]
     with open(OUT, "w") as f:
         json.dump({"ckpt": CKPT, "nll": out, "skipped": skipped,
-                   "step": payload.get("step")}, f, indent=2)
+                   "step": payload.get("step"), "recs": recs_out},
+                  f, indent=2)
     print("wrote {}".format(OUT), flush=True)
 
 

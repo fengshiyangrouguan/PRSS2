@@ -52,6 +52,61 @@ def _covs(zc: torch.Tensor, pc: torch.Tensor, den: float,
     return 0.5 * (czz + czz.t()), 0.5 * (cpp + cpp.t()), czp, sym_err
 
 
+def _oas_alpha(cov: torch.Tensor, n: float) -> float:
+    """OAS shrinkage intensity for one covariance (Chen et al. 2010).
+
+    Review round 8 (turn-14 small-sample stability): the fixed ridge only
+    keeps the Cholesky alive; it does not remove the small-sample CCA
+    upward bias.  OAS estimates the shrink intensity from the CURRENT
+    window:
+
+        alpha = min(beta / delta, 1)
+        beta  = (1 - 2/p) tr(C^2) + tr(C)^2
+        delta = (n + 1 - 2/p) (tr(C^2) - tr(C)^2 / p)
+
+    ``n`` is the effective degrees of freedom (the window's cluster-level
+    D).  The intensity is DETACHED (stop-gradient): it is a window
+    statistic, never an optimization variable.  ``delta`` at zero means
+    the sample covariance is already isotropic — full shrinkage to the
+    identity then costs nothing, so the clamp is safe.
+    """
+    p = int(cov.shape[0])
+    tr2 = torch.trace(cov) ** 2
+    trc2 = (cov * cov).sum()
+    beta = (1.0 - 2.0 / p) * trc2 + tr2
+    delta = (n + 1.0 - 2.0 / p) * (trc2 - tr2 / p)
+    denom = torch.clamp(delta, min=1e-12)
+    alpha = torch.clamp(beta / denom, 0.0, 1.0)
+    return float(alpha.detach())
+
+
+def _oas_shrink(czz: torch.Tensor, czp: torch.Tensor,
+                cpp: torch.Tensor, n: float):
+    """Paired OAS covariance shrinkage (review round 8).
+
+    Keeps the joint covariance CONSISTENT while damping the small-sample
+    over-correlation: each side shrinks toward its own identity and the
+    cross term is rescaled by the geometric mean of the two retained
+    masses:
+
+        C_ZZ' = (1 - a_Z) C_ZZ + a_Z I
+        C_PP' = (1 - a_P) C_PP + a_P I
+        C_ZP' = sqrt((1 - a_Z)(1 - a_P)) C_ZP
+
+    Returns the shrunk triple plus ``{"alpha_z", "alpha_p"}`` for the
+    diagnostics.  The tiny ridge keeps its old role (numerical safety
+    only) — it no longer carries the regularization load.
+    """
+    az = _oas_alpha(czz, n)
+    ap = _oas_alpha(cpp, n)
+    czz_s = (1.0 - az) * czz + az * torch.eye(
+        czz.shape[0], dtype=czz.dtype, device=czz.device)
+    cpp_s = (1.0 - ap) * cpp + ap * torch.eye(
+        cpp.shape[0], dtype=cpp.dtype, device=cpp.device)
+    czp_s = ((1.0 - az) * (1.0 - ap)) ** 0.5 * czp
+    return czz_s, czp_s, cpp_s, {"alpha_z": az, "alpha_p": ap}
+
+
 def _score_from_covs(czz: torch.Tensor, czp: torch.Tensor,
                      cpp: torch.Tensor, eps: float,
                      variant: str = "full_balancing"):
@@ -239,7 +294,7 @@ def kf_vjp_batch(z_b: torch.Tensor, p_b: torch.Tensor, w_b: torch.Tensor,
 
 
 def latent_z_adjoint(z_rows, p_rows, w, cut_ids, mu_z, mu_p, D,
-                     eps, strict=False):
+                     eps, strict=False, oas=False):
     """Contract the moment adjoint onto CUT-LEVEL z-adjoints.
 
     At window close, the whole-window score F(S) is replayed on the
@@ -265,12 +320,22 @@ def latent_z_adjoint(z_rows, p_rows, w, cut_ids, mu_z, mu_p, D,
     mzz = (zc * sw).t() @ (zc * sw)
     mzp = (zc * sw).t() @ (pc * sw)
     mpp = (pc * sw).t() @ (pc * sw)
-    j, score_diag = _score_from_covs(mzz / D, mzp / D, mpp / D, eps)
+    czz = mzz / D
+    czp = mzp / D
+    cpp = mpp / D
+    if oas:
+        # Review round 8: paired OAS shrinkage with stop-gradded
+        # intensities (window statistics, never optimization variables).
+        czz, czp, cpp, shrink_diag = _oas_shrink(czz, czp, cpp, D)
+    else:
+        shrink_diag = {}
+    j, score_diag = _score_from_covs(czz, czp, cpp, eps)
     if score_diag["failed"] is not None:
         if strict:
             raise RuntimeError("latent_z_adjoint close failed: {}"
                                .format(score_diag))
         return None, None, score_diag
+    score_diag.update(shrink_diag)
     j.backward()
     g = z.grad.detach()               # [M, r]
     g_by_cut: Dict[tuple, torch.Tensor] = {}
@@ -834,7 +899,7 @@ class KFMomentWindow:
     def __init__(self, state_dims: Dict[str, int], *, min_ratio: float = 2.0,
                  min_abs: int = 64, eps: float = 1e-4, fixed_maps=None,
                  strict: bool = False, autoclose: bool = True,
-                 variant: str = "full_balancing"):
+                 variant: str = "full_balancing", oas: bool = False):
         if variant not in ("full_balancing", "diagonal", "reconstruction"):
             raise ValueError("unknown kf_variant {}".format(variant))
         self.variant = str(variant)
@@ -847,6 +912,9 @@ class KFMomentWindow:
         # autoclose=False (replay mode): ``add`` only accumulates; the
         # loop decides when to call ``close_replay``.
         self.autoclose = bool(autoclose)
+        # Review round 8: paired OAS covariance shrinkage on close
+        # (default False keeps the TGN-line behavior unchanged).
+        self.oas = bool(oas)
         self._windows: Dict[str, dict] = {}
 
     def _threshold(self, tau: str) -> float:
@@ -963,7 +1031,12 @@ class KFMomentWindow:
         zc = z_all - mu_z
         pc = p_all - mu_p
         czz, cpp, czp, sym_err = _covs(zc, pc, D, w=w)
+        if self.oas:
+            czz, czp, cpp, shrink_diag = _oas_shrink(czz, czp, cpp, D)
+        else:
+            shrink_diag = {}
         j, score_diag = _score_from_covs(czz, czp, cpp, self.eps)
+        score_diag.update(shrink_diag)
         if score_diag["failed"] is not None:
             if self.strict:
                 raise RuntimeError(
@@ -1011,6 +1084,13 @@ class KFMomentWindow:
                 _mu_p = (new_p * wc).sum(0, keepdim=True) / W
                 _pc = (new_p - _mu_p).double()
                 _czzs, _cpps, _czps, _ = _covs(zc, _pc, D, w=w)
+                if self.oas:
+                    # Same shrinkage as the real close: the shuffled
+                    # baseline must live in the SAME measurement space,
+                    # or J_real - J_shuffled compares two different
+                    # objectives (round 8 smoke caught this).
+                    _czzs, _czps, _cpps, _ = _oas_shrink(
+                        _czzs, _czps, _cpps, D)
                 _js, _ = _score_from_covs(_czzs, _czps, _cpps, self.eps)
                 if _js is not None:
                     j_shuff_list.append(float(_js))
@@ -1089,7 +1169,8 @@ class KFMomentWindow:
             r = wf.result()
             j, g_by_cut, score_diag = latent_z_adjoint(
                 z_all, p_all, w, win["cut_ids_list"],
-                r["mu_z"], r["mu_p"], r["D"], self.eps, self.strict)
+                r["mu_z"], r["mu_p"], r["D"], self.eps, self.strict,
+                oas=self.oas)
             if j is None:
                 closed[tau] = 0.0
                 replay_plan[tau] = {"by_batch": [[]], "by_oid": {}}

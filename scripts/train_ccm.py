@@ -28,6 +28,7 @@ exits with the derived lambda.
 """
 
 import argparse
+import dataclasses
 import hashlib
 import json
 import math
@@ -62,6 +63,81 @@ from rpbe.llm.utterance_embed import UtteranceEmbed
 from rpbe.loss import KFMomentWindow
 from rpbe.training.checkpoint import _restore_rng, _rng_state
 
+
+class BranchEnsembleWindow:
+    """Review round 8: four independent 32-dim sketch branches.
+
+    Wraps one :class:`KFMomentWindow` per measurement branch.  Each
+    branch sees the same rows with ``p_override`` sliced to its own
+    32-dim sketch; branches close independently and the ensemble score
+    is ``J_ens = (1/N) sum_r J_r``.  The branches are NEVER concatenated
+    into one 128-dim covariance — that would restore the small-sample
+    ill-conditioning the ensemble exists to avoid.  The replay gradient
+    is the branch-mean of the per-cut adjoints (dJ_ens/dz = (1/N) sum_r
+    dJ_r/dz; a failed branch contributes zero).
+    """
+
+    def __init__(self, branches):
+        self.ws = list(branches)
+        self.nb = len(self.ws)
+
+    def add(self, rows):
+        for br, w in enumerate(self.ws):
+            sub = [dataclasses.replace(r, p_override=r.p_override[br])
+                   for r in rows]
+            w.add(sub)
+        return {}, {}, []
+
+    def window_ready(self) -> bool:
+        return all(w.window_ready() for w in self.ws)
+
+    def _threshold(self, tau: str) -> float:
+        return self.ws[0]._threshold(tau)
+
+    def close_replay(self):
+        closed: dict = {}
+        plans = []
+        diags = []
+        j_branches = []
+        for br, w in enumerate(self.ws):
+            c, p, d = w.close_replay()
+            for tau, j in c.items():
+                closed[tau] = closed.get(tau, 0.0) + float(j) / self.nb
+            plans.append(p)
+            diags.append(d)
+            j_branches.append({tau: float(jj) for tau, jj in c.items()})
+        plan: dict = {}
+        diag: dict = {}
+        for tau in closed:
+            oid_all = set()
+            for p in plans:
+                oid_all |= set(p.get(tau, {}).get("by_oid", {}).keys())
+            by_oid = {}
+            for oid in oid_all:
+                gs = [p.get(tau, {}).get("by_oid", {}).get(oid)
+                      for p in plans]
+                gs = [g for g in gs if g is not None]
+                if gs:
+                    by_oid[oid] = (sum(gs) / self.nb).float()
+            plan[tau] = {"by_batch": [[]], "by_oid": by_oid}
+            d0 = None
+            for p_d in diags:
+                if tau in p_d:
+                    d0 = dict(p_d[tau])
+                    break
+            if d0 is None:
+                diag[tau] = {"failed": None, "below_threshold": True}
+            else:
+                d0["J_branches"] = [jb.get(tau, float("nan"))
+                                    for jb in j_branches]
+                d0["J_ens"] = closed.get(tau, 0.0)
+                if d0.get("J_shuffled") is not None:
+                    d0["J_real_minus_shuffled"] = (
+                        float(closed.get(tau, 0.0))
+                        - float(d0["J_shuffled"]))
+                diag[tau] = d0
+        return closed, plan, diag
+
 N_TOK = N_TOK_LOCK  # comp slots; 2 comp + 2 sum = 4 added tokens
 
 
@@ -90,7 +166,7 @@ def parse_args():
                    choices=["window-matched", "official"],
                    help="window-matched: the ccm_merge arm fires an update "
                         "on the same adaptive boundary as the RPBE arms "
-                        "(>= min-effective-cuts dialogues with k>=4), so "
+                        "(>= min-effective-cuts dialogues with k>=3), so "
                         "task exposure and scheduler cadence are identical "
                         "across the three arms (frozen_method.json "
                         "cadence; review P0-2).  official: fixed "
@@ -364,7 +440,60 @@ def build_dataset(args, tokenizer):
     return dialog, collator
 
 
-def parse_meta(batch, comp_ids, sum_ids, sample_id_global):
+# ---------------------------------------------------------------------
+# Review round 8 (turn-14 legal-cut scarcity): depth-stratified candidate
+# pools.  Depth L = compressed-history turn count; a dialogue contributes
+# to pool L iff its ORIGINAL length >= L + 2 (L history turns + 1
+# immediate context + 1 target).  k_L = L + 2 is the fixed prefix length,
+# so the cut is the memory after exactly L compressions and the target is
+# always the (L+2)-th turn — strictly legal by construction (same
+# dialogue, contiguous, complete utterances, no EOS/padding/truncation
+# crossing, never the trailing suffix, and the memory state is real).
+# Turn-14/L=13 requires the original dialogue to be long enough, and its
+# target is FIXED at the 15th turn with a 13-turn compressed history.
+# ---------------------------------------------------------------------
+DEPTH_LEVELS = (1, 2, 4, 8, 13)          # L = compressed-history turns
+K_OF_L = {L: L + 2 for L in DEPTH_LEVELS}  # fixed prefix length per depth
+DEPTH_CAP = 3.0 / len(DEPTH_LEVELS)      # max oversampling vs uniform
+
+
+def build_depth_pools(train_items):
+    """L -> list of ORIGINAL dialogue indices eligible at that depth.
+
+    One original dialogue appears in every pool its length permits; the
+    per-window dedup (one dialogue per window) is enforced at sampling
+    time, not here.
+    """
+    pools = {L: [] for L in DEPTH_LEVELS}
+    for i, item in enumerate(train_items):
+        n = len(item["dialog"])
+        for L in DEPTH_LEVELS:
+            if n >= K_OF_L[L]:
+                pools[L].append(i)
+    return pools
+
+
+def depth_sampling_probs(pools):
+    """q_L ~ 1/sqrt(n_L), normalized, with a 3x-uniform oversampling cap.
+
+    Review round 8: sqrt-inverse-frequency re-weights the rare deep
+    (turn-14) dialogues UP without letting a handful of long dialogues
+    dominate training; the 3x cap bounds the maximum re-weighting.
+    """
+    w = np.array([1.0 / math.sqrt(max(len(pools[L]), 1))
+                  for L in DEPTH_LEVELS], dtype=np.float64)
+    q = w / w.sum()
+    for _ in range(20):
+        over = q > DEPTH_CAP
+        if not over.any():
+            break
+        excess = float((q[over] - DEPTH_CAP).sum())
+        q[over] = DEPTH_CAP
+        q[~over] += excess * q[~over] / q[~over].sum()
+    return q
+
+
+def parse_meta(batch, comp_ids, sum_ids, sample_id_global, orig_ids=None):
     """Deterministic per-sample metadata from the padded collator batch.
 
     Returns a list (one per batch row) of dicts: k, blocks (C0/S0
@@ -402,7 +531,12 @@ def parse_meta(batch, comp_ids, sum_ids, sample_id_global):
                       "k": k,
                       "blocks": blocks,
                       "utterance_spans": utterance_spans,
-                      "prompt_end": prompt_end, "ok": ok})
+                      "prompt_end": prompt_end, "ok": ok,
+                      # Review round 8: stable ORIGINAL dialogue id for
+                      # the tree identity (fall back to the stream cursor
+                      # when the caller does not supply it).
+                      "orig_id": int(orig_ids[b]) if orig_ids is not None
+                      else -1})
     return metas
 
 
@@ -480,7 +614,7 @@ def collect_rows(meta, adapter, builder, utter_embed, phi_embed,
     z_v is the memory at v = k - 3; the two rows share cut_id and enter
     the same Ky Fan window with weights 0.5/0.5.  chi/phi are frozen
     input-embedding sketches (no extra LLaMA forward, no grad flow)."""
-    if not meta["ok"] or meta["k"] < 4:
+    if not meta["ok"] or meta["k"] < 3:
         return []
     v = meta["k"] - 3
     s0_pos = meta["blocks"][v][1]
@@ -503,7 +637,8 @@ def collect_rows(meta, adapter, builder, utter_embed, phi_embed,
     dm = DialogueMeta(sample_id=int(meta["sample_id"]), k=int(meta["k"]),
                       sum_positions=[(p + 2, p + 3) for (p, _s)
                                      in meta["blocks"]],
-                      utterance_spans=list(meta["utterance_spans"]))
+                      utterance_spans=list(meta["utterance_spans"]),
+                      orig_id=int(meta.get("orig_id", -1)))
     return builder.build(dm, z, chi1[0], chi2[0], phi1[0], phi2[0])
 
 
@@ -664,7 +799,12 @@ def main():
                                  head_dim=cfg.hidden_size
                                  // cfg.num_attention_heads,
                                  z_dim=args.z_dim, seed=args.rpbe_seed)
-        maps = Llmmaps(d_chi=64, d_phi=32, m=args.sketch_dim,
+        # Review round 8: FOUR independent 32-dim sketch branches (the
+        # single 64-dim sketch had too much collision variance for the
+        # rare turn-14 rows).  J_ens = mean_r J_r at window close; the
+        # branches share d_chi = 64 and the depth bucket encoding.
+        maps = Llmmaps(d_chi=64, d_phi=32, m=32,
+                       n_branches=Llmmaps.N_BRANCHES,
                        seed=args.rpbe_seed).to(device)
         builder = DialogueCutBuilder(maps, z_dim=args.z_dim,
                                      seed=args.rpbe_seed)
@@ -673,10 +813,16 @@ def main():
                                      combine_dim=1).to(device)
         phi_embed = UtteranceEmbed(hidden_dim=cfg.hidden_size, d_chi=32,
                                    seed=args.rpbe_seed + 100).to(device)
-        window = KFMomentWindow({MEM_TAU: args.z_dim}, min_ratio=2.0,
-                                min_abs=args.kf_min_cuts,
-                                eps=args.ridge_eps, fixed_maps=maps,
-                                strict=False, autoclose=False)
+        branches = [KFMomentWindow({MEM_TAU: args.z_dim}, min_ratio=2.0,
+                                   min_abs=args.kf_min_cuts,
+                                   eps=args.ridge_eps, fixed_maps=maps,
+                                   strict=False, autoclose=False,
+                                   # Review round 8: paired OAS shrinkage;
+                                   # the fixed ridge keeps only its
+                                   # numerical-safety role.
+                                   oas=True)
+                    for _ in range(Llmmaps.N_BRANCHES)]
+        window = BranchEnsembleWindow(branches)
 
     params = [p for p in model.parameters() if p.requires_grad]
     # Official CCM protocol (L6.5 review P0-2): AdamW with weight_decay=0,
@@ -709,12 +855,56 @@ def main():
     train_items = dialog.train_dataset
     n_items = len(train_items)
     sample_cursor = 0
+    # Review round 8: depth-stratified candidate pools + sampling probs.
+    # Persisted for the statistical report (per-level candidate counts,
+    # unique dialogues, the q_L used, and the achieved per-window mix).
+    pools = build_depth_pools(train_items)
+    depth_probs = depth_sampling_probs(pools)
+    pool_all = list(range(n_items))
+    seen_dialogs = set()  # one ORIGINAL dialogue per window (cleared at
+                          # every window close)
+    depth_win = {L: 0 for L in DEPTH_LEVELS}  # per-window counters
+    save_json(out / "depth_pools.json", {
+        "levels": {str(L): {"n_pool": len(pools[L]),
+                            "q": float(depth_probs[i])}
+                   for i, L in enumerate(DEPTH_LEVELS)},
+        "n_items": n_items,
+        "k_of_L": {str(L): K_OF_L[L] for L in DEPTH_LEVELS},
+        "rule": "q_L ~ 1/sqrt(n_L), 3x-uniform oversampling cap; one "
+                "original dialogue per window; fixed k_L = L + 2",
+        "note_L1": "depth L=1 dialogues (3 turns) carry task CE only: "
+                   "the cut formula v = k - 3 >= 1 requires L >= 2, so "
+                   "L=1 contributes no RPBE row (legacy protocol "
+                   "semantics, unchanged by round 8)",
+    })
 
     def next_batch():
+        # Review round 8 (depth-stratified legal cuts): draw depth L with
+        # q_L ~ 1/sqrt(n_L) (3x cap), then one dialogue from pool L that
+        # has NOT appeared in this window (one dialogue per window), and
+        # collate it at the FIXED prefix k_L = L + 2.  The same RNG stream
+        # drives both arms (seed_all), so task-only and ours see the
+        # identical sampling stream.
         nonlocal sample_cursor
-        item = train_items[int(sample_cursor % n_items)]
+        L = DEPTH_LEVELS[int(np.random.choice(len(DEPTH_LEVELS),
+                                              p=depth_probs))]
+        cand = [i for i in pools[L] if i not in seen_dialogs]
+        if not cand:
+            # Pool exhausted within this window: fall back to any unseen
+            # dialogue (dedup preserved; depth mix degrades gracefully).
+            cand = [i for i in pool_all if i not in seen_dialogs]
+        if not cand:
+            raise RuntimeError(
+                "degenerate depth window: every dialogue already seen "
+                "(window grew past the whole pool)")
+        orig_id = int(random.choice(cand))
+        seen_dialogs.add(orig_id)
+        item = train_items[orig_id]
+        item = dict(item)
+        item["dialog"] = list(item["dialog"])[:K_OF_L[L]]
+        item["fixed_depth"] = True  # vendored collator LOCAL FIX honors it
         sample_cursor += 1
-        return collator([item]), sample_cursor - 1
+        return collator([item]), sample_cursor - 1, orig_id, L
 
     threshold = window._threshold(MEM_TAU) if window else None
     save_json(out / "config.json", {
@@ -762,9 +952,10 @@ def main():
     cut_records = []
     window_start_state = None
     # Review P0-2: the ccm_merge arm counts effective cuts (dialogues
-    # with k >= 4) in the same stream and fires its update on the same
-    # boundary as the RPBE windows, so all three arms see the same task
-    # samples at the same scheduler step.
+    # with k >= 3, review round 8: depth L = 1 contributes cuts too) in
+    # the same stream and fires its update on the same boundary as the
+    # RPBE windows, so all three arms see the same task samples at the
+    # same scheduler step.
     merge_eff_cuts = 0
     # L6.5 gate 1: every arm hashes its (sample_id, k) data stream so the
     # three arms can be compared bit-for-bit after a run; the raw stream
@@ -781,6 +972,30 @@ def main():
     boundary_hash = hashlib.sha256()
     boundary_records = []
     data_flow_path = out / "data_flow.jsonl"
+    # Review round 8 statistical report: per-window depth-stratified
+    # coverage (per-level cut counts, unique dialogues, duplication rate,
+    # row-level ESS, turn-14 coverage).  Written on every window close;
+    # the dedup set and per-window counters reset with the window.
+    depth_diag_path = out / "depth_diag.jsonl"
+
+    def close_depth_window(n_mb, step_val, n_cuts):
+        uniq = len(seen_dialogs)
+        with depth_diag_path.open("a") as f:
+            f.write(json.dumps({
+                "step": int(step_val),
+                "n_mb": int(n_mb),
+                "per_L": {str(L): int(depth_win[L]) for L in DEPTH_LEVELS},
+                "unique_dialogs": int(uniq),
+                "dup_rate": float(1.0 - uniq / max(int(n_mb), 1)),
+                "n_cuts": int(n_cuts),
+                # rows w=0.5: ESS=2*n_cuts (L=1 microbatches carry no
+                # RPBE row: v = k - 3 >= 1 requires depth L >= 2)
+                "ess_rows": float(2 * n_cuts),
+                "L13_cover": float(depth_win[13] / max(int(n_mb), 1)),
+            }) + "\n")
+        seen_dialogs.clear()
+        for L in DEPTH_LEVELS:
+            depth_win[L] = 0
     if args.resume_from:
         payload = load_trainable(args.resume_from, model, optimizer, device)
         step = int(payload.get("step", 0))
@@ -971,17 +1186,27 @@ def main():
         return not amp_skipped
 
     while step < args.max_steps:
-        batch, sample_id = next_batch()
+        batch, sample_id, orig_id, L = next_batch()
+        depth_win[L] += 1
         # Data-stream hash for every arm (parse_meta is pure, no RNG).
-        metas = parse_meta(batch, comp_ids, sum_ids, sample_id)
+        # Review round 8: the stream records the STABLE dialogue id and
+        # its depth level — the per-step cursor is no longer the identity.
+        metas = parse_meta(batch, comp_ids, sum_ids, sample_id,
+                           orig_ids=[orig_id])
         for m in metas:
             data_flow_hash.update(struct.pack(
-                ">qq", int(m["sample_id"]) % n_items, int(m["k"])))
+                ">qq", int(m["orig_id"]) if m["orig_id"] >= 0
+                else int(m["sample_id"]) % n_items, int(m["k"])))
             data_flow_len += 1
         with data_flow_path.open("a") as f:
             for m in metas:
-                f.write(json.dumps({"sid": int(m["sample_id"]) % n_items,
-                                    "k": int(m["k"])}) + "\n")
+                # meta.k = len(blocks) + 1, so the compressed-history depth
+                # L = meta.k - 1 (dialog prefix = L + 2 turns).
+                f.write(json.dumps({
+                    "did": int(m["orig_id"]) if m["orig_id"] >= 0
+                    else int(m["sample_id"]) % n_items,
+                    "L": int(m["k"]) - 1,
+                    "k": int(m["k"])}) + "\n")
         if window_start_state is None:
             # Builder counters are NOT rewound here: pass 2 never touches
             # the builder, so occurrence ids stay monotonic across the
@@ -998,7 +1223,7 @@ def main():
             # is unchanged (L6.5 perf: DailyDialog's effective-cut rate
             # is ~50%, halving the pass-1 cost).
             state = {"rng": _rng_state()}
-            if any(m["ok"] and m["k"] >= 4 for m in metas):
+            if any(m["ok"] and m["k"] >= 3 for m in metas):
                 batch_cuts = pass1_one(batch, metas)
             else:
                 batch_cuts = []
@@ -1021,6 +1246,13 @@ def main():
                             _d.get("J_real_minus_shuffled"),
                         "J_shuffled_mean": _d.get("J_shuffled"),
                         "J_shuffled_n": _d.get("J_shuffled_n"),
+                        # Review round 8: per-branch scores + ensemble.
+                        "J_ens": _d.get("J_ens"),
+                        "J_branches": _d.get("J_branches"),
+                        # OAS shrinkage intensities (branch 0's window
+                        # statistics, detached by construction).
+                        "alpha_z": _d.get("alpha_z"),
+                        "alpha_p": _d.get("alpha_p"),
                     }) + "\n")
                 # P0-1 fix: capture the REAL post-pass-1 data-stream RNG
                 # position; pass 2 replays from the window start and the
@@ -1201,11 +1433,12 @@ def main():
                     kf_closed, len(pending), n_cut_win).encode())
                 boundary_records.append("w{}:{}:{}:".format(
                     kf_closed, len(pending), n_cut_win))
-                if args.max_windows and step >= args.max_windows:
-                    break
+                close_depth_window(len(pending), step, n_cut_win)
                 pending = []
                 cut_records = []
                 window_start_state = None
+                if args.max_windows and step >= args.max_windows:
+                    break
             elif len(pending) >= args.max_pending_mbs:
                 raise RuntimeError(
                     "degenerate window: {} microbatch collected fewer "
@@ -1223,7 +1456,7 @@ def main():
             # exposure; --merge-cadence official keeps the fixed cadence
             # for the ccm_merge_official reproduction reference only.
             eff = sum(1 for m in metas
-                      if m["ok"] and m["k"] >= 4)
+                      if m["ok"] and m["k"] >= 3)
             if args.merge_cadence == "window-matched":
                 merge_eff_cuts += eff
             fire = (args.merge_cadence == "window-matched"
@@ -1269,9 +1502,10 @@ def main():
                     boundary_records.append("w{}:{}:{}:".format(
                         step, len(pending), merge_eff_cuts))
                     merge_eff_cuts = 0
+                close_depth_window(len(pending), step, merge_eff_cuts)
+                pending = []
                 if args.max_windows and step >= args.max_windows:
                     break
-                pending = []
         if (step and step != last_logged_step
                 and step % args.log_every == 0):
             # L7 smoke: without the dedup this block re-prints the same

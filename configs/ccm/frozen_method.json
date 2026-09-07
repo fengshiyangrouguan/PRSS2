@@ -15,7 +15,7 @@
   },
   "rpbe": {
     "ridge_eps": 0.001,
-    "sketch_dim_m": 64,
+    "sketch_dim_m": 32,
     "rpbe_map_seed": 0,
     "z_v_dim": 128,
     "horizon_weights": [
@@ -28,7 +28,13 @@
       "lambda_kf_note": "CONDITIONAL-2Obs calibration (review round 5, 2026-09-06): lambda = 0.1 / r_eff measured on theta_0 with the restored conditional P construction (chi(C)xphi(Y), u_k consumed). r_eff(lambda=1) ~ 61.6. Marginal-P pilots (obsolete for the main result, kept as ablation): 2.030e-3 (0.3 arm), 6.768e-4 (0.1 arm)."
     },
     "z_v_source": "J_mem(M_v) fixed adapter (TGN identity is its special case)",
-    "witness": "none (main experiment)"
+    "witness": "none (main experiment)",
+    "sketch_ensemble_n_branches": 4,
+    "sketch_ensemble_note": "Review round 8 (2026-09-07): the single 64-dim sketch is replaced by FOUR independent 32-dim branches (J_ens = mean_r J_r; never concatenated into one 128-dim covariance). Depth bucket b(L_v) modulates the future signature phi_r(h,b(L)) = phi_h + b_L^(r) with fixed per-branch per-depth +/-1 signatures.",
+    "oas_shrinkage": {
+      "enabled": true,
+      "rule": "paired OAS covariance shrinkage per branch: C_ZZ'=(1-a_Z)C_ZZ+a_Z I, C_PP'=(1-a_P)C_PP+a_P I, C_ZP'=sqrt((1-a_Z)(1-a_P)) C_ZP; a_Z,a_P from the OAS rule (Chen et al. 2010) estimated on the current window, stop-gradient. The fixed ridge keeps only its numerical-safety role."
+    }
   },
   "gamma": {
     "placement": "one module per layer, shared across the K/V merges and the two COMP/SUM slots",
@@ -57,5 +63,17 @@
     "checkpoint_every": 50,
     "schedule_total_steps": 1000,
     "schedule_note": "Keep the ORIGINAL 1000-step warmup/cosine LR schedule (warmup=30, cosine over 1000) while the e50 pilot stops at 500 — review ruling 2026-09-05: a 500-step schedule would NOT be the first half of the 1000-step run."
+  },
+  "sampling": {
+    "depth_levels": [
+      1,
+      2,
+      4,
+      8,
+      13
+    ],
+    "k_of_L": "L + 2 (fixed prefix length per depth)",
+    "rule": "depth-stratified legal cuts: q_L ~ 1/sqrt(n_L) with 3x-uniform oversampling cap; ONE original dialogue per window (tree_id = stable original dialogue id, not the stream cursor); turn-14/L=13 uses only long-enough dialogues with the target FIXED at the 15th turn and a 13-turn compressed history; L=1 dialogues carry task CE only (v = k - 3 >= 1 requires L >= 2).",
+    "paired_report": "scripts/eval_ccm_paired.py: paired d_i = NLL_task,i - NLL_ours,i; BCa bootstrap (20k), Huber location, paired randomization test, LOO stability, single-dialogue share <= 20%, branch direction agreement >= 3/4."
   }
 }

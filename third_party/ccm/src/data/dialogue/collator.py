@@ -32,9 +32,15 @@ class DataCollatorForDialogue_LLAMA:
 
         model_inputs = defaultdict(list)
         for instance in batch:
+            # LOCAL FIX (review round 8): depth-stratified sampling passes
+            # an instance whose ``dialog`` is ALREADY truncated to the
+            # fixed k_L = L + 2 and marks ``fixed_depth``; the official
+            # random-k path (random_k=True) must then stay OFF so the
+            # caller's exact depth survives.  Official behavior unchanged
+            # for unmarked instances.
             instance = self.dialog.sample_dialog(
                 instance,
-                random_k=True,
+                random_k=not instance.get("fixed_depth", False),
                 sum_token=self.sum_token,
                 sum_recur=self.comp_args.attn_type == "merge_recur",
                 neg_control=self.comp_args.comp_type == "neg_control",

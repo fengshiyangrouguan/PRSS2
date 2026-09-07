@@ -38,11 +38,54 @@ class CutCandidate:
 
 
 @dataclass
+class ConsumedPairCandidate:
+    """One real child-parent consumption pair recorded at the parent
+    aggregation site (paper recursive-closure supervision).
+
+    ``child`` is a NEIGHBOR state actually consumed by ``parent``'s
+    aggregation::
+
+        child  = neighbor_lower[parent_row, slot]   (layer = parent_layer - 1)
+        parent = source state at ``parent_layer`` that aggregated it
+
+    Both child and parent query times are the PARENT's query time ``t`` — the
+    time the host actually recursed them at (repeated_times).  We NEVER change
+    a child's query time to its historical edge_time: that would make ``z``
+    include information between edge_time and ``t`` (leakage).  The historical
+    relation time is kept separately as ``relation_time`` (<= query time).
+
+    Only INTERNAL compressed child layers (0 < child_layer < L) are recorded,
+    and only the actual neighbor_lower tensor used by aggregate() is kept as
+    ``z`` (full gradient connection).
+    """
+
+    pair_id: tuple               # globally-unique, exact-replay-stable
+    root_row: int
+    tau: str                     # child compressible interface ("tjo:layer<c>")
+    child_layer: int
+    parent_layer: int
+    child_node: int
+    child_time: float            # = parent query time (repeated_times)
+    parent_node: int
+    parent_time: float
+    relation_time: float         # historical edge time, <= query time
+    relation_edge_id: int
+    relation_lag: float          # parent_query_time - relation_time
+    relation_slot: int
+    path: Tuple[int, float]      # tuple of (relation_code, delta_t) steps
+    z: torch.Tensor              # neighbor_lower[row, slot] (gradient-connected)
+
+
+@dataclass
 class CompactCutTrace:
     """Only selected query roots and their bounded cut candidates."""
 
     root_rows: List[int] = field(default_factory=list)
     cuts: List[CutCandidate] = field(default_factory=list)
+    pairs: List[ConsumedPairCandidate] = field(default_factory=list)
 
     def add(self, candidate: CutCandidate) -> None:
         self.cuts.append(candidate)
+
+    def add_pair(self, candidate: ConsumedPairCandidate) -> None:
+        self.pairs.append(candidate)

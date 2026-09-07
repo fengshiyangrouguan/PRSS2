@@ -74,6 +74,10 @@ def parse_args():
                         "and select best.pt by sampled_query_val_mrr")
     p.add_argument("--query-sets", default="",
                    help="fixed query-id json (shared across arms/seeds)")
+    p.add_argument("--kf-fail-below", action="store_true",
+                   help="abort at the FIRST below-threshold KF window "
+                        "(fail-fast; calibration runs leave it off so "
+                        "window_diag.jsonl records real yields)")
     return p.parse_args()
 
 
@@ -193,7 +197,8 @@ def main():
         trace_roots=args.trace_roots,
         trace_pairs_per_parent=args.trace_pairs_per_parent,
         kf_group_batches=args.kf_group_batches,
-        kf_min_trees=args.kf_min_trees)
+        kf_min_trees=args.kf_min_trees,
+        fail_below=args.kf_fail_below)
 
     save_json(out / "config.json", {
         "data": "tgbl-wiki", "seed": args.seed, "arm": args.arm,
@@ -209,6 +214,8 @@ def main():
     best_epoch = -1
     gs = 0
     val_history = []
+    win_diag_path = out / "window_diag.jsonl"
+    win_diag_path.unlink(missing_ok=True)
     for epoch in range(args.epochs):
         t0 = time.time()
         row = loop.train_epoch(
@@ -217,6 +224,11 @@ def main():
         gs = row.get("global_step", gs)
         row["epoch"] = epoch
         row["epoch_seconds"] = time.time() - t0
+        for wd in row.get("window_diag", []):
+            wd["epoch"] = epoch
+            with win_diag_path.open("a") as f:
+                f.write(json.dumps(wd, allow_nan=True) + "\n")
+        row.pop("window_diag", None)
         with metrics_path.open("a") as f:
             f.write(json.dumps(row, allow_nan=True) + "\n")
         print(json.dumps({"epoch": epoch, **{k: row[k] for k in

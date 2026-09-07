@@ -62,7 +62,8 @@ class TGBPairLinkLoop:
                  edge_table, arm, rpbe_cfg, repr_optimizer, head_optimizer,
                  trace_roots=32, trace_pairs_per_parent=2,
                  kf_group_batches=56, kf_min_trees=896,
-                 n_observations=2, trace_mode="evenly_spaced"):
+                 n_observations=2, trace_mode="evenly_spaced",
+                 fail_below=False):
         self.tgn = tgn
         self.device = device
         self.batch_size = int(batch_size)
@@ -90,10 +91,15 @@ class TGBPairLinkLoop:
         self.trace_mode = trace_mode
         self.use_parent = arm_use_parent(arm)
         self.kf_on = arm_kf_on(arm, self.lambda_kf)
+        self.fail_below = bool(fail_below)
 
         # per-interface PairKFWindow (child tau keys)
         self.pair_windows: Dict[str, PairKFWindow] = {}
         self._window_eps = float(rpbe_cfg.ridge_eps) if rpbe_cfg else 1e-3
+        # window diagnostics: per group per tau M_unique_trees / threshold /
+        # actual group batch count (used to calibrate the macro-group length
+        # from real child-parent pair yield on tgbl-wiki v2).
+        self.window_diag = []
 
         if self.kf_on:
             from rpbe.pair_rows import PairRowProjector
@@ -241,6 +247,7 @@ class TGBPairLinkLoop:
         n_aux_batches = 0
         n_closed = 0
         below = 0
+        self.window_diag = []
 
         group_start = 0
         while group_start < run_batches:
@@ -257,6 +264,13 @@ class TGBPairLinkLoop:
                     if out is None:
                         continue
                     _, records = out
+                    # root_row is a batch-local index (0..batch_size) reused
+                    # every batch; remap to a globally-unique tree id so the
+                    # per-tree window count / tree weight are correct across
+                    # the macro group (matching node-class _tree_counter).
+                    for rec in records:
+                        rec.root_row = int(b) * self.batch_size \
+                            + int(rec.root_row)
                     if records:
                         pass1_records.extend(records)
             # window + close (only for the enabled arm)
@@ -283,8 +297,21 @@ class TGBPairLinkLoop:
                     win.reset()
                     for r in tau_recs:
                         win.add(r)
+                    m_trees = win.n_unique_trees()
+                    self.window_diag.append({
+                        "group_batches": group_k,
+                        "tau": tau,
+                        "M_unique_trees": m_trees,
+                        "threshold": self.kf_min_trees,
+                        "n_records": len(tau_recs)})
                     if not win.ready():
                         below += 1
+                        if self.fail_below:
+                            raise RuntimeError(
+                                "kf window below threshold: tau={} "
+                                "M_unique_trees={} < {} in {} batches".format(
+                                    tau, m_trees, self.kf_min_trees,
+                                    group_k))
                         continue
                     j, g_pos, diag = win.close_replay(
                         _MapsAdapter(self, tau))
@@ -349,6 +376,7 @@ class TGBPairLinkLoop:
             "n_below": below,
             "n_batches": run_batches,
             "global_step": global_step,
+            "window_diag": list(self.window_diag),
         }
 
     def _clip(self, params):

@@ -724,8 +724,11 @@ def main() -> None:
                     print(f"[best @ {step}] val {val_loss:.4f}", flush=True)
 
             if step % args.checkpoint_every == 0:
-                torch.save(_ckpt_dict(), run_dir / "checkpoint.pt")
-                print(f"checkpoint saved @ {step}", flush=True)
+                # rolling "latest" overwrite (long-run retention: only
+                # best.pt + latest.pt accumulate; checkpoint.pt is written
+                # once at the very end)
+                torch.save(_ckpt_dict(), run_dir / "latest.pt")
+                print(f"latest saved @ {step}", flush=True)
 
     # final checkpoint keeps FULL metadata via _ckpt_dict() (arm/best_val/
     # task_filter/seed), not a bare weights-only dict (approval small fix 2)

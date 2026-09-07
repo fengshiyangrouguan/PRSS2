@@ -134,7 +134,10 @@ def build_vla(args: argparse.Namespace):
         per_token_size=256,
         use_rpbe_gamma=flags["is_gamma"],
         gamma_rank=64,
-        gamma_alpha_init=0.0,
+        # alpha=1 + U=0 (review ruling B1): training start == official
+        # AvgMerge but dL/dU = alpha*h != 0 opens the learning path.  alpha=0
+        # would freeze every Gamma parameter at zero gradient forever.
+        gamma_alpha_init=1.0,
         rpbe_merge_records=flags["is_gamma"],
         rpbe_task_grad=flags["is_gamma"],
     )

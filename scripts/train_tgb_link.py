@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+﻿#!/usr/bin/env python3
 """TGB tgbl-wiki recursive-closure link training runner (one arm/seed).
 
 Builds the official multi-layer recursive Twitter-TGN on tgbl-wiki, attaches
@@ -13,10 +13,12 @@ Usage:
 """
 
 import argparse
+import hashlib
 import json
 import math
 import os
 import random
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -42,6 +44,7 @@ from rpbe.compressor import RecursiveCompressor
 from rpbe.pair_maps import BoundaryMaps
 from rpbe.link_records import LinkFutureIndex
 from rpbe.training.tgb_link_loop import TGBPairLinkLoop, ARMS
+from rpbe.audit import AuditAccumulator
 
 
 def parse_args():
@@ -198,7 +201,8 @@ def main():
         trace_pairs_per_parent=args.trace_pairs_per_parent,
         kf_group_batches=args.kf_group_batches,
         kf_min_trees=args.kf_min_trees,
-        fail_below=args.kf_fail_below)
+        fail_below=args.kf_fail_below,
+        audit_trace=True)
 
     save_json(out / "config.json", {
         "data": "tgbl-wiki", "seed": args.seed, "arm": args.arm,
@@ -274,6 +278,28 @@ def main():
                "best_epoch": int(best_epoch),
                "best_sampled_val_mrr": float(best_val)}
     save_json(out / "summary.json", summary)
+    # ---- read-only comparison sidecar (spec §26 item 13) ----
+    try:
+        commit = subprocess.run(
+            ["git", "rev-parse", "HEAD"], capture_output=True, text=True,
+            timeout=10, cwd=str(Path(__file__).resolve().parents[1])
+        ).stdout.strip()
+    except Exception:  # noqa: BLE001
+        commit = "unknown"
+    config_hash = hashlib.blake2b(
+        json.dumps(vars(args), sort_keys=True, default=str).encode("utf-8"),
+        digest_size=16).hexdigest()
+    fixed_feature = {
+        "rpbe_seed": int(args.rpbe_seed),
+        "sketch_dim": int(args.sketch_dim),
+        "width_D": int(args.width_D),
+        "d_ctx": int(c["rpbe_cfg"].d_c) if hasattr(c["rpbe_cfg"], "d_c") else None,
+        "d_event": int(c["rpbe_cfg"].d_f) if hasattr(c["rpbe_cfg"], "d_f") else None,
+    }
+    audit = loop.audit
+    save_json(out / "comparison_audit.json",
+              audit.dump(commit=commit, config_hash=config_hash,
+                         fixed_feature=fixed_feature))
     save_json(out / "_SUCCESS.json", {"status": "complete",
                                       "best_epoch": int(best_epoch),
                                       "selection": "sampled_query_val_mrr"})

@@ -1,4 +1,4 @@
-"""Same-window two-pass KF window over child-parent boundary records.
+﻿"""Same-window two-pass KF window over child-parent boundary records.
 
 Each ``BoundaryRecord`` is ONE supervised row::
 
@@ -61,6 +61,11 @@ class PairKFWindow:
 
     def n_unique_trees(self) -> int:
         return len(self._tree_seen)
+
+    @property
+    def records(self) -> list:
+        """Read-only view of the accumulated records (audit sidecar)."""
+        return list(self._records)
 
     def ready(self) -> bool:
         return len(self._tree_seen) >= self.min_unique_trees
@@ -132,9 +137,17 @@ class PairKFWindow:
             variant="full_balancing")
         if score_diag["failed"] is not None:
             return None, {}, score_diag
-        # latent_z_adjoint keys by cut_id; map boundary_key -> position
-        pos_of = {r.boundary_key: i for i, r in enumerate(records)}
-        g_by_position = {pos_of[k]: g for k, g in g_by_cut.items()}
+        # latent_z_adjoint keys by cut_id (boundary_key) and MERGES the
+        # per-row gradients of one cut into a single cut-level adjoint
+        # g_v = sum_h g_{v,h}.  Broadcast that adjoint to EVERY record of
+        # the cut — a dict keyed by boundary_key would silently keep only
+        # the last position and drop the rest (which starved ~80% of the
+        # window records of auxiliary gradient in pass 2).
+        g_by_position = {}
+        for i, r in enumerate(records):
+            g = g_by_cut.get(r.boundary_key)
+            if g is not None:
+                g_by_position[i] = g
         return float(j), g_by_position, {
             "M_unique_trees": len(self._tree_seen),
             "below_threshold": False}

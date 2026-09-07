@@ -1,4 +1,4 @@
-"""TGB tgbl-wiki link training with pair-window exact replay (4 arms).
+﻿"""TGB tgbl-wiki link training with pair-window exact replay (4 arms).
 
 Joint training from step 0::
 
@@ -42,6 +42,7 @@ from rpbe.training.jodie_loop import select_trace_rows
 from rpbe.link_records import build_boundary_records
 from rpbe.pair_arms import (feasible_positions,
                             build_mispaired_parent_map)
+from rpbe.audit import AuditAccumulator
 
 ARMS = ("gamma_task_only", "1obs", "2obs_aligned", "2obs_mispaired")
 
@@ -63,7 +64,7 @@ class TGBPairLinkLoop:
                  trace_roots=32, trace_pairs_per_parent=2,
                  kf_group_batches=56, kf_min_trees=896,
                  n_observations=2, trace_mode="evenly_spaced",
-                 fail_below=False):
+                 fail_below=False, audit_trace=False):
         self.tgn = tgn
         self.device = device
         self.batch_size = int(batch_size)
@@ -92,6 +93,14 @@ class TGBPairLinkLoop:
         self.use_parent = arm_use_parent(arm)
         self.kf_on = arm_kf_on(arm, self.lambda_kf)
         self.fail_below = bool(fail_below)
+        # audit side-channel: when True the trace runs even without KF so
+        # gamma_task_only records the SAME underlying population as the aux
+        # arms (spec §24.5 acceptance).  Pure record-keeping: trace row
+        # selection is deterministic (evenly_spaced, no RNG) and the audit
+        # touches no tensors and no optimizer state.
+        self.audit_trace = bool(audit_trace)
+        self.audit = AuditAccumulator()
+        self._mispaired_map: Dict[int, object] = {}
 
         # per-interface PairKFWindow (child tau keys)
         self.pair_windows: Dict[str, PairKFWindow] = {}
@@ -128,10 +137,18 @@ class TGBPairLinkLoop:
         return recs
 
     def _pv(self, rec):
-        """One p_v row for a record under this arm's use_parent."""
+        """One p_v row for a record under this arm's use_parent.
+
+        The mispaired arm consumes a donor parent future (position-level
+        perfect derangement built in pass 1); every other arm consumes the
+        true parent future.  ``parent_future_used`` is attached to the
+        pass-1 record object only — the record's own fields are untouched.
+        """
         ctx = _ctx_vec(rec, d_ctx=self._ctx_dim(), device=self.device)
         child = self._event(rec.child_future, rec.child_time)
-        parent = self._event(rec.parent_future, rec.parent_time)
+        parent = self._event(
+            getattr(rec, "parent_future_used", rec.parent_future),
+            rec.parent_time)
         return self.boundary_maps.pv(ctx, child, parent,
                                      use_parent=self.use_parent)
 
@@ -209,7 +226,7 @@ class TGBPairLinkLoop:
         negatives = self._sample_negatives(train, size)
 
         trace_rows = []
-        if self.kf_on:
+        if self.kf_on or self.audit_trace:
             trace_rows = select_trace_rows(
                 np.zeros(size), self.trace_roots, self.seed, global_step,
                 mode=self.trace_mode)
@@ -228,7 +245,8 @@ class TGBPairLinkLoop:
             + F.binary_cross_entropy(
                 negative.squeeze(), torch.zeros(size, device=self.device)))
         records = []
-        if self.kf_on and trace_rows and self.adapter.trace is not None:
+        if (self.kf_on or self.audit_trace) and trace_rows \
+                and self.adapter.trace is not None:
             records = self._records_from_trace(self.adapter.trace)
         self.adapter.clear_trace()
         return link_loss, records
@@ -253,13 +271,20 @@ class TGBPairLinkLoop:
         while group_start < run_batches:
             group_end = min(group_start + self.kf_group_batches, run_batches)
             group_k = group_end - group_start
+            # group-anchored step counter: pass 2 increments `global_step`
+            # per batch, so pass 1 and pass 2 MUST both derive the per-batch
+            # step from the group-start value — otherwise the trace_batch
+            # seed (and hence the neighbor-slot sampling of the official
+            # neighbor finder, which draws np.random per batch) diverges
+            # after the first batch and exact replay silently breaks.
+            group_gs = global_step
             # ------------ pass 1: collect records per batch, no grad -------
             state = self._save_group_state()
             pass1_records = []
             with torch.no_grad():
                 for b in range(group_start, group_end):
                     out = self._run_batch(
-                        train, b, global_step + (b - group_start),
+                        train, b, group_gs + (b - group_start),
                         grad_enabled=False)
                     if out is None:
                         continue
@@ -276,17 +301,32 @@ class TGBPairLinkLoop:
             # window + close (only for the enabled arm)
             g_by_pos_all = {}
             closed_tau = {}
+            # shared surviving set across ALL arms: infeasible (mispaired)
+            # positions are dropped identically everywhere, and the mispaired
+            # arm additionally deranges the consumed parent futures.  The
+            # audit population (valid_cut / occurrence / y multisets) is
+            # recorded here so gamma_task_only sees the same data population.
+            if pass1_records:
+                fea = feasible_positions(pass1_records, seed=self.seed,
+                                         batch_seed=global_step)
+                if self.arm == "2obs_mispaired":
+                    self._mispaired_map = build_mispaired_parent_map(
+                        pass1_records, seed=self.seed,
+                        batch_seed=global_step)
+                    # map keys must agree with the feasibility set (same
+                    # bucket + derangement internals); intersect for safety
+                    fea = [i for i in fea if i in self._mispaired_map]
+                else:
+                    self._mispaired_map = {}
+                for i in fea:
+                    r = pass1_records[i]
+                    if self._mispaired_map:
+                        r.parent_future_used = self._mispaired_map[i]
+                    self.audit.add_population(r)
             if self.kf_on and pass1_records:
                 weights = tree_equal_weights(pass1_records)
                 for r in pass1_records:
                     r.weight = weights[int(r.root_row)]
-                # drop infeasible (mispaired) positions identically for the
-                # pair arm so aligned/mispaired share the surviving set
-                if self.arm == "2obs_mispaired":
-                    fea = feasible_positions(pass1_records, seed=self.seed,
-                                             batch_seed=global_step)
-                else:
-                    fea = list(range(len(pass1_records)))
                 by_tau: Dict[str, List] = {}
                 for i in fea:
                     by_tau.setdefault(pass1_records[i].tau, []).append(i)
@@ -325,13 +365,24 @@ class TGBPairLinkLoop:
                         # whose pair_ids match (RNG/oid restored), but whose
                         # python id() differs.
                         g_by_pos_all[tau_recs[pos_in_tau].pair_id] = g
+                        # audit: consumed pairing (donor future for mispaired)
+                        r = tau_recs[pos_in_tau]
+                        pf_used = getattr(r, "parent_future_used",
+                                          r.parent_future)
+                        eid = int(pf_used.event_id) if pf_used is not None \
+                            else -1
+                        self.audit.add_pairing(r, eid)
+                    self.audit.add_window_close(
+                        tau, [r.pair_id for r in win.records])
             # ------------ restore and pass 2: train -----------------------
             self._restore_group_state(state)
             self.repr_optimizer.zero_grad(set_to_none=True)
+            _grp_hits = 0
+            _grp_recs = 0
             for b in range(group_start, group_end):
                 self.head_optimizer.zero_grad(set_to_none=True)
                 out = self._run_batch(
-                    train, b, global_step + (b - group_start),
+                    train, b, group_gs + (b - group_start),
                     grad_enabled=True)
                 if out is None:
                     continue
@@ -340,9 +391,12 @@ class TGBPairLinkLoop:
                 if self.kf_on and records and g_by_pos_all:
                     terms = []
                     for r in records:
+                        _grp_recs += 1
                         g = g_by_pos_all.get(r.pair_id)
                         if g is None:
                             continue
+                        _grp_hits += 1
+                        self.audit.add_replay(r)
                         z = r.z
                         gd = g.detach()
                         terms.append((gd * z).sum() - (gd * z.detach()).sum())
@@ -360,6 +414,10 @@ class TGBPairLinkLoop:
                 total_link += float(link_loss.detach())
                 global_step += 1
             # group close: repr step once
+            if self.kf_on:
+                print("[audit-debug] group=%d keys=%d records=%d hits=%d"
+                      % (group_start // self.kf_group_batches,
+                         len(g_by_pos_all), _grp_recs, _grp_hits), flush=True)
             if self.repr_optimizer is not None and self.repr_params:
                 for p in self.repr_params:
                     if p.grad is not None:

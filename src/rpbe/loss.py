@@ -238,7 +238,7 @@ def kf_vjp_batch(z_b: torch.Tensor, p_b: torch.Tensor, w_b: torch.Tensor,
 
 
 def latent_z_adjoint(z_rows, p_rows, w, cut_ids, mu_z, mu_p, D,
-                     eps, strict=False):
+                     eps, strict=False, variant="full_balancing"):
     """Contract the moment adjoint onto CUT-LEVEL z-adjoints.
 
     At window close, the whole-window score F(S) is replayed on the
@@ -254,6 +254,12 @@ def latent_z_adjoint(z_rows, p_rows, w, cut_ids, mu_z, mu_p, D,
     moment-adjoint form, but pass 2 needs NO p, NO moments and NO
     re-walk: just index the traced z and take dot products.
 
+    ``variant`` is forwarded to ``_score_from_covs`` so the adjoint uses the
+    SAME score variant as the window (diagonal / reconstruction / full
+    balancing).  Omitting it silently fell back to full balancing for every
+    variant — harmless for the current full-balancing arms, but wrong for
+    any future diagonal/reconstruction exact-replay ablation.
+
     Returns ``(j_float, g_by_cut, score_diag)``; ``g_by_cut`` maps the
     cut_id tuple to the merged gradient tensor [r].
     """
@@ -264,7 +270,8 @@ def latent_z_adjoint(z_rows, p_rows, w, cut_ids, mu_z, mu_p, D,
     mzz = (zc * sw).t() @ (zc * sw)
     mzp = (zc * sw).t() @ (pc * sw)
     mpp = (pc * sw).t() @ (pc * sw)
-    j, score_diag = _score_from_covs(mzz / D, mzp / D, mpp / D, eps)
+    j, score_diag = _score_from_covs(mzz / D, mzp / D, mpp / D, eps,
+                                     variant)
     if score_diag["failed"] is not None:
         if strict:
             raise RuntimeError("latent_z_adjoint close failed: {}"
@@ -1060,7 +1067,8 @@ class KFMomentWindow:
             r = wf.result()
             j, g_by_cut, score_diag = latent_z_adjoint(
                 z_all, p_all, w, win["cut_ids_list"],
-                r["mu_z"], r["mu_p"], r["D"], self.eps, self.strict)
+                r["mu_z"], r["mu_p"], r["D"], self.eps, self.strict,
+                variant=self.variant)
             if j is None:
                 closed[tau] = 0.0
                 replay_plan[tau] = {"by_batch": [[]]}

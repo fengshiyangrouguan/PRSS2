@@ -10,7 +10,7 @@ import numpy as np
 import torch
 
 
-def build_ctx_vector(rec, d_ctx: int) -> torch.Tensor:
+def build_ctx_vector(rec, d_ctx: int, device=None) -> torch.Tensor:
     """Fixed structural-context chi(C_v) -> [d_ctx] (frozen, deterministic).
 
     Encodes only cut-time-known recursion structure via a stable bin index
@@ -20,10 +20,14 @@ def build_ctx_vector(rec, d_ctx: int) -> torch.Tensor:
     sid = (int(rec.child_layer) * 1009 + int(rec.parent_layer) * 1003
            + int(rec.relation_slot) * 997 + bin_rel_lag * 991
            + len(rec.path) * 983) % (2 ** 31)
+    # CPU generator for determinism; result moved to device after.
     base = torch.randn(d_ctx, generator=torch.Generator().manual_seed(0))
     dirv = torch.randn(d_ctx,
                        generator=torch.Generator().manual_seed(int(sid)))
-    return base + 0.5 * torch.tanh(dirv)
+    out = base + 0.5 * torch.tanh(dirv)
+    if device is not None:
+        out = out.to(device)
+    return out
 
 
 class PairRowProjector:
@@ -41,12 +45,9 @@ class PairRowProjector:
         self.d_ctx = int(d_ctx)
 
     def _message(self, edge_id):
-        idx = int(edge_id)
-        if hasattr(self.edge_table, "ndim") and self.edge_table.ndim == 2:
-            row = self.edge_table[idx]
-        else:
-            row = self.edge_table[idx]
-        return torch.as_tensor(row, dtype=torch.float32)
+        dev = self.maps.rff_w.device
+        row = self.edge_table[int(edge_id)]
+        return torch.as_tensor(row, dtype=torch.float32, device=dev)
 
     def _event(self, future, cut_time):
         return {
@@ -58,7 +59,7 @@ class PairRowProjector:
 
     def pv_row(self, rec):
         """One p_v for one BoundaryRecord."""
-        ctx = build_ctx_vector(rec, self.d_ctx)
+        ctx = build_ctx_vector(rec, self.d_ctx, device=self.maps.rff_w.device)
         child = self._event(rec.child_future, rec.child_time)
         parent = self._event(rec.parent_future, rec.parent_time)
         return self.maps.pv(ctx, child, parent,

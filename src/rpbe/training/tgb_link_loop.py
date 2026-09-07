@@ -123,7 +123,7 @@ class TGBPairLinkLoop:
 
     def _pv(self, rec):
         """One p_v row for a record under this arm's use_parent."""
-        ctx = _ctx_vec(rec, d_ctx=self._ctx_dim())
+        ctx = _ctx_vec(rec, d_ctx=self._ctx_dim(), device=self.device)
         child = self._event(rec.child_future, rec.child_time)
         parent = self._event(rec.parent_future, rec.parent_time)
         return self.boundary_maps.pv(ctx, child, parent,
@@ -371,7 +371,7 @@ class _MapsAdapter:
         return self.loop._pv(rec)
 
 
-def _ctx_vec(rec, d_ctx):
+def _ctx_vec(rec, d_ctx, device=None):
     """Structural context C_v (cut-time-known only); see pair_rows."""
     from rpbe.pair_rows import build_ctx_vector
-    return build_ctx_vector(rec, d_ctx)
+    return build_ctx_vector(rec, d_ctx, device=device)

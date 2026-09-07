@@ -56,8 +56,8 @@ def _rebuild(cfg_cli, device, ds):
     ms, ss = float(ts.mean()), float(ts.std()) + 1e-8
     tgn = TGN(
         neighbor_finder=finder,
-        node_features=torch.as_tensor(ds.node_features, dtype=torch.float32),
-        edge_features=torch.as_tensor(ds.edge_features, dtype=torch.float32),
+        node_features=ds.node_features.astype(np.float32),
+        edge_features=ds.edge_features.astype(np.float32),
         device=device, n_layers=args.n_layers, n_heads=2, dropout=0.1,
         use_memory=True, message_dimension=100, memory_dimension=172,
         memory_update_at_start=True,

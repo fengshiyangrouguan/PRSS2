@@ -98,8 +98,8 @@ def build_model(args, device):
 
     tgn = TGN(
         neighbor_finder=finder,
-        node_features=torch.as_tensor(ds.node_features, dtype=torch.float32),
-        edge_features=torch.as_tensor(ds.edge_features, dtype=torch.float32),
+        node_features=ds.node_features.astype(np.float32),
+        edge_features=ds.edge_features.astype(np.float32),
         device=device,
         n_layers=args.n_layers,
         n_heads=2,

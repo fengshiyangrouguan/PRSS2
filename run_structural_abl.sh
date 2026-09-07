@@ -29,12 +29,20 @@ PAR=3
 
 while [ $# -gt 0 ]; do
   case "$1" in
-    --seeds) shift; SEEDS="$@"; break ;;
+    --seeds)
+      shift
+      SEEDS=""
+      while [ $# -gt 0 ] && [[ "$1" != --* ]]; do
+        SEEDS="$SEEDS $1"
+        shift
+      done
+      ;;
     --outroot) OUTROOT="$2"; shift 2 ;;
     --parallel) PAR="$2"; shift 2 ;;
     *) echo "unknown arg $1"; exit 2 ;;
   esac
 done
+SEEDS=$(echo $SEEDS)
 
 run_one() {
   seed=$1; arm=$2

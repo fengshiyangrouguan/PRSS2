@@ -57,6 +57,7 @@ run_one() {
       --n-neighbors 10 --n-layers 3 --trace-roots 32 \
       --trace-pairs-per-parent ${K} --kf-group-batches 56 --kf-min-trees 896 \
       --lambda-kf 0.088 --ridge-eps 1e-3 --sketch-dim 64 --width-D 128 \
+      --eval-every 5 --query-sets datasets/tgb_wiki_query_sets.json \
       > $out.log 2>&1
   echo "DONE seed$seed/$arm (rc=$?)"
 }

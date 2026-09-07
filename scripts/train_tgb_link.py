@@ -69,6 +69,11 @@ def parse_args():
     p.add_argument("--no-fail-on-monitor-error", action="store_true")
     p.add_argument("--max-batches", type=int, default=0,
                    help="cap each train epoch at N batches (0=full; smoke)")
+    p.add_argument("--eval-every", type=int, default=0,
+                   help="score fixed val query set every N epochs (0=off) "
+                        "and select best.pt by sampled_query_val_mrr")
+    p.add_argument("--query-sets", default="",
+                   help="fixed query-id json (shared across arms/seeds)")
     return p.parse_args()
 
 
@@ -203,6 +208,7 @@ def main():
     bad = 0
     best_epoch = -1
     gs = 0
+    val_history = []
     for epoch in range(args.epochs):
         t0 = time.time()
         row = loop.train_epoch(
@@ -216,30 +222,80 @@ def main():
         print(json.dumps({"epoch": epoch, **{k: row[k] for k in
               ("train_link_loss", "n_closed", "n_below", "n_aux_batches")}},
               allow_nan=True), flush=True)
-        # rolling best (val MRR selection happens in eval step; here we keep
-        # a placeholder improving on train link loss so a best.pt exists)
-        score = -float(row.get("train_link_loss", 1e9))
-        if score > best_val:
-            best_val = score
-            best_epoch = epoch
-            bad = 0
+        # ---- sampled-val MRR checkpoint selection every eval_every epochs
+        val_mrr = None
+        if args.eval_every > 0 and args.query_sets \
+                and (epoch + 1) % args.eval_every == 0:
+            val_mrr = _val_mrr_inprocess(args, device, c, ds, out)
+            val_history.append({"epoch": epoch, "sampled_query_val_mrr":
+                                val_mrr})
+            with (out / "val_history.jsonl").open("a") as f:
+                f.write(json.dumps(val_history[-1], allow_nan=True) + "\n")
+            print("epoch {} sampled_val_mrr={:.5f}".format(
+                epoch, val_mrr), flush=True)
+            if val_mrr > best_val:
+                best_val = float(val_mrr)
+                best_epoch = epoch
+                bad = 0
+                torch.save({
+                    "model": {"tgn": c["tgn"].state_dict(),
+                              "compressor": c["compressor"].state_dict()},
+                    "epoch": epoch, "score": float(best_val),
+                    "arm": args.arm, "seed": args.seed,
+                    "selection": "sampled_query_val_mrr",
+                }, out / "best.pt")
+            else:
+                bad += 1
+                if bad >= args.patience:
+                    print("early stop at epoch {} (val mrr)".format(epoch),
+                          flush=True)
+                    break
+        elif epoch == 0:
+            # always keep a first best.pt so downstream eval has one
             torch.save({
                 "model": {"tgn": c["tgn"].state_dict(),
                           "compressor": c["compressor"].state_dict()},
-                "epoch": epoch, "score": float(best_val),
+                "epoch": epoch, "score": 0.0,
                 "arm": args.arm, "seed": args.seed,
             }, out / "best.pt")
-        else:
-            bad += 1
-            if bad >= args.patience:
-                print("early stop at epoch {}".format(epoch), flush=True)
-                break
     summary = {"data": "tgbl-wiki", "seed": args.seed, "arm": args.arm,
-               "best_epoch": int(best_epoch), "best_val_link": float(best_val)}
+               "best_epoch": int(best_epoch),
+               "best_sampled_val_mrr": float(best_val)}
     save_json(out / "summary.json", summary)
     save_json(out / "_SUCCESS.json", {"status": "complete",
-                                      "best_epoch": int(best_epoch)})
+                                      "best_epoch": int(best_epoch),
+                                      "selection": "sampled_query_val_mrr"})
     print(json.dumps(summary), flush=True)
+
+
+def _val_mrr_inprocess(args, device, c, ds, out):
+    """Score the fixed val query set at the current model state."""
+    from rpbe.link_eval import score_split
+    ds.load_val_ns()
+    qs = json.load(open(args.query_sets))
+    qids = qs["val_query_ids"]
+    tgn = c["tgn"]
+
+    def _adv(src, dst, t, eidx, bs=1):
+        with torch.no_grad():
+            tgn.compute_edge_probabilities(
+                np.asarray(src, dtype=np.int64),
+                np.asarray(dst, dtype=np.int64),
+                np.asarray(dst, dtype=np.int64),
+                np.asarray(t, dtype=np.float64),
+                np.asarray(eidx, dtype=np.int64), args.n_neighbors)
+
+    # train_epoch ends with memory at train-end state; replay the fixed
+    # val stream? score_split advances per scored event. To keep it a clean
+    # per-event online eval we pass advance_stream that steps one event.
+    def step(src, dst, t, eidx):
+        _adv(src, dst, t, eidx, bs=1)
+
+    with torch.no_grad():
+        res = score_split(tgn, ds, "val", qids,
+                          n_neighbors=args.n_neighbors,
+                          chunk=64, advance_stream=step)
+    return float(res.get("sampled_query_val_mrr", float("nan")))
 
 
 if __name__ == "__main__":

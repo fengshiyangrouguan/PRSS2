@@ -31,7 +31,7 @@ if [ "${SMOKE:-1}" = "1" ]; then ARGS+=(--max-batches "$SMOKE_BATCHES"); fi
 for ID in R0 P0 P1 P2 S1 S2 C1 B1 E1; do
   echo "=== $ID ==="
   mkdir -p "$OUT/$ID"
-  python -m scripts.train_tgb_link --config "$ID" "${ARGS[@]}" \
+  "${PYTHON:-python}" -m scripts.train_tgb_link --config "$ID" "${ARGS[@]}" \
       --output "$OUT/$ID" > "$OUT/$ID.log" 2>&1 \
     || { echo "FAILED $ID"; tail -40 "$OUT/$ID.log"; exit 1; }
   echo "--- $ID tail ---"; tail -3 "$OUT/$ID.log"

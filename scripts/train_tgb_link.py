@@ -383,6 +383,11 @@ def main():
     save_json(out / "config.json", {
         "data": "tgbl-wiki", "seed": args.seed, "arm": eff_arm,
         "config": args.config, "aux_kind": aux_kind,
+        "use_parent": int(use_parent if use_parent is not None
+                          else (1 if eff_arm in ("2obs_aligned",
+                                                 "2obs_mispaired") else 0)),
+        "mispaired": bool(mispaired if mispaired is not None
+                          else (eff_arm == "2obs_mispaired")),
         "context_mode": context_mode, "variant": variant,
         "device": str(device), "epochs": args.epochs, "bs": args.bs,
         "n_neighbors": args.n_neighbors, "n_layers": args.n_layers,

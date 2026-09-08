@@ -149,9 +149,9 @@ def score_split_binary(tgn, ds, split, negatives: CompactNegatives, *,
             if collect:
                 pos_scores[idx] = p.squeeze().cpu().numpy()
                 neg_scores[idx] = ng.squeeze().cpu().numpy()
-                hist_flags[idx] = [int(negatives.type_for(
-                    split, int(r) - 1) or "rand") == "hist"
-                    for r in eidx_b]
+                hist_flags[idx] = [
+                    (negatives.type_for(split, int(r) - 1) or "rand")
+                    == "hist" for r in eidx_b]
     if not collect:
         return {}
     return global_metrics(pos_scores, neg_scores, hist_flags)

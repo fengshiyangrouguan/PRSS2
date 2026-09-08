@@ -62,6 +62,7 @@ def make_args(**over):
     p.add_argument("--sketch_dim", type=int, default=64)
     p.add_argument("--width_D", type=int, default=128)
     p.add_argument("--rpbe_seed", type=int, default=0)
+    p.add_argument("--lr", type=float, default=1e-4)
     args = p.parse_args([])
     for k, v in over.items():
         setattr(args, k, v)

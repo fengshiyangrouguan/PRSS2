@@ -543,10 +543,11 @@ class TGBPairLinkLoop:
             loss = link_loss + auxiliary
             if self._comp_params and not _g_done:
                 auxv = float(auxiliary.detach())
-                # measure the compressor aux gradient on the FIRST batch of
-                # the group that actually carries a surrogate term (for a
-                # task-only arm, measure task at the first batch).
-                if auxv != 0.0 or b == group_start:
+                # Aux gauge: fire on the FIRST batch that actually carries an
+                # auxiliary term (kyfan surrogate batches can start later than
+                # batch 0).  Task-only arms never have aux -> gauge task once.
+                if auxv != 0.0 or (self.aux_kind == "none"
+                                   and b == group_start):
                     _g_done = True
                     tn, an = self.gauge_comp(
                         link_loss, auxiliary if auxv != 0.0 else None)
@@ -805,10 +806,9 @@ class TGBPairLinkLoop:
                         if r.pair_id in meta:
                             self.audit.add_replay(r)
             loss = link_loss + contrib
-            if not gauge_done and self._comp_params:
-                tn, an = self.gauge_comp(
-                    link_loss, contrib if float(contrib.detach()) != 0.0
-                    else None)
+            if not gauge_done and self._comp_params \
+                    and float(contrib.detach()) != 0.0:
+                tn, an = self.gauge_comp(link_loss, contrib)
                 self._gauge_group_task.append(tn)
                 self._gauge_group_aux.append(an)
                 gauge_done = True

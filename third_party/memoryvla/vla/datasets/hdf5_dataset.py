@@ -80,7 +80,13 @@ class HDF5BatchTransform:
     """Row transform replicating RLDSBatchTransform prompt/label logic with
     official BOUNDS_Q99 normalization on the 6 continuous dims.  The gripper
     (dim 6) and any q01==q99 dim (e.g. rotation==0 here) are NOT normalized:
-    mask False keeps their raw model-space value."""
+    mask False keeps their raw model-space value.
+
+    Optional official image augmentation (train only): RandomResizedCrop
+    scale=(0.9,0.9) ratio=(1,1) + brightness 0.2 + contrast/saturation
+    (0.8,1.2) + hue 0.05, applied BEFORE image_transform, with an independent
+    RNG derived from (aug_seed, epoch, episode_id, t) so augmentation never
+    consumes the global torch diffusion RNG stream."""
     base_tokenizer: PreTrainedTokenizerBase
     image_transform: ImageTransform
     prompt_builder_fn: Any
@@ -89,9 +95,37 @@ class HDF5BatchTransform:
     action_mask: np.ndarray     # [7] bool: True where q01 != q99
     predict_stop_token: bool = True
     action_window: int = 16
+    image_aug: bool = False
+    aug_seed: int = 0
+
+    def _augment(self, img: Image.Image, key: Tuple[int, int, int, int]):
+        """Official OpenVLA-style augment, deterministic per
+        (seed, epoch, episode_id, t) via a LOCAL numpy RNG."""
+        import torchvision.transforms.functional as F
+        seed, epoch, eid, t = key
+        rng = np.random.default_rng(
+            int((seed * 1000003 + epoch) * 100003 + eid) * 10007 + t)
+        W, H = img.size
+        crop_scale = 0.9
+        ch = int(round(min(H, W) * crop_scale))
+        cw = ch                          # ratio=(1,1)
+        top = int(rng.integers(0, H - ch + 1))
+        left = int(rng.integers(0, W - cw + 1))
+        img = F.resized_crop(img, top, left, ch, cw, (H, W),
+                             interpolation=Image.BILINEAR)
+        img = F.adjust_brightness(img, 1.0 + float(rng.uniform(-0.2, 0.2)))
+        img = F.adjust_contrast(img, float(rng.uniform(0.8, 1.2)))
+        img = F.adjust_saturation(img, float(rng.uniform(0.8, 1.2)))
+        img = F.adjust_hue(img, float(rng.uniform(-0.05, 0.05)))
+        return img
 
     def __call__(self, row: Dict[str, Any]) -> Dict[str, Any]:
         img = Image.fromarray(row["agentview_rgb"])            # uint8 HWC
+        if self.image_aug:
+            epoch = int(row.get("epoch", 0))
+            eid = int(row.get("episode_idx", 0))
+            t = int(row.get("t", 0))
+            img = self._augment(img, (self.aug_seed, epoch, eid, t))
         lang = row["instruction"].lower()
 
         prompt_builder = self.prompt_builder_fn("openvla")
@@ -282,13 +316,6 @@ class HDF5DenseDataset(IterableDataset):
                 ep, a, rgb = self._load(idx)
                 T = a.shape[0]
                 K = self.action_window
-                # neutral tail action (model space): continuous dims = their
-                # norm-zero value = q01-midpoint only if masked; unmasked
-                # dims already q01==q99 so their 'neutral' is meaningless; we
-                # fill continuous masked dims with 0 in NORMALIZED space by
-                # letting transform see a flag?  Instead we build the neutral
-                # as the raw action equal to the BOUNDS midpoint (maps to 0).
-                tail = T - 0  # frames available beyond t
                 # For each physical frame t emit a K-step window.
                 for t in range(T):
                     n_avail = T - t
@@ -315,12 +342,45 @@ class HDF5DenseDataset(IterableDataset):
                         instruction=ep["instruction"],
                         task_name=ep["task_name"],
                         t=t,
+                        epoch=epoch,
                         episode_idx=idx,
                     )
                     yield self.batch_transform(row)
             if not self.repeat:
                 return
             epoch += 1
+
+    def iter_episode(self, idx: int) -> Iterator[Dict[str, Any]]:
+        """Yield transformed rows for ONE episode in strict frame order
+        (no shuffle, no repeat).  Used by whole-episode dense validation so
+        each demo is scored end-to-end with continuous memory state."""
+        ep, a, rgb = self._load(idx)
+        T = a.shape[0]
+        K = self.action_window
+        for t in range(T):
+            n_avail = T - t
+            if n_avail >= K:
+                chunk = a[t:t + K]
+                valid = np.ones(K, dtype=bool)
+            else:
+                chunk = np.zeros((K, 7), dtype=np.float32)
+                chunk[:n_avail] = a[t:T]
+                last_g = a[T - 1, 6]
+                chunk[n_avail:, :6] = 0.0
+                chunk[n_avail:, 6] = last_g
+                valid = np.zeros(K, dtype=bool)
+                valid[:n_avail] = True
+            row = dict(
+                agentview_rgb=rgb[t],
+                actions=chunk,
+                valid_mask=valid,
+                instruction=ep["instruction"],
+                task_name=ep["task_name"],
+                t=t,
+                epoch=0,
+                episode_idx=idx,
+            )
+            yield self.batch_transform(row)
 
 
 def get_hdf5_decision_stream_dataset_and_collator(
@@ -334,11 +394,14 @@ def get_hdf5_decision_stream_dataset_and_collator(
     model_max_length: int = 2048,
     pad_token_id: int = 0,
     task_filter: Optional[str] = None,
+    image_aug: bool = False,
+    aug_seed: int = 0,
 ):
     """Build dataset + action stats + collator for a single split.
 
     Action statistics are computed on the TRAIN split only (both splits
-    share the same normalization, as in the official pipeline)."""
+    share the same normalization, as in the official pipeline).  Official
+    image augmentation is applied ONLY on the training split."""
     action_window = future_action_window_size + 1
     train_episodes, _ = scan_episodes(Path(data_root), "train",
                                       task_filter=task_filter)
@@ -352,6 +415,8 @@ def get_hdf5_decision_stream_dataset_and_collator(
         action_q99=stats["q99"],
         action_mask=stats["mask"],
         action_window=action_window,
+        image_aug=(image_aug and split == "train"),
+        aug_seed=aug_seed,
     )
 
     dataset = HDF5DenseDataset(

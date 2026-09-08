@@ -77,9 +77,22 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--grad-accum", type=int, default=2)
     p.add_argument("--log-every", type=int, default=10)
     p.add_argument("--checkpoint-every", type=int, default=1000)
-    p.add_argument("--eval-every", type=int, default=500,
-                   help="run val-split action-loss evaluation every N "
-                        "OPTIMIZER steps (0 = never)")
+    p.add_argument("--eval-every", type=int, default=1000,
+                   help="run whole-episode val evaluation every N OPTIMIZER "
+                        "steps (0 = never)")
+    p.add_argument("--val-episodes", type=int, default=3,
+                   help="number of complete val demos scored per eval "
+                        "(equal-weight averaged)")
+    p.add_argument("--eval-seed", type=int, default=1234,
+                   help="FIXED eval seed (independent of training step) so "
+                        "re-eval of a checkpoint is bitwise reproducible")
+    p.add_argument("--image-aug", type=int, default=1,
+                   help="apply official RandomResizedCrop+ColorJitter image "
+                        "augmentation on the TRAIN split only (0=off)")
+    p.add_argument("--aug-seed", type=int, default=12345,
+                   help="base seed for the independent per-row augment RNG "
+                        "(derived as aug_seed+epoch+eid+t; never touches the "
+                        "global diffusion RNG stream)")
     p.add_argument("--lr", type=float, default=2e-5)
     p.add_argument("--warmup-steps", type=int, default=100,
                    help="warmup in OPTIMIZER steps")
@@ -92,7 +105,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--mem-length", type=int, default=16,
                    help="CogMemBank capacity (dense protocol: 16 frames)")
     p.add_argument("--repeated-diffusion-steps", type=int, default=4)
-    p.add_argument("--resume-from", default="")
+    p.add_argument("--init-from-weights", default="",
+                   help="WEIGHTS-SNAPSHOT ONLY: load trainable weights from a "
+                        "checkpoint and start training at opt 0 with fresh "
+                        "optimizer/scheduler/RNG/memory.  NOT a resumption -- "
+                        "never splice its output onto the prior run.")
     # RPBE
     p.add_argument("--kf-variant", choices=["full_dual", "diag"],
                    default="full_dual")
@@ -180,7 +197,8 @@ def main() -> None:
             future_action_window_size=args.future_action_window_size,
             seed=args.seed, split="train",
             pad_token_id=tokenizer.pad_token_id,
-            task_filter=args.task_filter))
+            task_filter=args.task_filter,
+            image_aug=bool(args.image_aug), aug_seed=args.aug_seed))
     print("train episodes:", len(train_dataset), flush=True)
     n_train_rows = sum(max(0, ep["T"]) for ep in train_dataset.episodes)
     print(f"train rows/epoch (dense): {n_train_rows}", flush=True)
@@ -191,7 +209,7 @@ def main() -> None:
         train_dataset, batch_size=args.batch_size, num_workers=0,
         collate_fn=collator, drop_last=True)
 
-    val_loader = None
+    val_dataset = None
     if args.eval_every > 0:
         val_dataset, _, _ = get_hdf5_decision_stream_dataset_and_collator(
             data_root=Path(args.data_root), tokenizer=tokenizer,
@@ -201,9 +219,6 @@ def main() -> None:
             seed=args.seed, split="val",
             pad_token_id=tokenizer.pad_token_id,
             task_filter=args.task_filter)
-        val_loader = DataLoader(
-            val_dataset, batch_size=args.batch_size, num_workers=0,
-            collate_fn=collator, drop_last=True)
         print("val episodes:", len(val_dataset), flush=True)
 
     def _snapshot_bank(bank):
@@ -225,10 +240,15 @@ def main() -> None:
         bank.eid_stream = snap["eid_stream"]
 
     def run_eval(optimizer_step: int) -> float:
-        """Val-split action loss over min(40, len) batches, with full
-        isolation: cog+per bank state and CPU/CUDA/python RNG are snapshotted
-        before and restored after, and eval draws its own FIXED seed so it
-        can never perturb the training random stream."""
+        """Whole-episode val action loss over --val-episodes complete demos.
+
+        Each demo is run from its first frame to its last IN ORDER with
+        continuous CogMemBank state, the per-demo loss is its frame mean, and
+        the returned value is the EQUAL-WEIGHT mean over demos.  A fixed seed
+        (--eval-seed, NOT a function of optimizer_step) gives bitwise
+        reproducible re-evals of one checkpoint.  Full isolation: cog+per bank
+        state and CPU/CUDA/python RNG are snapshotted before and restored
+        after so eval never perturbs the training stream."""
         cog = vla.cog_mem_bank
         per = vla.per_mem_bank
         cog_snap = _snapshot_bank(cog)
@@ -236,40 +256,77 @@ def main() -> None:
         rng_snapshot = (copy.deepcopy(torch.get_rng_state()),
                         copy.deepcopy(torch.cuda.get_rng_state()),
                         np.random.get_state())
-        losses = []
+        demo_losses = []
         try:
             vla.eval()
-            cog.reset()
-            per.reset()
-            torch.manual_seed(1234 + optimizer_step % 1000)
-            torch.cuda.manual_seed(1234 + optimizer_step % 1000)
-            with torch.no_grad():
-                for batch in val_loader:
-                    if len(losses) >= 40:
-                        break
-                    pixel_values = batch["pixel_values"]
-                    if isinstance(pixel_values, dict):
-                        pixel_values = {k: v.to("cuda", dtype=torch.bfloat16)
-                                        for k, v in pixel_values.items()}
-                    else:
-                        pixel_values = pixel_values.to(
-                            "cuda", dtype=torch.bfloat16)
-                    with torch.autocast("cuda", dtype=torch.bfloat16,
-                                        enabled=True):
-                        loss, _ = vla(
-                            input_ids=batch["input_ids"].to("cuda"),
-                            attention_mask=batch["attention_mask"].to("cuda"),
-                            actions=batch["actions"].to(
-                                "cuda", dtype=torch.bfloat16),
-                            action_masks=batch["action_masks"].to("cuda"),
-                            pixel_values=pixel_values,
-                            labels=batch["labels"].to("cuda"),
-                            timesteps=batch["timesteps"],
-                            episode_ids=batch["episode_ids"],
-                            output_hidden_states=True,
-                            repeated_diffusion_steps=args.repeated_diffusion_steps,
-                        )
-                    losses.append(loss.item())
+            torch.manual_seed(args.eval_seed)
+            torch.cuda.manual_seed(args.eval_seed)
+            n_demos = min(args.val_episodes, len(val_dataset.episodes))
+            for di in range(n_demos):
+                cog.reset()
+                per.reset()
+                ep_losses = []
+                rows_buf = []
+                for row in val_dataset.iter_episode(di):
+                    rows_buf.append(row)
+                    if len(rows_buf) >= args.batch_size:
+                        batch = collator(rows_buf)
+                        rows_buf = []
+                        with torch.no_grad():
+                            pv = batch["pixel_values"]
+                            if isinstance(pv, dict):
+                                pv = {k: v.to("cuda", dtype=torch.bfloat16)
+                                      for k, v in pv.items()}
+                            else:
+                                pv = pv.to("cuda", dtype=torch.bfloat16)
+                            with torch.autocast("cuda", dtype=torch.bfloat16,
+                                                enabled=True):
+                                loss, _ = vla(
+                                    input_ids=batch["input_ids"].to("cuda"),
+                                    attention_mask=batch["attention_mask"].to("cuda"),
+                                    actions=batch["actions"].to(
+                                        "cuda", dtype=torch.bfloat16),
+                                    action_masks=batch["action_masks"].to("cuda"),
+                                    pixel_values=pv,
+                                    labels=batch["labels"].to("cuda"),
+                                    timesteps=batch["timesteps"],
+                                    episode_ids=batch["episode_ids"],
+                                    output_hidden_states=True,
+                                    repeated_diffusion_steps=args.repeated_diffusion_steps,
+                                )
+                        ep_losses.append(loss.item())
+                # flush any partial final batch (keep whole-demo coverage)
+                if rows_buf:
+                    batch = collator(rows_buf)
+                    rows_buf = []
+                    with torch.no_grad():
+                        pv = batch["pixel_values"]
+                        if isinstance(pv, dict):
+                            pv = {k: v.to("cuda", dtype=torch.bfloat16)
+                                  for k, v in pv.items()}
+                        else:
+                            pv = pv.to("cuda", dtype=torch.bfloat16)
+                        with torch.autocast("cuda", dtype=torch.bfloat16,
+                                            enabled=True):
+                            loss, _ = vla(
+                                input_ids=batch["input_ids"].to("cuda"),
+                                attention_mask=batch["attention_mask"].to("cuda"),
+                                actions=batch["actions"].to(
+                                    "cuda", dtype=torch.bfloat16),
+                                action_masks=batch["action_masks"].to("cuda"),
+                                pixel_values=pv,
+                                labels=batch["labels"].to("cuda"),
+                                timesteps=batch["timesteps"],
+                                episode_ids=batch["episode_ids"],
+                                output_hidden_states=True,
+                                repeated_diffusion_steps=args.repeated_diffusion_steps,
+                            )
+                    ep_losses.append(loss.item())
+                if ep_losses:
+                    demo_mean = sum(ep_losses) / len(ep_losses)
+                    demo_losses.append(demo_mean)
+                    print(f"[eval demo {di}] mean {demo_mean:.4f} "
+                          f"({len(ep_losses)} batches)", flush=True)
         finally:
             _restore_bank(cog, cog_snap)
             _restore_bank(per, per_snap)
@@ -277,10 +334,10 @@ def main() -> None:
             torch.cuda.set_rng_state(rng_snapshot[1])
             np.random.set_state(rng_snapshot[2])
             vla.train()
-        if losses:
-            mean = sum(losses) / len(losses)
+        if demo_losses:
+            mean = sum(demo_losses) / len(demo_losses)
             print(f"[eval @ opt {optimizer_step}] val action loss "
-                  f"{mean:.4f} ({len(losses)} batches)", flush=True)
+                  f"{mean:.4f} ({len(demo_losses)} demos)", flush=True)
             return mean
         return float("inf")
 
@@ -532,6 +589,7 @@ def main() -> None:
             "seed": args.seed,
             "task_filter": args.task_filter,
             "best_val": best_val,
+            "weights_snapshot_only": True,
             "opt_task": _opt_state(opt_task),
         }
         if opt_gamma is not None:
@@ -541,8 +599,8 @@ def main() -> None:
         return payload
 
     best_val = float("inf")
-    if args.resume_from:
-        ck = torch.load(args.resume_from, map_location="cpu",
+    if args.init_from_weights:
+        ck = torch.load(args.init_from_weights, map_location="cpu",
                         weights_only=False)
         named = dict(vla.named_parameters())
         unexpected = 0
@@ -551,35 +609,15 @@ def main() -> None:
                 named[n].data.copy_(t.to(named[n].dtype))
             else:
                 unexpected += 1
-        optimizer_step = ck.get("step", 0)
-        micro_step = ck.get("micro_step", optimizer_step * args.grad_accum)
-        best_val = ck.get("best_val", float("inf"))
-        vla.cog_mem_bank.param_version = ck.get("param_version", 0)
-        # restore optimizer + scheduler state so a mid-run resume does not
-        # reset Adam momentum / LR phase
-        if "opt_task" in ck:
-            opt_task.load_state_dict(ck["opt_task"])
-            sched_task.load_state_dict(ck.get("sched_task", sched_task.state_dict()))
-            if opt_gamma is not None and "opt_gamma" in ck:
-                opt_gamma.load_state_dict(ck["opt_gamma"])
-                sched_gamma.load_state_dict(ck.get("sched_gamma",
-                                                   sched_gamma.state_dict()))
-        print(f"resumed from {args.resume_from} @ opt {optimizer_step} "
-              f"(micro {micro_step}, pv {vla.cog_mem_bank.param_version}, "
-              f"unexpected keys: {unexpected})", flush=True)
-        # fast-forward the data stream so the batch sequence matches the
-        # checkpoint exactly (dense HDF5 stream is deterministic per seed)
-        n_rows = micro_step * args.batch_size
-        it = iter(train_loader)
-        consumed = 0
-        while consumed < n_rows:
-            try:
-                b = next(it)
-                consumed += len(b["input_ids"])
-            except StopIteration:
-                raise RuntimeError(
-                    "resume step beyond dataset epoch boundary")
-        train_loader = it
+        # WEIGHTS-SNAPSHOT ONLY: do NOT restore optimizer/scheduler/RNG/
+        # memory/queue/cursor state.  optimizer_step stays 0 and every
+        # training structure is freshly initialized; this is an initialisation
+        # of weights from a prior run, NOT a resumption, and its output must
+        # never be spliced onto the prior run's trajectory.
+        print(f"[weights-snapshot] loaded trainable weights from "
+              f"{args.init_from_weights} (unexpected keys: {unexpected}); "
+              f"training starts at opt 0 with fresh optimizer/scheduler/RNG",
+              flush=True)
 
     # ---- main loop ----
     it = iter(train_loader)

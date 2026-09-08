@@ -473,8 +473,17 @@ def main() -> None:
                   f"lr={lr_now:.2e} mean|B|={mean_b:.3e} "
                   f"nzB={nz}/{n_b}", flush=True)
 
+    def _opt_state(opt):
+        """Optimizer state moved to CPU for a disk-friendly checkpoint."""
+        st = opt.state_dict()
+        for pstate in st["state"].values():
+            for k, v in pstate.items():
+                if torch.is_tensor(v):
+                    pstate[k] = v.detach().cpu()
+        return st
+
     def _ckpt_dict():
-        return {
+        payload = {
             "model": {n: p.detach().cpu()
                       for n, p in vla.named_parameters()
                       if p.requires_grad},
@@ -483,13 +492,20 @@ def main() -> None:
                             "lora_dropout": lora_config.lora_dropout},
             "arm": args.arm,
             "step": optimizer_step,
+            "micro_step": micro_step,
             "param_version": vla.cog_mem_bank.param_version,
             "mem_length": args.mem_length,
             "lambda_rpbe": args.lambda_rpbe,
             "seed": args.seed,
             "task_filter": args.task_filter,
             "best_val": best_val,
+            "opt_task": _opt_state(opt_task),
         }
+        if opt_gamma is not None:
+            payload["opt_gamma"] = _opt_state(opt_gamma)
+            payload["sched_gamma"] = sched_gamma.state_dict()
+        payload["sched_task"] = sched_task.state_dict()
+        return payload
 
     best_val = float("inf")
     if args.resume_from:
@@ -503,12 +519,24 @@ def main() -> None:
             else:
                 unexpected += 1
         optimizer_step = ck.get("step", 0)
+        micro_step = ck.get("micro_step", optimizer_step * args.grad_accum)
         best_val = ck.get("best_val", float("inf"))
         vla.cog_mem_bank.param_version = ck.get("param_version", 0)
+        # restore optimizer + scheduler state so a mid-run resume does not
+        # reset Adam momentum / LR phase
+        if "opt_task" in ck:
+            opt_task.load_state_dict(ck["opt_task"])
+            sched_task.load_state_dict(ck.get("sched_task", sched_task.state_dict()))
+            if opt_gamma is not None and "opt_gamma" in ck:
+                opt_gamma.load_state_dict(ck["opt_gamma"])
+                sched_gamma.load_state_dict(ck.get("sched_gamma",
+                                                   sched_gamma.state_dict()))
         print(f"resumed from {args.resume_from} @ opt {optimizer_step} "
-              f"(unexpected keys: {len(unexpected)})", flush=True)
-        # fast-forward: each optimizer step consumed grad_accum*batch rows
-        n_rows = optimizer_step * args.grad_accum * args.batch_size
+              f"(micro {micro_step}, pv {vla.cog_mem_bank.param_version}, "
+              f"unexpected keys: {len(unexpected)})", flush=True)
+        # fast-forward the data stream so the batch sequence matches the
+        # checkpoint exactly (dense HDF5 stream is deterministic per seed)
+        n_rows = micro_step * args.batch_size
         it = iter(train_loader)
         consumed = 0
         while consumed < n_rows:

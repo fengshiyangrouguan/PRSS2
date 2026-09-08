@@ -533,7 +533,7 @@ def main() -> None:
                                                    sched_gamma.state_dict()))
         print(f"resumed from {args.resume_from} @ opt {optimizer_step} "
               f"(micro {micro_step}, pv {vla.cog_mem_bank.param_version}, "
-              f"unexpected keys: {len(unexpected)})", flush=True)
+              f"unexpected keys: {unexpected})", flush=True)
         # fast-forward the data stream so the batch sequence matches the
         # checkpoint exactly (dense HDF5 stream is deterministic per seed)
         n_rows = micro_step * args.batch_size

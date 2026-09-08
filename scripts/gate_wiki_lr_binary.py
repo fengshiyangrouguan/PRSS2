@@ -222,6 +222,27 @@ def main():
     if scan_summary["censored_tail_groups"] > 0:
         print("note: last {} group(s) are task-only censored tail".format(
             scan_summary["censored_tail_groups"]), flush=True)
+    assert scan_summary["aux_prefix_groups"] >= 1, \
+        "no eligible group in full-train scan"
+    # plan meta + deterministic SHA over the canonical subset (runner validates)
+    import math as _math
+    out["bs"] = 200
+    out["n_train_events"] = int(len(train.sources))
+    out["n_train_batches"] = int(_math.ceil(len(train.sources) / 200.0))
+    from rpbe.data.wiki_binary_negatives import content_sha256
+    canon = {
+        "data": ds.name, "n_neighbors": 5, "n_layers": 3, "bs": 200,
+        "kf_min_trees": args.kf_min_trees,
+        "group_batches": int(chosen["group_batches"]),
+        "trace_roots": int(chosen["trace_roots"]),
+        "n_train_events": out["n_train_events"],
+        "n_train_batches": out["n_train_batches"],
+        "aux_prefix_groups": scan_summary["aux_prefix_groups"],
+        "censored_tail_groups": scan_summary["censored_tail_groups"],
+        "prefix_min": scan_summary["prefix_min"],
+        "prefix_p5": scan_summary["prefix_p5"],
+    }
+    out["plan_sha"] = content_sha256(canon)
     Path(args.out).parent.mkdir(parents=True, exist_ok=True)
     with open(args.out, "w") as f:
         json.dump(out, f, indent=2)

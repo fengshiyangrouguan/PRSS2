@@ -8,12 +8,16 @@ Covers what is unit-testable without a GPU / real TGB dataset:
   * stable negative digest determinism — §1.1 #4 foundation.
 """
 
+import json
+
 import numpy as np
 import pytest
 
 from rpbe.training.histrand_sampler import HistRandTrainSampler
 from rpbe.training.wiki_binary_eval import _ap, _auc, global_metrics
-from rpbe.data.wiki_binary_negatives import _pick, _stable_digest
+from rpbe.data.wiki_binary_negatives import (_pick, _stable_digest,
+                                             CompactNegatives,
+                                             manifest_sha256)
 
 
 def _ref_ap(p, n):
@@ -118,6 +122,71 @@ def test_histrand_same_st_exclusion():
         assert n not in (10, 20)
         n = int(s.sample(0, 0, [1], [20], [1.0], [1])[0])
         assert n not in (10, 20)
+
+
+class _FakeSplit:
+    def __init__(self, edge_idxs):
+        self.edge_idxs = np.asarray(edge_idxs, dtype=np.int64)
+        self.sources = np.zeros(len(edge_idxs), dtype=np.int64)
+
+
+class _FakeDs:
+    name = "tgbl-wiki"
+
+    def __init__(self, n_val, n_test):
+        # internal edge idx = global row + 1
+        self.val = _FakeSplit([i + 1 for i in range(n_val)])
+        self.test = _FakeSplit([1000 + i + 1 for i in range(n_test)])
+
+
+def _write_manifest(tmp_path, val_keys, test_keys, dataset="tgbl-wiki",
+                    sha=True):
+    body = {"val": {str(k): {"neg": 0, "type": "hist"} for k in val_keys},
+            "test": {str(k): {"neg": 0, "type": "hist"} for k in test_keys}}
+    meta = {"protocol_seed": 1, "dataset": dataset,
+            "counts": {"val_hist": len(val_keys), "test_hist": len(test_keys)},
+            "positive_counts": {"val": len(val_keys),
+                                "test": len(test_keys)}}
+    if sha:
+        meta["sha256"] = manifest_sha256(body)
+    payload = dict(body)
+    payload["_meta"] = meta
+    p = tmp_path / "neg.json"
+    p.write_text(json.dumps(payload))
+    return p
+
+
+def test_manifest_verify_accepts_exact(tmp_path):
+    ds = _FakeDs(5, 3)
+    p = _write_manifest(tmp_path, list(range(5)),
+                        [1000 + i for i in range(3)])
+    CompactNegatives(str(p)).verify(ds)   # must not raise
+
+
+def test_manifest_verify_fails_wrong_dataset_or_keys(tmp_path):
+    ds = _FakeDs(5, 3)
+    p = _write_manifest(tmp_path, list(range(5)), [1000, 1001, 1001])
+    with pytest.raises(ValueError):        # duplicate key -> row count wrong
+        CompactNegatives(str(p)).verify(ds)
+    p2 = _write_manifest(tmp_path, list(range(4)), [1000, 1001, 1002])
+    with pytest.raises(ValueError):        # missing a val key
+        CompactNegatives(str(p2)).verify(ds)
+    p3 = _write_manifest(tmp_path, list(range(5)),
+                         [1000, 1001, 1002], dataset="other")
+    with pytest.raises(ValueError):        # dataset must be strict
+        CompactNegatives(str(p3)).verify(ds)
+
+
+def test_manifest_verify_fails_missing_dataset_or_sha(tmp_path):
+    ds = _FakeDs(5, 3)
+    p = _write_manifest(tmp_path, list(range(5)),
+                        [1000, 1001, 1002], dataset=None)
+    with pytest.raises(ValueError):
+        CompactNegatives(str(p)).verify(ds)
+    p2 = _write_manifest(tmp_path, list(range(5)),
+                         [1000, 1001, 1002], sha=False)
+    with pytest.raises(ValueError):        # no sha256 in meta
+        CompactNegatives(str(p2)).verify(ds)
 
 
 def test_stable_digest_deterministic_inrange():

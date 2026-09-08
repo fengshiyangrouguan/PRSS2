@@ -85,6 +85,10 @@ def parse_args():
                    help="Wiki-LR-Binary fixed one-neg-per-positive manifest; "
                         "when set, selection is per-epoch FULL-val ap_all "
                         "(spec §2.4) and train negatives are HistRand")
+    p.add_argument("--group-plan", default="",
+                   help="shared macro-group plan json (gate output). When set "
+                        "the aux-eligible prefix and the task-only censored "
+                        "tail are enforced; plan fields are validated strictly")
     p.add_argument("--val-every", type=int, default=1,
                    help="epochs between full-val ap_all evaluations (1=every)")
     p.add_argument("--kf-fail-below", action="store_true",
@@ -204,6 +208,68 @@ def build_model(args, device):
                            "repr_names": repr_names})
 
 
+def _group_plan_canonical(plan):
+    """Canonical subset of a group plan that runner and gate must agree on."""
+    sm = plan.get("scan", {}).get("summary", {})
+    chosen = plan.get("chosen", {})
+    return {
+        "data": plan.get("data"),
+        "n_neighbors": plan.get("n_neighbors"),
+        "n_layers": plan.get("n_layers"),
+        "bs": plan.get("bs"),
+        "kf_min_trees": plan.get("kf_min_trees"),
+        "group_batches": chosen.get("group_batches"),
+        "trace_roots": chosen.get("trace_roots"),
+        "n_train_events": plan.get("n_train_events"),
+        "n_train_batches": plan.get("n_train_batches"),
+        "aux_prefix_groups": sm.get("aux_prefix_groups"),
+        "censored_tail_groups": sm.get("censored_tail_groups"),
+        "prefix_min": sm.get("prefix_min"),
+        "prefix_p5": sm.get("prefix_p5"),
+    }
+
+
+def _validate_group_plan(plan, args, ds, train):
+    """Strict gate: plan must match the run config + data + its own SHA."""
+    import math as _math
+    from rpbe.data.wiki_binary_negatives import content_sha256
+    chk = {
+        "data": plan.get("data"),
+        "bs": plan.get("bs"),
+        "n_neighbors": plan.get("n_neighbors"),
+        "n_layers": plan.get("n_layers"),
+        "kf_min_trees": plan.get("kf_min_trees"),
+        "group_batches": plan.get("chosen", {}).get("group_batches"),
+        "trace_roots": plan.get("chosen", {}).get("trace_roots"),
+        "n_train_events": plan.get("n_train_events"),
+        "n_train_batches": plan.get("n_train_batches"),
+    }
+    exp = {
+        "data": ds.name,
+        "bs": args.bs,
+        "n_neighbors": args.n_neighbors,
+        "n_layers": args.n_layers,
+        "kf_min_trees": args.kf_min_trees,
+        "group_batches": args.kf_group_batches,
+        "trace_roots": args.trace_roots,
+        "n_train_events": int(len(train.sources)),
+        "n_train_batches": int(_math.ceil(
+            len(train.sources) / float(max(1, args.bs)))),
+    }
+    for k, v in exp.items():
+        if chk.get(k) != v:
+            raise ValueError(
+                "group plan field {} = {} but run requires {}".format(
+                    k, chk.get(k), v))
+    sha = content_sha256(_group_plan_canonical(plan))
+    if plan.get("plan_sha") != sha:
+        raise ValueError("group plan sha {} != recomputed {}".format(
+            plan.get("plan_sha"), sha))
+    sm = plan.get("scan", {}).get("summary", {})
+    return sha, int(sm.get("aux_prefix_groups")), int(
+        sm.get("censored_tail_groups"))
+
+
 def main():
     args = parse_args()
     seed_all(args.seed)
@@ -216,6 +282,16 @@ def main():
     train = ds.train
     val = ds.val
     monitor = None  # minimal; metrics go to jsonl
+    # ---- shared group plan: aux-eligible prefix + task-only censored tail
+    plan_sha = None
+    aux_prefix = None
+    censored_tail = None
+    if args.group_plan:
+        plan = json.load(open(args.group_plan))
+        plan_sha, aux_prefix, censored_tail = _validate_group_plan(
+            plan, args, ds, train)
+        print("group-plan ok: prefix={} censored_tail={} sha={}".format(
+            aux_prefix, censored_tail, plan_sha), flush=True)
     loop = TGBPairLinkLoop(
         tgn=c["tgn"], device=device, batch_size=args.bs,
         n_neighbors=args.n_neighbors, grad_clip=5.0, monitor=monitor,
@@ -229,7 +305,8 @@ def main():
         kf_group_batches=args.kf_group_batches,
         kf_min_trees=args.kf_min_trees,
         fail_below=args.kf_fail_below,
-        audit_trace=True)
+        audit_trace=True,
+        aux_prefix_groups=aux_prefix, group_plan_sha=plan_sha)
 
     save_json(out / "config.json", {
         "data": "tgbl-wiki", "seed": args.seed, "arm": args.arm,
@@ -237,6 +314,7 @@ def main():
         "n_neighbors": args.n_neighbors, "n_layers": args.n_layers,
         "lambda_kf": args.lambda_kf, "kf_group_batches": args.kf_group_batches,
         "kf_min_trees": args.kf_min_trees,
+        "group_plan_sha": plan_sha,
         "opt_split": c["opt_split"], "cli": vars(args)})
 
     # ---- Wiki-LR-Binary negatives: fixed one-neg-per-positive manifest for

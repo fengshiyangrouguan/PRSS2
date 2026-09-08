@@ -135,6 +135,13 @@ def manifest_sha256(payload: dict) -> str:
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
+def content_sha256(obj) -> str:
+    """Stable SHA-256 of an arbitrary JSON-able object (canonical subset)."""
+    canonical = json.dumps(obj, sort_keys=True, separators=(",", ":"),
+                           allow_nan=True)
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
 class CompactNegatives:
     """Read-only lookup of fixed negatives keyed by global event row."""
 
@@ -154,9 +161,11 @@ class CompactNegatives:
                 "manifest content hash mismatch: {} != {}".format(
                     sha, self.meta.get("sha256")))
         if ds is not None:
-            if self.meta.get("dataset") not in (None, ds.name):
-                raise ValueError("manifest dataset {} != {}".format(
-                    self.meta.get("dataset"), ds.name))
+            dsname = self.meta.get("dataset")
+            if dsname != ds.name:
+                raise ValueError(
+                    "manifest dataset {!r} != dataset {!r} "
+                    "(field required)".format(dsname, ds.name))
             expected = {"val": int(len(ds.val.sources)),
                         "test": int(len(ds.test.sources))}
             pc = self.meta.get("positive_counts") or {}
@@ -165,10 +174,21 @@ class CompactNegatives:
                     raise ValueError(
                         "manifest {} positives {} != dataset {}".format(
                             sp, pc.get(sp), expected[sp]))
-                if int(len(self._rows.get(sp, {}))) != expected[sp]:
+                # global-row key sets must match the split EXACTLY
+                split_obj = {"val": ds.val, "test": ds.test}[sp]
+                data_keys = {(int(x) - 1) for x in split_obj.edge_idxs}
+                man_keys = {int(k) for k in self._rows.get(sp, {})}
+                if man_keys != data_keys:
+                    raise ValueError(
+                        "manifest {} global-row keys do not match dataset "
+                        "(only_manifest={} only_data={})".format(
+                            sp,
+                            sorted(man_keys - data_keys)[:5],
+                            sorted(data_keys - man_keys)[:5]))
+                if len(man_keys) != expected[sp]:
                     raise ValueError(
                         "manifest {} rows {} != dataset {}".format(
-                            sp, len(self._rows.get(sp, {})), expected[sp]))
+                            sp, len(man_keys), expected[sp]))
 
     def neg_for(self, split: str, global_row: int) -> Optional[int]:
         """Raw (0-based) negative dst for a global row, or None."""

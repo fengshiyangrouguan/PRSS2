@@ -65,7 +65,8 @@ class TGBPairLinkLoop:
                  kf_group_batches=56, kf_min_trees=896,
                  n_observations=2, trace_mode="evenly_spaced",
                  fail_below=False, train_neg_sampler=None,
-                 audit_trace=False):
+                 audit_trace=False, aux_prefix_groups=None,
+                 group_plan_sha=None):
         self.tgn = tgn
         self.device = device
         self.batch_size = int(batch_size)
@@ -106,6 +107,18 @@ class TGBPairLinkLoop:
         # uniform-over-destination-universe fallback is used.
         self.train_neg_sampler = train_neg_sampler
         self._dst_univ = None
+        # shared group plan (spec §1.1-final): aux_prefix_groups = number of
+        # leading macro groups eligible for the auxiliary windows; groups after
+        # it are a task-only censored tail (never counted as n_below).  When
+        # None the legacy per-group below/fail behaviour is unchanged.
+        self.aux_prefix_groups = (None if aux_prefix_groups is None
+                                  else int(aux_prefix_groups))
+        self.group_plan_sha = group_plan_sha
+        self.n_censored_tail_groups = 0
+        # canonical pair child taus == the adapter's compressible internal
+        # layers (layer 1..n_layers-1); every eligible group must produce them.
+        self._canon_taus = list(getattr(
+            self.adapter, "compression_taus", []) or [])
 
         # per-interface PairKFWindow (child tau keys)
         self.pair_windows: Dict[str, PairKFWindow] = {}
@@ -283,10 +296,12 @@ class TGBPairLinkLoop:
         n_aux_batches = 0
         n_closed = 0
         below = 0
+        n_censored_tail_groups = 0
         self.window_diag = []
 
         group_start = 0
         repr_step = 0
+        gi = 0
         while group_start < run_batches:
             group_end = min(group_start + self.kf_group_batches, run_batches)
             group_k = group_end - group_start
@@ -297,6 +312,38 @@ class TGBPairLinkLoop:
             # neighbor finder, which draws np.random per batch) diverges
             # after the first batch and exact replay silently breaks.
             group_gs = global_step
+            # ---- task-only censored tail (shared group plan): past the
+            # auxiliary-eligible prefix these batches run pure task training —
+            # no pass 1 / no windows / no aux; never counted as n_below.
+            if self.aux_prefix_groups is not None and \
+                    gi >= self.aux_prefix_groups:
+                self.repr_optimizer.zero_grad(set_to_none=True)
+                for b in range(group_start, group_end):
+                    self.head_optimizer.zero_grad(set_to_none=True)
+                    out = self._run_batch(
+                        train, b, group_gs + (b - group_start),
+                        grad_enabled=True, epoch=epoch)
+                    if out is None:
+                        continue
+                    link_loss, _records = out
+                    link_loss.backward()
+                    self._clip(self.head_params)
+                    self.head_optimizer.step()
+                    if self.tgn.use_memory:
+                        self.tgn.memory.detach_memory()
+                    total_link += float(link_loss.detach())
+                    global_step += 1
+                if self.repr_optimizer is not None and self.repr_params:
+                    for p in self.repr_params:
+                        if p.grad is not None:
+                            p.grad.div_(float(max(1, group_k)))
+                    self._clip(self.repr_params)
+                    self.repr_optimizer.step()
+                    repr_step += 1
+                n_censored_tail_groups += 1
+                group_start = group_end
+                gi += 1
+                continue
             # ------------ pass 1: collect records per batch, no grad -------
             state = self._save_group_state()
             pass1_records = []
@@ -342,6 +389,11 @@ class TGBPairLinkLoop:
                     if self._mispaired_map:
                         r.parent_future_used = self._mispaired_map[i]
                     self.audit.add_population(r)
+            if self.kf_on and self.aux_prefix_groups is not None \
+                    and not pass1_records:
+                raise RuntimeError(
+                    "eligible group {}..{} produced no pair records".format(
+                        group_start, group_end))
             if self.kf_on and pass1_records:
                 weights = tree_equal_weights(pass1_records)
                 for r in pass1_records:
@@ -349,6 +401,15 @@ class TGBPairLinkLoop:
                 by_tau: Dict[str, List] = {}
                 for i in fea:
                     by_tau.setdefault(pass1_records[i].tau, []).append(i)
+                if self.aux_prefix_groups is not None:
+                    # eligible (non-tail) group must produce EVERY canonical
+                    # tau; a missing one is an immediate failure.
+                    missing = [t for t in self._canon_taus
+                               if t not in by_tau]
+                    if missing:
+                        raise RuntimeError(
+                            "eligible group {}..{} missing canonical tau(s) "
+                            "{}".format(group_start, group_end, missing))
                 for tau, idxs in by_tau.items():
                     win = self._win(tau)
                     tau_recs = [pass1_records[i] for i in idxs]
@@ -365,7 +426,8 @@ class TGBPairLinkLoop:
                         "n_records": len(tau_recs)})
                     if not win.ready():
                         below += 1
-                        if self.fail_below:
+                        if self.fail_below or \
+                                self.aux_prefix_groups is not None:
                             raise RuntimeError(
                                 "kf window below threshold: tau={} "
                                 "M_unique_trees={} < {} in {} batches".format(
@@ -445,6 +507,7 @@ class TGBPairLinkLoop:
                 self.repr_optimizer.step()
                 repr_step += 1
             group_start = group_end
+            gi += 1
         return {
             "train_link_loss": total_link / max(run_batches, 1),
             "train_aux": total_aux / max(n_aux_batches, 1)
@@ -452,6 +515,7 @@ class TGBPairLinkLoop:
             "n_aux_batches": n_aux_batches,
             "n_closed": n_closed,
             "n_below": below,
+            "n_censored_tail_groups": n_censored_tail_groups,
             "n_batches": run_batches,
             "global_step": global_step,
             "task_step": global_step,
@@ -471,13 +535,16 @@ class TGBPairLinkLoop:
     # --------------------------------------------------------- topology scan
     def scan_topology(self, epoch, train, group_batches=None,
                       n_batches=None):
-        """No-grad full-train scan of per-group / per-tau pair yields.
+        """No-grad full-train scan mirroring the TRAINING window path.
 
-        Only the pass-1 record collection runs (no close_replay, no backward,
-        no optimizer).  Returns one record per macro group with per-tau unique
-        trees, so future-censoring near the train tail is visible and an
-        auxiliary-eligible prefix can be fixed (§1.1 #7).  Does not touch
-        training state (fresh windows; adapters cleared per batch).
+        Each macro group runs the exact pass-1 record collection (per-batch
+        global-step schedule, root_row remap), then the SAME surviving-set
+        filtering the training loop applies — ``feasible_positions`` and, for
+        the mispaired arm, the derangement-map intersection — before counting
+        per-tau unique trees.  Every canonical tau is reported (0 trees when a
+        group produced none).  Used to fix the auxiliary-eligible prefix and
+        mark the future-censored tail (§1.1-final).  No close_replay / no
+        backward / no optimizer; does not mutate training state.
         """
         gb = int(group_batches or self.kf_group_batches)
         self.reset_memory()
@@ -489,23 +556,40 @@ class TGBPairLinkLoop:
             return []
         groups = []
         g0 = 0
+        gstep = 0
         while g0 < num_batch:
             g1 = min(g0 + gb, num_batch)
-            per_tau: Dict[str, List] = {}
+            group_gs = gstep
+            recs_all = []
             with torch.no_grad():
                 for b in range(g0, g1):
                     out = self._run_batch(
-                        train, b, 0, grad_enabled=False, epoch=epoch)
+                        train, b, group_gs + (b - g0),
+                        grad_enabled=False, epoch=epoch)
+                    gstep += 1
                     if out is None:
                         continue
                     _, recs = out
                     for rec in recs:
                         rec.root_row = b * self.batch_size + int(rec.root_row)
-                    for rec in recs:
-                        per_tau.setdefault(rec.tau, []).append(rec)
+                    recs_all.extend(recs)
+            # surviving set = what the training window would actually see
+            if recs_all:
+                fea = feasible_positions(recs_all, seed=self.seed,
+                                         batch_seed=group_gs)
+                if self.arm == "2obs_mispaired":
+                    mmap = build_mispaired_parent_map(
+                        recs_all, seed=self.seed, batch_seed=group_gs)
+                    fea = [i for i in fea if i in mmap]
+            else:
+                fea = []
+            by_tau: Dict[str, List] = {}
+            for i in fea:
+                by_tau.setdefault(recs_all[i].tau, []).append(recs_all[i])
             row = {"group_start": g0, "group_end": g1, "n_batches": g1 - g0,
                    "taus": {}}
-            for tau, recs in per_tau.items():
+            for tau in sorted(set(self._canon_taus) | set(by_tau)):
+                recs = by_tau.get(tau, [])
                 win = PairKFWindow(tau=tau, eps=self._window_eps,
                                    min_unique_trees=self.kf_min_trees)
                 for r in recs:

@@ -113,14 +113,28 @@ def main():
             speed_s, args.time_cap_min)
 
     # ---------------- 2./3. group-yield + VRAM gate -----------------
-    sampler = HistRandTrainSampler(
-        train.sources, train.destinations, train.timestamps, model_seed=0)
+    # Each candidate is tested from a FRESH model at identical init (rebuild
+    # + reseed) so comparisons are reproducible and no candidate leaks weight
+    # updates into the next (§1.1 #8).  128-root fallback if 160 does not fit.
+    train = ds.train
     chosen = None
-    roots_tried = [int(args.trace_roots)]
-    if int(args.trace_roots) > 160:
-        roots_tried = [int(args.trace_roots)]
-    for gs in [int(x) for x in args.group_sizes.split(",")]:
-        for roots in list(roots_tried):
+    for roots in ([int(args.trace_roots)] + ([128] if int(args.trace_roots)
+                                             != 128 else [])):
+        if int(args.trace_roots) != roots and int(args.trace_roots) not in (
+                160, 128):
+            # only meaningful fallback path is 160 -> 128
+            break
+        if chosen is not None:
+            break
+        for gs in [int(x) for x in args.group_sizes.split(",")]:
+            seed_all(0)
+            c = build_model(make_args(
+                data_dir=args.data_dir, n_neighbors=5, n_layers=3,
+                kf_min_trees=args.kf_min_trees, trace_pairs_per_parent=2),
+                device)
+            sampler = HistRandTrainSampler(
+                train.sources, train.destinations, train.timestamps,
+                model_seed=0)
             torch.cuda.reset_peak_memory_stats()
             try:
                 loop = TGBPairLinkLoop(
@@ -135,7 +149,8 @@ def main():
                     head_optimizer=c["head_optimizer"],
                     trace_roots=roots, trace_pairs_per_parent=2,
                     kf_group_batches=gs, kf_min_trees=args.kf_min_trees,
-                    fail_below=False, train_neg_sampler=sampler)
+                    fail_below=False, train_neg_sampler=sampler,
+                    audit_trace=False)
                 row = loop.train_epoch(0, 0, train, max_batches=gs)
                 diag = row.get("window_diag", [])
                 peak_gb = torch.cuda.max_memory_allocated() / 1e9
@@ -148,17 +163,65 @@ def main():
                     and peak_gb <= args.vram_cap_gb
                 if ok and chosen is None:
                     chosen = {"group_batches": gs, "trace_roots": roots}
-                    print("CHOSEN group plan:", json.dumps(chosen), flush=True)
+                    print("CHOSEN group plan:", json.dumps(chosen),
+                          flush=True)
+                    break
             except torch.cuda.OutOfMemoryError:
                 print("OOM gs={} roots={}".format(gs, roots), flush=True)
                 torch.cuda.empty_cache()
-            if chosen is not None:
-                break
         if chosen is not None:
             break
+        print("roots={} gave no pass; fallback candidates".format(roots),
+              flush=True)
     if chosen is None:
         raise SystemExit("no group size met yield/VRAM gates; see candidates")
     out["chosen"] = chosen
+
+    # ---- full-train no-grad topology scan under the CHOSEN plan (§1.1 #7)
+    seed_all(0)
+    c = build_model(make_args(data_dir=args.data_dir, n_neighbors=5,
+                              n_layers=3, kf_min_trees=args.kf_min_trees,
+                              trace_pairs_per_parent=2), device)
+    sampler = HistRandTrainSampler(train.sources, train.destinations,
+                                   train.timestamps, model_seed=0)
+    loop = TGBPairLinkLoop(
+        tgn=c["tgn"], device=device, batch_size=200, n_neighbors=5,
+        grad_clip=5.0, monitor=None, seed=0, adapter=c["adapter"],
+        link_future_index=c["link_future_index"],
+        boundary_maps=c["boundary_maps"], edge_table=c["edge_table"],
+        arm=bargs.arm, rpbe_cfg=c["rpbe_cfg"],
+        repr_optimizer=c["repr_optimizer"], head_optimizer=c["head_optimizer"],
+        trace_roots=int(chosen["trace_roots"]), trace_pairs_per_parent=2,
+        kf_group_batches=int(chosen["group_batches"]),
+        kf_min_trees=args.kf_min_trees, fail_below=False,
+        train_neg_sampler=sampler, audit_trace=False)
+    scan = loop.scan_topology(0, train)
+    per_grp = [{"start": g["group_start"], "end": g["group_end"],
+                "yields": {t: int(v["unique_trees"])
+                           for t, v in g["taus"].items()}}
+               for g in scan]
+    # auxiliary-eligible prefix: contiguous groups from the start where every
+    # canonical tau is ready; the rest is a task-only censored tail.
+    prefix = 0
+    for g in scan:
+        vals = [v["unique_trees"] for v in g["taus"].values()]
+        if vals and min(vals) >= args.kf_min_trees:
+            prefix += 1
+        else:
+            break
+    elig = [v["unique_trees"] for g in scan[:prefix]
+            for v in g["taus"].values()]
+    scan_summary = {"n_groups": len(scan),
+                    "aux_prefix_groups": prefix,
+                    "censored_tail_groups": max(0, len(scan) - prefix),
+                    "prefix_min": int(min(elig)) if elig else None,
+                    "prefix_p5": int(np.percentile(elig, 5))
+                    if elig else None}
+    out["scan"] = {"per_group": per_grp, "summary": scan_summary}
+    print(json.dumps(scan_summary), flush=True)
+    if scan_summary["censored_tail_groups"] > 0:
+        print("note: last {} group(s) are task-only censored tail".format(
+            scan_summary["censored_tail_groups"]), flush=True)
     Path(args.out).parent.mkdir(parents=True, exist_ok=True)
     with open(args.out, "w") as f:
         json.dump(out, f, indent=2)

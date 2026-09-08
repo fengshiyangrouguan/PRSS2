@@ -456,7 +456,7 @@ class TGBPairLinkLoop:
             "global_step": global_step,
             "task_step": global_step,
             "repr_step": repr_step,
-            "closed_window_step": repr_step,
+            "closed_window_step": n_closed,   # real closed windows (>= kf arms)
             "window_diag": list(self.window_diag),
         }
 
@@ -467,6 +467,56 @@ class TGBPairLinkLoop:
         if live:
             torch.nn.utils.clip_grad_norm_(
                 live, max_norm=self.grad_clip, error_if_nonfinite=True)
+
+    # --------------------------------------------------------- topology scan
+    def scan_topology(self, epoch, train, group_batches=None,
+                      n_batches=None):
+        """No-grad full-train scan of per-group / per-tau pair yields.
+
+        Only the pass-1 record collection runs (no close_replay, no backward,
+        no optimizer).  Returns one record per macro group with per-tau unique
+        trees, so future-censoring near the train tail is visible and an
+        auxiliary-eligible prefix can be fixed (§1.1 #7).  Does not touch
+        training state (fresh windows; adapters cleared per batch).
+        """
+        gb = int(group_batches or self.kf_group_batches)
+        self.reset_memory()
+        self.tgn.train(False)
+        num_batch = math.ceil(len(train.sources) / self.batch_size)
+        if n_batches is not None:
+            num_batch = min(num_batch, max(0, int(n_batches)))
+        if num_batch <= 0:
+            return []
+        groups = []
+        g0 = 0
+        while g0 < num_batch:
+            g1 = min(g0 + gb, num_batch)
+            per_tau: Dict[str, List] = {}
+            with torch.no_grad():
+                for b in range(g0, g1):
+                    out = self._run_batch(
+                        train, b, 0, grad_enabled=False, epoch=epoch)
+                    if out is None:
+                        continue
+                    _, recs = out
+                    for rec in recs:
+                        rec.root_row = b * self.batch_size + int(rec.root_row)
+                    for rec in recs:
+                        per_tau.setdefault(rec.tau, []).append(rec)
+            row = {"group_start": g0, "group_end": g1, "n_batches": g1 - g0,
+                   "taus": {}}
+            for tau, recs in per_tau.items():
+                win = PairKFWindow(tau=tau, eps=self._window_eps,
+                                   min_unique_trees=self.kf_min_trees)
+                for r in recs:
+                    win.add(r)
+                row["taus"][tau] = {
+                    "unique_trees": int(win.n_unique_trees()),
+                    "n_records": len(recs),
+                    "ready": bool(win.ready())}
+            groups.append(row)
+            g0 = g1
+        return groups
 
 
 class _MapsAdapter:

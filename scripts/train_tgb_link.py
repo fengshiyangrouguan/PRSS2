@@ -253,6 +253,8 @@ def main():
         selection = "ap_all"
     else:
         loop.train_neg_sampler = None
+    if negs is not None:
+        negs.verify(ds)   # fail-closed load gate (§1.1 #4)
 
     metrics_path = out / "metrics.jsonl"
     metrics_path.unlink(missing_ok=True)
@@ -263,6 +265,8 @@ def main():
     bad = 0
     best_epoch = -1
     gs = 0
+    repr_cum = 0
+    closed_cum = 0
     win_diag_path = out / "window_diag.jsonl"
 
     start_epoch = 0
@@ -280,6 +284,12 @@ def main():
         gs = row.get("global_step", gs)
         row["epoch"] = epoch
         row["epoch_seconds"] = time.time() - t0
+        # cumulative repr/closed step counters across epochs (§1.1 #6); curves
+        # use cumulative repr_step as their x-axis.
+        repr_cum += int(row.get("repr_step", 0))
+        closed_cum += int(row.get("closed_window_step", 0))
+        row["repr_step"] = repr_cum
+        row["closed_window_step"] = closed_cum
         for wd in row.get("window_diag", []):
             wd["epoch"] = epoch
             with win_diag_path.open("a") as f:

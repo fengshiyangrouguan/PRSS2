@@ -24,8 +24,8 @@
     ],
     "lambda_calibration": {
       "rule": "r_eff = lambda * ||g_KF|| / ||g_task|| ~ 0.1, measured on theta_0 (calibration-only run, before ANY optimizer/scheduler step), calibrated once on the initial full window (training-only), then frozen for all seeds",
-      "lambda_kf": 0.02229659292991447,
-      "lambda_kf_note": "R8 RECALIBRATED (2026-09-08, theta_0 under the round-8 protocol: depth-stratified sampling + 4x32 sketch ensemble + OAS shrinkage): r_eff(lambda=1)=4.485, derived lambda = 0.1/r_eff = 0.02230. Old protocol value 1.6234e-3 retired (J scale changed ~6x)."
+      "lambda_kf": 0.0669,
+      "lambda_kf_note": "R8 r_eff=0.3 scan arm (2026-09-08, user ruling): lambda = 0.3 / r_eff(lambda=1)=4.485 -> 0.06689 (0.0669). Main arm lambda 0.02230 (r_eff~0.1) stored in .bak_r8_lambda backup. Seed1 ours run."
     },
     "z_v_source": "J_mem(M_v) fixed adapter (TGN identity is its special case)",
     "witness": "none (main experiment)",

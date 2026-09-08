@@ -91,6 +91,13 @@ def parse_args():
                         "and sets aux_kind/use_parent/mispaired/context/variant")
     p.add_argument("--aux-lambda", type=float, default=0.0,
                    help="rec/pred supervision weight (0 -> reuse --lambda-kf)")
+    p.add_argument("--calibrate", action="store_true",
+                   help="no-update lambda0 calibration over --calib-groups "
+                        "eligible groups at fixed init; writes lambda_<family>.json")
+    p.add_argument("--calib-groups", type=int, default=8)
+    p.add_argument("--family-lambdas", default="",
+                   help="json {kyfan|rec|pred: lambda0}; when set, the aux "
+                        "weight for this run's aux_kind is read from it")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--gpu", type=int, default=0)
     p.add_argument("--output", required=True)
@@ -427,6 +434,48 @@ def main():
         loop.train_neg_sampler = None
     if negs is not None:
         negs.verify(ds)   # fail-closed load gate (§1.1 #4)
+
+    # ---- calibrated family lambdas: A2-A5 (all aux_kind=kyfan) reuse R0's
+    # coefficient; rec uses lambda_rec; pred uses lambda_pred.
+    if args.family_lambdas and aux_kind != "none":
+        fl = json.load(open(args.family_lambdas))
+        key = aux_kind if aux_kind in ("rec", "pred") else "kyfan"
+        if key not in fl:
+            raise ValueError(
+                "family-lambdas missing {} (have {})".format(key,
+                                                             sorted(fl)))
+        aux_lambda = float(fl[key])
+        loop.aux_lambda = aux_lambda
+        print("aux_lambda[{}]={}".format(key, aux_lambda), flush=True)
+
+    # ---- lambda0 calibration: fixed init, NO weight updates, first N groups
+    if args.calibrate:
+        loop.calibrate_groups = int(args.calib_groups)
+        loop.calibrate = loop.calibrate_groups > 0
+        loop.train_epoch(0, 0, train,
+                         max_batches=int(args.calib_groups
+                                         * args.kf_group_batches))
+        import statistics as _st
+        ratios = [float(tn) / float(an)
+                  for tn, an in zip(loop._gauge_group_task,
+                                    loop._gauge_group_aux)
+                  if an is not None and an > 1e-9
+                  and tn is not None and tn > 1e-9]
+        fam = aux_kind if aux_kind in ("rec", "pred") else "kyfan"
+        cal = {
+            "family": fam, "aux_kind": aux_kind,
+            "lambda0": float(_st.median(ratios)) if ratios else float("nan"),
+            "n_ratios": len(ratios),
+            "data": ds.name, "seed": args.seed,
+            "rpbe_seed": args.rpbe_seed,
+            "plan_sha": plan_sha,
+            "maps_sha": c["boundary_maps"].isolation_fingerprint()["sha256"],
+            "kf_group_batches": args.kf_group_batches,
+            "calib_groups": int(args.calib_groups),
+        }
+        save_json(out / "lambda_{}.json".format(fam), cal)
+        print(json.dumps(cal), flush=True)
+        return
 
     metrics_path = out / "metrics.jsonl"
     metrics_path.unlink(missing_ok=True)

@@ -69,7 +69,7 @@ class TGBPairLinkLoop:
                  group_plan_sha=None, use_parent=None, mispaired=None,
                  context_mode="full", variant="full_balancing",
                  aux_kind="kyfan", aux_heads=None, aux_optimizer=None,
-                 aux_lambda=None):
+                 aux_lambda=None, calibrate_groups=0):
         self.tgn = tgn
         self.device = device
         self.batch_size = int(batch_size)
@@ -108,6 +108,11 @@ class TGBPairLinkLoop:
         self.aux_optimizer = aux_optimizer
         self.aux_lambda = (float(aux_lambda) if aux_lambda is not None
                            else self.lambda_kf)
+        # lambda calibration mode: run up to N eligible macro-groups at a FIXED
+        # initialization without stepping any optimizer, capturing compressor
+        # task/aux gradient gauges (spec §final item 7).
+        self.calibrate_groups = int(calibrate_groups)
+        self.calibrate = self.calibrate_groups > 0
         self.kf_on = self.aux_kind in ("kyfan", "rec", "pred") \
             and self.lambda_kf > 0
         self.fail_below = bool(fail_below)
@@ -333,6 +338,8 @@ class TGBPairLinkLoop:
         repr_step = 0
         gi = 0
         while group_start < run_batches:
+            if self.calibrate and gi >= self.calibrate_groups:
+                break
             group_end = min(group_start + self.kf_group_batches, run_batches)
             group_k = group_end - group_start
             # group-anchored step counter: pass 2 increments `global_step`
@@ -533,25 +540,26 @@ class TGBPairLinkLoop:
                         n_aux_batches += 1
                         aux_terms_total += len(terms)
                         total_aux += float(auxiliary.detach())
-                if self._comp_params and not _g_done:
-                    auxv = float(auxiliary.detach())
-                    # measure the compressor aux gradient on the FIRST batch of
-                    # the group that actually carries a surrogate term (for a
-                    # task-only arm, measure task at the first batch).
-                    if auxv != 0.0 or b == group_start:
-                        _g_done = True
-                        tn, an = self.gauge_comp(
-                            link_loss, auxiliary if auxv != 0.0 else None)
-                        self._gauge_group_task.append(tn)
-                        self._gauge_group_aux.append(an)
-                loss = link_loss + auxiliary
-                loss.backward()
-                self._clip(self.head_params)
+            loss = link_loss + auxiliary
+            if self._comp_params and not _g_done:
+                auxv = float(auxiliary.detach())
+                # measure the compressor aux gradient on the FIRST batch of
+                # the group that actually carries a surrogate term (for a
+                # task-only arm, measure task at the first batch).
+                if auxv != 0.0 or b == group_start:
+                    _g_done = True
+                    tn, an = self.gauge_comp(
+                        link_loss, auxiliary if auxv != 0.0 else None)
+                    self._gauge_group_task.append(tn)
+                    self._gauge_group_aux.append(an)
+            loss.backward()
+            self._clip(self.head_params)
+            if not self.calibrate:
                 self.head_optimizer.step()
-                if self.tgn.use_memory:
-                    self.tgn.memory.detach_memory()
-                total_link += float(link_loss.detach())
-                global_step += 1
+            if self.tgn.use_memory:
+                self.tgn.memory.detach_memory()
+            total_link += float(link_loss.detach())
+            global_step += 1
             # group close: repr step once
             if self.kf_on:
                 print("[audit-debug] group=%d keys=%d records=%d hits=%d"
@@ -562,8 +570,9 @@ class TGBPairLinkLoop:
                     if p.grad is not None:
                         p.grad.div_(float(max(1, group_k)))
                 self._clip(self.repr_params)
-                self.repr_optimizer.step()
-                self.record_param_delta()
+                if not self.calibrate:
+                    self.repr_optimizer.step()
+                    self.record_param_delta()
                 repr_step += 1
             group_start = group_end
             gi += 1
@@ -805,23 +814,26 @@ class TGBPairLinkLoop:
                 gauge_done = True
             loss.backward()
             self._clip(self.head_params)
-            self.head_optimizer.step()
+            if not self.calibrate:
+                self.head_optimizer.step()
             if self.tgn.use_memory:
                 self.tgn.memory.detach_memory()
             link_sum += float(link_loss.detach())
         # group close: repr and aux heads step once (per macro group)
-        for opt in (self.repr_optimizer, self.aux_optimizer):
-            if opt is None:
-                continue
-            ps = opt.param_groups[0]["params"]
-            for p in ps:
-                if p.grad is not None:
-                    p.grad.div_(float(max(1, group_k)))
-            live = [p for p in ps if p.grad is not None]
-            if live:
-                torch.nn.utils.clip_grad_norm_(live, max_norm=self.grad_clip)
-            opt.step()
-        self.record_param_delta()
+        if not self.calibrate:
+            for opt in (self.repr_optimizer, self.aux_optimizer):
+                if opt is None:
+                    continue
+                ps = opt.param_groups[0]["params"]
+                for p in ps:
+                    if p.grad is not None:
+                        p.grad.div_(float(max(1, group_k)))
+                live = [p for p in ps if p.grad is not None]
+                if live:
+                    torch.nn.utils.clip_grad_norm_(
+                        live, max_norm=self.grad_clip)
+                opt.step()
+            self.record_param_delta()
         return {"link_sum": link_sum, "aux_sum": aux_sum,
                 "aux_batches": aux_batches, "aux_terms": aux_terms,
                 "closed": closed, "repr_step": 1, "gs_end": gs}

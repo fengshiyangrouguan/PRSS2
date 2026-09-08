@@ -53,7 +53,8 @@ def _covs(zc: torch.Tensor, pc: torch.Tensor, den: float,
 
 def _score_from_covs(czz: torch.Tensor, czp: torch.Tensor,
                      cpp: torch.Tensor, eps: float,
-                     variant: str = "full_balancing"):
+                     variant: str = "full_balancing",
+                     scale_bounds: bool = False):
     """Scale-normalized Ky Fan score with gradient; ``(J, diag)``.
 
     Variants (paper Table 2):
@@ -106,23 +107,33 @@ def _score_from_covs(czz: torch.Tensor, czp: torch.Tensor,
                           "scale_p": float(sp.detach())}
         w = torch.linalg.solve_triangular(lz, c, upper=False)
         k = torch.linalg.solve_triangular(lp, w.t(), upper=False).t()
-        return k.square().sum(), {"failed": None,
-                                  "scale_z": float(sz.detach()),
-                                  "scale_p": float(sp.detach())}
+        j = k.square().sum()
+        if scale_bounds:
+            # Fairness (§final #2): whitened ||.||_F^2 is bounded by
+            # min(d_z, m); dividing puts full_balancing ~[0,1].
+            j = j / float(min(r, q))
+        return j, {"failed": None,
+                   "scale_z": float(sz.detach()),
+                   "scale_p": float(sp.detach())}
     if variant == "diagonal":
         # Diagonal whitening only: D_Z^-1/2 S_ZP D_P^-1/2.
         dz = czz.diagonal()
         dp = cpp.diagonal()
         if float((dz > 0).all().detach()) and                 float((dp > 0).all().detach()):
             c = czp / torch.sqrt(dz[:, None] * dp[None, :])
-            return c.square().sum(), {"failed": None,
-                                      "scale_z": float(sz.detach()),
-                                      "scale_p": float(sp.detach())}
+            j = c.square().sum()
+            if scale_bounds:
+                # natural upper bound of a per-entry-normalized matrix: d_z * m
+                j = j / float(czz.shape[0] * cpp.shape[0])
+            return j, {"failed": None,
+                       "scale_z": float(sz.detach()),
+                       "scale_p": float(sp.detach())}
         return None, {"failed": "nonpositive_scale",
                       "scale_z": float(sz.detach()),
                       "scale_p": float(sp.detach())}
     if variant == "unbalanced":
-        # Spec B1: no whitening at all; trace-normalized squared dependence.
+        # Spec B1: no whitening at all; trace-normalized squared dependence is
+        # already ~[0,1] by Cauchy-Schwarz, so NO further normalization.
         num = czp.square().sum()
         den = czz.diagonal().sum() * cpp.diagonal().sum() + eps
         return num / den.clamp(min=1e-30), {
@@ -250,7 +261,8 @@ def kf_vjp_batch(z_b: torch.Tensor, p_b: torch.Tensor, w_b: torch.Tensor,
 
 
 def latent_z_adjoint(z_rows, p_rows, w, cut_ids, mu_z, mu_p, D,
-                     eps, strict=False, variant="full_balancing"):
+                     eps, strict=False, variant="full_balancing",
+                     scale_bounds=False):
     """Contract the moment adjoint onto CUT-LEVEL z-adjoints.
 
     At window close, the whole-window score F(S) is replayed on the
@@ -283,7 +295,7 @@ def latent_z_adjoint(z_rows, p_rows, w, cut_ids, mu_z, mu_p, D,
     mzp = (zc * sw).t() @ (pc * sw)
     mpp = (pc * sw).t() @ (pc * sw)
     j, score_diag = _score_from_covs(mzz / D, mzp / D, mpp / D, eps,
-                                     variant)
+                                     variant, scale_bounds)
     if score_diag["failed"] is not None:
         if strict:
             raise RuntimeError("latent_z_adjoint close failed: {}"

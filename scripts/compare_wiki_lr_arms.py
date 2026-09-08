@@ -28,7 +28,9 @@ ALLOWED = {
     "C1": {"context_mode"}, "B1": {"variant"}, "E1": {"variant"},
 }
 FIXED = ["data", "bs", "n_neighbors", "n_layers", "kf_group_batches",
-         "kf_min_trees", "lambda_kf"]
+         "kf_min_trees", "lambda_kf", "group_plan_sha", "maps_sha"]
+CLI_FIXED = ["negatives", "group_plan", "bs", "n_neighbors", "n_layers",
+             "kf_group_batches", "kf_min_trees", "rpbe_seed"]
 
 
 def main():
@@ -49,6 +51,9 @@ def main():
                                "context_mode", "variant")
                    if cfg.get(k) != r0.get(k)}
         fixed_bad = [k for k in FIXED if cfg.get(k) != r0.get(k)]
+        cli0, clic = r0.get("cli", {}), cfg.get("cli", {})
+        fixed_bad += ["cli." + k for k in CLI_FIXED
+                      if clic.get(k) != cli0.get(k)]
         allowed = ALLOWED[cid]
         good = changed == allowed and not fixed_bad
         ok = ok and good

@@ -335,7 +335,15 @@ def main():
     aux_heads = None
     aux_optimizer = None
     if aux_kind in ("rec", "pred"):
+        import random as _random
         from rpbe.training.aux_heads import AuxHeads
+        # RNG isolation (fairness): building the extra predictors must not
+        # perturb the global RNG stream the main model / task dropout uses, so
+        # a P1/P2 run and a P0/R0 run draw identical task forward/update RNGs.
+        _rng_saved = (torch.get_rng_state(), np.random.get_state(),
+                      _random.getstate(),
+                      torch.cuda.get_rng_state(device)
+                      if torch.cuda.is_available() else None)
         host_dim = int(c["tgn"].embedding_dimension)
         taus = list(getattr(c["adapter"], "compression_taus", []) or [])
         d_out = host_dim if aux_kind == "rec" else int(c["boundary_maps"].m)
@@ -343,6 +351,11 @@ def main():
             aux_kind, taus=taus, z_dim=host_dim,
             d_ctx=int(getattr(c["rpbe_cfg"], "d_c", 32)),
             d_out=d_out).to(device)
+        torch.set_rng_state(_rng_saved[0])
+        np.random.set_state(_rng_saved[1])
+        _random.setstate(_rng_saved[2])
+        if _rng_saved[3] is not None:
+            torch.cuda.set_rng_state(_rng_saved[3], device)
         aux_optimizer = torch.optim.Adam(aux_heads.parameters(), lr=args.lr)
         tgn_ids = {id(p) for p in c["tgn"].parameters()}
         assert tgn_ids.isdisjoint(
@@ -395,6 +408,7 @@ def main():
         "kf_group_batches": args.kf_group_batches,
         "kf_min_trees": args.kf_min_trees,
         "group_plan_sha": plan_sha,
+        "maps_sha": c["boundary_maps"].isolation_fingerprint()["sha256"],
         "opt_split": c["opt_split"], "cli": vars(args)})
 
     # ---- Wiki-LR-Binary negatives: fixed one-neg-per-positive manifest for

@@ -98,7 +98,7 @@ class PairKFWindow:
         if not (D > 0.0):
             return None
         j, diag = _score_from_covs(mzz / D, mzp / D, mpp / D, self.eps,
-                                   self.variant)
+                                   self.variant, scale_bounds=True)
         if diag["failed"] is not None:
             if self.strict:
                 raise RuntimeError("pair window close failed: {}".format(diag))
@@ -136,7 +136,7 @@ class PairKFWindow:
             z.detach().float(), p.float(), w,
             [r.boundary_key for r in records],
             mu_z.float(), mu_p.float(), D, self.eps, self.strict,
-            variant=self.variant)
+            variant=self.variant, scale_bounds=True)
         if score_diag["failed"] is not None:
             return None, {}, score_diag
         # latent_z_adjoint keys by cut_id (boundary_key) and MERGES the

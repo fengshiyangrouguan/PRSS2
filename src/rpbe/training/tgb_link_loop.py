@@ -135,6 +135,13 @@ class TGBPairLinkLoop:
         # layers (layer 1..n_layers-1); every eligible group must produce them.
         self._canon_taus = list(getattr(
             self.adapter, "compression_taus", []) or [])
+        # gradient gauges (fairness gates): compressor grad norms / param delta
+        comp = getattr(self.adapter, "compressor", None)
+        self._comp_params = list(comp.parameters()) if comp is not None else []
+        self._gauge_group_aux = []
+        self._gauge_group_task = []
+        self._gauge_param_delta = None
+        self._gauge_pd_snapshot = None
 
         # per-interface PairKFWindow (child tau keys)
         self.pair_windows: Dict[str, PairKFWindow] = {}
@@ -318,6 +325,8 @@ class TGBPairLinkLoop:
         n_closed = 0
         below = 0
         n_censored_tail_groups = 0
+        aux_terms_total = 0
+        self.reset_gauges()
         self.window_diag = []
 
         group_start = 0
@@ -372,6 +381,7 @@ class TGBPairLinkLoop:
                 total_link += r_["link_sum"]
                 total_aux += r_["aux_sum"]
                 n_aux_batches += r_["aux_batches"]
+                aux_terms_total += r_["aux_terms"]
                 n_closed += r_["closed"]
                 repr_step += r_["repr_step"]
                 global_step = r_["gs_end"]
@@ -492,6 +502,8 @@ class TGBPairLinkLoop:
             # ------------ restore and pass 2: train -----------------------
             self._restore_group_state(state)
             self.repr_optimizer.zero_grad(set_to_none=True)
+            self.snapshot_comp_params()
+            _g_first = True
             _grp_hits = 0
             _grp_recs = 0
             for b in range(group_start, group_end):
@@ -519,7 +531,15 @@ class TGBPairLinkLoop:
                         coeff = -self.lambda_kf * float(group_k)
                         auxiliary = coeff * sum(terms)
                         n_aux_batches += 1
+                        aux_terms_total += len(terms)
                         total_aux += float(auxiliary.detach())
+                if _g_first and self._comp_params:
+                    _g_first = False
+                    tn, an = self.gauge_comp(
+                        link_loss, auxiliary
+                        if float(auxiliary.detach()) != 0.0 else None)
+                    self._gauge_group_task.append(tn)
+                    self._gauge_group_aux.append(an)
                 loss = link_loss + auxiliary
                 loss.backward()
                 self._clip(self.head_params)
@@ -539,9 +559,11 @@ class TGBPairLinkLoop:
                         p.grad.div_(float(max(1, group_k)))
                 self._clip(self.repr_params)
                 self.repr_optimizer.step()
+                self.record_param_delta()
                 repr_step += 1
             group_start = group_end
             gi += 1
+        gsum = self.gauge_summary()
         return {
             "train_link_loss": total_link / max(run_batches, 1),
             "train_aux": total_aux / max(n_aux_batches, 1)
@@ -555,6 +577,10 @@ class TGBPairLinkLoop:
             "task_step": global_step,
             "repr_step": repr_step,
             "closed_window_step": n_closed,   # real closed windows (>= kf arms)
+            "aux_terms": aux_terms_total,
+            "aux_comp_grad_norm": gsum["aux_comp_grad_norm"],
+            "task_comp_grad_norm": gsum["task_comp_grad_norm"],
+            "comp_param_delta": gsum["comp_param_delta"],
             "window_diag": list(self.window_diag),
         }
 
@@ -580,6 +606,69 @@ class TGBPairLinkLoop:
                     rec.root_row = b * self.batch_size + int(rec.root_row)
                 recs.extend(records)
         return recs
+
+    # ---------------------------------------------------- gradient gauges
+    @staticmethod
+    def _g_norm(grads):
+        s = 0.0
+        for g in grads:
+            if g is not None:
+                s += float((g.detach() ** 2).sum())
+        return float(s ** 0.5)
+
+    def gauge_comp(self, link_loss, aux_scalar):
+        """Compressor grad norms (task-only and aux-only) via autograd.grad.
+
+        Does not mutate ``.grad`` (retain_graph=True), so the caller still does
+        its own backward.  ``aux_scalar=None`` for task-only arms.
+        """
+        if not self._comp_params:
+            return 0.0, 0.0
+        params = self._comp_params
+        g_t = torch.autograd.grad(link_loss, params, retain_graph=True,
+                                  allow_unused=True)
+        task_n = self._g_norm(g_t)
+        aux_n = 0.0
+        if aux_scalar is not None and float(aux_scalar.detach()) != 0.0:
+            g_a = torch.autograd.grad(aux_scalar, params, retain_graph=True,
+                                      allow_unused=True)
+            aux_n = self._g_norm(g_a)
+        return float(task_n), float(aux_n)
+
+    def snapshot_comp_params(self):
+        if self._comp_params and self._gauge_pd_snapshot is None:
+            self._gauge_pd_snapshot = [
+                p.detach().clone().to("cpu") for p in self._comp_params]
+
+    def record_param_delta(self):
+        """First-repr-step compressor parameter change (one-shot per epoch)."""
+        if self._gauge_param_delta is not None or not self._comp_params:
+            return
+        snap = self._gauge_pd_snapshot
+        if snap is None:
+            return
+        delta = 0.0
+        for s, p in zip(snap, self._comp_params):
+            delta += float(((p.detach().cpu() - s) ** 2).sum())
+        self._gauge_param_delta = float(delta ** 0.5)
+        self._gauge_pd_snapshot = None
+
+    def reset_gauges(self):
+        self._gauge_group_aux = []
+        self._gauge_group_task = []
+        self._gauge_param_delta = None
+        self._gauge_pd_snapshot = None
+
+    def gauge_summary(self):
+        return {
+            "aux_comp_grad_norm": float(np.mean(self._gauge_group_aux))
+            if self._gauge_group_aux else 0.0,
+            "task_comp_grad_norm": float(np.mean(self._gauge_group_task))
+            if self._gauge_group_task else 0.0,
+            "comp_param_delta": (float(self._gauge_param_delta)
+                                 if self._gauge_param_delta is not None
+                                 else 0.0),
+        }
 
     def _super_target(self, rec):
         """Detached supervision target for one surviving record (P1/P2)."""
@@ -617,11 +706,13 @@ class TGBPairLinkLoop:
         weights = tree_equal_weights(recs)
         meta = {}
         by_tau: Dict[str, List] = {}
+        w_by_tau: Dict[str, float] = {}
         for i in fea:
             r = recs[i]
             r.weight = weights[int(r.root_row)]
             meta[r.pair_id] = float(r.weight)
             by_tau.setdefault(r.tau, []).append(r)
+            w_by_tau[r.tau] = w_by_tau.get(r.tau, 0.0) + float(r.weight)
         if not fea:
             raise RuntimeError(
                 "eligible supervised group {}..{} produced no records".format(
@@ -631,6 +722,8 @@ class TGBPairLinkLoop:
             raise RuntimeError(
                 "supervised group {}..{} missing canonical tau(s) {}".format(
                     g0, g1, missing))
+        ntaus = len(by_tau)
+        # readiness + shared window audit (same as the kyfan arm would close)
         for tau, rl in by_tau.items():
             mt = len({int(r.root_row) for r in rl})
             self.window_diag.append({
@@ -641,11 +734,16 @@ class TGBPairLinkLoop:
                 raise RuntimeError(
                     "supervised group below trees: tau={} {} < {}".format(
                         tau, mt, self.kf_min_trees))
-        # fit FROZEN per-tau target statistics once (calibration), then pass 2
+            self.audit.add_window_close(tau, [r.pair_id for r in rl])
+        for i in fea:
+            self.audit.add_population(recs[i])
+        # FROZEN per-tau target stats, PER-TREE-WEIGHTED over the whole window
         if self.aux_heads is not None:
             for tau, rl in by_tau.items():
                 tgt = torch.stack([self._super_target(r) for r in rl])
-                self.aux_heads.fit(tau, tgt)
+                wts = torch.tensor([float(r.weight) for r in rl],
+                                   dtype=tgt.dtype, device=tgt.device)
+                self.aux_heads.fit_weighted(tau, tgt, wts)
         self._restore_group_state(state)
 
         self.repr_optimizer.zero_grad(set_to_none=True)
@@ -654,8 +752,11 @@ class TGBPairLinkLoop:
         link_sum = 0.0
         aux_sum = 0.0
         aux_batches = 0
-        closed = 0
+        aux_terms = 0
+        closed = len(by_tau)     # accepted (eligible) tau windows this group
+        gauge_done = False
         gs = gs0
+        self.snapshot_comp_params()
         for b in range(g0, g1):
             self.head_optimizer.zero_grad(set_to_none=True)
             out = self._run_batch(train, b, group_gs + (b - g0),
@@ -664,26 +765,40 @@ class TGBPairLinkLoop:
             if out is None:
                 continue
             link_loss, records = out
-            aux_term = torch.zeros((), device=self.device)
+            contrib = torch.zeros((), device=self.device)
             if self.aux_heads is not None and records and meta:
-                terms = []
-                wsum = 0.0
+                parts = []
                 for r in records:
                     w = meta.get(r.pair_id)
                     if w is None:
                         continue
+                    Wtau = w_by_tau.get(r.tau, 0.0)
+                    if Wtau <= 0.0:
+                        continue
                     tgt = self._super_target(r)
-                    L = self.aux_heads.regression_loss(
+                    Lr = self.aux_heads.regression_loss(
                         r.tau, r.z.reshape(1, -1),
                         self._super_ctx(r).reshape(1, -1),
                         tgt.reshape(1, -1))
-                    terms.append(w * L)
-                    wsum += w
-                if wsum > 0.0 and terms:
-                    aux_term = sum(terms) / wsum
+                    # per-batch partial sums, across the group, to
+                    # (lambda / n_layers) * per-tree-weighted window mean
+                    parts.append((w / Wtau) * (self.aux_lambda / ntaus) * Lr)
+                    aux_terms += 1
+                if parts:
+                    contrib = sum(parts)
                     aux_batches += 1
-                    aux_sum += float(aux_term.detach())
-            loss = link_loss + self.aux_lambda * aux_term
+                    aux_sum += float(contrib.detach())
+                    for r in records:
+                        if r.pair_id in meta:
+                            self.audit.add_replay(r)
+            loss = link_loss + contrib
+            if not gauge_done and self._comp_params:
+                tn, an = self.gauge_comp(
+                    link_loss, contrib if float(contrib.detach()) != 0.0
+                    else None)
+                self._gauge_group_task.append(tn)
+                self._gauge_group_aux.append(an)
+                gauge_done = True
             loss.backward()
             self._clip(self.head_params)
             self.head_optimizer.step()
@@ -702,9 +817,10 @@ class TGBPairLinkLoop:
             if live:
                 torch.nn.utils.clip_grad_norm_(live, max_norm=self.grad_clip)
             opt.step()
+        self.record_param_delta()
         return {"link_sum": link_sum, "aux_sum": aux_sum,
-                "aux_batches": aux_batches, "closed": closed,
-                "repr_step": 1, "gs_end": gs}
+                "aux_batches": aux_batches, "aux_terms": aux_terms,
+                "closed": closed, "repr_step": 1, "gs_end": gs}
 
     def scan_topology(self, epoch, train, group_batches=None,
                       n_batches=None):

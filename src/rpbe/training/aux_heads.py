@@ -81,6 +81,23 @@ class AuxHeads(nn.Module):
             self._scale(tau).copy_(scale)
         self._fitted.add(tau)
 
+    def fit_weighted(self, tau: str, target: torch.Tensor,
+                     weights: torch.Tensor) -> None:
+        """Frozen once, PER-TREE-WEIGHTED stats over the whole window."""
+        if tau in self._fitted:
+            return
+        with torch.no_grad():
+            t = target.detach()
+            w = weights.detach().to(t.dtype)
+            w = w / w.sum().clamp_min(1e-30)
+            mean = (t * w.unsqueeze(-1)).sum(0)
+            d = t - mean
+            var = (d * d * w.unsqueeze(-1)).sum(0)
+            scale = (var + self.eps).sqrt().clamp_min(1e-6)
+            self._mean(tau).copy_(mean)
+            self._scale(tau).copy_(scale)
+        self._fitted.add(tau)
+
     def normalize(self, tau: str, target: torch.Tensor) -> torch.Tensor:
         return (target.detach() - self._mean(tau)) / self._scale(tau)
 

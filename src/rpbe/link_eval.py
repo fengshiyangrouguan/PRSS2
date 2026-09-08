@@ -50,6 +50,63 @@ def avg_tie_rank(pos_score, neg_scores):
     return 1.0 + 0.5 * (gt + ge)
 
 
+def score_online_sampled(tgn, ds, split_mode, qids: Sequence[int], *,
+                         n_neighbors: int = 10, chunk: int = 64,
+                         memory_bs: int = 200) -> dict:
+    """Correct sampled-query MRR: advance memory over the WHOLE split.
+
+    Memory is advanced over every real split event in chronological order with
+    its TRUE edge idx, so each scored query sees the exact online state at its
+    time.  Non-scored events are advanced (scores discarded) via a memory-only
+    forward; a scored event is read-only-scored against the pre-event memory
+    first, then advanced.  ``qids`` are row indices into the split (assumed
+    ascending).  Caller must have already replayed TRAIN so memory starts at
+    train-end.
+    """
+    split_obj = {"val": ds.val, "test": ds.test, "train": ds.train}[split_mode]
+    isrc = split_obj.sources
+    idst = split_obj.destinations
+    itt = split_obj.timestamps
+    eidx = split_obj.edge_idxs
+    raw_src, raw_dst, raw_t = ds.raw_split(split_mode)
+    n = len(isrc)
+
+    def _advance(lo, hi):
+        if hi <= lo:
+            return
+        with torch.no_grad():
+            tgn.compute_edge_probabilities(
+                isrc[lo:hi], idst[lo:hi], idst[lo:hi], itt[lo:hi],
+                eidx[lo:hi], n_neighbors)
+
+    ranks = []
+    ptr = 0
+    with torch.no_grad():
+        for q in sorted(set(int(x) for x in qids)):
+            if not (0 <= q < n):
+                raise ValueError("qid {} out of split range".format(q))
+            if ptr < q:                      # advance intervening real events
+                _advance(ptr, q)
+                ptr = q
+            # score query q read-only against pre-event memory, official negs
+            mem = _current_memory(tgn)
+            negs_raw = ds.query_negatives(
+                np.asarray([int(raw_src[q])], dtype=np.int64),
+                np.asarray([int(raw_dst[q])], dtype=np.int64),
+                np.asarray([float(raw_t[q])], dtype=np.float64),
+                split_mode=split_mode)
+            neg_in = np.asarray([int(x) for x in negs_raw[0]],
+                                dtype=np.int64) + 1
+            ps, ns = score_one(tgn, mem, int(isrc[q]), float(itt[q]),
+                               int(idst[q]), neg_in, n_neighbors, chunk)
+            ranks.append(1.0 / avg_tie_rank(ps, ns))
+            _advance(q, q + 1)               # then advance the real event
+            ptr = q + 1
+    mrr = float(np.mean(ranks)) if ranks else float("nan")
+    return {"sampled_query_{}_mrr".format(split_mode): mrr,
+            "n_scored": len(ranks)}
+
+
 def score_split(tgn, ds, split_mode, qids: Sequence[int], *,
                 n_neighbors: int = 10, chunk: int = 64,
                 advance_stream=None) -> dict:

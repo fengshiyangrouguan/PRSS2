@@ -64,7 +64,8 @@ class TGBPairLinkLoop:
                  trace_roots=32, trace_pairs_per_parent=2,
                  kf_group_batches=56, kf_min_trees=896,
                  n_observations=2, trace_mode="evenly_spaced",
-                 fail_below=False, audit_trace=False):
+                 fail_below=False, train_neg_sampler=None,
+                 audit_trace=False):
         self.tgn = tgn
         self.device = device
         self.batch_size = int(batch_size)
@@ -101,6 +102,10 @@ class TGBPairLinkLoop:
         self.audit_trace = bool(audit_trace)
         self.audit = AuditAccumulator()
         self._mispaired_map: Dict[int, object] = {}
+        # prefix-causal train negative sampler (root task only); when None a
+        # uniform-over-destination-universe fallback is used.
+        self.train_neg_sampler = train_neg_sampler
+        self._dst_univ = None
 
         # per-interface PairKFWindow (child tau keys)
         self.pair_windows: Dict[str, PairKFWindow] = {}
@@ -208,12 +213,20 @@ class TGBPairLinkLoop:
                 buf.copy_(state["buffers"]["{}.{}".format(mname, name)])
 
     # ------------------------------------------------------------- negative
-    def _sample_negatives(self, train, size):
-        return np.random.choice(np.asarray(train.destinations),
-                                size=size, replace=True)
+    def _sample_negatives(self, sources, dst_pos, timestamps, global_rows,
+                          epoch=None):
+        """HistRand (prefix-causal) negatives for the CURRENT batch rows."""
+        if self.train_neg_sampler is not None:
+            return self.train_neg_sampler.sample(
+                epoch, 0, sources, dst_pos, timestamps, global_rows)
+        size = len(sources)
+        univ = self._dst_univ if self._dst_univ is not None \
+            else np.asarray(dst_pos)
+        return np.random.choice(univ, size=size, replace=True)
 
     # ---------------------------------------------------------------- forward
-    def _run_batch(self, train, batch_index, global_step, grad_enabled):
+    def _run_batch(self, train, batch_index, global_step, grad_enabled,
+                   epoch=None):
         start = batch_index * self.batch_size
         stop = min(len(train.sources), (batch_index + 1) * self.batch_size)
         if stop <= start:
@@ -223,7 +236,10 @@ class TGBPairLinkLoop:
         timestamps = train.timestamps[start:stop]
         edge_idxs = train.edge_idxs[start:stop]
         size = len(sources)
-        negatives = self._sample_negatives(train, size)
+        # global event row = internal edge id - 1 (stream rows are contiguous
+        # in the FULL dataset; train.eidx are 1-based full-stream rows)
+        negatives = self._sample_negatives(
+            sources, destinations, timestamps, edge_idxs - 1, epoch)
 
         trace_rows = []
         if self.kf_on or self.audit_trace:
@@ -255,6 +271,8 @@ class TGBPairLinkLoop:
     def train_epoch(self, epoch, global_step, train, max_batches=None):
         self.reset_memory()
         self.tgn.train(True)
+        if self.train_neg_sampler is None and self._dst_univ is None:
+            self._dst_univ = np.unique(np.asarray(train.destinations))
         num_batch = math.ceil(len(train.sources) / self.batch_size)
         run_batches = num_batch if max_batches is None else min(
             num_batch, max(0, int(max_batches)))
@@ -268,6 +286,7 @@ class TGBPairLinkLoop:
         self.window_diag = []
 
         group_start = 0
+        repr_step = 0
         while group_start < run_batches:
             group_end = min(group_start + self.kf_group_batches, run_batches)
             group_k = group_end - group_start
@@ -285,7 +304,7 @@ class TGBPairLinkLoop:
                 for b in range(group_start, group_end):
                     out = self._run_batch(
                         train, b, group_gs + (b - group_start),
-                        grad_enabled=False)
+                        grad_enabled=False, epoch=epoch)
                     if out is None:
                         continue
                     _, records = out
@@ -383,7 +402,7 @@ class TGBPairLinkLoop:
                 self.head_optimizer.zero_grad(set_to_none=True)
                 out = self._run_batch(
                     train, b, group_gs + (b - group_start),
-                    grad_enabled=True)
+                    grad_enabled=True, epoch=epoch)
                 if out is None:
                     continue
                 link_loss, records = out
@@ -424,6 +443,7 @@ class TGBPairLinkLoop:
                         p.grad.div_(float(max(1, group_k)))
                 self._clip(self.repr_params)
                 self.repr_optimizer.step()
+                repr_step += 1
             group_start = group_end
         return {
             "train_link_loss": total_link / max(run_batches, 1),
@@ -434,6 +454,9 @@ class TGBPairLinkLoop:
             "n_below": below,
             "n_batches": run_batches,
             "global_step": global_step,
+            "task_step": global_step,
+            "repr_step": repr_step,
+            "closed_window_step": repr_step,
             "window_diag": list(self.window_diag),
         }
 

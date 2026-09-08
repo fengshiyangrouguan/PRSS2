@@ -55,7 +55,11 @@ def parse_args():
     p.add_argument("--gpu", type=int, default=0)
     p.add_argument("--output", required=True)
     p.add_argument("--epochs", type=int, default=30)
-    p.add_argument("--patience", type=int, default=5)
+    p.add_argument("--patience", type=int, default=8)
+    p.add_argument("--min-delta", type=float, default=1e-3,
+                   help="val selection must beat best by >= this AP to reset")
+    p.add_argument("--budget-cap", type=int, default=60,
+                   help="hard cap when a run is budget-censored (spec §6)")
     p.add_argument("--bs", type=int, default=200)
     p.add_argument("--lr", type=float, default=1e-4)
     p.add_argument("--n-neighbors", type=int, default=10)
@@ -73,10 +77,16 @@ def parse_args():
     p.add_argument("--max-batches", type=int, default=0,
                    help="cap each train epoch at N batches (0=full; smoke)")
     p.add_argument("--eval-every", type=int, default=0,
-                   help="score fixed val query set every N epochs (0=off) "
-                        "and select best.pt by sampled_query_val_mrr")
+                   help="[legacy] score fixed val query set every N epochs "
+                        "(0=off) and select best.pt by sampled_query_val_mrr")
     p.add_argument("--query-sets", default="",
-                   help="fixed query-id json (shared across arms/seeds)")
+                   help="[legacy] fixed query-id json (shared across arms)")
+    p.add_argument("--negatives", default="",
+                   help="Wiki-LR-Binary fixed one-neg-per-positive manifest; "
+                        "when set, selection is per-epoch FULL-val ap_all "
+                        "(spec §2.4) and train negatives are HistRand")
+    p.add_argument("--val-every", type=int, default=1,
+                   help="epochs between full-val ap_all evaluations (1=every)")
     p.add_argument("--kf-fail-below", action="store_true",
                    help="abort at the FIRST below-threshold KF window "
                         "(fail-fast; calibration runs leave it off so "
@@ -149,16 +159,29 @@ def build_model(args, device):
         n_neighbors=args.n_neighbors,
         trace_pairs_per_parent=args.trace_pairs_per_parent)
     tgn.embedding_module = adapter
-    # two optimizers: head = decoder params only (LinkPredictor is built-in);
-    # repr = host + compressor
+    # Optimizer ownership must be disjoint (Wiki-LR-Binary spec §4.1): head =
+    # the affinity decoder ONLY; repr = every OTHER trainable parameter (host
+    # encoder + Gamma + compressor + memory).  A leaf is visited twice under
+    # tgn.parameters() (e.g. time_encoder is shared with the embedding module),
+    # so id-dedup AFTER excluding head; a param in BOTH optimizers would be
+    # double-stepped (head each batch, repr each macro group).
     head_params = [p for p in tgn.affinity_score.parameters()
                    if p.requires_grad]
-    repr_params = [p for p in tgn.parameters() if p.requires_grad]
-    seen = set()
-    repr_params = [p for p in repr_params
-                   if not (id(p) in seen or seen.add(id(p)))]
+    head_ids = {id(p) for p in head_params}
+    repr_params = []
+    _seen_ids = set()
+    for p in tgn.parameters():
+        if not p.requires_grad or id(p) in head_ids or id(p) in _seen_ids:
+            continue
+        _seen_ids.add(id(p))
+        repr_params.append(p)
+    assert head_ids.isdisjoint({id(p) for p in repr_params}), \
+        "head and repr param sets must be disjoint"
     head_optimizer = torch.optim.Adam(head_params, lr=args.lr)
     repr_optimizer = torch.optim.Adam(repr_params, lr=args.lr)
+    opt_names = {id(p): n for n, p in tgn.named_parameters()}
+    head_names = sorted(opt_names[id(p)] for p in head_params)
+    repr_names = sorted(opt_names[id(p)] for p in repr_params)
     # boundary maps
     d_msg = int(ds.msg_dim)
     boundary_maps = BoundaryMaps(
@@ -174,7 +197,11 @@ def build_model(args, device):
                 compressor=compressor, head_optimizer=head_optimizer,
                 repr_optimizer=repr_optimizer, boundary_maps=boundary_maps,
                 link_future_index=link_future_index,
-                edge_table=ds.edge_features)
+                edge_table=ds.edge_features,
+                opt_split={"n_head": len(head_params),
+                           "n_repr": len(repr_params),
+                           "head_names": head_names,
+                           "repr_names": repr_names})
 
 
 def main():
@@ -209,18 +236,43 @@ def main():
         "device": str(device), "epochs": args.epochs, "bs": args.bs,
         "n_neighbors": args.n_neighbors, "n_layers": args.n_layers,
         "lambda_kf": args.lambda_kf, "kf_group_batches": args.kf_group_batches,
-        "kf_min_trees": args.kf_min_trees, "cli": vars(args)})
+        "kf_min_trees": args.kf_min_trees,
+        "opt_split": c["opt_split"], "cli": vars(args)})
+
+    # ---- Wiki-LR-Binary negatives: fixed one-neg-per-positive manifest for
+    # val/test selection + prefix-causal HistRand negatives for train.
+    selection = "sampled_query_val_mrr"   # legacy fallback
+    negs = None
+    if args.negatives:
+        from rpbe.data.wiki_binary_negatives import CompactNegatives
+        from rpbe.training.histrand_sampler import HistRandTrainSampler
+        negs = CompactNegatives(args.negatives)
+        loop.train_neg_sampler = HistRandTrainSampler(
+            train.sources, train.destinations, train.timestamps,
+            model_seed=args.seed)
+        selection = "ap_all"
+    else:
+        loop.train_neg_sampler = None
+
     metrics_path = out / "metrics.jsonl"
     metrics_path.unlink(missing_ok=True)
 
+    val_history_path = out / "val_history.jsonl"
+    val_history_path.unlink(missing_ok=True)
     best_val = -1e9
     bad = 0
     best_epoch = -1
     gs = 0
-    val_history = []
     win_diag_path = out / "window_diag.jsonl"
-    win_diag_path.unlink(missing_ok=True)
-    for epoch in range(args.epochs):
+
+    start_epoch = 0
+    epoch_aps = []
+    budget = args.epochs if args.epochs > 0 else args.budget_cap
+    extended = False
+    stop_reason = "budget"
+
+    epoch = start_epoch
+    while epoch < budget:
         t0 = time.time()
         row = loop.train_epoch(
             epoch, gs, train,
@@ -235,48 +287,77 @@ def main():
         row.pop("window_diag", None)
         with metrics_path.open("a") as f:
             f.write(json.dumps(row, allow_nan=True) + "\n")
-        print(json.dumps({"epoch": epoch, **{k: row[k] for k in
-              ("train_link_loss", "n_closed", "n_below", "n_aux_batches")}},
-              allow_nan=True), flush=True)
-        # ---- sampled-val MRR checkpoint selection every eval_every epochs
-        val_mrr = None
-        if args.eval_every > 0 and args.query_sets \
+        print(json.dumps({"epoch": epoch, "repr_step": row.get("repr_step"),
+              **{k: row[k] for k in
+                 ("train_link_loss", "n_closed", "n_below",
+                  "n_aux_batches")}}, allow_nan=True), flush=True)
+
+        # ---- checkpoint selection --------------------------------
+        val_row = None
+        if negs is not None and (epoch + 1) % args.val_every == 0:
+            vm = _val_ap_inprocess(args, device, c, ds, negs)
+            val_row = {"epoch": epoch,
+                       "repr_step": row.get("repr_step", gs),
+                       "selection": "ap_all",
+                       **{k: vm.get(k, float("nan")) for k in
+                          ("ap_all", "auc_all", "nll_all", "paired_acc",
+                           "ap_hist", "auc_hist", "nll_hist",
+                           "n_hist", "n_random")}}
+            epoch_aps.append(float(vm.get("ap_all", float("nan"))))
+            improved = vm.get("ap_all", float("nan")) > best_val + args.min_delta
+        elif negs is None and args.eval_every > 0 and args.query_sets \
                 and (epoch + 1) % args.eval_every == 0:
-            val_mrr = _val_mrr_inprocess(args, device, c, ds, out)
-            val_history.append({"epoch": epoch, "sampled_query_val_mrr":
-                                val_mrr})
-            with (out / "val_history.jsonl").open("a") as f:
-                f.write(json.dumps(val_history[-1], allow_nan=True) + "\n")
-            print("epoch {} sampled_val_mrr={:.5f}".format(
-                epoch, val_mrr), flush=True)
-            if val_mrr > best_val:
-                best_val = float(val_mrr)
+            vm = {"sampled_query_val_mrr":
+                  _val_mrr_inprocess(args, device, c, ds, out)}
+            val_row = {"epoch": epoch, "selection": "sampled_query_val_mrr",
+                       "sampled_query_val_mrr":
+                       vm["sampled_query_val_mrr"]}
+            improved = vm["sampled_query_val_mrr"] > best_val
+        else:
+            improved = False
+            vm = {}
+
+        if val_row is not None:
+            with val_history_path.open("a") as f:
+                f.write(json.dumps(val_row, allow_nan=True) + "\n")
+            print("epoch {} {}={:.5f}".format(
+                epoch, selection, val_row.get(selection)), flush=True)
+            if improved:
+                best_val = float(val_row.get(selection))
                 best_epoch = epoch
                 bad = 0
-                torch.save({
-                    "model": {"tgn": c["tgn"].state_dict(),
-                              "compressor": c["compressor"].state_dict()},
-                    "epoch": epoch, "score": float(best_val),
-                    "arm": args.arm, "seed": args.seed,
-                    "selection": "sampled_query_val_mrr",
-                }, out / "best.pt")
+                _save_ckpt(out / "best.pt", c, epoch, best_val, args, selection)
             else:
                 bad += 1
-                if bad >= args.patience:
-                    print("early stop at epoch {} (val mrr)".format(epoch),
-                          flush=True)
+                if negs is not None and bad >= args.patience:
+                    stop_reason = "early_stop_ap"
+                    break
+                if negs is None and bad >= args.patience:
+                    stop_reason = "early_stop_mrr"
                     break
         elif epoch == 0:
             # always keep a first best.pt so downstream eval has one
-            torch.save({
-                "model": {"tgn": c["tgn"].state_dict(),
-                          "compressor": c["compressor"].state_dict()},
-                "epoch": epoch, "score": 0.0,
-                "arm": args.arm, "seed": args.seed,
-            }, out / "best.pt")
+            _save_ckpt(out / "best.pt", c, epoch, 0.0, args, selection)
+        _save_ckpt(out / "last.pt", c, epoch, best_val, args, selection)
+        epoch += 1
+        # ---- budget-censored extension (spec §6): only when the epoch cap
+        # is hit, training is still visibly improving, and the best lies in
+        # the last few epochs.  One extension of +20 up to the hard cap.
+        if epoch >= budget and stop_reason != "early_stop_ap" \
+                and negs is not None and not extended \
+                and budget < args.budget_cap:
+            recent = epoch_aps[-5:] if epoch_aps else []
+            if len(recent) == 5 and recent[-1] - recent[0] > 0.002 \
+                    and best_epoch >= epoch - 4:
+                extended = True
+                budget = min(args.budget_cap, budget + 20)
+                print("budget-censored: extend to epoch {}".format(budget),
+                      flush=True)
     summary = {"data": "tgbl-wiki", "seed": args.seed, "arm": args.arm,
                "best_epoch": int(best_epoch),
-               "best_sampled_val_mrr": float(best_val)}
+               "best_{}".format(selection): float(best_val),
+               "selection": selection, "stop_reason": stop_reason,
+               "extended": bool(extended)}
     save_json(out / "summary.json", summary)
     # ---- read-only comparison sidecar (spec §26 item 13) ----
     try:
@@ -302,8 +383,27 @@ def main():
                          fixed_feature=fixed_feature))
     save_json(out / "_SUCCESS.json", {"status": "complete",
                                       "best_epoch": int(best_epoch),
-                                      "selection": "sampled_query_val_mrr"})
+                                      "selection": selection,
+                                      "stop_reason": stop_reason})
     print(json.dumps(summary), flush=True)
+
+
+def _save_ckpt(path, c, epoch, score, args, selection):
+    torch.save({
+        "model": {"tgn": c["tgn"].state_dict(),
+                  "compressor": c["compressor"].state_dict()},
+        "epoch": int(epoch), "score": float(score),
+        "arm": args.arm, "seed": args.seed,
+        "selection": selection,
+    }, path)
+
+
+def _val_ap_inprocess(args, device, c, ds, negs):
+    """Full-split val ap_all at current model state (memory restored after)."""
+    from rpbe.training.wiki_binary_eval import evaluate_val
+    with torch.no_grad():
+        return evaluate_val(c["tgn"], ds, negs,
+                            n_neighbors=args.n_neighbors, bs=args.bs)
 
 
 def _val_mrr_inprocess(args, device, c, ds, out):

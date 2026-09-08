@@ -36,7 +36,7 @@ from rpbe.hosts.official_tgn import TGN, get_neighbor_finder
 from rpbe.hosts.jodie_tgn import JodieTGNAdapter, TAU_TEMPLATE
 from rpbe.config import RPBConfig
 from rpbe.compressor import RecursiveCompressor
-from rpbe.link_eval import score_split
+from rpbe.link_eval import score_online_sampled
 
 
 def parse_args():
@@ -141,13 +141,12 @@ def main():
              train.edge_idxs, bs=200)
     print("train replay {:.1f}s".format(time.time() - t0), flush=True)
 
-    def step(src, dst, t, eidx):
-        _advance(tgn, src, dst, t, eidx, bs=1)
-
+    # correct online sampled-query MRR: memory advances over ALL val events
+    # (true edge idx), not only the scored subset.
     t1 = time.time()
-    res = score_split(tgn, ds, split_mode, qids,
-                      n_neighbors=10, chunk=args.dst_chunk,
-                      advance_stream=step)
+    res = score_online_sampled(tgn, ds, split_mode, qids,
+                               n_neighbors=args.n_neighbors,
+                               chunk=args.dst_chunk)
     res["scored_seconds"] = time.time() - t1
     metric = "sampled_query_{}_mrr".format(split_mode)
     out_json = outdir / "eval_{}.json".format(split_mode)

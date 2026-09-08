@@ -503,7 +503,7 @@ class TGBPairLinkLoop:
             self._restore_group_state(state)
             self.repr_optimizer.zero_grad(set_to_none=True)
             self.snapshot_comp_params()
-            _g_first = True
+            _g_done = False
             _grp_hits = 0
             _grp_recs = 0
             for b in range(group_start, group_end):
@@ -533,13 +533,17 @@ class TGBPairLinkLoop:
                         n_aux_batches += 1
                         aux_terms_total += len(terms)
                         total_aux += float(auxiliary.detach())
-                if _g_first and self._comp_params:
-                    _g_first = False
-                    tn, an = self.gauge_comp(
-                        link_loss, auxiliary
-                        if float(auxiliary.detach()) != 0.0 else None)
-                    self._gauge_group_task.append(tn)
-                    self._gauge_group_aux.append(an)
+                if self._comp_params and not _g_done:
+                    auxv = float(auxiliary.detach())
+                    # measure the compressor aux gradient on the FIRST batch of
+                    # the group that actually carries a surrogate term (for a
+                    # task-only arm, measure task at the first batch).
+                    if auxv != 0.0 or b == group_start:
+                        _g_done = True
+                        tn, an = self.gauge_comp(
+                            link_loss, auxiliary if auxv != 0.0 else None)
+                        self._gauge_group_task.append(tn)
+                        self._gauge_group_aux.append(an)
                 loss = link_loss + auxiliary
                 loss.backward()
                 self._clip(self.head_params)

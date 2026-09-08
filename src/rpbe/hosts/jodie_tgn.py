@@ -1,4 +1,4 @@
-"""RPBE adapter for the official twitter-research TGN host.
+﻿"""RPBE adapter for the official twitter-research TGN host.
 
 The host's recursive aggregation remains intact.  Gamma is inserted only at
 an *internal aggregated state* that is passed to another aggregation:
@@ -232,9 +232,13 @@ class JodieTGNAdapter(HostAdapter):
                           if int(neighbors[prow, s]) != 0]
                 if not nonpad:
                     continue
+                # mask to 32 bits: `_trace_batch` is a cumulative global
+                # step that grows past 2**32/1000003 after a few epochs,
+                # which would make RandomState raise (seed must be < 2**32).
+                # The mask is the identity for all values reached so far.
                 rng = np.random.RandomState(
-                    (self._trace_batch * 1000003) ^ (int(prow) * 104729)
-                    ^ (int(parent_layer) * 7919))
+                    ((self._trace_batch * 1000003) ^ (int(prow) * 104729)
+                     ^ (int(parent_layer) * 7919)) & 0xFFFFFFFF)
                 k = min(self.trace_pairs_per_parent, len(nonpad))
                 slots = [nonpad[i] for i in
                          rng.choice(len(nonpad), size=k, replace=False)]

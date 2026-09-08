@@ -1,4 +1,4 @@
-"""Structural arms over a shared set of child-parent boundary records.
+﻿"""Structural arms over a shared set of child-parent boundary records.
 
 The three structural arms consume the SAME candidate set (the valid
 BoundaryRecords from a trace); they differ ONLY in how the parent future is
@@ -89,7 +89,7 @@ def build_mispaired_parent_map(records: List[BoundaryRecord], *,
             bucket_seed = (bucket_seed * 31 + i) % (2 ** 31)
         perm = _fixed_bipartite_derangement(
             times_from, times_to,
-            (seed * 104729) ^ int(batch_seed) ^ bucket_seed)
+            ((seed * 104729) ^ int(batch_seed) ^ bucket_seed) & 0xFFFFFFFF)
         if perm is None:
             # infeasible bucket: drop from ALL arms (absent from mapping)
             continue
@@ -119,7 +119,7 @@ def feasible_positions(records: List[BoundaryRecord], *,
             bucket_seed = (bucket_seed * 31 + i) % (2 ** 31)
         perm = _fixed_bipartite_derangement(
             times_from, times_to,
-            (seed * 104729) ^ int(batch_seed) ^ bucket_seed)
+            ((seed * 104729) ^ int(batch_seed) ^ bucket_seed) & 0xFFFFFFFF)
         if perm is not None:
             ok.update(idxs)
     return sorted(ok)

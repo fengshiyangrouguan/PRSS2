@@ -363,9 +363,11 @@ def main() -> None:
     task_ids = {id(p) for p in task_params}
     overlap = task_ids & gamma_ids
     assert not overlap, f"gamma/task param overlap: {len(overlap)}"
-    opt_task = torch.optim.AdamW(task_params, lr=args.lr)
+    opt_task = torch.optim.AdamW(task_params, lr=args.lr,
+                             foreach=False)
     if gamma_params:
-        opt_gamma = torch.optim.AdamW(gamma_params, lr=args.lr)
+        opt_gamma = torch.optim.AdamW(gamma_params, lr=args.lr,
+                               foreach=False)
     else:
         opt_gamma = None
 
@@ -564,8 +566,13 @@ def main() -> None:
                   f"nzB={nz}/{n_b}", flush=True)
 
     def _opt_state(opt):
-        """Optimizer state moved to CPU for a disk-friendly checkpoint."""
-        st = opt.state_dict()
+        """Optimizer state moved to CPU for a disk-friendly checkpoint.
+
+        NOTE: opt.state_dict() shares its nested state tensors with the live
+        optimizer; mutating them in place (pstate[k]=v.cpu()) would permanently
+        move exp_avg/exp_avg_sq to CPU and break the NEXT optimizer step.
+        deepcopy FIRST so only the snapshot's tensors are moved."""
+        st = copy.deepcopy(opt.state_dict())
         for pstate in st["state"].values():
             for k, v in pstate.items():
                 if torch.is_tensor(v):

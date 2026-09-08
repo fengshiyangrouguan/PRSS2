@@ -74,6 +74,10 @@ class ConsumedPairCandidate:
     relation_slot: int
     path: Tuple[int, float]      # tuple of (relation_code, delta_t) steps
     z: torch.Tensor              # neighbor_lower[row, slot] (gradient-connected)
+    # Pre-Gamma vanilla aggregate of the SAME child occurrence (the tensor the
+    # child returned before Gamma compression), for the Reconstruction aux
+    # (P1): D_rec([z, chi(C)]) -> sg(u).  None when not traced.
+    u: Optional[torch.Tensor] = None
 
 
 @dataclass

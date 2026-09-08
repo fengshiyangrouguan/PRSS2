@@ -159,16 +159,21 @@ class JodieTGNAdapter(HostAdapter):
             self._trace = None
             paths = {}
         return self._compute(memory, source_nodes, timestamps,
-                             int(n_layers), int(n_neighbors), paths)
+                             int(n_layers), int(n_neighbors), paths)[0]
 
     def _compute(self, memory, source_nodes, timestamps, layer, n_neighbors,
                  trace_paths):
-        """Recursive host query plus a SELF-spine trace token dictionary.
+        """Recursive host query returning ``(state, pre_gamma)`` per SELF row.
 
-        ``trace_paths`` maps rows in this recursion call to their top-level
-        structural path.  Tokens go only through ``source_lower``.  The
-        neighbor recursion receives no tokens, which removes full-tree trace
-        allocation without changing any embedding computation.
+        ``state`` is the tensor handed UP to the parent aggregation (compressed
+        at internal layers, vanilla at root/leaf); ``pre_gamma`` is the child's
+        vanilla aggregate BEFORE Gamma — needed so a consuming parent can trace
+        the child's pre-compression ``u`` for the Reconstruction aux (P1)
+        without an extra tree walk.  ``trace_paths`` maps rows in this
+        recursion call to their top-level structural path.  Tokens go only
+        through ``source_lower``.  The neighbor recursion receives no tokens,
+        which removes full-tree trace allocation without changing any
+        embedding computation.
         """
         device = self.device
         source_nodes_t = torch.from_numpy(source_nodes).long().to(device)
@@ -180,12 +185,12 @@ class JodieTGNAdapter(HostAdapter):
 
         # A leaf has no child aggregation, so Gamma is undefined here.
         if layer == 0:
-            return raw_source
+            return raw_source, raw_source
 
         source_paths = {
             int(row): list(path) + [(0, 0.0)]
             for row, path in trace_paths.items()}
-        source_lower = self._compute(
+        src_low_z, _src_low_u = self._compute(
             memory, source_nodes, timestamps, layer - 1, n_neighbors,
             source_paths)
 
@@ -199,11 +204,14 @@ class JodieTGNAdapter(HostAdapter):
         flat_neighbors = neighbors.reshape(-1)
         repeated_times = np.repeat(timestamps, n_neighbors)
         # Neighbor states are computed exactly as before; only trace tokens
-        # are absent, so no neighbor occurrence objects are retained.
-        neighbor_lower = self._compute(
+        # are absent, so no neighbor occurrence objects are retained.  Both the
+        # compressed child state (fed to aggregate / traced as z) and the
+        # child's pre-Gamma aggregate (traced as u) come from ONE recursion.
+        neigh_low_z, neigh_low_u = self._compute(
             memory, flat_neighbors, repeated_times, layer - 1, n_neighbors,
             {})
-        neighbor_lower = neighbor_lower.view(len(source_nodes), n_neighbors, -1)
+        neighbor_lower = neigh_low_z.view(len(source_nodes), n_neighbors, -1)
+        neighbor_u = neigh_low_u.view(len(source_nodes), n_neighbors, -1)
         edge_time = self.host.time_encoder(edge_deltas)
         edge_features = self.host.edge_features[edge_idxs]
         mask = neighbors_t == 0
@@ -247,6 +255,7 @@ class JodieTGNAdapter(HostAdapter):
                     rel_edge_id = int(edge_idxs_np[prow, slot])
                     rel_time = float(edge_times[prow, slot])
                     child_z = neighbor_lower[prow, slot]
+                    child_u = neighbor_u[prow, slot]
                     child_path = tuple(list(path) + [(NEIGHBOR_REL,
                                                       ptime - rel_time)])
                     pair_id = (self._next_pair_id, int(prow),
@@ -266,10 +275,11 @@ class JodieTGNAdapter(HostAdapter):
                         relation_lag=ptime - rel_time,
                         relation_slot=int(slot),
                         path=child_path,
-                        z=child_z))
+                        z=child_z,
+                        u=child_u))
                     self._next_pair_id += 1
         vanilla = self.host.aggregate(
-            layer, source_lower, source_time, neighbor_lower, edge_time,
+            layer, src_low_z, source_time, neighbor_lower, edge_time,
             edge_features, mask)
 
         # Only an internal aggregate is passed upward to another tree node.
@@ -277,8 +287,10 @@ class JodieTGNAdapter(HostAdapter):
             tau = TAU_TEMPLATE.format(layer)
             z = self.compressor.compress(
                 tau=tau, own_input=raw_source, aggregate_output=vanilla)
+            u = vanilla
         else:
             z = vanilla
+            u = vanilla
 
         # Root and leaf are deliberately absent.  Each selected query emits
         # at most one graph-connected state for this internal interface.
@@ -300,4 +312,4 @@ class JodieTGNAdapter(HostAdapter):
                     u=vanilla[row],
                     path=list(path)))
                 self._next_oid += 1
-        return z
+        return z, u

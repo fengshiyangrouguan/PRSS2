@@ -59,6 +59,7 @@ class BoundaryRecord:
     child_future: Optional[ObservedLinkEvent]
     parent_future: Optional[ObservedLinkEvent]
     weight: float = 1.0
+    u: Optional[torch.Tensor] = None      # child pre-Gamma aggregate (P1)
 
     @property
     def valid(self) -> bool:
@@ -135,7 +136,8 @@ def build_boundary_records(pairs, future_index: LinkFutureIndex,
             parent_node=p.parent_node, parent_time=p.parent_time,
             relation_time=p.relation_time, relation_lag=p.relation_lag,
             relation_slot=p.relation_slot, path=p.path, z=p.z,
-            child_future=cf, parent_future=pf, weight=weight)
+            child_future=cf, parent_future=pf, weight=weight,
+            u=getattr(p, "u", None))
         if rec.valid:
             out.append(rec)
     return out

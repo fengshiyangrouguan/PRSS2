@@ -100,20 +100,28 @@ class HDF5BatchTransform:
 
     def _augment(self, img: Image.Image, key: Tuple[int, int, int, int]):
         """Official OpenVLA-style augment, deterministic per
-        (seed, epoch, episode_id, t) via a LOCAL numpy RNG."""
+        (seed, epoch, episode_id, t) via a LOCAL numpy RNG.
+
+        RandomResizedCrop preserves 90% AREA (side = sqrt(0.9)); brightness
+        is ADDITIVE in [-0.2, 0.2] (matches official), contrast/saturation
+        multiplicative, hue additive -- in official order."""
         import torchvision.transforms.functional as F
         seed, epoch, eid, t = key
         rng = np.random.default_rng(
             int((seed * 1000003 + epoch) * 100003 + eid) * 10007 + t)
         W, H = img.size
-        crop_scale = 0.9
-        ch = int(round(min(H, W) * crop_scale))
-        cw = ch                          # ratio=(1,1)
+        crop_ratio = math.sqrt(0.9)     # side keeps 90% area
+        ch = int(round(H * crop_ratio))
+        cw = int(round(W * crop_ratio))
         top = int(rng.integers(0, H - ch + 1))
         left = int(rng.integers(0, W - cw + 1))
         img = F.resized_crop(img, top, left, ch, cw, (H, W),
                              interpolation=Image.BILINEAR)
-        img = F.adjust_brightness(img, 1.0 + float(rng.uniform(-0.2, 0.2)))
+        # additive brightness delta in [-0.2, 0.2] on the [0,255] image
+        arr = np.asarray(img, dtype=np.float32)
+        arr = arr + float(rng.uniform(-0.2, 0.2)) * 255.0
+        arr = np.clip(arr, 0.0, 255.0)
+        img = Image.fromarray(arr.astype(np.uint8))
         img = F.adjust_contrast(img, float(rng.uniform(0.8, 1.2)))
         img = F.adjust_saturation(img, float(rng.uniform(0.8, 1.2)))
         img = F.adjust_hue(img, float(rng.uniform(-0.05, 0.05)))

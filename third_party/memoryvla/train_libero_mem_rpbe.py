@@ -565,21 +565,10 @@ def main() -> None:
                   f"lr={lr_now:.2e} mean|B|={mean_b:.3e} "
                   f"nzB={nz}/{n_b}", flush=True)
 
-    def _opt_state(opt):
-        """Optimizer state moved to CPU for a disk-friendly checkpoint.
-
-        NOTE: opt.state_dict() shares its nested state tensors with the live
-        optimizer; mutating them in place (pstate[k]=v.cpu()) would permanently
-        move exp_avg/exp_avg_sq to CPU and break the NEXT optimizer step.
-        deepcopy FIRST so only the snapshot's tensors are moved."""
-        st = copy.deepcopy(opt.state_dict())
-        for pstate in st["state"].values():
-            for k, v in pstate.items():
-                if torch.is_tensor(v):
-                    pstate[k] = v.detach().cpu()
-        return st
-
     def _ckpt_dict():
+        # WEIGHTS-ONLY snapshot (reviewer ruling): never serialize optimizer
+        # or scheduler state.  Avoids the Adam-state CPU-poisoning hazard and
+        # the extra save-time memory peak entirely.
         payload = {
             "model": {n: p.detach().cpu()
                       for n, p in vla.named_parameters()
@@ -597,12 +586,7 @@ def main() -> None:
             "task_filter": args.task_filter,
             "best_val": best_val,
             "weights_snapshot_only": True,
-            "opt_task": _opt_state(opt_task),
         }
-        if opt_gamma is not None:
-            payload["opt_gamma"] = _opt_state(opt_gamma)
-            payload["sched_gamma"] = sched_gamma.state_dict()
-        payload["sched_task"] = sched_task.state_dict()
         return payload
 
     best_val = float("inf")

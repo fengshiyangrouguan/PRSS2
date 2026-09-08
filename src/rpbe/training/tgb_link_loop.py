@@ -510,7 +510,8 @@ class TGBPairLinkLoop:
             self._restore_group_state(state)
             self.repr_optimizer.zero_grad(set_to_none=True)
             self.snapshot_comp_params()
-            _g_done = False
+            _g_task_done = False
+            _g_aux_done = False
             _grp_hits = 0
             _grp_recs = 0
             for b in range(group_start, group_end):
@@ -541,17 +542,15 @@ class TGBPairLinkLoop:
                         aux_terms_total += len(terms)
                         total_aux += float(auxiliary.detach())
             loss = link_loss + auxiliary
-            if self._comp_params and not _g_done:
-                auxv = float(auxiliary.detach())
-                # Aux gauge: fire on the FIRST batch that actually carries an
-                # auxiliary term (kyfan surrogate batches can start later than
-                # batch 0).  Task-only arms never have aux -> gauge task once.
-                if auxv != 0.0 or (self.aux_kind == "none"
-                                   and b == group_start):
-                    _g_done = True
-                    tn, an = self.gauge_comp(
-                        link_loss, auxiliary if auxv != 0.0 else None)
+            if self._comp_params:
+                if not _g_task_done and b == group_start:
+                    _g_task_done = True
+                    tn, _an = self.gauge_comp(link_loss, None)
                     self._gauge_group_task.append(tn)
+                auxv = float(auxiliary.detach())
+                if not _g_aux_done and auxv != 0.0:
+                    _g_aux_done = True
+                    _tn, an = self.gauge_comp(link_loss, auxiliary)
                     self._gauge_group_aux.append(an)
             loss.backward()
             self._clip(self.head_params)

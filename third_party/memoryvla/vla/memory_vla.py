@@ -310,9 +310,9 @@ class CogMemBank(nn.Module):
                 merge_id=self.next_merge_id,
                 merge_decision_time=int(trigger_ts.item()) if isinstance(
                     trigger_ts, torch.Tensor) else int(trigger_ts),
-                left_state=feat_i.detach().clone().reshape(-1),
-                right_state=feat_j.detach().clone().reshape(-1),
-                merged_state=fused_feat.detach().clone().reshape(-1),
+                left_state=feat_i.detach().cpu().reshape(-1),
+                right_state=feat_j.detach().cpu().reshape(-1),
+                merged_state=fused_feat.detach().cpu().reshape(-1),
                 left_id=meta_i[0],
                 right_id=meta_j[0],
                 node_id=new_meta[0],

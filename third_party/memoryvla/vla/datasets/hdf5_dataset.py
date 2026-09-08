@@ -267,12 +267,16 @@ class HDF5DenseDataset(IterableDataset):
 
     def __iter__(self) -> Iterator[Dict[str, Any]]:
         worker_info = torch.utils.data.get_worker_info()
-        order = list(range(len(self.episodes)))
-        if self.split == "train":
-            rng = np.random.default_rng(self.seed + (worker_info.id if worker_info else 0))
-            rng.shuffle(order)
-
+        epoch = 0
         while True:
+            # re-shuffle episode order EVERY epoch; the per-epoch seed is
+            # seed + epoch so consecutive epochs give different orders but
+            # any given (epoch, seed) is reproducible (reviewer fix).
+            order = list(range(len(self.episodes)))
+            if self.split == "train":
+                rng = np.random.default_rng(
+                    self.seed + epoch + (worker_info.id if worker_info else 0))
+                rng.shuffle(order)
             self._cache = {}    # fresh cache each epoch
             for idx in order:
                 ep, a, rgb = self._load(idx)
@@ -292,20 +296,16 @@ class HDF5DenseDataset(IterableDataset):
                         chunk = a[t:t + K]
                         valid = np.ones(K, dtype=bool)
                     else:
-                        # neutral padding for the missing tail
+                        # neutral padding for the missing tail: raw 0.0 motion
+                        # (physical no-op) for the 6 continuous dims -- the
+                        # batch transform later normalizes these to the
+                        # official norm-zero value -- and the gripper holds its
+                        # last known state (model space {0,1}).
                         chunk = np.zeros((K, 7), dtype=np.float32)
                         chunk[:n_avail] = a[t:T]
-                        # neutral continuous value = midpoint of q01/q99 for
-                        # masked dims (normalized -> 0); for gripper keep last
-                        # known state (model space).
                         last_g = a[T - 1, 6]
-                        for j in range(n_avail, K):
-                            chunk[j, 6] = last_g
-                            for d in range(6):
-                                if self.mask[d]:
-                                    chunk[j, d] = 0.5 * (self.q01[d] + self.q99[d])
-                                else:
-                                    chunk[j, d] = 0.0
+                        chunk[n_avail:, :6] = 0.0
+                        chunk[n_avail:, 6] = last_g
                         valid = np.zeros(K, dtype=bool)
                         valid[:n_avail] = True
                     row = dict(
@@ -320,6 +320,7 @@ class HDF5DenseDataset(IterableDataset):
                     yield self.batch_transform(row)
             if not self.repeat:
                 return
+            epoch += 1
 
 
 def get_hdf5_decision_stream_dataset_and_collator(

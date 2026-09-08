@@ -93,6 +93,10 @@ class PendingMergeQueue:
     def n_merges_for(self, episode_id: int) -> int:
         return self.ep_merge_count.get(episode_id, 1)
 
+    def pending_episodes(self) -> set:
+        """Episode ids that still have merges awaiting futures (not drained)."""
+        return {eid for (eid, _mid) in self.pending}
+
     def offer(self, episode_id: int, decision_idx: int,
               context: dict, outcome: torch.Tensor) -> List[EmbodiedCutRow]:
         """Feed one post-decision future sample; records futures only.
@@ -127,7 +131,10 @@ class PendingMergeQueue:
         HORIZON_OMEGA.  Merges with any missing future are censored
         (counted, dropped)."""
         if n_merges is None:
-            n_merges = self.n_merges_for(episode_id)
+            # per-episode count is consumed at drain: a re-appearing
+            # episode_id in a later epoch must not accumulate a 2x/3x
+            # denominator that would shrink tree weights each epoch.
+            n_merges = self.ep_merge_count.pop(episode_id, 1)
         rows: List[EmbodiedCutRow] = []
         for key, pm in list(self.pending.items()):
             if pm.rec.episode_id != episode_id:

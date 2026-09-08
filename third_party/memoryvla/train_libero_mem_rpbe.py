@@ -140,6 +140,7 @@ def build_vla(args: argparse.Namespace):
         gamma_alpha_init=1.0,
         rpbe_merge_records=flags["is_gamma"],
         rpbe_task_grad=flags["is_gamma"],
+        rpbe_seed=args.seed,
     )
     vla.vlm.requires_grad_(False)
     llm = vla.vlm.llm_backbone.llm
@@ -286,16 +287,25 @@ def main() -> None:
     # ---- parameter split ----
     # opt_task: cog/per banks + per_compr + DiT + LoRA -> dense (every block).
     # opt_gamma: gamma merge operator only -> macro boundary replay.
+    # NOTE: gamma is registered both on vla.gamma AND as cog_mem_bank.gamma
+    # (memory_vla.py:594), so cog_mem_bank.parameters() already includes it;
+    # it must be EXCLUDED from the task optimizer and live only in opt_gamma.
     lora_params = [p for n, p in vla.named_parameters()
                    if p.requires_grad and "lora_" in n]
     lora_ids = {id(p) for p in lora_params}
+    gamma_params = (list(vla.gamma.parameters())
+                    if vla.gamma is not None else [])
+    gamma_ids = {id(p) for p in gamma_params}
     task_modules = [vla.cog_mem_bank, vla.per_mem_bank, vla.per_compr,
                     vla.action_model]
     task_params = [p for m in task_modules for p in m.parameters()
-                   if p.requires_grad and id(p) not in lora_ids]
+                   if p.requires_grad and id(p) not in lora_ids
+                   and id(p) not in gamma_ids]
     task_params += lora_params
-    gamma_params = (list(vla.gamma.parameters())
-                    if vla.gamma is not None else [])
+    # disjointness guarantee (reviewer): no trainable param in both optimizers
+    task_ids = {id(p) for p in task_params}
+    overlap = task_ids & gamma_ids
+    assert not overlap, f"gamma/task param overlap: {len(overlap)}"
     opt_task = torch.optim.AdamW(task_params, lr=args.lr)
     if gamma_params:
         opt_gamma = torch.optim.AdamW(gamma_params, lr=args.lr)
@@ -346,6 +356,8 @@ def main() -> None:
     optimizer_step = 0
     micro_step = 0
     episodes_since_boundary = 0
+    window_micro = 0          # micro-backwards since last gamma boundary
+    boundary_pending = False  # repr threshold crossed; fire at fresh-episode top
     last_eid = None
     t0 = time.time()
     print("== training loop start (arm={}) ==".format(args.arm), flush=True)
@@ -390,10 +402,12 @@ def main() -> None:
             last_eid = eid
         episodes_since_boundary += n_done
 
-    def _gamma_boundary():
-        """One gamma macro-boundary update (dense protocol: repr_boundary
-        episodes per boundary).  Gamma gets no graph grads; its ONLY grads
-        are the local task / RPBE replay losses computed here."""
+    def _gamma_boundary(scale):
+        """One gamma macro-boundary update.  scale = grad_accum/window_micro
+        normalizes the task cotangents (summed over window_micro micro-back-
+        wards each scaled by 1/grad_accum) to a per-micro mean BEFORE any
+        replay adds its contribution, keeping the RPBE-vs-task relative
+        weight independent of episode length under the dense protocol."""
         nonlocal window, task_cotangents, rpbe_cotangents, rpbe_pending_loss
         if not IS_GAMMA or vla.gamma is None:
             return
@@ -420,8 +434,11 @@ def main() -> None:
             window = EmbodiedRPBEWindow(
                 variant=rpbe_cfg.kf_variant, eps=rpbe_cfg.ridge_eps,
                 min_abs=rpbe_cfg.kf_min_abs)
-        # task replay (independent key set from RPBE)
+        # task replay (independent key set from RPBE); scale the summed
+        # leaf cotangents to a per-micro mean (reviewer normalization fix)
         keys = [k for k in task_cotangents if k in merge_registry]
+        if keys and scale != 1.0:
+            task_cotangents = {k: v * scale for k, v in task_cotangents.items()}
         if keys:
             m_a = torch.stack(
                 [merge_registry[k].left_state for k in keys]
@@ -445,9 +462,11 @@ def main() -> None:
             ).to("cuda", dtype=torch.bfloat16)
             l_rpbe = gamma_replay_loss(vla.gamma, m_a_r, m_b_r,
                                        rpbe_cotangents, rkeys)
-            (args.lambda_rpbe * l_rpbe).backward()
+            # RPBE maximizes J (loss.py docstring: rpbe part -<g,z_hat>),
+            # so the sign is NEGATIVE -- gradient ascent on J.
+            (-args.lambda_rpbe * l_rpbe).backward()
             print(f"[gamma step] rpbe replay "
-                  f"{args.lambda_rpbe * l_rpbe.item():.4f}", flush=True)
+                  f"{-args.lambda_rpbe * l_rpbe.item():.4f}", flush=True)
         if opt_gamma is not None:
             torch.nn.utils.clip_grad_norm_(gamma_params, args.grad_clip)
             opt_gamma.step()
@@ -457,6 +476,20 @@ def main() -> None:
         task_cotangents = {}
         rpbe_cotangents = {}
         rpbe_pending_loss = []
+        # free replay bookkeeping for episodes whose merges have all drained
+        # (no longer pending futures).  Their records are not needed again:
+        # cotangents were consumed above and re-accumulate per new episode.
+        # Kept keys -> queue.pending episodes (still maturing futures).
+        live = queue.pending_episodes()
+        dead = [k for k in list(merge_registry) if k[0] not in live]
+        for k in dead:
+            merge_registry.pop(k, None)
+        dead_m = [k for k in list(merge_id_map) if k[0] not in live]
+        for k in dead_m:
+            merge_id_map.pop(k, None)
+        if dead or dead_m:
+            print(f"[gamma step] freed registry {len(dead)} maps {len(dead_m)} "
+                  f"(live eps {len(live)})", flush=True)
 
     def _log_lora_norm():
         b_norms = []
@@ -554,6 +587,19 @@ def main() -> None:
         batch = next(it)
         micro_step += 1
 
+        # gamma macro boundary fires at the TOP of a batch, once a completed
+        # episode has crossed the repr threshold (set by feed_merges_and_-
+        # futures below).  Firing here -- before any frame of the next episode
+        # is processed -- guarantees an episode never mixes two gamma
+        # versions: merges only form after mem_length>=16 banked frames, and
+        # the fire happens strictly before that can occur.
+        if IS_GAMMA and boundary_pending:
+            scale = args.grad_accum / max(1, window_micro)
+            _gamma_boundary(scale)
+            episodes_since_boundary = 0
+            window_micro = 0
+            boundary_pending = False
+
         pixel_values = batch["pixel_values"]
         if isinstance(pixel_values, dict):
             pixel_values = {k: v.to("cuda", dtype=torch.bfloat16)
@@ -584,6 +630,7 @@ def main() -> None:
                 repeated_diffusion_steps=args.repeated_diffusion_steps,
             )
         (loss / args.grad_accum).backward()
+        window_micro += 1
 
         if IS_GAMMA:
             for f, eid, node_id in leaf_snapshot:
@@ -597,6 +644,10 @@ def main() -> None:
         # gamma arms feed merges/futures every microbatch (tracks episodes)
         if IS_GAMMA:
             feed_merges_and_futures(batch)
+            # threshold crossed -> fire at the TOP of the next batch (fresh
+            # episode edge), never version-splitting an in-progress episode.
+            if episodes_since_boundary >= args.repr_boundary_episodes:
+                boundary_pending = True
 
         # dense optimizer step every grad_accum micro-batches
         if micro_step % args.grad_accum == 0:
@@ -616,11 +667,6 @@ def main() -> None:
                 print(f"opt {optimizer_step}/{args.max_steps} "
                       f"(micro {micro_step}) | loss {loss.item():.4f}"
                       f"{diag} | {dt/60:.1f} min", flush=True)
-
-            # gamma macro boundary (dense: every repr_boundary_episodes)
-            if IS_GAMMA and episodes_since_boundary >= args.repr_boundary_episodes:
-                _gamma_boundary()
-                episodes_since_boundary = 0
 
             if args.eval_every > 0 and optimizer_step % args.eval_every == 0:
                 val_loss = run_eval(optimizer_step)

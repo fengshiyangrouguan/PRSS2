@@ -541,25 +541,25 @@ class TGBPairLinkLoop:
                         n_aux_batches += 1
                         aux_terms_total += len(terms)
                         total_aux += float(auxiliary.detach())
-            loss = link_loss + auxiliary
-            if self._comp_params:
-                if not _g_task_done and b == group_start:
-                    _g_task_done = True
-                    tn, _an = self.gauge_comp(link_loss, None)
-                    self._gauge_group_task.append(tn)
-                auxv = float(auxiliary.detach())
-                if not _g_aux_done and auxv != 0.0:
-                    _g_aux_done = True
-                    _tn, an = self.gauge_comp(link_loss, auxiliary)
-                    self._gauge_group_aux.append(an)
-            loss.backward()
-            self._clip(self.head_params)
-            if not self.calibrate:
-                self.head_optimizer.step()
-            if self.tgn.use_memory:
-                self.tgn.memory.detach_memory()
-            total_link += float(link_loss.detach())
-            global_step += 1
+                loss = link_loss + auxiliary
+                if self._comp_params:
+                    if not _g_task_done and b == group_start:
+                        _g_task_done = True
+                        tn, _an = self.gauge_comp(link_loss, None)
+                        self._gauge_group_task.append(tn)
+                    auxv = float(auxiliary.detach())
+                    if not _g_aux_done and auxv != 0.0:
+                        _g_aux_done = True
+                        _tn, an = self.gauge_comp(link_loss, auxiliary)
+                        self._gauge_group_aux.append(an)
+                loss.backward()
+                self._clip(self.head_params)
+                if not self.calibrate:
+                    self.head_optimizer.step()
+                if self.tgn.use_memory:
+                    self.tgn.memory.detach_memory()
+                total_link += float(link_loss.detach())
+                global_step += 1
             # group close: repr step once
             if self.kf_on:
                 print("[audit-debug] group=%d keys=%d records=%d hits=%d"

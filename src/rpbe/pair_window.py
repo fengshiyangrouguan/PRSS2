@@ -39,11 +39,13 @@ class PairKFWindow:
     """Accumulate BoundaryRecords and close them into cut-level adjoints."""
 
     def __init__(self, *, tau: str, eps: float = 1e-4,
-                 min_unique_trees: int = 64, strict: bool = False):
+                 min_unique_trees: int = 64, strict: bool = False,
+                 variant: str = "full_balancing"):
         self.tau = str(tau)
         self.eps = float(eps)
         self.min_unique_trees = int(min_unique_trees)
         self.strict = bool(strict)
+        self.variant = str(variant)   # full_balancing / diagonal / unbalanced
         self.reset()
 
     def reset(self):
@@ -96,7 +98,7 @@ class PairKFWindow:
         if not (D > 0.0):
             return None
         j, diag = _score_from_covs(mzz / D, mzp / D, mpp / D, self.eps,
-                                   "full_balancing")
+                                   self.variant)
         if diag["failed"] is not None:
             if self.strict:
                 raise RuntimeError("pair window close failed: {}".format(diag))
@@ -134,7 +136,7 @@ class PairKFWindow:
             z.detach().float(), p.float(), w,
             [r.boundary_key for r in records],
             mu_z.float(), mu_p.float(), D, self.eps, self.strict,
-            variant="full_balancing")
+            variant=self.variant)
         if score_diag["failed"] is not None:
             return None, {}, score_diag
         # latent_z_adjoint keys by cut_id (boundary_key) and MERGES the

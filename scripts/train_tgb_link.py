@@ -46,11 +46,51 @@ from rpbe.link_records import LinkFutureIndex
 from rpbe.training.tgb_link_loop import TGBPairLinkLoop, ARMS
 from rpbe.audit import AuditAccumulator
 
+# 9 unique configurations (spec §5).  ``arm`` stays one of the historical
+# ARMS so feasibility/audit code paths are reused; the axes override arm_derived
+# defaults in the loop.  ``lambda`` (None -> keep --lambda-kf) sets aux weight.
+CONFIG_MAP = {
+    "R0": dict(arm="2obs_aligned", aux_kind="kyfan", use_parent=1,
+               mispaired=False, context_mode="full", variant="full_balancing"),
+    "P0": dict(arm="gamma_task_only", aux_kind="none", use_parent=1,
+               mispaired=False, context_mode="full", variant="full_balancing"),
+    "P1": dict(arm="2obs_aligned", aux_kind="rec", use_parent=1,
+               mispaired=False, context_mode="full", variant="full_balancing"),
+    "P2": dict(arm="2obs_aligned", aux_kind="pred", use_parent=1,
+               mispaired=False, context_mode="full", variant="full_balancing"),
+    "S1": dict(arm="1obs", aux_kind="kyfan", use_parent=0,
+               mispaired=False, context_mode="full", variant="full_balancing"),
+    "S2": dict(arm="2obs_mispaired", aux_kind="kyfan", use_parent=1,
+               mispaired=True, context_mode="full", variant="full_balancing"),
+    "C1": dict(arm="2obs_aligned", aux_kind="kyfan", use_parent=1,
+               mispaired=False, context_mode="constant",
+               variant="full_balancing"),
+    "B1": dict(arm="2obs_aligned", aux_kind="kyfan", use_parent=1,
+               mispaired=False, context_mode="full", variant="unbalanced"),
+    "E1": dict(arm="2obs_aligned", aux_kind="kyfan", use_parent=1,
+               mispaired=False, context_mode="full", variant="diagonal"),
+}
+
+
+def resolve_config(args):
+    """Return (arm, axes-dict or None) after applying ``--config``."""
+    if args.config:
+        if args.config not in CONFIG_MAP:
+            raise ValueError("unknown --config {}".format(args.config))
+        ax = dict(CONFIG_MAP[args.config])
+        return ax.pop("arm"), ax
+    return args.arm, None
+
 
 def parse_args():
     p = argparse.ArgumentParser("tgbl-wiki pair link train")
     p.add_argument("--data-dir", default="datasets")
     p.add_argument("--arm", choices=list(ARMS), default="2obs_aligned")
+    p.add_argument("--config", default="",
+                   help="9-config id (R0/P0/P1/P2/S1/S2/C1/B1/E1); overrides arm "
+                        "and sets aux_kind/use_parent/mispaired/context/variant")
+    p.add_argument("--aux-lambda", type=float, default=0.0,
+                   help="rec/pred supervision weight (0 -> reuse --lambda-kf)")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--gpu", type=int, default=0)
     p.add_argument("--output", required=True)
@@ -282,6 +322,34 @@ def main():
     train = ds.train
     val = ds.val
     monitor = None  # minimal; metrics go to jsonl
+    # ---- 9-config registry axes (config overrides arm-derived defaults)
+    eff_arm, axes = resolve_config(args)
+    aux_kind = (axes or {}).get("aux_kind", "kyfan")
+    use_parent = (axes or {}).get("use_parent")
+    mispaired = (axes or {}).get("mispaired")
+    context_mode = (axes or {}).get("context_mode", "full")
+    variant = (axes or {}).get("variant", "full_balancing")
+    if axes is None and args.arm == "gamma_task_only":
+        aux_kind = "none"
+    aux_lambda = args.aux_lambda if args.aux_lambda > 0.0 else args.lambda_kf
+    aux_heads = None
+    aux_optimizer = None
+    if aux_kind in ("rec", "pred"):
+        from rpbe.training.aux_heads import AuxHeads
+        host_dim = int(c["tgn"].embedding_dimension)
+        taus = list(getattr(c["adapter"], "compression_taus", []) or [])
+        d_out = host_dim if aux_kind == "rec" else int(c["boundary_maps"].m)
+        aux_heads = AuxHeads(
+            aux_kind, taus=taus, z_dim=host_dim,
+            d_ctx=int(getattr(c["rpbe_cfg"], "d_c", 32)),
+            d_out=d_out).to(device)
+        aux_optimizer = torch.optim.Adam(aux_heads.parameters(), lr=args.lr)
+        tgn_ids = {id(p) for p in c["tgn"].parameters()}
+        assert tgn_ids.isdisjoint(
+            {id(p) for p in aux_heads.parameters()}), \
+            "aux head params must be disjoint from the host"
+        print("aux_heads({}) taus={} z={} d_out={}".format(
+            aux_kind, taus, host_dim, d_out), flush=True)
     # ---- shared group plan: aux-eligible prefix + task-only censored tail
     plan_sha = None
     aux_prefix = None
@@ -298,7 +366,7 @@ def main():
         seed=args.seed, adapter=c["adapter"],
         link_future_index=c["link_future_index"],
         boundary_maps=c["boundary_maps"], edge_table=c["edge_table"],
-        arm=args.arm, rpbe_cfg=c["rpbe_cfg"],
+        arm=eff_arm, rpbe_cfg=c["rpbe_cfg"],
         repr_optimizer=c["repr_optimizer"], head_optimizer=c["head_optimizer"],
         trace_roots=args.trace_roots,
         trace_pairs_per_parent=args.trace_pairs_per_parent,
@@ -306,13 +374,20 @@ def main():
         kf_min_trees=args.kf_min_trees,
         fail_below=args.kf_fail_below,
         audit_trace=True,
-        aux_prefix_groups=aux_prefix, group_plan_sha=plan_sha)
+        aux_prefix_groups=aux_prefix, group_plan_sha=plan_sha,
+        use_parent=use_parent, mispaired=mispaired,
+        context_mode=context_mode, variant=variant,
+        aux_kind=aux_kind, aux_heads=aux_heads,
+        aux_optimizer=aux_optimizer, aux_lambda=aux_lambda)
 
     save_json(out / "config.json", {
-        "data": "tgbl-wiki", "seed": args.seed, "arm": args.arm,
+        "data": "tgbl-wiki", "seed": args.seed, "arm": eff_arm,
+        "config": args.config, "aux_kind": aux_kind,
+        "context_mode": context_mode, "variant": variant,
         "device": str(device), "epochs": args.epochs, "bs": args.bs,
         "n_neighbors": args.n_neighbors, "n_layers": args.n_layers,
-        "lambda_kf": args.lambda_kf, "kf_group_batches": args.kf_group_batches,
+        "lambda_kf": args.lambda_kf, "aux_lambda": aux_lambda,
+        "kf_group_batches": args.kf_group_batches,
         "kf_min_trees": args.kf_min_trees,
         "group_plan_sha": plan_sha,
         "opt_split": c["opt_split"], "cli": vars(args)})
@@ -414,7 +489,7 @@ def main():
                 best_val = float(val_row.get(selection))
                 best_epoch = epoch
                 bad = 0
-                _save_ckpt(out / "best.pt", c, epoch, best_val, args, selection)
+                _save_ckpt(out / "best.pt", c, epoch, best_val, args, selection, aux_heads)
             else:
                 bad += 1
                 if negs is not None and bad >= args.patience:
@@ -425,8 +500,8 @@ def main():
                     break
         elif epoch == 0:
             # always keep a first best.pt so downstream eval has one
-            _save_ckpt(out / "best.pt", c, epoch, 0.0, args, selection)
-        _save_ckpt(out / "last.pt", c, epoch, best_val, args, selection)
+            _save_ckpt(out / "best.pt", c, epoch, 0.0, args, selection, aux_heads)
+        _save_ckpt(out / "last.pt", c, epoch, best_val, args, selection, aux_heads)
         epoch += 1
         # ---- budget-censored extension (spec §6): only when the epoch cap
         # is hit, training is still visibly improving, and the best lies in
@@ -476,14 +551,15 @@ def main():
     print(json.dumps(summary), flush=True)
 
 
-def _save_ckpt(path, c, epoch, score, args, selection):
-    torch.save({
-        "model": {"tgn": c["tgn"].state_dict(),
-                  "compressor": c["compressor"].state_dict()},
-        "epoch": int(epoch), "score": float(score),
-        "arm": args.arm, "seed": args.seed,
-        "selection": selection,
-    }, path)
+def _save_ckpt(path, c, epoch, score, args, selection, aux_heads=None):
+    ck = {"model": {"tgn": c["tgn"].state_dict(),
+                    "compressor": c["compressor"].state_dict()},
+          "epoch": int(epoch), "score": float(score),
+          "arm": args.arm, "seed": args.seed,
+          "selection": selection}
+    if aux_heads is not None:
+        ck["aux_heads"] = aux_heads.state_dict()
+    torch.save(ck, path)
 
 
 def _val_ap_inprocess(args, device, c, ds, negs):

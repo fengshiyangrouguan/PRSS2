@@ -66,7 +66,10 @@ class TGBPairLinkLoop:
                  n_observations=2, trace_mode="evenly_spaced",
                  fail_below=False, train_neg_sampler=None,
                  audit_trace=False, aux_prefix_groups=None,
-                 group_plan_sha=None):
+                 group_plan_sha=None, use_parent=None, mispaired=None,
+                 context_mode="full", variant="full_balancing",
+                 aux_kind="kyfan", aux_heads=None, aux_optimizer=None,
+                 aux_lambda=None):
         self.tgn = tgn
         self.device = device
         self.batch_size = int(batch_size)
@@ -92,8 +95,21 @@ class TGBPairLinkLoop:
         self.kf_min_trees = int(kf_min_trees)
         self.n_observations = int(n_observations)
         self.trace_mode = trace_mode
-        self.use_parent = arm_use_parent(arm)
-        self.kf_on = arm_kf_on(arm, self.lambda_kf)
+        # config-resolved axes (9-config registry): parent usage, mispaired
+        # pairing, auxiliary context mode, score variant, aux supervision kind.
+        self.use_parent = (int(use_parent) if use_parent is not None
+                           else arm_use_parent(arm))
+        self.mispaired = (bool(mispaired) if mispaired is not None
+                          else arm == "2obs_mispaired")
+        self.context_mode = str(context_mode)
+        self.variant = str(variant)
+        self.aux_kind = str(aux_kind)   # kyfan / rec / pred / none
+        self.aux_heads = aux_heads
+        self.aux_optimizer = aux_optimizer
+        self.aux_lambda = (float(aux_lambda) if aux_lambda is not None
+                           else self.lambda_kf)
+        self.kf_on = self.aux_kind in ("kyfan", "rec", "pred") \
+            and self.lambda_kf > 0
         self.fail_below = bool(fail_below)
         # audit side-channel: when True the trace runs even without KF so
         # gamma_task_only records the SAME underlying population as the aux
@@ -163,6 +179,10 @@ class TGBPairLinkLoop:
         pass-1 record object only — the record's own fields are untouched.
         """
         ctx = _ctx_vec(rec, d_ctx=self._ctx_dim(), device=self.device)
+        if self.context_mode == "constant":
+            # C1 no-C: the aux witness drops chi(C) (zero context block) while
+            # keeping the intercept / p dim / fixed sketch unchanged.
+            ctx = torch.zeros_like(ctx)
         child = self._event(rec.child_future, rec.child_time)
         parent = self._event(
             getattr(rec, "parent_future_used", rec.parent_future),
@@ -187,7 +207,8 @@ class TGBPairLinkLoop:
         if tau not in self.pair_windows:
             self.pair_windows[tau] = PairKFWindow(
                 tau=tau, eps=self._window_eps,
-                min_unique_trees=self.kf_min_trees)
+                min_unique_trees=self.kf_min_trees,
+                variant=self.variant)
         return self.pair_windows[tau]
 
     def _save_group_state(self):
@@ -344,6 +365,19 @@ class TGBPairLinkLoop:
                 group_start = group_end
                 gi += 1
                 continue
+            if self.aux_kind in ("rec", "pred"):
+                r_ = self._train_group_supervised(
+                    train, group_start, group_end, group_gs, group_k, epoch,
+                    global_step)
+                total_link += r_["link_sum"]
+                total_aux += r_["aux_sum"]
+                n_aux_batches += r_["aux_batches"]
+                n_closed += r_["closed"]
+                repr_step += r_["repr_step"]
+                global_step = r_["gs_end"]
+                group_start = group_end
+                gi += 1
+                continue
             # ------------ pass 1: collect records per batch, no grad -------
             state = self._save_group_state()
             pass1_records = []
@@ -375,7 +409,7 @@ class TGBPairLinkLoop:
             if pass1_records:
                 fea = feasible_positions(pass1_records, seed=self.seed,
                                          batch_seed=global_step)
-                if self.arm == "2obs_mispaired":
+                if self.mispaired:
                     self._mispaired_map = build_mispaired_parent_map(
                         pass1_records, seed=self.seed,
                         batch_seed=global_step)
@@ -533,6 +567,145 @@ class TGBPairLinkLoop:
                 live, max_norm=self.grad_clip, error_if_nonfinite=True)
 
     # --------------------------------------------------------- topology scan
+    def _collect_pass1_records(self, train, g0, g1, gstep0, epoch):
+        recs = []
+        with torch.no_grad():
+            for b in range(g0, g1):
+                out = self._run_batch(train, b, gstep0 + (b - g0),
+                                      grad_enabled=False, epoch=epoch)
+                if out is None:
+                    continue
+                _, records = out
+                for rec in records:
+                    rec.root_row = b * self.batch_size + int(rec.root_row)
+                recs.extend(records)
+        return recs
+
+    def _super_target(self, rec):
+        """Detached supervision target for one surviving record (P1/P2)."""
+        if self.aux_kind == "rec":
+            u = getattr(rec, "u", None)
+            if u is None:
+                raise RuntimeError("rec target missing u on record")
+            return u.detach().reshape(-1)
+        # pred: bitwise R0 aligned-2Obs p for the same cut / C / Y
+        return self._pv(rec).detach().reshape(-1)
+
+    def _super_ctx(self, rec):
+        from rpbe.pair_rows import build_ctx_vector
+        d_ctx = int(getattr(self.rpbe_cfg, "d_c", 32))
+        return build_ctx_vector(rec, d_ctx, device=self.device)
+
+    def _train_group_supervised(self, train, g0, g1, group_gs, group_k,
+                                epoch, gs0):
+        """Rec/Pred macro group: single-population, per-tree-weighted MSE.
+
+        Population and tree weights mirror the R0 kyfan surviving set
+        (feasible_positions + mispaired derangement-map intersection), so P1/P2
+        supervise the SAME cut intersection as R0.  Pass 2 needs no surrogate:
+        the head decodes live ``[z, chi(C)]`` against the frozen-normalized
+        detached target.
+        """
+        state = self._save_group_state()
+        recs = self._collect_pass1_records(train, g0, g1, group_gs, epoch)
+        fea = feasible_positions(recs, seed=self.seed,
+                                 batch_seed=group_gs) if recs else []
+        if self.mispaired:
+            mmap = build_mispaired_parent_map(recs, seed=self.seed,
+                                              batch_seed=group_gs)
+            fea = [i for i in fea if i in mmap]
+        weights = tree_equal_weights(recs)
+        meta = {}
+        by_tau: Dict[str, List] = {}
+        for i in fea:
+            r = recs[i]
+            r.weight = weights[int(r.root_row)]
+            meta[r.pair_id] = float(r.weight)
+            by_tau.setdefault(r.tau, []).append(r)
+        if not fea:
+            raise RuntimeError(
+                "eligible supervised group {}..{} produced no records".format(
+                    g0, g1))
+        missing = [t for t in self._canon_taus if t not in by_tau]
+        if missing:
+            raise RuntimeError(
+                "supervised group {}..{} missing canonical tau(s) {}".format(
+                    g0, g1, missing))
+        for tau, rl in by_tau.items():
+            mt = len({int(r.root_row) for r in rl})
+            self.window_diag.append({
+                "group_batches": group_k, "tau": tau,
+                "M_unique_trees": mt, "threshold": self.kf_min_trees,
+                "n_records": len(rl)})
+            if mt < self.kf_min_trees:
+                raise RuntimeError(
+                    "supervised group below trees: tau={} {} < {}".format(
+                        tau, mt, self.kf_min_trees))
+        # fit FROZEN per-tau target statistics once (calibration), then pass 2
+        if self.aux_heads is not None:
+            for tau, rl in by_tau.items():
+                tgt = torch.stack([self._super_target(r) for r in rl])
+                self.aux_heads.fit(tau, tgt)
+        self._restore_group_state(state)
+
+        self.repr_optimizer.zero_grad(set_to_none=True)
+        if self.aux_optimizer is not None:
+            self.aux_optimizer.zero_grad(set_to_none=True)
+        link_sum = 0.0
+        aux_sum = 0.0
+        aux_batches = 0
+        closed = 0
+        gs = gs0
+        for b in range(g0, g1):
+            self.head_optimizer.zero_grad(set_to_none=True)
+            out = self._run_batch(train, b, group_gs + (b - g0),
+                                  grad_enabled=True, epoch=epoch)
+            gs += 1
+            if out is None:
+                continue
+            link_loss, records = out
+            aux_term = torch.zeros((), device=self.device)
+            if self.aux_heads is not None and records and meta:
+                terms = []
+                wsum = 0.0
+                for r in records:
+                    w = meta.get(r.pair_id)
+                    if w is None:
+                        continue
+                    tgt = self._super_target(r)
+                    L = self.aux_heads.regression_loss(
+                        r.tau, r.z.reshape(1, -1),
+                        self._super_ctx(r).reshape(1, -1),
+                        tgt.reshape(1, -1))
+                    terms.append(w * L)
+                    wsum += w
+                if wsum > 0.0 and terms:
+                    aux_term = sum(terms) / wsum
+                    aux_batches += 1
+                    aux_sum += float(aux_term.detach())
+            loss = link_loss + self.aux_lambda * aux_term
+            loss.backward()
+            self._clip(self.head_params)
+            self.head_optimizer.step()
+            if self.tgn.use_memory:
+                self.tgn.memory.detach_memory()
+            link_sum += float(link_loss.detach())
+        # group close: repr and aux heads step once (per macro group)
+        for opt in (self.repr_optimizer, self.aux_optimizer):
+            if opt is None:
+                continue
+            ps = opt.param_groups[0]["params"]
+            for p in ps:
+                if p.grad is not None:
+                    p.grad.div_(float(max(1, group_k)))
+            live = [p for p in ps if p.grad is not None]
+            if live:
+                torch.nn.utils.clip_grad_norm_(live, max_norm=self.grad_clip)
+            opt.step()
+        return {"link_sum": link_sum, "aux_sum": aux_sum,
+                "aux_batches": aux_batches, "closed": closed,
+                "repr_step": 1, "gs_end": gs}
+
     def scan_topology(self, epoch, train, group_batches=None,
                       n_batches=None):
         """No-grad full-train scan mirroring the TRAINING window path.
@@ -577,7 +750,7 @@ class TGBPairLinkLoop:
             if recs_all:
                 fea = feasible_positions(recs_all, seed=self.seed,
                                          batch_seed=group_gs)
-                if self.arm == "2obs_mispaired":
+                if self.mispaired:
                     mmap = build_mispaired_parent_map(
                         recs_all, seed=self.seed, batch_seed=group_gs)
                     fea = [i for i in fea if i in mmap]

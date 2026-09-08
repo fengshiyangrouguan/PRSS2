@@ -70,6 +70,10 @@ def _score_from_covs(czz: torch.Tensor, czp: torch.Tensor,
       pre-compression U in the Z slot and Z in the P slot): only the Z
       side is whitened; the U side is left untouched (PCA-equivalent for
       a linear encoder).
+    * ``unbalanced`` — ``J_unbal = ||S_ZP||_F^2 / (tr(S_ZZ) tr(S_PP) + eps)``:
+      NO per-direction whitening is applied; the same centered weighted
+      covariances and ridge/eps configuration are kept, and the trace
+      normalization keeps the score scale-free in the whole matrix (spec B1).
 
     ``diag["failed"]`` is ``None`` on success, else a short code.
     """
@@ -117,6 +121,14 @@ def _score_from_covs(czz: torch.Tensor, czp: torch.Tensor,
         return None, {"failed": "nonpositive_scale",
                       "scale_z": float(sz.detach()),
                       "scale_p": float(sp.detach())}
+    if variant == "unbalanced":
+        # Spec B1: no whitening at all; trace-normalized squared dependence.
+        num = czp.square().sum()
+        den = czz.diagonal().sum() * cpp.diagonal().sum() + eps
+        return num / den.clamp(min=1e-30), {
+            "failed": None,
+            "scale_z": float(sz.detach()),
+            "scale_p": float(sp.detach())}
     if variant == "reconstruction":
         # Review form: J_rec = tr(C_UZ (C_ZZ + eps I)^-1 C_ZU) /
         # (tr(C_UU) + eps), Z trainable and U the DETACHED
@@ -560,7 +572,7 @@ class KFLaggedWindow:
                  strict: bool = False, variant: str = "full_balancing"):
         if fixed_maps is None:
             raise ValueError("KFLaggedWindow requires fixed_maps")
-        if variant not in ("full_balancing", "diagonal", "reconstruction"):
+        if variant not in ("full_balancing", "diagonal", "reconstruction", "unbalanced"):
             raise ValueError("unknown kf_variant {}".format(variant))
         self.variant = str(variant)
         self.state_dims = dict(state_dims)
@@ -838,7 +850,7 @@ class KFMomentWindow:
                  min_abs: int = 64, eps: float = 1e-4, fixed_maps=None,
                  strict: bool = False, autoclose: bool = True,
                  variant: str = "full_balancing"):
-        if variant not in ("full_balancing", "diagonal", "reconstruction"):
+        if variant not in ("full_balancing", "diagonal", "reconstruction", "unbalanced"):
             raise ValueError("unknown kf_variant {}".format(variant))
         self.variant = str(variant)
         self.state_dims = dict(state_dims)

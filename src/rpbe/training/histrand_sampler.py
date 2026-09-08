@@ -1,14 +1,22 @@
-"""Prefix-causal HistRand train negative sampler (Wiki-LR-Binary §2.3).
+"""Prefix-causal HistRand train negative sampler (Wiki-LR-Binary §2.3, §1.1 #5).
 
 For each train positive event the root task needs one negative destination.
 With probability 0.5 the negative is a *historical* destination of that src
-(a dst the src has interacted with at an EARLIER train event); otherwise it
-is drawn from the train destination universe.  The current positive dst —
-and any other true positive destination of the same (src, t) — are excluded.
+(a dst the src interacted with at an EARLIER train event); otherwise it is
+drawn from the train destination universe, EXCLUDING every dst this src has
+already seen (so hist and random are genuinely disjoint partitions).  The
+current positive dst — and any other true positive destination of the same
+(src, t) — are excluded from both branches.
 
-The sampler is deterministic in ``(model_seed, epoch, global_event_row)`` and
-only ever serves the root link task: negatives never enter the future index,
-boundary records, or any PRBE auxiliary window.
+Determinism: per-event seed ``(model_seed, epoch, global_event_row)``.
+
+Efficiency (§1.1 #5): prefix structures are built once as per-src first-
+occurrence tables (dst dedup for free); the hist branch slices one array, the
+random branch uses bounded rejection sampling over the numpy universe — never
+a per-event python rebuild of the whole universe list.
+
+The sampler only ever serves the root link task: negatives never enter the
+future index, boundary records, or any PRBE auxiliary window.
 """
 
 import bisect
@@ -16,6 +24,8 @@ import hashlib
 from typing import Dict, List, Sequence, Tuple
 
 import numpy as np
+
+_UNIVERSE_MAX_TRIES = 64
 
 
 def _row_seed(model_seed: int, epoch: int, row: int) -> int:
@@ -38,15 +48,25 @@ class HistRandTrainSampler:
         self.hist_p = float(hist_p)
         self.rng_seed = int(rng_seed)
         n = int(len(self.sources))
-        # per-src prefix structure: rows and dsts in chronological order
-        rows_by_src: Dict[int, List[int]] = {}
-        dst_by_src: Dict[int, List[int]] = {}
+        # per-src FIRST-occurrence tables: fr_rows[s] ascending global rows at
+        # which each distinct dst was first seen; fr_dst[s] parallel dst ids.
+        # hist candidates of (s, r) = fr_dst[s][:bisect(fr_rows[s], r)] (dst
+        # dedup is built in).  first_map[s] = {dst: first_row} for O(1) seen.
+        fr_rows: Dict[int, List[int]] = {}
+        fr_dst: Dict[int, List[int]] = {}
+        first_map: Dict[int, Dict[int, int]] = {}
+        seen: Dict[int, set] = {}
         for i in range(n):
             s = int(self.sources[i])
-            rows_by_src.setdefault(s, []).append(i)
-            dst_by_src.setdefault(s, []).append(int(self.destinations[i]))
-        self._rows_by_src = rows_by_src
-        self._dst_by_src = dst_by_src
+            d = int(self.destinations[i])
+            if d not in seen.get(s, ()):
+                fr_rows.setdefault(s, []).append(i)
+                fr_dst.setdefault(s, []).append(d)
+                first_map.setdefault(s, {})[d] = i
+                seen.setdefault(s, set()).add(d)
+        self._fr_rows = fr_rows
+        self._fr_dst = fr_dst
+        self._first_map = first_map
         # true positive dsts per (src, t)
         self._pos_by_st: Dict[Tuple[int, float], List[int]] = {}
         for i in range(n):
@@ -58,12 +78,7 @@ class HistRandTrainSampler:
     def sample(self, epoch: int, row_lo: int,
                src: Sequence[int], dst_pos: Sequence[int],
                t: Sequence[float], global_rows: Sequence[int]) -> np.ndarray:
-        """Sample one negative per positive; all ids INTERNAL (+1).
-
-        ``global_rows`` gives each event its global (model-wide) event row used
-        for the deterministic seed; ``row_lo`` is the stream offset of the
-        current batch (unused given global_rows, kept for interface clarity).
-        """
+        """Sample one negative per positive; all ids INTERNAL (+1)."""
         del row_lo
         src = np.asarray(src, dtype=np.int64)
         dst_pos = np.asarray(dst_pos, dtype=np.int64)
@@ -79,20 +94,41 @@ class HistRandTrainSampler:
             if use_hist and hist:
                 neg[j] = int(hist[int(rng.randint(len(hist)))])
             else:
-                pool = [u for u in self._universe.tolist()
-                        if u not in excluded]
-                if not pool:  # degenerate tiny universe: fall back to any != d
-                    pool = [u for u in self._universe.tolist() if u != d]
-                neg[j] = int(pool[int(rng.randint(len(pool)))])
+                neg[j] = int(self._random_dst(rng, s, int(gr[j]),
+                                              excluded, d))
         return neg
 
     def _hist_dsts(self, src: int, global_row: int,
                    excluded: set) -> List[int]:
-        """Historical dsts of ``src`` at events strictly before global_row."""
-        rows = self._rows_by_src.get(src, [])
+        """Unique dsts of ``src`` first seen at events strictly before row."""
+        rows = self._fr_rows.get(src)
         if not rows:
             return []
-        # strictly earlier (stream row < global_row), per prefix causality
         k = bisect.bisect_left(rows, int(global_row))
-        dsts = self._dst_by_src[src]
+        dsts = self._fr_dst[src]
+        if not excluded:
+            return dsts[:k]
         return [d for d in dsts[:k] if d not in excluded]
+
+    def _random_dst(self, rng, src: int, global_row: int, excluded: set,
+                    cur_pos: int) -> int:
+        """Random dst in universe \\ (prefix-seen(src) U excluded U {cur})."""
+        fm = self._first_map.get(src, {})
+        uni = self._universe
+        for _ in range(_UNIVERSE_MAX_TRIES):
+            cand = int(uni[int(rng.randint(len(uni)))])
+            if cand == cur_pos or cand in excluded:
+                continue
+            if cand in fm and fm[cand] < global_row:
+                continue  # already-seen dst is reserved for the hist branch
+            return cand
+        # bounded rejection failed (pathological tiny universe): explicit mask
+        keep = np.asarray([int(u) for u in uni if u != cur_pos
+                           and u not in excluded
+                           and not (u in fm and fm[u] < global_row)],
+                          dtype=np.int64)
+        if keep.size == 0:
+            raise ValueError(
+                "no legal random negative (src={} row={})".format(
+                    src, global_row))
+        return int(keep[int(rng.randint(keep.size))])

@@ -96,8 +96,6 @@ def build_compact_negatives(ds, protocol_seed: int = 20260908,
             hist = [int(x) for x in negs if (src, int(x)) in train_edges]
             pool = hist if hist else [int(x) for x in negs]
             chosen = _pick(np.asarray(pool, dtype=np.int64), h)
-            ntype = "hist" if hist else "random"
-            counts[split + "_" + ntype] += 1
             # collision gate: not the positive dst, and not any true positive
             # dst at the same (src, t)
             if chosen == dst or chosen in pos_by_st[(src, t)]:
@@ -110,6 +108,10 @@ def build_compact_negatives(ds, protocol_seed: int = 20260908,
                         "no legal negative for split={} row={}".format(
                             split, i))
                 chosen = legal[int(h) % len(legal)]
+            # neg_type reflects the FINAL candidate (spec §1.1 #4): a fallback
+            # candidate may change hist/random membership.
+            ntype = "hist" if (src, chosen) in train_edges else "random"
+            counts[split + "_" + ntype] += 1
             rows[gid] = {"neg": int(chosen), "type": ntype}
         manifest[split] = rows
     manifest["_meta"] = {
@@ -141,6 +143,32 @@ class CompactNegatives:
             self._data = json.load(f)
         self.meta = self._data.get("_meta", {})
         self._rows = {k: v for k, v in self._data.items() if k != "_meta"}
+
+    def verify(self, ds=None) -> None:
+        """Fail-closed load gate (spec §1.1 #4): content hash, split counts,
+        dataset name, per-split row completeness."""
+        body = {k: v for k, v in self._data.items() if k != "_meta"}
+        sha = manifest_sha256(body)
+        if sha != self.meta.get("sha256"):
+            raise ValueError(
+                "manifest content hash mismatch: {} != {}".format(
+                    sha, self.meta.get("sha256")))
+        if ds is not None:
+            if self.meta.get("dataset") not in (None, ds.name):
+                raise ValueError("manifest dataset {} != {}".format(
+                    self.meta.get("dataset"), ds.name))
+            expected = {"val": int(len(ds.val.sources)),
+                        "test": int(len(ds.test.sources))}
+            pc = self.meta.get("positive_counts") or {}
+            for sp in ("val", "test"):
+                if int(pc.get(sp, -1)) != expected[sp]:
+                    raise ValueError(
+                        "manifest {} positives {} != dataset {}".format(
+                            sp, pc.get(sp), expected[sp]))
+                if int(len(self._rows.get(sp, {}))) != expected[sp]:
+                    raise ValueError(
+                        "manifest {} rows {} != dataset {}".format(
+                            sp, len(self._rows.get(sp, {})), expected[sp]))
 
     def neg_for(self, split: str, global_row: int) -> Optional[int]:
         """Raw (0-based) negative dst for a global row, or None."""

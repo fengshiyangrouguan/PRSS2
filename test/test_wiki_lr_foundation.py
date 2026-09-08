@@ -1,12 +1,11 @@
-"""Foundation gates for Wiki-LR-Binary (spec §8, non-TGB subset).
+"""Foundation-review gates for Wiki-LR-Binary (spec §8 + §1.1, non-TGB).
 
 Covers what is unit-testable without a GPU / real TGB dataset:
-  * metric definitions match a scalar reference exactly;
-  * HistRandTrainSampler is deterministic, prefix-causal, excludes the current
-    positive dst (and same-(src,t) positives);
-  * stable negative digest / pick are deterministic and in-range.
-The evaluator-vs-host and real-data gates (manifest hash, zero collision,
-group yield, VRAM, speed) run on the server where the dataset lives.
+  * AP/AUC definitions match a scalar reference AND behave on all-ties inputs
+    (AP=positive rate, AUC=0.5, always within [0,1]) — §1.1 #1/#2;
+  * HistRandTrainSampler determinism, prefix dedup, hist/random disjointness,
+    same-(src,t) exclusion — §1.1 #5;
+  * stable negative digest determinism — §1.1 #4 foundation.
 """
 
 import numpy as np
@@ -18,18 +17,20 @@ from rpbe.data.wiki_binary_negatives import _pick, _stable_digest
 
 
 def _ref_ap(p, n):
+    """Tie-group reference: equal scores processed as one block."""
+    p = np.asarray(p, float); n = np.asarray(n, float)
     s = np.concatenate([p, n])
     y = np.concatenate([np.ones(len(p)), np.zeros(len(n))])
-    order = np.lexsort((-y, -s))
-    tot = 0.0
-    corr = 0.0
-    ap = 0.0
-    for i in order:
-        tot += 1
-        if y[i] == 1:
-            corr += 1
-            ap += corr / tot
-    return ap / len(p)
+    order = np.argsort(-s, kind="stable")
+    ss = s[order]; yy = y[order]
+    cuts = np.flatnonzero(np.diff(ss) != 0) + 1
+    starts = np.concatenate([[0], cuts]); ends = np.concatenate([cuts, [len(ss)]])
+    cum_p = cum_t = 0.0
+    acc = 0.0
+    for a, b in zip(starts, ends):
+        gp = yy[a:b].sum(); cum_p += gp; cum_t += b - a
+        acc += gp * (cum_p / cum_t)
+    return acc / len(p)
 
 
 def _ref_auc(p, n):
@@ -49,6 +50,22 @@ def test_ap_auc_match_scalar_reference():
     assert abs(_auc(pos, neg) - _ref_auc(pos, neg)) < 1e-12
 
 
+def test_ap_all_ties_is_positive_rate():
+    pos = np.full(100, 0.5)
+    neg = np.full(100, 0.5)
+    assert abs(_ap(pos, neg) - 0.5) < 1e-12
+    # imbalanced all-ties -> positive rate p/(p+n)
+    assert abs(_ap(np.full(30, 0.5), np.full(70, 0.5)) - 0.3) < 1e-12
+
+
+def test_auc_all_ties_is_half_and_bounded():
+    assert abs(_auc(np.full(100, 0.5), np.full(100, 0.5)) - 0.5) < 1e-12
+    for k in (10, 100):
+        p = np.full(k, 1.0); n = np.full(k, 1.0)
+        assert 0.0 <= _auc(p, n) <= 1.0
+        assert 0.0 <= _auc(np.full(k, 0.0), np.full(k, 0.0)) <= 1.0
+
+
 def test_global_metrics_hist_subset():
     rng = np.random.RandomState(1)
     pos = rng.rand(100)
@@ -62,28 +79,36 @@ def test_global_metrics_hist_subset():
     assert res["n_pos"] == 100
 
 
-def test_histrand_deterministic_and_prefix():
-    # 5 events, node 1 seen dsts {10, 20, 30} then 40 at rows 0..3
-    src = np.array([1, 1, 1, 1, 2])
-    dst = np.array([10, 20, 30, 40, 50])
-    t = np.array([0.0, 1.0, 2.0, 3.0, 4.0])
-    s = HistRandTrainSampler(src, dst, t, model_seed=7)
-    # event row 3 (dst 40): hist pool for node1 is {10,20,30} (rows<3)
+def test_histrand_deterministic_and_prefix_unique():
+    s = HistRandTrainSampler(
+        np.array([1, 1, 1, 1, 2]), np.array([10, 20, 30, 40, 50]),
+        np.array([0.0, 1.0, 2.0, 3.0, 4.0]), model_seed=7)
     a = s.sample(0, 0, [1], [40], [3.0], [3])
     b = s.sample(0, 0, [1], [40], [3.0], [3])
-    assert a[0] == b[0]
-    assert int(a[0]) in (10, 20, 30)
-    assert int(a[0]) != 40
-    # event row 0 (dst 10): no history yet -> can only come from universe
-    # (forced-hist not testable directly since hist_p=0.5; check exclusion)
-    all_neg = [int(s.sample(e, 0, [1], [10], [0.0], [0])[0])
-               for e in range(5) for _ in range(10)]
-    assert 10 not in all_neg  # current dst always excluded
+    assert int(a[0]) == int(b[0])
+    assert s._hist_dsts(1, 3, set()) == [10, 20, 30]
+    assert s._hist_dsts(1, 1, set()) == [10]
+    # dedup: same dst repeated is listed once
+    s2 = HistRandTrainSampler(
+        np.array([1, 1, 1]), np.array([7, 7, 8]),
+        np.array([0.0, 1.0, 2.0]))
+    assert s2._hist_dsts(1, 3, set()) == [7, 8]
+
+
+def test_histrand_random_excludes_prefix_seen():
+    # hist_p=0 forces the random branch; src 1 has seen {10,20,30} before row 3
+    s = HistRandTrainSampler(
+        np.array([1, 1, 1, 1, 9]),
+        np.array([10, 20, 30, 40, 200]),
+        np.array([0.0, 1.0, 2.0, 3.0, 0.0]), model_seed=1, hist_p=0.0)
+    for _ in range(60):
+        n = int(s.sample(0, 0, [1], [40], [3.0], [3])[0])
+        assert n != 40
+        assert n not in (10, 20, 30)   # never a seen dst on the random branch
+        assert n in (200,)
 
 
 def test_histrand_same_st_exclusion():
-    # node 1 has two positives at the SAME (src,t); universe is padded out by
-    # other nodes so exclusion leaves plenty of legal candidates (real data)
     src = np.array([1, 1, 1, 1, 9, 9, 9, 9])
     dst = np.array([10, 20, 30, 40, 100, 200, 300, 400])
     t = np.array([1.0, 1.0, 2.0, 3.0, 1.0, 1.0, 1.0, 1.0])
@@ -101,6 +126,5 @@ def test_stable_digest_deterministic_inrange():
     c = _stable_digest(20260908, "val", 7, 3, 5, 1.2500000001)
     assert a == b
     assert a != c
-    # _pick stays within the candidate array
     negs = np.arange(20)
     assert _pick(negs, a) in negs.tolist()

@@ -14,21 +14,49 @@ scalar/reference implementation over the same score sequence reproduces them
 exactly (spec §8 unit gate).
 """
 
+from contextlib import contextmanager
 from typing import Callable, Dict, List, Optional, Sequence
 
 import numpy as np
 import torch
 
 from rpbe.data.wiki_binary_negatives import CompactNegatives
+from rpbe.hosts.official_tgn import get_neighbor_finder
+
+
+@contextmanager
+def _full_finder_ctx(tgn, ds):
+    """Serve recursive neighbors from the FULL stream during an evaluation.
+
+    Training uses a train-only finder; when we evaluate val/test the memory
+    advances over events the train finder cannot see, so the recursion must
+    also see them.  ``find_before`` keeps strictly-before-cut-time neighbours,
+    so a full-stream finder never leaks future edges.  The caller's finder is
+    restored afterwards (spec §1.1 #3).
+    """
+    full = getattr(ds, "_wiki_full_finder", None)
+    if full is None:
+        full = get_neighbor_finder(
+            ds.full, uniform=False,
+            max_node_idx=int(ds.n_internal_nodes - 1))
+        ds._wiki_full_finder = full
+    orig = tgn.neighbor_finder
+    tgn.set_neighbor_finder(full)
+    try:
+        yield
+    finally:
+        tgn.set_neighbor_finder(orig)
 
 
 # ------------------------------------------------------------------ metrics
 def _ap(pos: np.ndarray, neg: np.ndarray) -> float:
-    """Average precision (positives-first within score ties).
+    """Average precision with tie-groups processed as one block.
 
-    Candidates sorted by (desc score, desc label).  Ties therefore resolve
-    positives ahead of negatives; the definition is deterministic and matches
-    sklearn's when there are no score ties.
+    Candidates are sorted by descending score (stable); every candidate with
+    the SAME score forms one tie-group, and the group's positives all receive
+    the precision reached AFTER the whole group is added.  With all scores
+    equal this returns the positive rate (1:1 -> 0.5), never ~1.  When there
+    are no ties it matches the usual running-precision definition.
     """
     pos = np.asarray(pos, dtype=np.float64)
     neg = np.asarray(neg, dtype=np.float64)
@@ -36,30 +64,34 @@ def _ap(pos: np.ndarray, neg: np.ndarray) -> float:
         return float("nan")
     scores = np.concatenate([pos, neg])
     labels = np.concatenate([np.ones(pos.size), np.zeros(neg.size)])
-    order = np.lexsort((-labels, -scores))  # desc label within desc score
-    n_correct = 0
-    total = 0.0
-    ap = 0.0
-    for idx in order:
-        total += 1
-        if labels[idx] == 1:
-            n_correct += 1
-            ap += n_correct / total
-    return float(ap / pos.size)
+    order = np.argsort(-scores, kind="stable")
+    ss = scores[order]
+    ll = labels[order]
+    n = ss.size
+    # group boundaries at distinct descending scores
+    cuts = np.flatnonzero(np.diff(ss) != 0) + 1
+    starts = np.concatenate([[0], cuts])
+    ends = np.concatenate([cuts, [n]])
+    lens = ends - starts
+    grp_pos = np.add.reduceat(ll, starts)
+    cum_pos = np.cumsum(grp_pos)
+    cum_tot = np.cumsum(lens)
+    ap = float((grp_pos * (cum_pos / cum_tot)).sum() / pos.size)
+    return ap
 
 
 def _auc(pos: np.ndarray, neg: np.ndarray) -> float:
-    """ROC-AUC via the pair-count rank statistic (ties count 0.5)."""
+    """ROC-AUC via the pair-count rank statistic (strict >; ties count 0.5)."""
     pos = np.sort(np.asarray(pos, dtype=np.float64))
     neg = np.sort(np.asarray(neg, dtype=np.float64))
     if pos.size == 0 or neg.size == 0:
         return float("nan")
-    # for each negative, how many positives are strictly below / tied
-    below = np.searchsorted(pos, neg, side="right")   # pos <= neg
-    strictly = np.searchsorted(pos, neg, side="left")  # pos < neg
-    wins = pos.size - strictly                        # pos > neg
-    ties = below - strictly                            # pos == neg
-    return float((wins + 0.5 * ties).sum() / (pos.size * neg.size))
+    below = np.searchsorted(pos, neg, side="right")    # #pos <= neg
+    strictly = np.searchsorted(pos, neg, side="left")   # #pos < neg
+    wins = pos.size - below                              # #pos > neg
+    ties = below - strictly                              # #pos == neg
+    out = (wins + 0.5 * ties).sum() / (pos.size * neg.size)
+    return float(min(1.0, max(0.0, out)))
 
 
 def _nll(pos: np.ndarray, neg: np.ndarray) -> float:
@@ -139,19 +171,28 @@ def score_split_binary(tgn, ds, split, negatives: CompactNegatives, *,
             pos_b = dst_pos[idx]
             t_b = timestamps[idx]
             eidx_b = eidx[idx]
-            neg_b = np.asarray(
-                [int(negatives.neg_for(split, int(r) - 1))
-                 + 1 if negatives.neg_for(split, int(r) - 1) is not None
-                 else int(pos_b[k]) for k, r in enumerate(eidx_b)],
-                dtype=np.int64)
+            # fail-closed: every split event must be present in the manifest
+            # (spec §1.1 #4); a missing negative is an error, never a fallback
+            # to the positive dst.
+            neg_vals = np.zeros(len(eidx_b), dtype=np.int64)
+            if collect:
+                hist_flags[idx] = False
+            for k, r in enumerate(eidx_b):
+                gr = int(r) - 1
+                nv = negatives.neg_for(split, gr)
+                if nv is None:
+                    raise KeyError(
+                        "manifest missing negative: split={} global_row={}".format(
+                            split, gr))
+                neg_vals[k] = int(nv) + 1
+                if collect:
+                    hist_flags[idx][k] = (negatives.type_for(split, gr)
+                                          == "hist")
             p, ng = tgn.compute_edge_probabilities(
-                src_b, pos_b, neg_b, t_b, eidx_b, n_neighbors)
+                src_b, pos_b, neg_vals, t_b, eidx_b, n_neighbors)
             if collect:
                 pos_scores[idx] = p.squeeze().cpu().numpy()
                 neg_scores[idx] = ng.squeeze().cpu().numpy()
-                hist_flags[idx] = [
-                    (negatives.type_for(split, int(r) - 1) or "rand")
-                    == "hist" for r in eidx_b]
     if not collect:
         return {}
     return global_metrics(pos_scores, neg_scores, hist_flags)
@@ -186,8 +227,9 @@ def evaluate_val(tgn, ds, negatives: CompactNegatives, *,
     """
     backup = tgn.memory.backup_memory() if tgn.use_memory else None
     try:
-        return score_split_binary(tgn, ds, "val", negatives,
-                                  n_neighbors=n_neighbors, bs=bs)
+        with _full_finder_ctx(tgn, ds):
+            return score_split_binary(tgn, ds, "val", negatives,
+                                      n_neighbors=n_neighbors, bs=bs)
     finally:
         if backup is not None:
             tgn.memory.restore_memory(backup)
@@ -199,6 +241,7 @@ def run_test_protocol(tgn, ds, negatives: CompactNegatives, *,
     if tgn.use_memory:
         tgn.memory.__init_memory__()
     replay_memory(tgn, ds, "train", n_neighbors=n_neighbors, bs=bs)
-    replay_memory(tgn, ds, "val", n_neighbors=n_neighbors, bs=bs)
-    return score_split_binary(tgn, ds, "test", negatives,
-                              n_neighbors=n_neighbors, bs=bs)
+    with _full_finder_ctx(tgn, ds):
+        replay_memory(tgn, ds, "val", n_neighbors=n_neighbors, bs=bs)
+        return score_split_binary(tgn, ds, "test", negatives,
+                                  n_neighbors=n_neighbors, bs=bs)

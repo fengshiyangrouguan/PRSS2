@@ -528,10 +528,6 @@ def main():
             st1 = stash[(r, 1)]
             st2 = stash[(r, 2)]
             root = rec["root"]
-            futr = fut.query(root, rec["t_root"])
-            if futr is None:
-                continue
-            j, dt, cp = futr
             node_times = [st1["t"], st2["t"], rec["t_root"]]
             edge_feats = [st1["edge_feat"], st2["edge_feat"],
                           rec["edge_feat_top"]]
@@ -560,6 +556,29 @@ def main():
             if any(v is None for v in
                    (dz3_2, dz3_1, dz3_r, dz2_1, dz2_r, dz1_r)):
                 continue
+            # ---- per-node aligned boundary futures S_s=(Y_s, Y_p(s)).
+            # Each path node's own first strict-future event after ITS
+            # occurrence time; leaf time = its parent edge time.  Stored per
+            # node so every line builds its own two-level boundary target
+            # (never the root's future for all three lines).
+            leaf_node = int(st1["leaf"])
+            a2_node = int(st1["node"])
+            a1_node = int(st2["node"])
+            Y = {}
+            for k, (node, t) in [
+                    ("leaf", (leaf_node, float(st1["edge_time"]))),
+                    ("a2", (a2_node, float(st1["t"]))),
+                    ("a1", (a1_node, float(st2["t"]))),
+                    ("root", (root, float(rec["t_root"])))]:
+                q = fut.query(node, t)
+                if q is None:
+                    break
+                j, dt, cp = q
+                Y[k] = (np.asarray(ds.edge_features[int(fut.eidx[j])],
+                                   dtype=np.float64),
+                        float(dt), int(cp), node)
+            if len(Y) != 4:
+                continue
             rows.append({
                 "u0": st1["u0"],
                 "z1": z1,
@@ -569,8 +588,10 @@ def main():
                 "d21": dz2_1, "d2r": dz2_r,
                 "d1r": dz1_r,
                 "ctx": ctx,
-                "S": (ds.edge_features[int(fut.eidx[j])],
-                      dt, cp, root),
+                "Y_leaf": Y["leaf"],
+                "Y_a2": Y["a2"],
+                "Y_a1": Y["a1"],
+                "Y_root": Y["root"],
             })
         return rows
 
@@ -675,29 +696,36 @@ def main():
         return
 
     # ------------------------------------------------------------ statistics
-    def make_P(rows_):
-        ef = np.stack([r["S"][0] for r in rows_])
-        dt = np.asarray([r["S"][1] for r in rows_], dtype=np.float64)
-        cp = np.asarray([r["S"][2] for r in rows_], dtype=np.int64)
-        sn = np.asarray([r["S"][3] for r in rows_], dtype=np.int64)
-        return fixed_phi_S(ef, dt, cp, sn)
-
     def col(rows_, key):
         return np.stack([r[key] for r in rows_])
 
-    def catF(D, C):
-        return np.concatenate([D, C], axis=1)
+    def _y_phi(rows_, key):
+        """fixed 128-d witness phi of one node's aligned future (Y_s)."""
+        ef = np.stack([r[key][0] for r in rows_])
+        dt = np.asarray([r[key][1] for r in rows_], dtype=np.float64)
+        cp = np.asarray([r[key][2] for r in rows_], dtype=np.int64)
+        sn = np.asarray([r[key][3] for r in rows_], dtype=np.int64)
+        return fixed_phi_S(ef, dt, cp, sn)
+
+    def line_P(rows_, k1, k2):
+        """Two-level boundary target S_s = (Y_s, Y_p(s)) as a 256-d witness."""
+        return np.concatenate([_y_phi(rows_, k1), _y_phi(rows_, k2)], axis=1)
 
     lines = {
         3: {"name": "U0", "source_key": "u0", "origin_phys": 0,
+            "target": ("Y_leaf", "Y_a2"),
+            "target_label": "(Y_{a3},Y_{a2})",
             "points": [(1, "d32"), (2, "d31"), (3, "d3r")]},
         2: {"name": "Z1", "source_key": "z1", "origin_phys": 1,
+            "target": ("Y_a2", "Y_a1"),
+            "target_label": "(Y_{a2},Y_{a1})",
             "points": [(2, "d21"), (3, "d2r")]},
         1: {"name": "Z2", "source_key": "z2", "origin_phys": 2,
+            "target": ("Y_a1", "Y_root"),
+            "target_label": "(Y_{a1},Y_{a0})",
             "points": [(3, "d1r")]},
     }
 
-    P_aud = make_P(audit_rows)
     C_aud = col(audit_rows, "ctx")
     # matched-context key = a historical node-time scalar in C (index 74:
     # root/leaf hashes and one node time precede the three edge times).
@@ -721,25 +749,37 @@ def main():
         layer."""
         Xc = col(calib_rows_, spec["source_key"])
         Xa = col(audit_rows_, spec["source_key"])
-        Pc = make_P(calib_rows_)
-        Qc, Qa = rs.source_component(Xc, Pc, Xa, lam=args.lam)
+        k1, k2 = spec["target"]
+        Pc = line_P(calib_rows_, k1, k2)
+        Pa = line_P(audit_rows_, k1, k2)
+        mpQ = rs.fit_ridge_map(Xc, Pc, lam=args.lam)
+        Qc = rs.apply_ridge_map(mpQ, Xc)
+        Qa = rs.apply_ridge_map(mpQ, Xa)
 
-        # ---- source signal: how much of the (non-residual) audit P does the
-        # fixed Q_s explain; gate = above the 95th pct of a within-strata
-        # shuffle null (permuting X_s destroys the source-future link).
-        sig = rs.explained_var(P_aud, Qa, eps=eps)
+        # ---- source signal: explained variance of the line's OWN boundary
+        # target P_s=(Y_s,Y_p(s)) by the fixed Q_s.  Gate: signal > 0 AND
+        # signal > null_p95 -- a negative explained variance is never a
+        # usable source signal (the shuffle null is also negative).
+        sig = rs.explained_var(Pa, Qa, eps=eps)
         rng_null = np.random.RandomState(FIXED_SEED + 5000 + s)
         nulls = []
         for _ in range(args.n_null):
             Xp = rs.permute_within_strata(Xa, strata, rng_null)
-            nulls.append(rs.explained_var(P_aud,
-                                          rs.apply_ridge_map(
-                                              rs.fit_ridge_map(
-                                                  Xc, Pc, lam=args.lam),
-                                              Xp),
+            nulls.append(rs.explained_var(Pa, rs.apply_ridge_map(mpQ, Xp),
                                           eps=eps))
         null_p95 = float(np.percentile(nulls, 95))
-        sig_ok = bool(sig > null_p95)
+        sig_ok = bool(sig > 0.0 and sig > null_p95)
+        # bootstrap CI on the source signal (root-cluster resampling)
+        rng_ci = np.random.RandomState(FIXED_SEED + 300 + s)
+        n_aud_l = len(audit_rows_)
+        sig_boot = []
+        for _ in range(args.n_bootstrap):
+            idx = rng_ci.choice(np.arange(n_aud_l), size=n_aud_l,
+                                replace=True)
+            sig_boot.append(rs.explained_var(
+                Pa[idx], rs.apply_ridge_map(mpQ, Xa[idx]), eps=eps))
+        sig_lo, sig_hi = rs.retention_ci(np.asarray(sig_boot))
+        sig_ci_ok = bool(sig_lo > 0.0)
 
         # ---- identity at the source: X_s itself recovers Q_s (~1) ----
         mp_id = rs.fit_ridge_map(Xc, Qc, lam=args.lam_ret)
@@ -788,11 +828,13 @@ def main():
         else:
             R_perm, perm_ok = float("nan"), True
 
-        line_ok = bool(sig_ok and id_ok and floor_ok and perm_ok
+        line_ok = bool(sig_ok and sig_ci_ok and id_ok and floor_ok and perm_ok
                        and mem_parity["ok"])
         return {
+            "target": spec.get("target_label"),
             "signal": {"value": float(sig), "null_p95": null_p95,
-                       "ok": sig_ok},
+                       "ci_lo": float(sig_lo), "ci_hi": float(sig_hi),
+                       "ok": sig_ok, "ci_ok": sig_ci_ok},
             "identity": {"value": float(R_id), "ok": id_ok},
             "delete_floor": {"value": float(R_floor), "ok": floor_ok},
             "mismatched_delta": {"value": float(R_perm), "ok": perm_ok},

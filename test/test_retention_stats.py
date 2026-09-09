@@ -212,5 +212,21 @@ def test_corr2_recoverability_range_and_affine_invariance():
     assert abs(R1 - R0) < 1e-9, (R0, R1)
 
 
+def test_corr2_weighted_selects_direction():
+    """Strength-weighting must emphasise the strongly recoverable direction."""
+    r = np.random.RandomState(12)
+    n = 500
+    Q = r.normal(size=(n, 2))
+    Qhat = np.zeros_like(Q)
+    Qhat[:, 0] = 1.5 * Q[:, 0] + 0.1 * r.normal(size=n)   # strong dir 0
+    Qhat[:, 1] = 0.1 * r.normal(size=n)                    # noise dir 1
+    eq = rs.corr2_recoverability(Q, Qhat)
+    wt = rs.corr2_recoverability(Q, Qhat, weights=[1.0, 0.0])
+    d0 = rs._dir_pearson2(Q, Qhat)[0]
+    assert abs(wt - d0) < 1e-6, (wt, d0)
+    assert wt >= eq, (wt, eq)
+    assert 0.0 <= wt <= 1.0
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-q"]))

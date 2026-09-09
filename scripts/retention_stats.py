@@ -154,10 +154,9 @@ def centered_sq_corr_strength(A, B, lam=1e-2, eps=1e-6):
                                           Cab.T @ M)))
 
 
-def corr2_recoverability(Q, Qhat):
-    """Centered, correlation-type recoverability in [0, 1]: mean over the k
-    source directions of the squared Pearson correlation between Q_s and its
-    recovery Qhat.  Invariant to mean/scale drift of either set."""
+def _dir_pearson2(Q, Qhat):
+    """Per-direction squared Pearson correlation (0 where a direction has no
+    variance)."""
     Q = Q - Q.mean(axis=0)
     Qh = Qhat - Qhat.mean(axis=0)
     vq = np.sqrt((Q ** 2).mean(axis=0))
@@ -166,15 +165,33 @@ def corr2_recoverability(Q, Qhat):
     good = den > 1e-12
     vals = np.zeros(Q.shape[1])
     vals[good] = ((Q * Qh).mean(axis=0)[good] / den[good]) ** 2
-    return float(vals.mean())
+    return vals
 
 
-def corr2_map_metric(mp, Qa, Fa):
+def corr2_recoverability(Q, Qhat, weights=None):
+    """Centered, correlation-type recoverability in [0, 1].
+
+    Mean over the k source directions of the squared Pearson correlation
+    between Q_s and its recovery Qhat.  With ``weights`` (e.g. the canonical
+    strengths squared), directions are combined as a strength-weighted mean
+    instead of equally.
+    """
+    vals = _dir_pearson2(Q, Qhat)
+    if weights is None:
+        return float(vals.mean())
+    w = np.asarray(weights, dtype=np.float64)
+    sw = w.sum()
+    if sw <= 0:
+        return float(vals.mean())
+    return float((w * vals).sum() / sw)
+
+
+def corr2_map_metric(mp, Qa, Fa, weights=None):
     """corr² recoverability of Q_s from features Fa using a pre-fitted map."""
-    return corr2_recoverability(Qa, apply_ridge_map(mp, Fa))
+    return corr2_recoverability(Qa, apply_ridge_map(mp, Fa), weights=weights)
 
 
-def corr2_bootstrap(mp, Qa, Fa, n_boot, seed):
+def corr2_bootstrap(mp, Qa, Fa, n_boot, seed, weights=None):
     """Cluster-bootstrap CI for the corr² recoverability (map fit on calib)."""
     rng = np.random.RandomState(seed)
     n = len(Qa)
@@ -182,7 +199,7 @@ def corr2_bootstrap(mp, Qa, Fa, n_boot, seed):
     out = []
     for _ in range(n_boot):
         idx = rng.choice(idx_all, size=n, replace=True)
-        out.append(corr2_map_metric(mp, Qa[idx], Fa[idx]))
+        out.append(corr2_map_metric(mp, Qa[idx], Fa[idx], weights=weights))
     return np.asarray(out)
 
 

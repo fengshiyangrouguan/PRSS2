@@ -76,9 +76,11 @@ Usage:
         --n-bootstrap 200 --memory-parity-batches 5
 """
 import argparse
+import hashlib
 import json
 import os
 import pickle
+import re
 import sys
 from pathlib import Path
 
@@ -223,6 +225,26 @@ class FutureIndex:
 
 
 # ------------------------------------------------------------------- main
+def model_meta(ckpt_path):
+    """Arm / seed / epoch / score + content hash of the audited checkpoint, so
+    a result can never be read without knowing exactly which model produced
+    it."""
+    p = Path(ckpt_path)
+    arm = p.parent.name
+    gp = p.parent.parent.name
+    m = re.search(r"seed(\d+)", gp)
+    seed = int(m.group(1)) if m else None
+    ck = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+    return {
+        "arm": arm,
+        "seed": seed,
+        "epoch": ck.get("epoch"),
+        "score": ck.get("score"),
+        "ckpt": str(p),
+        "ckpt_sha256": hashlib.sha256(p.read_bytes()).hexdigest()[:16],
+    }
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--ckpt", required=True)
@@ -798,6 +820,8 @@ def run_stats(calib_rows, audit_rows, calib_h_rows, args, mem_parity,
         Qc = rs.predict_source_component(mpd, Xc)
         Qa = rs.predict_source_component(mpd, Xa)
         Pq_aud = rs.project_future(mpd, Pa)
+        # per-direction canonical strengths squared -> strength-weighted mean
+        wts = np.asarray(mpd["sv"], dtype=np.float64) ** 2
 
         # ---- source signal: centered squared-canonical strength J ----
         J = rs.centered_sq_corr_strength(Qa, Pq_aud, lam=args.lam, eps=eps)
@@ -829,6 +853,7 @@ def run_stats(calib_rows, audit_rows, calib_h_rows, args, mem_parity,
         # ---- identity at the source: X_s recovers Q_s (corr² ~ 1) ----
         mp_id = rs.fit_ridge_map(Xc, Qc, lam=args.lam_ret)
         R_id = rs.corr2_map_metric(mp_id, Qa, Xa)
+        R_id_w = rs.corr2_map_metric(mp_id, Qa, Xa, weights=wts)
         id_ok = bool(R_id >= args.identity_min)
 
         # ---- remove-source floor: Delta = 0 recovers ~0 ----
@@ -839,9 +864,10 @@ def run_stats(calib_rows, audit_rows, calib_h_rows, args, mem_parity,
 
         # ---- per-point retention (correlation-type recoverability) ----
         points = [{"phys": spec["origin_phys"], "delta": "source",
-                   "R": float(R_id), "ci_lo": float(R_id),
-                   "ci_hi": float(R_id), "ev_raw": float(R_id),
-                   "ok": True}]
+                   "R": float(R_id), "Rw": float(R_id_w),
+                   "ci_lo": float(R_id), "ci_hi": float(R_id),
+                   "ciw_lo": float(R_id_w), "ciw_hi": float(R_id_w),
+                   "ev_raw": float(R_id), "ok": True}]
         first_dc = first_da = None
         for phys, dk in spec["points"]:
             Dc = col(calib_rows_, dk)
@@ -850,15 +876,23 @@ def run_stats(calib_rows, audit_rows, calib_h_rows, args, mem_parity,
                 first_dc, first_da = Dc, Da
             mp_k = rs.fit_ridge_map(Dc, Qc, lam=args.lam_ret)
             R_k = rs.corr2_map_metric(mp_k, Qa, Da)
+            R_kw = rs.corr2_map_metric(mp_k, Qa, Da, weights=wts)
             ev_k = rs.retention_map_R(mp_k, Qa, Da, eps=eps)  # diagnostic
             if do_ci:
                 boot = rs.corr2_bootstrap(mp_k, Qa, Da, args.n_bootstrap,
                                           FIXED_SEED + 9000 + s * 10 + phys)
+                boot_w = rs.corr2_bootstrap(mp_k, Qa, Da, args.n_bootstrap,
+                                            FIXED_SEED + 9500 + s * 10 + phys,
+                                            weights=wts)
                 lo, hi = rs.retention_ci(boot)
+                low, hiw = rs.retention_ci(boot_w)
             else:
                 lo = hi = float(R_k)
+                low = hiw = float(R_kw)
             points.append({"phys": int(phys), "delta": dk,
-                           "R": float(R_k), "ci_lo": lo, "ci_hi": hi,
+                           "R": float(R_k), "Rw": float(R_kw),
+                           "ci_lo": lo, "ci_hi": hi,
+                           "ciw_lo": low, "ciw_hi": hiw,
                            "ev_raw": float(ev_k), "ok": True})
 
         # ---- mismatched-delta control (permuted Delta recovers ~0) ----
@@ -876,11 +910,14 @@ def run_stats(calib_rows, audit_rows, calib_h_rows, args, mem_parity,
                        and mem_parity["ok"])
         return {
             "target": spec.get("target_label"),
+            "n_dir": int(args.n_dir),
+            "dir_weights": [float(x) for x in wts],
             "signal": {"J": float(J), "ev_raw": float(ev_raw),
                        "null_p95": null_p95,
                        "ci_lo": float(sig_lo), "ci_hi": float(sig_hi),
                        "ok": sig_ok, "ci_ok": sig_ci_ok},
-            "identity": {"value": float(R_id), "ok": id_ok},
+            "identity": {"value": float(R_id), "value_w": float(R_id_w),
+                         "ok": id_ok},
             "delete_floor": {"value": float(R_floor), "ok": floor_ok},
             "mismatched_delta": {"value": float(R_perm), "ok": perm_ok},
             "points": points,
@@ -913,10 +950,16 @@ def run_stats(calib_rows, audit_rows, calib_h_rows, args, mem_parity,
                 flush=True)
 
     report = {
-        "protocol": "same-source explained-variance retention, leak-free "
-                    "historical C, direct (non-chained) points; same-tail "
-                    "causal calibration is the main result, head->tail is a "
-                    "transfer stress test",
+        "protocol": "fixed same-source Q_s linear recoverability "
+                    "(corr², equal-mean and canonical-strength-weighted); "
+                    "source gate = audit-centered squared-canonical strength J "
+                    "vs same-layer shuffle-null p95; per-line two-level "
+                    "boundary target S_s=(Y_s,Y_p(s)); leak-free historical C; "
+                    "same-tail causal calibration (main) + head->tail transfer "
+                    "stress; no chaining, no per-layer J ratios.  NOT a "
+                    "retained-information fraction: the plotted value is "
+                    "correlation-type recoverability in [0,1].",
+        "model": model_meta(args.ckpt),
         "layout": layout if layout is not None else
             {"note": "recomputed from saved rows (block layout was stored at "
                      "extraction)"},

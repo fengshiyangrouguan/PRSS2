@@ -687,59 +687,77 @@ def main():
     # root/leaf hashes and one node time precede the three edge times).
     strata = rs.strata_ids(C_aud[:, 74])
 
+    def resid_on_C(Cc, Yc, Ca, Ya, lam=None):
+        """Regress C out of Y (fit on calib rows), apply to calib + audit."""
+        mp = rs.fit_ridge_map(Cc, Yc, lam=args.lam if lam is None else lam)
+        return (Yc - rs.apply_ridge_map(mp, Cc),
+                Ya - rs.apply_ridge_map(mp, Ca))
+
     def compute_line(s, spec, calib_rows_, audit_rows_, do_ci):
-        """Fit Q_s and the retention maps on `calib_rows_`, score the
-        `audit_rows_` (same audit rows for both fits).  Every point is a direct
-        explained variance of the SAME source component Q_s (no chaining)."""
+        """Source-specific predictive signal given context C.
+
+        Step 1 (calib only): residualize the source state and the future
+        observation against C -> X_s^perp, P^perp.  Step 2: the source
+        component Q_s = ridge(X_s^perp -> P^perp) is fit on those residuals --
+        it is the source's OWN incremental predictive signal over C, so it is
+        never re-residualized later.  Step 3: at each downstream position the
+        paired-removal delta is likewise C-residualized on calib
+        (Delta^perp) and tested on the audit set for how much of the SAME Q_s
+        it recovers.  Gates: source signal above a within-strata shuffle null
+        (else the source is not identifiable and the line is not drawn),
+        identity ~1, remove-source (Delta=0) ~0, mismatched-delta ~0.  Points
+        are direct regressions against Q_s -- no chaining."""
         Xc = col(calib_rows_, spec["source_key"])
         Xa = col(audit_rows_, spec["source_key"])
         Pc = make_P(calib_rows_)
         Cc = col(calib_rows_, "ctx")
-        Qc, Qa = rs.source_component(Xc, Pc, Xa, lam=args.lam)
 
-        # ---- source signal vs matched-context shuffle null ----
-        sig, null_p95 = rs.source_signal_and_null(
-            Xc, Pc, Xa, P_aud, strata, FIXED_SEED, lam=args.lam,
-            n_null=args.n_null, eps=eps)
+        XcR, XaR = resid_on_C(Cc, Xc, C_aud, Xa)
+        PcR, PaR = resid_on_C(Cc, Pc, C_aud, P_aud)
+        mpQ = rs.fit_ridge_map(XcR, PcR, lam=args.lam)
+        Qc = rs.apply_ridge_map(mpQ, XcR)
+        Qa = rs.apply_ridge_map(mpQ, XaR)
+
+        # ---- source signal (P^perp predicted by X^perp), paired-shuffle null
+        sig = rs.explained_var(PaR, Qa, eps=eps)
+        rng_null = np.random.RandomState(FIXED_SEED + 5000 + s)
+        nulls = []
+        for _ in range(args.n_null):
+            Xp = rs.permute_within_strata(XaR, strata, rng_null)
+            nulls.append(rs.explained_var(PaR,
+                                          rs.apply_ridge_map(mpQ, Xp),
+                                          eps=eps))
+        null_p95 = float(np.percentile(nulls, 95))
         sig_ok = bool(sig > null_p95)
 
-        # ---- identity at the source position ----
-        mp_id = rs.fit_ridge_map(catF(Xc, Cc), Qc, lam=args.lam_ret)
-        R_id = rs.retention_map_R(mp_id, Qa, catF(Xa, C_aud), eps=eps)
+        # ---- identity at the source: X_s^perp recovers Q_s
+        mp_id = rs.fit_ridge_map(XcR, Qc, lam=args.lam_ret)
+        R_id = rs.retention_map_R(mp_id, Qa, XaR, eps=eps)
         id_ok = bool(R_id >= args.identity_min)
 
-        # ---- C-only floor (delete-source: Delta = 0) ----
-        mp_floor = rs.fit_ridge_map(Cc, Qc, lam=args.lam_ret)
-        R_floor = rs.retention_map_R(mp_floor, Qa, C_aud, eps=eps)
-        floor_ok = bool(R_floor <= args.floor_max)
+        # ---- remove-source floor: Delta^perp = 0 must recover ~nothing
+        zero = np.zeros_like(XcR)
+        mp_floor = rs.fit_ridge_map(zero, Qc, lam=args.lam_ret)
+        R_floor = rs.retention_map_R(mp_floor, Qa, np.zeros_like(XaR),
+                                     eps=eps)
+        floor_ok = bool(abs(R_floor) <= args.floor_max)
 
-        # ---- mismatched-delta control (unrelated info must not recover Q) ----
-        if spec["points"]:
-            pk = spec["points"][0][1]
-            Da = col(audit_rows_, pk)
-            Dc = col(calib_rows_, pk)
-            perm = rs.permute_within_strata(Da, strata,
-                                            np.random.RandomState(
-                                                FIXED_SEED + 7000 + s))
-            mp_perm = rs.fit_ridge_map(catF(Dc, Cc), Qc, lam=args.lam_ret)
-            R_perm = rs.retention_map_R(mp_perm, Qa, catF(perm, C_aud),
-                                        eps=eps)
-            perm_ok = bool(R_perm - R_floor <= 0.02)
-        else:
-            R_perm, perm_ok = float("nan"), True
-
-        # ---- per-point retention (direct, same Q_s, no chaining) ----
+        # ---- per-point retention from residualized paired-removal deltas
         points = [{"phys": spec["origin_phys"], "delta": "source",
                    "R": float(R_id), "ci_lo": float(R_id),
                    "ci_hi": float(R_id), "ok": True}]
+        first_dc = first_da = None
         for phys, dk in spec["points"]:
-            Dc_k = col(calib_rows_, dk)
-            Da_k = col(audit_rows_, dk)
-            mp_k = rs.fit_ridge_map(catF(Dc_k, Cc), Qc, lam=args.lam_ret)
-            R_k = rs.retention_map_R(mp_k, Qa, catF(Da_k, C_aud), eps=eps)
+            Dc = col(calib_rows_, dk)
+            Da = col(audit_rows_, dk)
+            DcR, DaR = resid_on_C(Cc, Dc, C_aud, Da)
+            if first_dc is None:
+                first_dc, first_da = DcR, DaR
+            mp_k = rs.fit_ridge_map(DcR, Qc, lam=args.lam_ret)
+            R_k = rs.retention_map_R(mp_k, Qa, DaR, eps=eps)
             if do_ci:
                 boot = rs.retention_bootstrap(
-                    mp_k, Qa, catF(Da_k, C_aud), np.arange(len(audit_rows_)),
+                    mp_k, Qa, DaR, np.arange(len(audit_rows_)),
                     args.n_bootstrap, FIXED_SEED + 9000 + s * 10 + phys,
                     eps=eps)
                 lo, hi = rs.retention_ci(boot)
@@ -748,10 +766,22 @@ def main():
             points.append({"phys": int(phys), "delta": dk,
                            "R": float(R_k), "ci_lo": lo, "ci_hi": hi,
                            "ok": True})
+
+        # ---- mismatched-delta control (permuted Delta^perp recovers ~0)
+        if first_dc is not None:
+            perm = rs.permute_within_strata(first_da, strata,
+                                            np.random.RandomState(
+                                                FIXED_SEED + 7000 + s))
+            mp_perm = rs.fit_ridge_map(first_dc, Qc, lam=args.lam_ret)
+            R_perm = rs.retention_map_R(mp_perm, Qa, perm, eps=eps)
+            perm_ok = bool(R_perm - R_floor <= 0.02)
+        else:
+            R_perm, perm_ok = float("nan"), True
+
         line_ok = bool(sig_ok and id_ok and floor_ok and perm_ok
                        and mem_parity["ok"])
         return {
-            "signal": {"value": float(sig), "null_p95": float(null_p95),
+            "signal": {"value": float(sig), "null_p95": null_p95,
                        "ok": sig_ok},
             "identity": {"value": float(R_id), "ok": id_ok},
             "delete_floor": {"value": float(R_floor), "ok": floor_ok},

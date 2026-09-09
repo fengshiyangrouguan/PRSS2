@@ -195,12 +195,17 @@ def build_model(args, device):
     ts = train.timestamps.astype(np.float64)
     ms, ss = float(ts.mean()), float(ts.std()) + 1e-8
 
-    # BenchTemp official TGN, official end-mode memory update
-    # (memory_update_at_start=False — the protocol the official numbers
-    # were produced under).  A vendored monotonicity guard in model/tgn.py
-    # fixes the interleaved src/dst "time in the past" assert on
-    # homogeneous graphs.  n_layers >= 2 so internal compressible
-    # interfaces (0 < layer < n_layers) exist for Gamma.
+    # BenchTemp official TGN.  memory_update_at_start=True is the official /
+    # main-lineage protocol: the memory GRU update is in the loss path (so the
+    # cross-batch memory is actually learnable), versus end-mode where the
+    # loop's per-batch detach_memory() leaves the GRU with no task gradient.
+    # The model is ALWAYS built with use_memory=True (identical module graph +
+    # construction-time RNG across arms); --no-memory is applied AFTER
+    # construction as a runtime toggle (see below), so memory and no-memory
+    # arms are strictly paired.  A vendored monotonicity guard in model/tgn.py
+    # fixes the interleaved src/dst "time in the past" assert on homogeneous
+    # graphs.  n_layers >= 2 so internal compressible interfaces (0 < layer <
+    # n_layers) exist for Gamma.
     assert args.n_layers >= 2, "host needs n_layers >= 2 for Gamma"
     tgn = TGN(
         neighbor_finder=finder,
@@ -210,10 +215,10 @@ def build_model(args, device):
         n_layers=args.n_layers,
         n_heads=2,
         dropout=0.1,
-        use_memory=not args.no_memory,
+        use_memory=True,
         message_dimension=100,
         memory_dimension=172,
-        memory_update_at_start=False,
+        memory_update_at_start=True,
         embedding_module_type="graph_attention",
         message_function="identity",
         aggregator_type="last",
@@ -240,12 +245,30 @@ def build_model(args, device):
     if args.no_compress:
         compressor = None
     else:
+        # RNG isolation: building Gamma must not consume the task-stream RNG,
+        # so a --no-compress control and a compressed arm draw identical
+        # dropout / sampling sequences (same isolation the aux heads use).
+        _rng_saved = (torch.get_rng_state(), np.random.get_state(),
+                      random.getstate(),
+                      torch.cuda.get_rng_state(device)
+                      if torch.cuda.is_available() else None)
         compressor = RecursiveCompressor(rpbe_cfg).to(device)
+        torch.set_rng_state(_rng_saved[0])
+        np.random.set_state(_rng_saved[1])
+        random.setstate(_rng_saved[2])
+        if _rng_saved[3] is not None:
+            torch.cuda.set_rng_state(_rng_saved[3], device)
     adapter = UciTGNAdapter(
         tgn.embedding_module, compressor=compressor,
         n_neighbors=args.n_neighbors,
         trace_pairs_per_parent=args.trace_pairs_per_parent)
     tgn.embedding_module = adapter
+    # --no-memory is a runtime toggle on an IDENTICAL architecture (matched
+    # control): memory modules exist and consumed identical init RNG, but the
+    # host recursion and the TGN forward both ignore them at run time.
+    if args.no_memory:
+        tgn.use_memory = False
+        adapter.host.use_memory = False
     # Optimizer ownership must be disjoint (Wiki-LR-Binary spec §4.1): head =
     # the affinity decoder ONLY; repr = every OTHER trainable parameter (host
     # encoder + Gamma + compressor + memory).  A leaf is visited twice under
@@ -431,12 +454,12 @@ def main():
         kf_min_trees=args.kf_min_trees,
         fail_below=args.kf_fail_below,
         audit_trace=True,
-        repr_every_batch=(aux_kind == "none"),
         aux_prefix_groups=aux_prefix, group_plan_sha=plan_sha,
         use_parent=use_parent, mispaired=mispaired,
         context_mode=context_mode, variant=variant,
         aux_kind=aux_kind, aux_heads=aux_heads,
-        aux_optimizer=aux_optimizer, aux_lambda=aux_lambda)
+        aux_optimizer=aux_optimizer, aux_lambda=aux_lambda,
+        memory_grad_probe=(not args.no_memory))
 
     save_json(out / "config.json", {
         "data": "uci", "seed": args.seed, "arm": eff_arm,
@@ -526,6 +549,7 @@ def main():
 
     epoch = start_epoch
     while epoch < budget:
+        gs_before = gs
         t0 = time.time()
         row = loop.train_epoch(
             epoch, gs, train,
@@ -533,6 +557,26 @@ def main():
         gs = row.get("global_step", gs)
         row["epoch"] = epoch
         row["epoch_seconds"] = time.time() - t0
+        # ---- hard cadence / memory-grad assertions (spec-final) ----
+        raw_task = int(row.get("task_step", gs)) - gs_before
+        raw_repr = int(row.get("repr_step", 0))
+        raw_nbatches = int(row.get("n_batches", 0))
+        mem_grad = float(row.get("mem_grad_norm", 0.0))
+        expected_repr = int(math.ceil(
+            raw_nbatches / float(max(1, args.kf_group_batches))))
+        assert raw_task == raw_nbatches, (
+            "cadence broken: task_step delta {} != n_batches {}".format(
+                raw_task, raw_nbatches))
+        assert raw_repr == expected_repr, (
+            "cadence broken: repr_step {} != expected {} (n_batches {}, "
+            "group_batches {})".format(
+                raw_repr, expected_repr, raw_nbatches,
+                args.kf_group_batches))
+        if epoch == 0 and not args.no_memory:
+            assert mem_grad > 0.0, (
+                "memory GRU received no task gradient in epoch 0 "
+                "(mem_grad_norm=0); start-mode cross-batch memory is not "
+                "learning")
         # cumulative repr/closed step counters across epochs (§1.1 #6); curves
         # use cumulative repr_step as their x-axis.
         repr_cum += int(row.get("repr_step", 0))
@@ -612,11 +656,31 @@ def main():
                 budget = min(args.budget_cap, budget + 20)
                 print("budget-censored: extend to epoch {}".format(budget),
                       flush=True)
+    # ---- final test: exactly once, from best.pt, memory reset -> replay
+    # train -> replay val -> score test (mirrors main).  Selection was val-AP
+    # only; test is never used for early stopping.
+    test_row = None
+    best_path = out / "best.pt"
+    if best_path.exists():
+        best = torch.load(best_path, map_location=device)
+        c["tgn"].load_state_dict(best["model"]["tgn"])
+        if c["compressor"] is not None and "compressor" in best["model"]:
+            c["compressor"].load_state_dict(best["model"]["compressor"])
+        if aux_heads is not None and "aux_heads" in best:
+            aux_heads.load_state_dict(best["aux_heads"])
+        from rpbe.training.uci_eval import evaluate_test
+        test_row = evaluate_test(
+            c["tgn"], ds, n_neighbors=args.n_neighbors, bs=args.bs,
+            full_finder=c["full_finder"])
+        print(json.dumps({"final_test": test_row}, allow_nan=True),
+              flush=True)
     summary = {"data": "uci", "seed": args.seed, "arm": args.arm,
                "best_epoch": int(best_epoch),
                "best_{}".format(selection): float(best_val),
                "selection": selection, "stop_reason": stop_reason,
                "extended": bool(extended)}
+    if test_row is not None:
+        summary["test"] = test_row
     save_json(out / "summary.json", summary)
     # ---- read-only comparison sidecar (spec §26 item 13) ----
     try:

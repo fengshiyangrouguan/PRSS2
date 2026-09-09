@@ -65,12 +65,12 @@ class TGBPairLinkLoop:
                  kf_group_batches=56, kf_min_trees=896,
                  n_observations=2, trace_mode="evenly_spaced",
                  fail_below=False, train_neg_sampler=None,
-                 repr_every_batch=False,
                  audit_trace=False, aux_prefix_groups=None,
                  group_plan_sha=None, use_parent=None, mispaired=None,
                  context_mode="full", variant="full_balancing",
                  aux_kind="kyfan", aux_heads=None, aux_optimizer=None,
-                 aux_lambda=None, calibrate_groups=0):
+                 aux_lambda=None, calibrate_groups=0,
+                 memory_grad_probe=False):
         self.tgn = tgn
         self.device = device
         self.batch_size = int(batch_size)
@@ -114,6 +114,15 @@ class TGBPairLinkLoop:
         # task/aux gradient gauges (spec §final item 7).
         self.calibrate_groups = int(calibrate_groups)
         self.calibrate = self.calibrate_groups > 0
+        # memory-GRU grad probe: records the first nonzero gradient norm over
+        # the memory updater's parameters so runners can hard-assert the
+        # cross-batch memory path is actually learning (start-mode only).
+        self.memory_grad_probe = bool(memory_grad_probe)
+        self._mem_probe_params = (
+            self._memory_updater_params() if self.memory_grad_probe else [])
+        self._mem_probe_done = False
+        self._mem_probe_batches = 0
+        self._mem_grad_norm = 0.0
         self.kf_on = self.aux_kind in ("kyfan", "rec", "pred") \
             and self.lambda_kf > 0
         self.fail_below = bool(fail_below)
@@ -128,8 +137,6 @@ class TGBPairLinkLoop:
         # prefix-causal train negative sampler (root task only); when None a
         # uniform-over-destination-universe fallback is used.
         self.train_neg_sampler = train_neg_sampler
-        self.repr_every_batch = bool(repr_every_batch)
-
         self._dst_univ = None
         # shared group plan (spec §1.1-final): aux_prefix_groups = number of
         # leading macro groups eligible for the auxiliary windows; groups after
@@ -335,6 +342,7 @@ class TGBPairLinkLoop:
         n_censored_tail_groups = 0
         aux_terms_total = 0
         self.reset_gauges()
+        self._reset_memory_grad_probe()
         self.window_diag = []
 
         group_start = 0
@@ -367,6 +375,7 @@ class TGBPairLinkLoop:
                         continue
                     link_loss, _records = out
                     link_loss.backward()
+                    self._probe_memory_grad()
                     self._clip(self.head_params)
                     self.head_optimizer.step()
                     if self.tgn.use_memory:
@@ -556,6 +565,7 @@ class TGBPairLinkLoop:
                         _tn, an = self.gauge_comp(link_loss, auxiliary)
                         self._gauge_group_aux.append(an)
                 loss.backward()
+                self._probe_memory_grad()
                 self._clip(self.head_params)
                 if not self.calibrate:
                     self.head_optimizer.step()
@@ -568,8 +578,7 @@ class TGBPairLinkLoop:
                 print("[audit-debug] group=%d keys=%d records=%d hits=%d"
                       % (group_start // self.kf_group_batches,
                          len(g_by_pos_all), _grp_recs, _grp_hits), flush=True)
-            if self.repr_optimizer is not None and self.repr_params \
-                    and not self.repr_every_batch:
+            if self.repr_optimizer is not None and self.repr_params:
                 for p in self.repr_params:
                     if p.grad is not None:
                         p.grad.div_(float(max(1, group_k)))
@@ -598,6 +607,7 @@ class TGBPairLinkLoop:
             "aux_comp_grad_norm": gsum["aux_comp_grad_norm"],
             "task_comp_grad_norm": gsum["task_comp_grad_norm"],
             "comp_param_delta": gsum["comp_param_delta"],
+            "mem_grad_norm": self._mem_grad_norm,
             "window_diag": list(self.window_diag),
         }
 
@@ -608,6 +618,38 @@ class TGBPairLinkLoop:
         if live:
             torch.nn.utils.clip_grad_norm_(
                 live, max_norm=self.grad_clip, error_if_nonfinite=True)
+
+    # ------------------------------------------------------ memory-grad probe
+    def _memory_updater_params(self):
+        """Parameters of the cross-batch memory GRU (trainable in repr)."""
+        mu = getattr(self.tgn, "memory_updater", None)
+        return list(mu.parameters()) if mu is not None else []
+
+    def _probe_memory_grad(self):
+        """After a grad-enabled backward, latch the first nonzero memory-GRU
+        grad norm.  Two grad batches are required: in start-mode the GRU only
+        enters the loss graph once the previous batch has stored messages."""
+        if self._mem_probe_done or not self.memory_grad_probe \
+                or self.calibrate or not self.tgn.use_memory \
+                or not self._mem_probe_params:
+            return
+        self._mem_probe_batches += 1
+        if self._mem_probe_batches < 2:
+            return
+        grads = [p.grad for p in self._mem_probe_params
+                 if p.grad is not None]
+        if not grads:
+            return
+        norm = float(sum(float((g.detach() ** 2).sum())
+                         for g in grads) ** 0.5)
+        if norm > 0.0:
+            self._mem_grad_norm = float(norm)
+            self._mem_probe_done = True
+
+    def _reset_memory_grad_probe(self):
+        self._mem_probe_done = False
+        self._mem_probe_batches = 0
+        self._mem_grad_norm = 0.0
 
     # --------------------------------------------------------- topology scan
     def _collect_pass1_records(self, train, g0, g1, gstep0, epoch):
@@ -816,15 +858,10 @@ class TGBPairLinkLoop:
                 self._gauge_group_aux.append(an)
                 gauge_done = True
             loss.backward()
+            self._probe_memory_grad()
             self._clip(self.head_params)
             if not self.calibrate:
                 self.head_optimizer.step()
-            if self.repr_every_batch and self.repr_optimizer is not None \
-                    and self.repr_params:
-                self._clip(self.repr_params)
-                if not self.calibrate:
-                    self.repr_optimizer.step()
-                self.repr_optimizer.zero_grad(set_to_none=True)
             if self.tgn.use_memory:
                 self.tgn.memory.detach_memory()
             link_sum += float(link_loss.detach())

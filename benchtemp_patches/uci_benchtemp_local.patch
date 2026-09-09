@@ -1,0 +1,32 @@
+diff --git a/experimental_codes/tgn-jodie-dyrep/model/tgn.py b/experimental_codes/tgn-jodie-dyrep/model/tgn.py
+index 277c420..5f3b572 100644
+--- a/experimental_codes/tgn-jodie-dyrep/model/tgn.py
++++ b/experimental_codes/tgn-jodie-dyrep/model/tgn.py
+@@ -228,6 +228,14 @@ class TGN(torch.nn.Module):
+     if len(unique_nodes) > 0:
+       unique_messages = self.message_function.compute_message(unique_messages)
+
++      # guard (vendored patch): on homogeneous graphs a node may appear on the
++      # source side of a LATER event and the destination side of an EARLIER
++      # event in one batch; the official assert rejects the earlier update.
++      # Clamp each node's update time to its current last_update so memory
++      # time stays monotonic (no-op when the stream is already ordered).
++      cur = self.memory.get_last_update(unique_nodes)
++      unique_timestamps = torch.maximum(unique_timestamps, cur)
++
+     # Update the memory with the aggregated messages
+     self.memory_updater.update_memory(unique_nodes, unique_messages,
+                                       timestamps=unique_timestamps)
+diff --git a/lp/dataloader.py b/lp/dataloader.py
+index 1269c58..8c6f5eb 100644
+--- a/lp/dataloader.py
++++ b/lp/dataloader.py
+@@ -42,7 +42,7 @@ class DataLoader:
+             set(destinations[timestamps > val_time]))
+         # Sample nodes which we keep as new nodes (to test inductiveness), so than we have to remove all
+         # their edges from training
+-        new_test_node_set = set(random.sample(test_node_set, int(0.1 * n_total_unique_nodes)))
++        new_test_node_set = set(random.sample(list(test_node_set), int(0.1 * n_total_unique_nodes)))  # py3.11+: sample() needs a sequence; list(set-of-ints) order is stable
+
+         # Mask saying for each source and destination whether they are new test nodes
+         new_test_source_mask = graph_df.u.map(lambda x: x in new_test_node_set).values

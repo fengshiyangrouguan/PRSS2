@@ -560,6 +560,9 @@ def main():
         n_b = min(n_batches, max(0, n_avail - start_batch))
         for b in range(start_batch):
             silent_batch(b)
+            if (b + 1) % 200 == 0:
+                print("[{}] prefix replay {}/{}".format(
+                    label, b + 1, start_batch), flush=True)
         for w in range(n_b):
             bb = start_batch + w
             keep, rm_snaps = window_batch(bb)

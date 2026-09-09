@@ -890,18 +890,22 @@ class MemoryVLA(nn.Module):
         """
         image_transform, tokenizer = self.vlm.vision_backbone.image_transform, self.vlm.llm_backbone.tokenizer
 
-        # Build VLA Prompt
+        # Build the EXACT training prompt: human turn + EMPTY gpt turn.  This
+        # replicates HDF5BatchTransform / memory_vla.forward so decode feeds the
+        # SAME input_ids as training.  The old path appended [29871,2] then ran
+        # generate() and gathered a shifted cog token (train-inference mismatch).
         prompt_builder = self.vlm.get_prompt_builder()
-        prompt_builder.add_turn(role="human", message=f"What action should the robot take to {instruction.lower()}?")
-        prompt_text = prompt_builder.get_prompt()
+        prompt_builder.add_turn(role="human",
+                                message=f"What action should the robot take to {instruction.lower()}?")
+        prompt_builder.add_turn(role="gpt", message="")
 
-        input_ids = tokenizer(prompt_text, truncation=True, return_tensors="pt").input_ids.to(self.vlm.device)
-        if isinstance(tokenizer, LlamaTokenizerFast):
-            input_ids = torch.cat(
-                (input_ids, torch.unsqueeze(torch.Tensor([29871, 2]).long(), dim=0).to(self.vlm.device)), dim=1
-            )
-        else:
-            raise ValueError(f"Unsupported `tokenizer` type = {type(tokenizer)}")
+        input_ids = tokenizer(
+            prompt_builder.get_prompt(),
+            add_special_tokens=True,
+            return_tensors="pt",
+        ).input_ids.to(self.vlm.device)
+
+        attention_mask = torch.ones_like(input_ids)
 
         model_dtype = next(self.parameters()).dtype
 
@@ -916,23 +920,39 @@ class MemoryVLA(nn.Module):
 
         autocast_dtype = torch.bfloat16 if model_dtype == torch.bfloat16 else torch.float32
 
+        # Plain causal forward (NOT generate) over the prompt-only sequence,
+        # exactly like the training forward, to recover the same hidden states.
         with torch.autocast("cuda", dtype=autocast_dtype, enabled=(autocast_dtype == torch.bfloat16)):
             # fmt: off
-            output = super(PrismaticVLM, self.vlm).generate(
+            output = self.vlm(
                 input_ids=input_ids,                            # Shape: [1, seq]
+                attention_mask=attention_mask,
                 pixel_values=pixel_values,                      # Shape: [1, 3, res, res] or Dict[str, ...]
-                max_new_tokens=1,
-                output_hidden_states=True, 
-                return_dict_in_generate=True,
-                **kwargs,
+                labels=None,
+                output_hidden_states=True,
+                return_dict=True,
             )
             # fmt: on
 
+        # Replicate memory_vla.forward cognition-token extraction EXACTLY.
         model_dtype = next(self.action_model.net.parameters()).dtype
-        cog_tokens = output.hidden_states[-1][-1][:,-1,:]
-        assert (cog_tokens.shape[0], cog_tokens.shape[1]) == (1,4096), "Batch size must be 1 for action prediction"
+        last_hidden_state = output.hidden_states[-1]
+        if self.vlm.vision_backbone.featurizer is not None:
+            num_patch = self.vlm.vision_backbone.featurizer.patch_embed.num_patches
+        elif (hasattr(self.vlm.vision_backbone, "siglip_featurizer")
+              and self.vlm.vision_backbone.siglip_featurizer is not None):
+            num_patch = self.vlm.vision_backbone.siglip_featurizer.patch_embed.num_patches
+        else:
+            raise ValueError("No vision backbone found")
+        last_hidden_state = last_hidden_state[:, num_patch:]
 
-        cog_tokens = cog_tokens.unsqueeze(1).to(model_dtype)  # [B, 1, D]
+        cumulative_sum = attention_mask.cumsum(dim=1)
+        last_true_indices = (cumulative_sum == cumulative_sum.max(dim=1, keepdim=True)[0]).float().argmax(dim=1)
+        cog_tokens = last_hidden_state.gather(
+            1, last_true_indices[:, None, None].expand(-1, 1, last_hidden_state.size(-1))
+        )  # [B, 1, D]
+        assert cog_tokens.shape == (1, 1, 4096), f"cog shape {tuple(cog_tokens.shape)}"
+        cog_tokens = cog_tokens.to(model_dtype)
 
         vision_feats = self.vlm.vision_feats
         per_tokens = self.per_compr(vision_feats)

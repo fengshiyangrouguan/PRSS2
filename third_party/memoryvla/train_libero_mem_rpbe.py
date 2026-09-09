@@ -93,6 +93,10 @@ def parse_args() -> argparse.Namespace:
                    help="base seed for the independent per-row augment RNG "
                         "(derived as aug_seed+epoch+eid+t; never touches the "
                         "global diffusion RNG stream)")
+    p.add_argument("--dim-weight", type=int, default=1,
+                   help="1 = per-dim weighted diffusion loss (x/y=1.5,z=2.0,"
+                        "rot=0.5,grip=1.0); 0 = plain mean MSE (equal-weight "
+                        "restart control experiment)")
     p.add_argument("--lr", type=float, default=2e-5)
     p.add_argument("--warmup-steps", type=int, default=100,
                    help="warmup in OPTIMIZER steps")
@@ -185,6 +189,9 @@ def main() -> None:
     run_dir.mkdir(parents=True, exist_ok=True)
 
     vla, lora_config = build_vla(args)
+    # per-dim weighted loss toggle (reviewer: default on; off = equal-weight
+    # restart control experiment)
+    vla.use_dim_weight = bool(args.dim_weight)
     vla.train()
 
     tokenizer = vla.vlm.llm_backbone.get_tokenizer()

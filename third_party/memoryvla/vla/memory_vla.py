@@ -709,17 +709,21 @@ class MemoryVLA(nn.Module):
             repeated_diffusion_steps, 1, 1)
 
         # per-dim weighted, padding-masked diffusion loss (2026-09-09 review):
-        #   x/y weights 1.5, z 2.0 (worst diagnostic), rotation 0.5 (still learns
-        #   to output zero), gripper 1.0; padded tail frames excluded via
-        #   action_mask.  loss = sum(sqerr*valid*w)/sum(valid*w).
+        # per-dim weighted / action-mask masking toggle.  Set vla.use_dim_weight
+        # from the trainer (default True = reviewer weighted loss; False = plain
+        # mean MSE for the equal-weight restart control experiment).  action_mask
+        # (exclude padded tail) applies in both modes.
         if action_masks is not None:
             mask_future = action_masks[:, -(self.future_action_window_size+1):]  # [B, K]
             action_mask_repeated = mask_future.repeat(repeated_diffusion_steps, 1)
         else:
             action_mask_repeated = None
-        dim_weight = torch.tensor(
-            [1.5, 1.5, 2.0, 0.5, 0.5, 0.5, 1.0],
-            device=actions_repeated.device, dtype=actions_repeated.dtype)
+        if getattr(self, "use_dim_weight", True):
+            dim_weight = torch.tensor(
+                [1.5, 1.5, 2.0, 0.5, 0.5, 0.5, 1.0],
+                device=actions_repeated.device, dtype=actions_repeated.dtype)
+        else:
+            dim_weight = None
 
         # Action model forward and compute loss
         loss = self.action_model.loss(

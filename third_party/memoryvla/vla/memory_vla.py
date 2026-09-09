@@ -708,11 +708,26 @@ class MemoryVLA(nn.Module):
         per_tokens_repeated = per_tokens.repeat(
             repeated_diffusion_steps, 1, 1)
 
+        # per-dim weighted, padding-masked diffusion loss (2026-09-09 review):
+        #   x/y weights 1.5, z 2.0 (worst diagnostic), rotation 0.5 (still learns
+        #   to output zero), gripper 1.0; padded tail frames excluded via
+        #   action_mask.  loss = sum(sqerr*valid*w)/sum(valid*w).
+        if action_masks is not None:
+            mask_future = action_masks[:, -(self.future_action_window_size+1):]  # [B, K]
+            action_mask_repeated = mask_future.repeat(repeated_diffusion_steps, 1)
+        else:
+            action_mask_repeated = None
+        dim_weight = torch.tensor(
+            [1.5, 1.5, 2.0, 0.5, 0.5, 0.5, 1.0],
+            device=actions_repeated.device, dtype=actions_repeated.dtype)
+
         # Action model forward and compute loss
         loss = self.action_model.loss(
             actions_repeated,
             cog_tokens_repeated,
             per_tokens_repeated,
+            action_mask=action_mask_repeated,
+            dim_weight=dim_weight,
         )
 
         return loss, output

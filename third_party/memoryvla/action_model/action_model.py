@@ -54,7 +54,7 @@ class ActionModel(nn.Module):
             )
 
     # Given condition z and ground truth token x, compute loss
-    def loss(self, x, z, per_token):
+    def loss(self, x, z, per_token, action_mask=None, dim_weight=None):
         # sample random noise and timestep
         noise = torch.randn_like(x) # [B, T, C]
 
@@ -68,7 +68,19 @@ class ActionModel(nn.Module):
 
         assert noise_pred.shape == noise.shape == x.shape
         # Compute L2 loss
-        loss = ((noise_pred - noise) ** 2).mean()
+        sqerr = (noise_pred - noise).pow(2)          # [B, T, D]
+        if action_mask is not None:
+            # action_mask: [B, T] bool (True = real frame, False = padded tail)
+            valid = action_mask[..., None].to(sqerr.dtype)   # [B, T, 1]
+        else:
+            valid = torch.ones_like(sqerr)
+        if dim_weight is not None:
+            dw = dim_weight.to(device=sqerr.device, dtype=sqerr.dtype).view(1, 1, -1)
+        else:
+            dw = torch.ones_like(sqerr)
+        loss = (sqerr * valid * dw).sum() / (
+            (valid * dw).sum() + 1e-8
+        )
         # Optional: loss += loss_vlb
 
         return loss

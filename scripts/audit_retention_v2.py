@@ -214,6 +214,9 @@ def main():
     ap.add_argument("--bs", type=int, default=64)
     ap.add_argument("--audit-batches", type=int, default=200)
     ap.add_argument("--calib-batches", type=int, default=60)
+    ap.add_argument("--audit-start-batches", type=int, default=None,
+                    help="override: start the audit window here (default: "
+                         "train tail = --audit-batches worth of batches)")
     ap.add_argument("--n-bootstrap", type=int, default=200)
     ap.add_argument("--n-null", type=int, default=200)
     ap.add_argument("--memory-parity-batches", type=int, default=5)
@@ -583,7 +586,10 @@ def main():
         return True
 
     n_train_batches = len(train.sources) // bs
-    audit_offset = max(0, n_train_batches - args.audit_batches)
+    if args.audit_start_batches is None:
+        audit_offset = max(0, n_train_batches - args.audit_batches)
+    else:
+        audit_offset = int(args.audit_start_batches)
 
     # ---- memory-parity pre-check: the keep/remove window scheme must leave
     # memory bit-identical to a pristine keep-only single pass.  Run over the

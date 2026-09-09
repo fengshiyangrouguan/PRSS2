@@ -1,32 +1,62 @@
 #!/usr/bin/env python3
-"""Introduction mechanism audit v2 — leaf-to-root path extraction.
+"""Introduction-mechanism retention audit v2 — corrected protocol.
 
-Review correction (2026-09): the measured object is ONE fixed 3-hop remote
-branch signal propagating along the computational dependency, NOT the same
-root node at different layers.
+This version supersedes the audit committed at 6bcaa81 whose JSON/figure were
+rejected by review: values were not retention fractions (ratios of unlike
+quantities, a zero denominator padded with eps -> 129k, chained products such
+as 0.503*1.035*1.691 = 0.88, CIs excluding their own point estimate), the CC
+context leaked the *future* event's edge feature (the same edge that builds
+the prediction target), and TGN memory never advanced (each batch restored a
+backup, and the "train tail" started from a zeroed memory without replaying
+the prefix).
 
-Path:  a_3 (3-hop leaf) -> a_2 (2-hop) -> a_1 (1-hop) -> a_0 (root)
+Corrected protocol
+------------------
+Path (one fixed leaf-to-root branch per root, slot chosen by a fixed hash):
+a_3 (leaf) -> a_2 -> a_1 -> a_0 (root); states
+    U0 = leaf layer-0 state
+    Z1 = h_{a_2} = Gamma_1(U0, N1)
+    Z2 = h_{a_1} = Gamma_2(Z1, N2)
+    Z3 = h_{a_0} = Gamma_3(Z2, N3)
 
-    U^(0) = h_{a_3}^{(0)}                      (leaf layer-0 state — the
-                                                branch tensor actually fed
-                                                into the first parent
-                                                aggregation)
-    Z^(1) = h_{a_2}^{(1)} = Gamma_1(U^(0), N1)
-    Z^(2) = h_{a_1}^{(2)} = Gamma_2(Z^(1), N2)
-    Z^(3) = h_{a_0}^{(3)} = Gamma_3(Z^(2), N3)
+History flow: memory is advanced exactly like a real single-pass stream.  A
+pass first replays the prefix with normal keep-only forwards, then processes
+its window batch by batch: snapshot pre-memory -> run the KEEP forward (this
+IS the advance) -> snapshot post-memory -> run each remove variant from the
+same pre-memory and restore after each -> restore post-memory.  A
+--memory-parity-batches pre-check asserts the window scheme leaves memory
+bit-identical to a pristine keep-only single pass.
 
-X-axis: # recursive aggregations (0 = 3-hop leaf, 0 compressions;
-3 = root, 3 compressions).  Retention is NOT forced monotonic; C contains
-summaries of the N_{1:3} added along the path.
+Context C is leak-free: it contains ONLY historical path structure (the three
+historical edges' edge_feat/edge_time and node times, path-outside
+other-neighbor means, root/leaf ids).  The future event appears ONLY in the
+prediction target P (fixed witness phi_S).
 
-Path selection: per root, a FIXED hash (root_id, layer) picks the child
-slot at every step (never "first non-zero slot" — slot order correlates
-with time and would bias the sample).  All k use the SAME full paths.
-Root trees equally weighted (one path per root).
+Retention (same-source fraction, bounded <= 1, no chaining).  For source depth
+s let X_s be its representation (3: U0, 2: Z1, 1: Z2) and Q_s the ridge
+prediction of the future witness P from X_s (fit on calib).  At each downstream
+position k of that source the paired-removal delta Delta_{s->k} is measured
+(keep minus remove; parent self and siblings cancel).  Retention
 
-Model: frozen task-only TGN checkpoint (main-branch code); the hook is a
-re-implementation of JodieTGNAdapter._compute with path sampling inserted
-after each neighbor recursion — no weight updates, no backprop.
+    R_{s->k} = 1 - ||Q_s - Qhat_s||_F^2 / (||Q_s - mean Q_s||_F^2 + eps)
+
+where Qhat_s is a ridge prediction of the SAME Q_s from [Delta_{s->k}; C]
+fitted on calib and evaluated on audit.  Every point is an independent direct
+regression against the source component -- never a chain of local factors and
+never a ratio of unlike quantities.  SSE >= 0 makes R <= 1 by construction;
+negative values are reported honestly.
+
+Gates run before plotting: source predictive signal above a matched-context
+shuffle null (95th pct), identity at the source ~1, delete-source (Delta = 0,
+C-only) floor ~0, and a mismatched-delta control (Delta permuted within
+strata) must not recover Q.  A memory-parity flag is stored.  The figure only
+draws lines whose gates all pass.
+
+Usage:
+    python scripts/audit_retention_v2.py \
+        --ckpt <best.pt> --data-dir <processed_tgn_data> --data-name wikipedia \
+        --gpu 0 --bs 64 --audit-batches 200 --calib-batches 60 \
+        --n-bootstrap 200 --memory-parity-batches 5
 """
 import argparse
 import json
@@ -44,6 +74,8 @@ HERE = Path(__file__).resolve().parent
 SRC = HERE.parent / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
+if str(HERE) not in sys.path:
+    sys.path.insert(0, str(HERE))
 
 from rpbe.hosts.official_tgn import TGN, get_neighbor_finder  # noqa: E402
 from rpbe.hosts.jodie_tgn import JodieTGNAdapter, TAU_TEMPLATE  # noqa: E402
@@ -51,12 +83,13 @@ from rpbe.config import RPBConfig  # noqa: E402
 from rpbe.compressor import RecursiveCompressor  # noqa: E402
 from rpbe.data.uci_link import UCILinkDataset  # noqa: E402
 
+import retention_stats as rs  # noqa: E402
+
 FIXED_SEED = 20260909
 P_DIM = 128
-# branch-wide context: path-OUTSIDE N_k projections (other-neighbor vector
-# mean 16 + edge features 8 per step, times/structure) — self raw state is
-# part of the branch and is NOT conditioned.  The SAME C conditions every
-# layer of the path.
+# branch-wide leak-free context: per step the path-OUTSIDE other-neighbor vector
+# mean (16) + the *historical* path edge feature (8), plus 2 id hashes, 3 node
+# times and 3 historical edge times.  No future index may enter C.
 CTX_DIM = 80
 
 
@@ -100,14 +133,11 @@ def fixed_phi_S(edge_feat, delta_t, counterpart, src_node):
                           axis=1)
 
 
-def _ctx_vector(root_id, leaf_id, times, other_neighbor_vecs, edge_feats,
-                self_raws=None):
-    """Branch-wide context: fixed projections of the path-OUTSIDE N_k
-    (vector mean of the OTHER neighbors, edge features, time) added at
-    each step.  self raw state is part of the remote branch itself and
-    MUST NOT be conditioned out — conditioning it removes the signal being
-    measured (null control fails).  The SAME C conditions every layer."""
-    del self_raws
+def _ctx_vector(root_id, leaf_id, node_times, edge_feats, edge_times,
+                other_neighbor_vecs):
+    """Leak-free path context (dim CTX_DIM).  Only historical structure:
+    the three path edges (edge_feat + edge_time), the node times, path-outside
+    other-neighbor means and root/leaf ids.  Deliberately NO future index."""
     parts = []
     for i in range(3):
         parts.append(_fixed_proj(other_neighbor_vecs[i], 16, 600 + i))
@@ -115,15 +145,16 @@ def _ctx_vector(root_id, leaf_id, times, other_neighbor_vecs, edge_feats,
     parts.append(np.asarray([
         _hash01(np.asarray([int(root_id)]), 401)[0],
         _hash01(np.asarray([int(leaf_id)]), 402)[0],
-        np.log1p(times[0]) / 12.0,
-        np.log1p(times[1]) / 12.0,
-        np.log1p(times[2]) / 12.0,
+        np.log1p(node_times[0]) / 12.0,
+        np.log1p(node_times[1]) / 12.0,
+        np.log1p(node_times[2]) / 12.0,
+        np.log1p(edge_times[0]) / 12.0,
+        np.log1p(edge_times[1]) / 12.0,
+        np.log1p(edge_times[2]) / 12.0,
     ], dtype=np.float64))
     out = np.concatenate([np.asarray(p, dtype=np.float64).reshape(-1)
                           for p in parts])
-    if len(out) < CTX_DIM:
-        out = np.concatenate(
-            [out, np.zeros(CTX_DIM - len(out), dtype=np.float64)])
+    assert len(out) == CTX_DIM, (len(out), CTX_DIM)
     return out[:CTX_DIM]
 
 
@@ -173,30 +204,6 @@ class FutureIndex:
         return j, float(self.t[j] - time), cp
 
 
-# -------------------------------------------------------------- ridge helpers
-def _ridge_fit(X, Y, lam=1e-2):
-    d = X.shape[1]
-    return np.linalg.solve(X.T @ X + lam * np.eye(d), X.T @ Y)
-
-
-def _cond_residual(X, C, Wx):
-    return X - C @ Wx
-
-
-def _j_lambda(X_res, P_res, lam=1e-2, eps=1e-6):
-    n = X_res.shape[0]
-    Cxx = (X_res.T @ X_res) / n
-    Cpp = (P_res.T @ P_res) / n
-    Cxp = (X_res.T @ P_res) / n
-    A = Cxx + lam * np.eye(X_res.shape[1])
-    B = Cpp + eps * np.eye(P_res.shape[1])
-    try:
-        M = np.linalg.solve(A, Cxp)
-        return float(np.trace(np.linalg.solve(B, Cxp.T @ M)))
-    except np.linalg.LinAlgError:
-        return float("nan")
-
-
 # ------------------------------------------------------------------- main
 def main():
     ap = argparse.ArgumentParser()
@@ -208,8 +215,15 @@ def main():
     ap.add_argument("--audit-batches", type=int, default=200)
     ap.add_argument("--calib-batches", type=int, default=60)
     ap.add_argument("--n-bootstrap", type=int, default=200)
+    ap.add_argument("--n-null", type=int, default=200)
+    ap.add_argument("--memory-parity-batches", type=int, default=5)
+    ap.add_argument("--lam", type=float, default=1e-2)
+    ap.add_argument("--lam-ret", type=float, default=1e-2)
+    ap.add_argument("--identity-min", type=float, default=0.90)
+    ap.add_argument("--floor-max", type=float, default=0.05)
     args = ap.parse_args()
 
+    eps = 1e-6
     device = torch.device(
         "cuda:{}".format(args.gpu) if torch.cuda.is_available() else "cpu")
     ds = UCILinkDataset(args.data_dir, data_name=args.data_name,
@@ -252,28 +266,23 @@ def main():
     n_neighbors = 5
     n_layers = 3
     bs = args.bs
-    # path sampling state: for the CURRENT batch
     path_state = {
-        # layer -> {flat_row_in_parent_neighbor_recursion: (root_row, depth)}
         "by_layer": {1: {}, 2: {}},
-        # root_row -> collected path pieces
         "recs": {},
-        # per-step record stash keyed by (root_row, depth)
         "stash": {},
     }
+    cur = {"d": None, "record": False}
 
     def _slot_hash(node_id, layer):
         return int((int(node_id) * 2654435761 + int(layer) * 104729)
                    % 1000003)
 
-    orig_compute = adapter._compute
-
-    cur_remove = {"d": None}
-
     def traced_compute(memory, source_nodes, timestamps, layer, n_neighbors_,
-                       trace_paths, remove_depth=None):
+                       trace_paths, remove_depth=None, record=None):
         if remove_depth is None:
-            remove_depth = cur_remove["d"]
+            remove_depth = cur["d"]
+        if record is None:
+            record = cur["record"]
         device_ = adapter.device
         source_nodes_t = torch.from_numpy(source_nodes).long().to(device_)
         timestamps_t = torch.from_numpy(timestamps).float().to(device_)
@@ -284,93 +293,93 @@ def main():
         if adapter.use_memory:
             raw_source = memory[source_nodes] + raw_source
         if layer == 0:
-            # leaf states may be needed by the parent recursion's sampling
             return raw_source
 
-        source_paths = {
-            int(row): list(path) + [(0, 0.0)]
-            for row, path in trace_paths.items()}
+        # ---- bookkeeping only when record=True; the tensor math below is
+        # bit-identical to the plain host recursion either way, so silent
+        # prefix replay advances memory exactly like a single real pass ----
+        source_paths = {}
+        if record:
+            source_paths = {
+                int(row): list(path) + [(0, 0.0)]
+                for row, path in trace_paths.items()}
+
         source_lower = traced_compute(
             memory, source_nodes, timestamps, layer - 1, n_neighbors_,
-            source_paths, remove_depth=remove_depth)
+            source_paths, remove_depth=remove_depth, record=record)
 
-        neighbors, edge_idxs_np, edge_times = \
+        neighbors, edge_idxs_np, edge_times_np = \
             adapter.neighbor_finder.get_temporal_neighbor(
                 source_nodes, timestamps, n_neighbors=n_neighbors_)
         neighbors_t = torch.from_numpy(neighbors).long().to(device_)
         edge_idxs = torch.from_numpy(edge_idxs_np).long().to(device_)
-        edge_deltas_np = timestamps[:, None] - edge_times
+        edge_deltas_np = timestamps[:, None] - edge_times_np
         edge_deltas = torch.from_numpy(edge_deltas_np).float().to(device_)
         flat_neighbors = neighbors.reshape(-1)
         repeated_times = np.repeat(timestamps, n_neighbors_)
 
-        # ---------- path slot selection BEFORE the child recursion ----------
+        # ---------- path slot selection (record only; never used by the
+        # tensor math of the plain pass) ----------
         is_top = (layer == n_layers and len(source_nodes) == 3 * bs)
-        if is_top:
-            # init per-batch state and pick each root's first child slot;
-            # the child recursion (layer-1 of the neighbor chain) consumes
-            # by_layer below.
-            path_state["recs"] = {}
-            path_state["stash"] = {}
-            path_state["by_layer"] = {1: {}, 2: {}}
-            for r in range(bs):
-                s = _slot_hash(int(source_nodes[r]), 3) % n_neighbors_
-                if int(neighbors[r, s]) != 0:
-                    path_state["recs"][r] = {
-                        "root": int(source_nodes[r]),
-                        "t_root": float(timestamps[r]),
-                        "slot3": s,
-                    }
-                    path_state["by_layer"][2][(r, s)] = r
-        # non-top path rows: this call's source_nodes are the flat neighbors
-        # of the parent call; a path row (parent_row, slot) lives at
-        # flat_row = parent_row * n_neighbors + slot.  Pick the next child
-        # slot BEFORE recursing into the children (so layer-1 sees it).
         self_path_choices = {}
-        for (pr, s), root_r in list(path_state["by_layer"].get(
-                layer, {}).items()):
-            flat_row = pr * n_neighbors_ + s
-            if flat_row >= len(source_nodes):
-                continue
-            node = int(source_nodes[flat_row])
-            if node == 0:
-                continue
-            if layer >= 2:
-                s2 = _slot_hash(node, layer - 1) % n_neighbors_
-                child = int(neighbors[flat_row, s2])
-                if child != 0:
-                    self_path_choices[(root_r, layer)] = {
-                        "node": node,
-                        "t": float(timestamps[flat_row]),
-                        "slot": s2,
-                        "flat_row": flat_row,
-                    }
-                    path_state["by_layer"][layer - 1][
-                        (flat_row, s2)] = root_r
-            else:
-                # layer 1 path rows: child slot is the parent-fixed s;
-                # record the choice so the post-recursion block writes U0
-                child = int(neighbors[flat_row, s])
-                if child != 0:
-                    self_path_choices[(root_r, layer)] = {
-                        "node": node,
-                        "t": float(timestamps[flat_row]),
-                        "slot": s,
-                        "flat_row": flat_row,
-                    }
+        if record:
+            if is_top:
+                path_state["recs"] = {}
+                path_state["stash"] = {}
+                path_state["by_layer"] = {1: {}, 2: {}}
+                for r in range(bs):
+                    s = _slot_hash(int(source_nodes[r]), 3) % n_neighbors_
+                    if int(neighbors[r, s]) != 0:
+                        path_state["recs"][r] = {
+                            "root": int(source_nodes[r]),
+                            "t_root": float(timestamps[r]),
+                            "slot3": s,
+                            "edge_feat_top": adapter.host.edge_features[
+                                int(edge_idxs_np[r, s])].detach().cpu().numpy(),
+                            "edge_time_top": float(edge_times_np[r, s]),
+                        }
+                        path_state["by_layer"][2][(r, s)] = r
+            for (pr, s), root_r in list(path_state["by_layer"].get(
+                    layer, {}).items()):
+                flat_row = pr * n_neighbors_ + s
+                if flat_row >= len(source_nodes):
+                    continue
+                node = int(source_nodes[flat_row])
+                if node == 0:
+                    continue
+                if layer >= 2:
+                    s2 = _slot_hash(node, layer - 1) % n_neighbors_
+                    child = int(neighbors[flat_row, s2])
+                    if child != 0:
+                        self_path_choices[(root_r, layer)] = {
+                            "node": node,
+                            "t": float(timestamps[flat_row]),
+                            "slot": s2,
+                            "flat_row": flat_row,
+                        }
+                        path_state["by_layer"][layer - 1][
+                            (flat_row, s2)] = root_r
+                else:
+                    child = int(neighbors[flat_row, s])
+                    if child != 0:
+                        self_path_choices[(root_r, layer)] = {
+                            "node": node,
+                            "t": float(timestamps[flat_row]),
+                            "slot": s,
+                            "flat_row": flat_row,
+                        }
 
         neighbor_lower = traced_compute(
             memory, flat_neighbors, repeated_times, layer - 1, n_neighbors_,
-            {}, remove_depth=remove_depth)
+            {}, remove_depth=remove_depth, record=record)
         neighbor_lower = neighbor_lower.view(
             len(source_nodes), n_neighbors_, -1)
         edge_time = adapter.host.time_encoder(edge_deltas)
         edge_features = adapter.host.edge_features[edge_idxs]
         mask = neighbors_t == 0
         # ---- paired removal: zero the selected child's message at the
-        # aggregation layer that consumes it (remove_depth=3 -> layer 1,
-        # 2 -> layer 2, 1 -> layer 3/top); everything else untouched ----
-        if remove_depth is not None and layer == (4 - remove_depth):
+        # aggregation layer that consumes it ----
+        if record and remove_depth is not None and layer == (4 - remove_depth):
             if remove_depth == 1 and is_top:
                 for r, rec in path_state["recs"].items():
                     neighbor_lower = neighbor_lower.clone()
@@ -398,154 +407,224 @@ def main():
             z = vanilla
 
         # ---------- path state recording AFTER z is available ----------
-        if is_top:
-            for r, rec in path_state["recs"].items():
-                rec["z3"] = z[r].detach().cpu().numpy()
-                rec["other_neighbors"] = _other_neighbor_vec(
-                    neighbor_lower, r, rec["slot3"], n_neighbors_)
-        for (root_r, lv), ch in self_path_choices.items():
-            flat_row = ch["flat_row"]
-            if lv >= 2:
-                path_state["stash"][(root_r, lv)] = {
+        if record:
+            if is_top:
+                for r, rec in path_state["recs"].items():
+                    rec["z3"] = z[r].detach().cpu().numpy()
+                    rec["other_neighbors"] = _other_neighbor_vec(
+                        neighbor_lower, r, rec["slot3"], n_neighbors_)
+            for (root_r, lv), ch in self_path_choices.items():
+                flat_row = ch["flat_row"]
+                base = {
                     "z": z[flat_row].detach().cpu().numpy(),
                     "node": ch["node"],
                     "t": ch["t"],
                     "edge_feat": adapter.host.edge_features[
                         int(edge_idxs_np[flat_row, ch["slot"]])]
                         .detach().cpu().numpy(),
-                    # VECTOR mean of the OTHER neighbors (path-outside)
+                    "edge_time": float(edge_times_np[flat_row, ch["slot"]]),
                     "other_neighbors": _other_neighbor_vec(
-                        neighbor_lower, flat_row, ch["slot"],
-                        n_neighbors_),
+                        neighbor_lower, flat_row, ch["slot"], n_neighbors_),
                 }
-            else:
-                # layer 1: child slot -> LEAF layer-0 state = U0
-                child = int(neighbors[flat_row, ch["slot"]])
-                path_state["stash"][(root_r, 1)] = {
-                    "z": z[flat_row].detach().cpu().numpy(),
-                    "node": ch["node"],
-                    "t": ch["t"],
-                    "u0": neighbor_lower[flat_row, ch["slot"]]
-                          .detach().cpu().numpy(),
-                    "leaf": child,
-                    "edge_feat": adapter.host.edge_features[
-                        int(edge_idxs_np[flat_row, ch["slot"]])]
-                        .detach().cpu().numpy(),
-                    "other_neighbors": _other_neighbor_vec(
-                        neighbor_lower, flat_row, ch["slot"],
-                        n_neighbors_),
-                }
+                if lv >= 2:
+                    path_state["stash"][(root_r, lv)] = base
+                else:
+                    child = int(neighbors[flat_row, ch["slot"]])
+                    base["u0"] = neighbor_lower[flat_row, ch["slot"]] \
+                        .detach().cpu().numpy()
+                    base["leaf"] = child
+                    path_state["stash"][(root_r, 1)] = base
         return z
 
     adapter._compute = traced_compute
 
-    def extract(stream, n_batches, offset_batches=0):
+    def _reset_path_state():
+        path_state["recs"] = {}
+        path_state["stash"] = {}
+        path_state["by_layer"] = {1: {}, 2: {}}
+
+    def _forward_batch(bb, rm, record=True):
+        cur["d"] = rm
+        cur["record"] = record
+        _reset_path_state()
+        s0 = bb * bs
+        s1 = s0 + bs
+        src = train.sources[s0:s1].astype(np.int64)
+        dst = train.destinations[s0:s1].astype(np.int64)
+        t = train.timestamps[s0:s1]
+        e = train.edge_idxs[s0:s1]
+        adapter.set_trace_source_rows([])
+        with torch.no_grad():
+            tgn.compute_edge_probabilities(src, dst, dst, t, e, n_neighbors)
+        adapter.clear_trace()
+        if not record:
+            return None
+        return {
+            "recs": dict(path_state["recs"]),
+            "stash": {k: dict(v) for k, v in path_state["stash"].items()},
+        }
+
+    def _backup_mem():
+        return tgn.memory.backup_memory() if tgn.use_memory else None
+
+    def _restore_mem(bak):
+        if tgn.use_memory and bak is not None:
+            tgn.memory.restore_memory(bak)
+
+    def window_batch(bb):
+        """Keep forward advances memory exactly once; removes run from the
+        same pre-memory and are rolled back; post-keep state is restored so
+        the stream continues like a pure keep-only single pass."""
+        mem_pre = _backup_mem()
+        keep = _forward_batch(bb, None, record=True)
+        mem_post = _backup_mem()
+        rm_snaps = {}
+        for rm in (3, 2, 1):
+            _restore_mem(mem_pre)
+            rm_snaps[rm] = _forward_batch(bb, rm, record=True)
+            _restore_mem(mem_pre)
+        _restore_mem(mem_post)
+        return keep, rm_snaps
+
+    def silent_batch(bb):
+        _forward_batch(bb, None, record=False)
+
+    def _rows_from(keep, rm_snaps):
+        recs = keep["recs"]
+        stash = keep["stash"]
+        rm3, rm2, rm1 = rm_snaps[3], rm_snaps[2], rm_snaps[1]
+        rows = []
+        for r, rec in recs.items():
+            if (r, 1) not in stash or (r, 2) not in stash:
+                continue
+            st1 = stash[(r, 1)]
+            st2 = stash[(r, 2)]
+            root = rec["root"]
+            futr = fut.query(root, rec["t_root"])
+            if futr is None:
+                continue
+            j, dt, cp = futr
+            node_times = [st1["t"], st2["t"], rec["t_root"]]
+            edge_feats = [st1["edge_feat"], st2["edge_feat"],
+                          rec["edge_feat_top"]]
+            edge_times = [st1["edge_time"], st2["edge_time"],
+                          rec["edge_time_top"]]
+            om = [st1["other_neighbors"],
+                  st2["other_neighbors"],
+                  rec["other_neighbors"]]
+            ctx = _ctx_vector(root, st1["leaf"], node_times, edge_feats,
+                              edge_times, om)
+            # paired-removal deltas: source component at each position
+            def _dz(var, key, orig_z):
+                if key == "z3":
+                    rr = var["recs"].get(r)
+                    return (orig_z - rr[key]) if rr is not None \
+                        and key in rr else None
+                ss = var["stash"].get((r, {"z1": 1, "z2": 2}[key]))
+                return (orig_z - ss["z"]) if ss is not None else None
+            z1 = st1["z"]; z2 = st2["z"]; z3 = rec["z3"]
+            dz3_2 = _dz(rm3, "z1", z1)
+            dz3_1 = _dz(rm3, "z2", z2)
+            dz3_r = _dz(rm3, "z3", z3)
+            dz2_1 = _dz(rm2, "z2", z2)
+            dz2_r = _dz(rm2, "z3", z3)
+            dz1_r = _dz(rm1, "z3", z3)
+            if any(v is None for v in
+                   (dz3_2, dz3_1, dz3_r, dz2_1, dz2_r, dz1_r)):
+                continue
+            rows.append({
+                "u0": st1["u0"],
+                "z1": z1,
+                "z2": z2,
+                "z3": z3,
+                "d32": dz3_2, "d31": dz3_1, "d3r": dz3_r,
+                "d21": dz2_1, "d2r": dz2_r,
+                "d1r": dz1_r,
+                "ctx": ctx,
+                "S": (ds.edge_features[int(fut.eidx[j])],
+                      dt, cp, root),
+            })
+        return rows
+
+    def extract_window(start_batch, n_batches, label):
+        """One pass from a fresh memory: replay the prefix (real single-pass
+        keep-only forwards), then collect rows over the window with the
+        keep/remove scheme."""
         if tgn.use_memory:
             tgn.memory.__init_memory__()
         rows = []
-        n_avail = len(stream.sources) // bs
-        n_b = min(n_batches, max(0, n_avail - offset_batches))
-        for b in range(n_b):
-            bb = offset_batches + b
-            s0 = bb * bs
-            s1 = s0 + bs
-            src = stream.sources[s0:s1].astype(np.int64)
-            dst = stream.destinations[s0:s1].astype(np.int64)
-            t = stream.timestamps[s0:s1]
-            e = stream.edge_idxs[s0:s1]
-            adapter.set_trace_source_rows([])  # no SELF-spine trace needed
-            # paired variants: 0=original, 3/2/1 = remove that source
-            var_states = {}
-            for rm in (None, 3, 2, 1):
-                cur_remove["d"] = rm
-                path_state["recs"] = {}
-                path_state["stash"] = {}
-                path_state["by_layer"] = {1: {}, 2: {}}
-                mem_bak = (tgn.memory.backup_memory()
-                           if tgn.use_memory else None)
-                with torch.no_grad():
-                    tgn.compute_edge_probabilities(src, dst, dst, t, e,
-                                                   n_neighbors)
-                if mem_bak is not None:
-                    tgn.memory.restore_memory(mem_bak)
-                adapter.clear_trace()
-                var_states[rm] = {
-                    "recs": dict(path_state["recs"]),
-                    "stash": {k: dict(v) for k, v
-                              in path_state["stash"].items()},
-                }
-            cur_remove["d"] = None
-            recs = var_states[None]["recs"]
-            stash = var_states[None]["stash"]
-            rm3 = var_states[3]
-            rm2 = var_states[2]
-            rm1 = var_states[1]
-            for r, rec in recs.items():
-                # need all three steps: stash keys (r,1),(r,2)
-                if (r, 1) not in stash or (r, 2) not in stash:
-                    continue
-                st1 = stash[(r, 1)]
-                st2 = stash[(r, 2)]
-                root = rec["root"]
-                futr = fut.query(root, rec["t_root"])
-                if futr is None:
-                    continue
-                j, dt, cp = futr
-                times = [st1["t"], st2["t"], rec["t_root"]]
-                om = [st1["other_neighbors"],
-                      st2["other_neighbors"],
-                      rec["other_neighbors"]]
-                ef = [st1["edge_feat"], st2["edge_feat"],
-                      ds.edge_features[int(fut.eidx[j])]]
-                ctx = _ctx_vector(root, st1["leaf"], times, om, ef)
-                # paired-removal deltas: source-component at each position
-                def _dz(var, key, orig_z):
-                    if key == "z3":
-                        rr = var["recs"].get(r)
-                        return (orig_z - rr[key]) if rr is not None \
-                            and key in rr else None
-                    ss = var["stash"].get((r, {"z1": 1, "z2": 2}[key]))
-                    return (orig_z - ss["z"]) if ss is not None else None
-                z1 = st1["z"]; z2 = st2["z"]; z3 = rec["z3"]
-                dz3_2 = _dz(rm3, "z1", z1)  # 3-hop source at the 2-hop node
-                dz3_1 = _dz(rm3, "z2", z2)
-                dz3_r = _dz(rm3, "z3", z3)
-                dz2_1 = _dz(rm2, "z2", z2)
-                dz2_r = _dz(rm2, "z3", z3)
-                dz1_r = _dz(rm1, "z3", z3)
-                if any(v is None for v in
-                       (dz3_2, dz3_1, dz3_r, dz2_1, dz2_r, dz1_r)):
-                    continue
-                rows.append({
-                    "u0": st1["u0"],           # Delta_{3->3} = U3 (leaf)
-                    "z1": st1["z"],            # Delta_{2->2} = U2
-                    "z2": st2["z"],            # Delta_{1->1} = U1
-                    "z3": z3,                  # original root state
-                    "d32": dz3_2, "d31": dz3_1, "d3r": dz3_r,
-                    "d21": dz2_1, "d2r": dz2_r,
-                    "d1r": dz1_r,
-                    "ctx": ctx,
-                    "S": (ds.edge_features[int(fut.eidx[j])],
-                          dt, cp, root),
-                })
-            if (b + 1) % 20 == 0:
-                print("[extract] batch {}/{} rows={}".format(
-                    b + 1, n_b, len(rows)), flush=True)
+        n_avail = len(train.sources) // bs
+        n_b = min(n_batches, max(0, n_avail - start_batch))
+        for b in range(start_batch):
+            silent_batch(b)
+        for w in range(n_b):
+            bb = start_batch + w
+            keep, rm_snaps = window_batch(bb)
+            rows += _rows_from(keep, rm_snaps)
+            if (w + 1) % 20 == 0:
+                print("[{}] batch {}/{} rows={}".format(
+                    label, w + 1, n_b, len(rows)), flush=True)
         return rows
+
+    def mem_identical(bak_a, bak_b):
+        if not tgn.use_memory:
+            return True
+        if not (torch.equal(bak_a[0], bak_b[0])
+                and torch.equal(bak_a[1], bak_b[1])):
+            return False
+        if set(bak_a[2]) != set(bak_b[2]):
+            return False
+        for k in bak_a[2]:
+            if len(bak_a[2][k]) != len(bak_b[2][k]):
+                return False
+            for (ta, ea), (tb, eb) in zip(bak_a[2][k], bak_b[2][k]):
+                if not (torch.equal(ta, tb) and torch.equal(ea, eb)):
+                    return False
+        return True
 
     n_train_batches = len(train.sources) // bs
     audit_offset = max(0, n_train_batches - args.audit_batches)
-    print("[audit] extracting audit set (train tail) ...", flush=True)
-    audit_rows = extract(train, args.audit_batches,
-                         offset_batches=audit_offset)
+
+    # ---- memory-parity pre-check: the keep/remove window scheme must leave
+    # memory bit-identical to a pristine keep-only single pass.  Run over the
+    # first few train batches (fresh memory == the real stream start) so the
+    # mechanics are validated without an extra full prefix replay.
+    mem_parity = {"ok": False, "n_batches": args.memory_parity_batches,
+                  "detail": "not run (use_memory={})".format(tgn.use_memory)}
+    if tgn.use_memory and args.memory_parity_batches > 0:
+        if tgn.use_memory:
+            tgn.memory.__init_memory__()
+        base = _backup_mem()
+        for w in range(args.memory_parity_batches):
+            window_batch(w)                          # keep + rolled-back removes
+        state_window = _backup_mem()
+        _restore_mem(base)
+        for w in range(args.memory_parity_batches):
+            silent_batch(w)                          # pristine keep-only pass
+        state_single = _backup_mem()
+        _restore_mem(base)
+        ok = mem_identical(state_window, state_single)
+        mem_parity = {"ok": ok, "n_batches": args.memory_parity_batches,
+                      "detail": "bit-identical vs keep-only single pass"
+                      if ok else "MISMATCH vs keep-only single pass"}
+        print("[parity] memory {} vs keep-only single pass".format(
+            "bit-identical" if ok else "MISMATCH"), flush=True)
+        if not ok:
+            print("FATAL: memory parity check failed; aborting", flush=True)
+            return
+
+    print("[audit] extracting audit set (train tail, {} prefix replay "
+          "batches) ...".format(audit_offset), flush=True)
+    audit_rows = extract_window(audit_offset, args.audit_batches, "audit")
     print("[audit] audit rows:", len(audit_rows), flush=True)
     print("[calib] extracting calibration set (train head) ...", flush=True)
-    calib_rows = extract(train, args.calib_batches, offset_batches=0)
+    calib_rows = extract_window(0, args.calib_batches, "calib")
     print("[calib] calib rows:", len(calib_rows), flush=True)
     if not audit_rows or not calib_rows:
         print("FATAL: no leaf-to-root paths extracted", flush=True)
         return
 
+    # ------------------------------------------------------------ statistics
     def make_P(rows_):
         ef = np.stack([r["S"][0] for r in rows_])
         dt = np.asarray([r["S"][1] for r in rows_], dtype=np.float64)
@@ -553,134 +632,125 @@ def main():
         sn = np.asarray([r["S"][3] for r in rows_], dtype=np.int64)
         return fixed_phi_S(ef, dt, cp, sn)
 
+    def col(rows_, key):
+        return np.stack([r[key] for r in rows_])
+
     P_cal = make_P(calib_rows)
-    C_cal = np.stack([r["ctx"] for r in calib_rows])
     P_aud = make_P(audit_rows)
-    C_aud = np.stack([r["ctx"] for r in audit_rows])
+    C_cal = col(calib_rows, "ctx")
+    C_aud = col(audit_rows, "ctx")
 
-    print("[stats] fitting conditional residuals ...", flush=True)
-    lam = 1e-2
-    eps = 1e-6
-    Wp = _ridge_fit(C_cal, P_cal)
-    P_res_aud = _cond_residual(P_aud, C_aud, Wp)
-    X_names = ["U0", "Z1", "Z2", "Z3"]
-    X_cal = {k: np.stack([r[k.lower()] for r in calib_rows])
-             for k in X_names}
-    X_aud = {k: np.stack([r[k.lower()] for r in audit_rows])
-             for k in X_names}
-    J = {}
-    for k in X_names:
-        Wx = _ridge_fit(C_cal, X_cal[k])
-        Xr_aud = _cond_residual(X_aud[k], C_aud, Wx)
-        J[k] = _j_lambda(Xr_aud, P_res_aud, lam=lam, eps=eps)
-    print("[stats] J values:", {k: round(v, 5) for k, v in J.items()},
-          flush=True)
-
-    # ---- per-source depth retention (review: three staggered lines) ----
-    # Same path data, three source depths:
-    #   3-hop line: U3=u0 -> T32=z1 -> T31=z2 -> T3r=z3
-    #   2-hop line: U2=z1        -> T21=z2 -> T2r=z3
-    #   1-hop line: U1=z2                   -> T1r=z3
-    # Each line normalized by its own source J(U_d | C); same C and same
-    # future target S_rho for all positions of a line.
-    # ---- paired-removal retention: source COMPONENT at each position ----
-    # Delta_{s->k} = h_k(keep s) - h_k(remove s); parent self and siblings
-    # cancel in the subtraction.  Each line normalized by its own source
-    # component Delta_{s->s}.
-    line_keys = {
-        "D3s": "U0", "D32": "D32", "D31": "D31", "D3r": "D3R",
-        "D2s": "Z1", "D21": "D21", "D2r": "D2R",
-        "D1s": "Z2", "D1r": "D1R",
+    # source representation per line and the paired-removal deltas it leaves
+    lines = {
+        3: {"name": "U0", "source_key": "u0", "origin_phys": 0,
+            "points": [(1, "d32"), (2, "d31"), (3, "d3r")]},
+        2: {"name": "Z1", "source_key": "z1", "origin_phys": 1,
+            "points": [(2, "d21"), (3, "d2r")]},
+        1: {"name": "Z2", "source_key": "z2", "origin_phys": 2,
+            "points": [(3, "d1r")]},
     }
-    # build delta tensors (calib/audit)
-    X_cal_d = dict(X_cal)
-    X_aud_d = dict(X_aud)
-    for kk, fld in [("D32", "d32"), ("D31", "d31"), ("D3R", "d3r"),
-                    ("D21", "d21"), ("D2R", "d2r"), ("D1R", "d1r")]:
-        X_cal_d[kk] = np.stack([r[fld] for r in calib_rows])
-        X_aud_d[kk] = np.stack([r[fld] for r in audit_rows])
-    J_line = {}
-    for name, key in line_keys.items():
-        Wx = _ridge_fit(C_cal, X_cal_d[key])
-        Xr = _cond_residual(X_aud_d[key], C_aud, Wx)
-        J_line[name] = _j_lambda(Xr, P_res_aud, lam=lam, eps=eps)
-    print("[stats] paired-removal J:", {k: round(v, 4)
-                                        for k, v in J_line.items()},
-          flush=True)
-    # RAW variant: same paired-removal deltas, no context residualization
-    # on X or P (review: raw/keep trace is the defensible primary line).
-    J_raw = {}
-    for name, key in line_keys.items():
-        J_raw[name] = _j_lambda(X_aud_d[key], P_aud, lam=lam, eps=eps)
-    print("[stats] paired-removal raw J:",
-          {k: round(v, 4) for k, v in J_raw.items()}, flush=True)
 
-    def _line_ret(us, ts):
-        d = J_line[us] + eps
-        return {t: J_line[t] / d for t in ts}
+    # matched-context key = a historical node-time scalar in C (index 74:
+    # root/leaf hashes and one node time precede the three edge times).
+    strata = rs.strata_ids(C_aud[:, 74])
 
-    line3 = _line_ret("D3s", ["D32", "D31", "D3r"])
-    line2 = _line_ret("D2s", ["D21", "D2r"])
-    line1 = _line_ret("D1s", ["D1r"])
-    print("[stats] line3 (3-hop source, paired removal):",
-          {k: round(v, 4) for k, v in line3.items()}, flush=True)
-    print("[stats] line2 (2-hop source, paired removal):",
-          {k: round(v, 4) for k, v in line2.items()}, flush=True)
-    print("[stats] line1 (1-hop source, paired removal):",
-          {k: round(v, 4) for k, v in line1.items()}, flush=True)
+    def catF(D, C):
+        return np.concatenate([D, C], axis=1)
 
-    # ---- cluster bootstrap (root = cluster) for the delta energies ----
-    rng = np.random.RandomState(FIXED_SEED)
-    n_aud = len(audit_rows)
-    boot_J = {name: [] for name in line_keys}
-    idx_all = np.arange(n_aud)
-    for _ in range(args.n_bootstrap):
-        idx = rng.choice(idx_all, size=n_aud, replace=True)
-        for name, key in line_keys.items():
-            Wx = _ridge_fit(C_cal, X_cal_d[key])
-            Xr2 = _cond_residual(X_aud_d[key][idx], C_aud[idx], Wx)
-            boot_J[name].append(_j_lambda(Xr2, P_res_aud[idx],
-                                          lam=lam, eps=eps))
-    ci_J = {}
-    for name, arr in boot_J.items():
-        a = np.asarray(arr)
-        ci_J[name] = (float(np.percentile(a, 2.5)),
-                      float(np.percentile(a, 97.5)))
-    print("[stats] CI on delta J:",
-          {k: [round(a, 4), round(b, 4)] for k, (a, b) in ci_J.items()},
-          flush=True)
+    results = {}
+    for s, spec in sorted(lines.items()):
+        Xc = col(calib_rows, spec["source_key"])
+        Xa = col(audit_rows, spec["source_key"])
+        Qc, Qa = rs.source_component(Xc, P_cal, Xa, lam=args.lam)
 
-    # ---- matched-context shuffle nulls on the three sources ----
-    strata = np.digitize(C_aud[:, 2], bins=np.linspace(0, 1.2, 8))
-    null_lo = {}
-    for src in ("U0", "Z1", "Z2"):
-        src_x = X_aud[src].copy()
-        null_J = []
-        for _ in range(20):
-            src_s = src_x.copy()
-            for s in np.unique(strata):
-                m = strata == s
-                perm = rng.permutation(m.sum())
-                src_s[m] = src_x[m][perm]
-            Wx = _ridge_fit(C_cal, X_cal[src])
-            Xr = _cond_residual(src_s, C_aud, Wx)
-            null_J.append(_j_lambda(Xr, P_res_aud, lam=lam, eps=eps))
-        null_lo[src] = float(np.percentile(null_J, 5))
-    print("[stats] source null (shuffled) J p5:",
-          {k: round(v, 5) for k, v in null_lo.items()}, flush=True)
+        # ---- source signal vs matched-context shuffle null ----
+        sig, null_p95 = rs.source_signal_and_null(
+            Xc, P_cal, Xa, P_aud, strata, FIXED_SEED, lam=args.lam,
+            n_null=args.n_null, eps=eps)
+        sig_ok = bool(sig > null_p95)
+        print("[line {}] source signal {:.4f} null p95 {:.4f} ok={}"
+              .format(s, sig, null_p95, sig_ok), flush=True)
+
+        # ---- identity at the source position ----
+        Fid_c = catF(Xc, C_cal)
+        Fid_a = catF(Xa, C_aud)
+        mp_id = rs.fit_ridge_map(Fid_c, Qc, lam=args.lam_ret)
+        R_id = rs.retention_map_R(mp_id, Qa, Fid_a, eps=eps)
+        id_ok = bool(R_id >= args.identity_min)
+        print("[line {}] identity R={:.4f} ok={}".format(s, R_id, id_ok),
+              flush=True)
+
+        # ---- C-only floor (delete-source: Delta = 0) ----
+        mp_floor = rs.fit_ridge_map(C_cal, Qc, lam=args.lam_ret)
+        R_floor = rs.retention_map_R(mp_floor, Qa, C_aud, eps=eps)
+        floor_ok = bool(R_floor <= args.floor_max)
+        print("[line {}] delete-source floor R={:.4f} ok={}"
+              .format(s, R_floor, floor_ok), flush=True)
+
+        # ---- mismatched-delta control (unrelated info must not recover Q) ----
+        if spec["points"]:
+            pk = spec["points"][0][1]
+            Da = col(audit_rows, pk)
+            Dc = col(calib_rows, pk)
+            perm = rs.permute_within_strata(Da, strata,
+                                            np.random.RandomState(
+                                                FIXED_SEED + 7000 + s))
+            mp_perm = rs.fit_ridge_map(catF(Dc, C_cal), Qc,
+                                       lam=args.lam_ret)
+            R_perm = rs.retention_map_R(mp_perm, Qa,
+                                        catF(perm, C_aud), eps=eps)
+            perm_ok = bool(R_perm - R_floor <= 0.02)
+            print("[line {}] mismatched-delta R={:.4f} floor={:.4f} ok={}"
+                  .format(s, R_perm, R_floor, perm_ok), flush=True)
+        else:
+            R_perm = float("nan")
+            perm_ok = True
+
+        # ---- per-point retention (direct, same Q_s, no chaining) ----
+        points = [{"phys": spec["origin_phys"], "delta": "source",
+                   "R": float(R_id), "ci_lo": float(R_id),
+                   "ci_hi": float(R_id), "ok": True}]
+        for phys, dk in spec["points"]:
+            Dc_k = col(calib_rows, dk)
+            Da_k = col(audit_rows, dk)
+            mp_k = rs.fit_ridge_map(catF(Dc_k, C_cal), Qc,
+                                    lam=args.lam_ret)
+            R_k = rs.retention_map_R(mp_k, Qa, catF(Da_k, C_aud), eps=eps)
+            boot = rs.retention_bootstrap(
+                mp_k, Qa, catF(Da_k, C_aud), np.arange(len(audit_rows)),
+                args.n_bootstrap, FIXED_SEED + 9000 + s * 10 + phys, eps=eps)
+            lo, hi = rs.retention_ci(boot)
+            points.append({"phys": int(phys), "delta": dk,
+                           "R": float(R_k), "ci_lo": lo, "ci_hi": hi,
+                           "ok": True})
+            print("[line {}] pos {} delta {} R={:.4f} CI=[{:.4f},{:.4f}]"
+                  .format(s, phys, dk, R_k, lo, hi), flush=True)
+
+        line_ok = bool(sig_ok and id_ok and floor_ok and perm_ok
+                       and mem_parity["ok"])
+        results[str(s)] = {
+            "name": spec["name"], "source_key": spec["source_key"],
+            "origin_phys": spec["origin_phys"],
+            "signal": {"value": float(sig), "null_p95": float(null_p95),
+                       "ok": sig_ok},
+            "identity": {"value": float(R_id), "ok": id_ok},
+            "delete_floor": {"value": float(R_floor), "ok": floor_ok},
+            "mismatched_delta": {"value": float(R_perm), "ok": perm_ok},
+            "points": points,
+            "line_ok": line_ok,
+        }
+        print("[line {}] line_ok={}".format(s, line_ok), flush=True)
 
     report = {
-        "J": J,
-        "paired_removal_J": J_line,
-        "paired_removal_raw_J": J_raw,
-        "retention_lines": {"line3": line3, "line2": line2, "line1": line1},
-        "ci_delta_J": ci_J,
-        "source_null_p5": null_lo,
-        "n_audit_rows": n_aud,
+        "protocol": "same-source explained-variance retention, "
+                    "leak-free historical C, direct (non-chained) points",
+        "n_audit_rows": len(audit_rows),
         "n_calib_rows": len(calib_rows),
-        "lam": lam, "eps": eps,
+        "lam": args.lam, "lam_ret": args.lam_ret, "eps": eps,
+        "identity_min": args.identity_min, "floor_max": args.floor_max,
         "fixed_seed": FIXED_SEED,
-        "extraction": "leaf-to-root paired-removal path",
+        "memory_parity": mem_parity,
+        "sources": results,
     }
     out = Path(args.ckpt).parent / "retention_audit_v2.json"
     with open(out, "w") as f:

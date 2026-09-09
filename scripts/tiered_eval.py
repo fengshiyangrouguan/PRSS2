@@ -1,17 +1,17 @@
-"""tiered_eval.py — OFFICIAL LIBERO-Mem tiered success eval.
+"""tiered_eval.py — OFFICIAL LIBERO-Mem tiered success eval (reviewer-fixed).
 
-Fixes the evaluator bug: official success requires advancing the subgoal
-state machine via env._check_success(inc=True) EVERY physical step, plus
-reading len(_satisfied_subgoals) as tiered progress.  Our earlier evals never
-called inc=True, so _satisfied_subgoals stayed empty -> always 0/3 even when
-the model actually completed pickups (the user's video showed 2).
-
-Protocol:
-  * 10 no-op settle
-  * reset_subgoal_progress + _overshot=False before each demo
-  * per executed env step: base._check_success(inc=True) THEN env.step
-  * after each step read satisfied = len(base._satisfied_subgoals)
-  * report tiered_success distribution {0,1,2,3}, final check_success
+Fixes that caused invalid Stage2/Stage3 comparisons:
+  1. NEVER exit early on env.step()'s done: LIBERO-Mem's step can return True
+     when an INTERMEDIATE subgoal is satisfied, which would truncate the
+     trajectory before 3 cycles complete.
+  2. Per-demo paired diffusion seed so the same demo receives the same noise
+     across checkpoints (strict paired comparison).
+  3. Separate reports: tiered_progress (tier/3), tier3_reached, and
+     strict_success (tier==3 AND not overshot AND check_success(inc=False)).
+  4. reset_subgoal_progress + _overshot=False each demo (official reset does
+     not clear _overshot -> cross-episode pollution).
+Protocol: 10 no-op settle, then fixed-length rollout; each physical step
+advances the subgoal machine via base._check_success(inc=True) BEFORE env.step.
 """
 import os, sys, json, argparse
 import numpy as np
@@ -33,7 +33,6 @@ ap.add_argument("--demo-start",type=int,default=1); ap.add_argument("--n",type=i
 ap.add_argument("--exec",type=int,default=8); ap.add_argument("--maxsteps",type=int,default=370)
 ap.add_argument("--seed",type=int,default=42)
 args=ap.parse_args()
-torch.manual_seed(args.seed); np.random.seed(args.seed)
 ck=torch.load(args.ckpt,map_location="cpu",weights_only=False)
 arm,mem=ck["arm"],ck.get("mem_length",16)
 vla=load_vla(model_id_or_path=BASE,hf_token=None,load_for_training=True,use_bf16=True,
@@ -60,44 +59,47 @@ rows=[]
 for i in range(args.n):
     demo="demo_%d"%(args.demo_start+i)
     if demo not in mi[TASK]: continue
+    ep_seed = args.seed + int(demo.split("_")[1])
+    torch.manual_seed(ep_seed); torch.cuda.manual_seed_all(ep_seed); np.random.seed(ep_seed)
     meta=mi[TASK][demo]; instr=meta["task_description"]
     env.reset()
     base.reset_subgoal_progress()
-    base._overshot=False          # official reset bug: overshot not cleared
+    base._overshot=False
     obs=env.set_init_state(np.asarray(meta["initial_state"],dtype=np.float64))
     for _ in range(WAIT): obs,*_=env.step([0,0,0,0,0,0,-1.0])
-    t=WAIT; q=0; ep_first="True"; done=False; max_sat=0
-    peak_tier={}; tier_step={}
+    t=WAIT; q=0; max_sat=0; ep_first="True"; overshot_ever=False
     while t<args.maxsteps+WAIT:
         acts,_=vla.predict_action(image=Image.fromarray(np.ascontiguousarray(obs["agentview_image"][::-1,:])),
             instruction=instr,unnorm_key=None,use_ddim=True,num_ddim_steps=10,episode_first_frame=ep_first)
         ep_first="False"; q+=1; acts=np.asarray(acts)
         if acts.shape!=(CHUNK,7): break
         for j in range(min(args.exec,args.maxsteps+WAIT-t)):
-            # OFFICIAL: advance subgoal state machine every physical step
-            base._check_success(inc=True)
+            base._check_success(inc=True)          # advance machine
             sat=len(base._satisfied_subgoals)
-            if sat>max_sat: max_sat=sat; tier_step[sat]=t-WAIT
+            if sat>max_sat: max_sat=sat
+            if base._overshot: overshot_ever=True
             a=acts[j].copy(); a[6]=-1.0 if a[6]>=0.5 else +1.0
-            obs,rew,done,info=env.step(a.tolist()); t+=1
-            if done and done is not None: break
-        if done: break
-    final_sat=len(base._satisfied_subgoals)
-    try: fin=bool(base._check_success(inc=False))
-    except Exception: fin=bool(done)
-    rows.append(dict(demo=demo,tier=final_sat,peak=max_sat,fin=fin,done=bool(done),q=q))
-    print("[%s] tier=%d/3 peak=%d done=%s fin=%s q=%d"%(demo,final_sat,max_sat,done,fin,q),flush=True)
+            obs,rew,step_done,info=env.step(a.tolist())   # NEVER break on step_done
+            t+=1
+    final_tier=len(base._satisfied_subgoals)
+    strict = bool(final_tier==3 and not base._overshot and base._check_success(inc=False))
+    tier3 = bool(final_tier==3)
+    rows.append(dict(demo=demo,tier=final_tier,peak=max_sat,strict=strict,tier3=tier3,
+                     overshot=overshot_ever,q=q))
+    print("[%s] tier=%d/3 peak=%d strict=%s tier3=%s overshot=%s q=%d"%(
+        demo,final_tier,max_sat,strict,tier3,overshot_ever,q),flush=True)
 env.close()
 dist={c:sum(1 for r in rows if r["tier"]==c) for c in range(4)}
-nf=sum(1 for r in rows if r["fin"])
-print("\n==== TIERED EVAL ====",flush=True)
+n_strict=sum(1 for r in rows if r["strict"])
+n_t3=sum(1 for r in rows if r["tier3"])
+n_ov=sum(1 for r in rows if r["overshot"])
 n=len(rows)
 wsum=sum(r["tier"] for r in rows)
 weighted=wsum/(3.0*max(1,n))
-full=sum(1 for r in rows if r["tier"]==3)
 ge1=sum(1 for r in rows if r["tier"]>=1)
 ge2=sum(1 for r in rows if r["tier"]>=2)
-print("arm=%s exec=%d n=%d tier_dist=%s final_success=%d"%(arm,args.exec,n,dist,nf),flush=True)
-print("weighted_success=%.1f%% (sum_tier=%d/%.0f)  full3/3=%d  >=1cycle=%d  >=2cycle=%d"%
-      (weighted*100, wsum, 3.0*n, full, ge1, ge2),flush=True)
+print("\n==== TIERED EVAL ====",flush=True)
+print("arm=%s exec=%d n=%d tier_dist=%s"%(arm,args.exec,n,dist),flush=True)
+print("weighted_success=%.1f%% (sum_tier=%d/%.0f)  tier3_reached=%d  strict_success=%d  >=1cycle=%d  >=2cycle=%d  overshot_demos=%d"%(
+      weighted*100, wsum, 3.0*n, n_t3, n_strict, ge1, ge2, n_ov),flush=True)
 print("TIERED_DONE",flush=True)

@@ -249,12 +249,25 @@ def main():
     ap.add_argument("--n-dir", type=int, default=5,
                     help="number of fixed predictive directions extracted for "
                          "Q_s (top predictable part of the local future)")
+    ap.add_argument("--recompute-from", default=None,
+                    help="recompute statistics from a saved retention_rows.pkl "
+                         "(no model run); ignores the extraction/model args")
     ap.add_argument("--memory-parity-batches", type=int, default=5)
     ap.add_argument("--lam", type=float, default=1e-2)
     ap.add_argument("--lam-ret", type=float, default=1e-2)
     ap.add_argument("--identity-min", type=float, default=0.90)
     ap.add_argument("--floor-max", type=float, default=0.05)
     args = ap.parse_args()
+    if args.recompute_from:
+        with open(args.recompute_from, "rb") as f:
+            rd = pickle.load(f)
+        run_stats(rd["calib"], rd["audit"], rd["head"], args,
+                  {"ok": True,
+                   "n_batches": args.memory_parity_batches,
+                   "detail": "recomputed from saved rows (parity was verified "
+                             "at extraction)"},
+                  layout=rd.get("meta", {}).get("layout"))
+        return
 
     eps = 1e-6
     device = torch.device(
@@ -704,6 +717,18 @@ def main():
                      "head": calib_h_rows}, f)
     print("[dump] rows saved to", dump_path, flush=True)
 
+    run_stats(calib_rows, audit_rows, calib_h_rows, args, mem_parity,
+              layout={"audit_batches": args.audit_batches,
+                      "audit_block": [audit_lo, audit_hi],
+                      "calib_batches": args.calib_batches,
+                      "same_tail_calib_block": [calib_lo, calib_hi],
+                      "gap_batches": gap,
+                      "head_calib_block": [0, transfer_hi]})
+    return
+
+def run_stats(calib_rows, audit_rows, calib_h_rows, args, mem_parity,
+              layout=None):
+    eps = 1e-6
     # ------------------------------------------------------------ statistics
     def col(rows_, key):
         return np.stack([r[key] for r in rows_])
@@ -877,9 +902,9 @@ def main():
         ht = head_tail
         print("[line {}] same-tail sig {:.4f}(null {:.4f}) id {:.4f} "
               "floor {:.4f} | head->tail sig {:.4f}(null {:.4f})".format(
-                  s, st["signal"]["value"], st["signal"]["null_p95"],
+                  s, st["signal"]["J"], st["signal"]["null_p95"],
                   st["identity"]["value"], st["delete_floor"]["value"],
-                  ht["signal"]["value"], ht["signal"]["null_p95"]),
+                  ht["signal"]["J"], ht["signal"]["null_p95"]),
               flush=True)
         for tag, res in (("same-tail", st), ("head->tail", ht)):
             print("  [{}] line_ok={} points={}".format(
@@ -892,14 +917,9 @@ def main():
                     "historical C, direct (non-chained) points; same-tail "
                     "causal calibration is the main result, head->tail is a "
                     "transfer stress test",
-        "layout": {
-            "audit_batches": args.audit_batches,
-            "audit_block": [audit_lo, audit_hi],
-            "calib_batches": args.calib_batches,
-            "same_tail_calib_block": [calib_lo, calib_hi],
-            "gap_batches": gap,
-            "head_calib_block": [0, transfer_hi],
-        },
+        "layout": layout if layout is not None else
+            {"note": "recomputed from saved rows (block layout was stored at "
+                     "extraction)"},
         "n_audit_rows": len(audit_rows),
         "n_same_tail_calib_rows": len(calib_rows),
         "n_head_calib_rows": len(calib_h_rows),
@@ -914,6 +934,7 @@ def main():
         json.dump(report, f, indent=2)
     print(json.dumps(report, indent=2), flush=True)
     print("wrote", out, flush=True)
+
 
 
 if __name__ == "__main__":

@@ -57,7 +57,8 @@ def main():
                          ("delete_floor", main["delete_floor"]),
                          ("mismatch", main["mismatched_delta"])]:
                 if not v["ok"]:
-                    fails.append("{}={:.3f}".format(g, v["value"]))
+                    val = v.get("value", v.get("J"))
+                    fails.append("{}={:.3f}".format(g, val))
             dropped.append("{}hop {} ({})".format(s, name, ", ".join(fails)))
             continue
         ok.append((s, name, color, phys, R, lo, hi))

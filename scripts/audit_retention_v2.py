@@ -32,32 +32,33 @@ historical edges' edge_feat/edge_time and node times, path-outside
 other-neighbor means, root/leaf ids).  The future event appears ONLY in the
 prediction target P (fixed witness phi_S).
 
-Retention (source-specific predictive signal GIVEN context C; bounded <= 1,
-no chaining).  For source depth s let X_s be its representation (3: U0, 2: Z1,
-1: Z2).  The source component is built from the C-residualized source state
-and future observation -- never by re-residualizing an already-fitted Q_s:
+Retention (fixed same-source signal, bounded <= 1, no chaining).  The figure's
+question is how much of a source node's useful signal survives one/two/three
+recursive aggregations toward the root.  For source depth s let X_s be its
+representation (3: U0, 2: Z1, 1: Z2) and fix the source signal ONCE as
 
-    X_s^perp = X_s - E[X_s | C]      (ridge on calib)
-    P^perp   = P    - E[P   | C]     (ridge on calib)
-    Q_s      = E[P^perp | X_s^perp]  (ridge on calib)
+    Q_s = ridge(X_s -> P)          (fit on calib; P = root future witness)
 
-so Q_s is the source node's OWN predictive signal over and above the context.
-At each downstream position k the paired-removal delta is also C-residualized
-on calib, Delta_{s->k}^perp = Delta_{s->k} - E[Delta_{s->k} | C], and retention
-is how much of the SAME Q_s the audit-set Delta^perp recovers:
+Q_s is never re-estimated per layer and never regressed against the context C.
+C is NOT subtracted from the source signal: the paired keep/remove happens on
+the SAME tree, so the environment (context, siblings, edges, times) is fixed by
+construction.  At each downstream position k the paired-removal delta
+Delta_{s->k} (ancestor state keep minus remove of this source) is measured, and
+retention is how much of the SAME Q_s the audit-set Delta recovers:
 
     R_{s->k} = 1 - ||Q_s - Qhat_s||_F^2 / (||Q_s - mean Q_s||_F^2 + eps)
 
-with Qhat_s a ridge prediction of Q_s from Delta_{s->k}^perp alone.  Every
-point is an independent direct regression against the source component -- never
-a chain of local factors and never a ratio of unlike quantities.  SSE >= 0
-makes R <= 1 by construction; negative values are reported honestly.
+with Qhat_s a ridge prediction of Q_s from Delta_{s->k} alone.  Every point is
+an independent direct regression against the same source component -- never a
+chain of local factors, never a ratio of per-layer J, never a per-layer
+re-prediction of the future.  SSE >= 0 makes R <= 1 by construction; negative
+values are reported honestly.
 
-Gates run before plotting: source signal (explained variance of audit P^perp
-by Q_s) must exceed a within-strata shuffle null (95th pct) or the source is
+Gates run before plotting: source signal (explained variance of audit P by
+Q_s) must exceed a within-strata shuffle null (95th pct) or the source is
 marked NOT IDENTIFIABLE and its line is not drawn; identity at the source ~1;
-remove-source (Delta^perp = 0) ~0; a mismatched (permuted) delta must not
-recover Q_s; memory parity is stored.  The figure only draws lines whose gates
+remove-source (Delta = 0) ~0; a mismatched (permuted) delta must not recover
+Q_s; memory parity is stored.  The figure only draws lines whose gates
 all pass.  Calibration for the MAIN result is the contiguous same-tail block
 (just before the audit block, silent gap between); a head-calibration ->
 tail-audit fit is kept only as a cross-temporal TRANSFER stress test.
@@ -405,15 +406,16 @@ def main():
         edge_time = adapter.host.time_encoder(edge_deltas)
         edge_features = adapter.host.edge_features[edge_idxs]
         mask = neighbors_t == 0
-        # ---- paired removal: zero the selected child's message at the
-        # aggregation layer that consumes it ----
+        # ---- paired removal: replace ONLY the tracked source state (zero the
+        # selected child's hidden contribution).  The neighbor slot, its edge
+        # feature, time diff and mask are left untouched so the removal does
+        # not change the surrounding environment -- C is fixed by the paired
+        # keep/remove on the same tree.
         if record and remove_depth is not None and layer == (4 - remove_depth):
             if remove_depth == 1 and is_top:
                 for r, rec in path_state["recs"].items():
                     neighbor_lower = neighbor_lower.clone()
                     neighbor_lower[r, rec["slot3"]] = 0.0
-                    mask = mask.clone()
-                    mask[r, rec["slot3"]] = True
             else:
                 for (pr, s), root_r in list(path_state["by_layer"].get(
                         layer, {}).items()):
@@ -422,8 +424,6 @@ def main():
                         continue
                     neighbor_lower = neighbor_lower.clone()
                     neighbor_lower[flat_row, s] = 0.0
-                    mask = mask.clone()
-                    mask[flat_row, s] = True
         vanilla = adapter.host.aggregate(
             layer, source_lower, source_time, neighbor_lower, edge_time,
             edge_features, mask)
@@ -703,62 +703,57 @@ def main():
     # root/leaf hashes and one node time precede the three edge times).
     strata = rs.strata_ids(C_aud[:, 74])
 
-    def resid_on_C(Cc, Yc, Ca, Ya, lam=None):
-        """Regress C out of Y (fit on calib rows), apply to calib + audit."""
-        mp = rs.fit_ridge_map(Cc, Yc, lam=args.lam if lam is None else lam)
-        return (Yc - rs.apply_ridge_map(mp, Cc),
-                Ya - rs.apply_ridge_map(mp, Ca))
-
     def compute_line(s, spec, calib_rows_, audit_rows_, do_ci):
-        """Source-specific predictive signal given context C.
+        """Retention of ONE fixed source signal Q_s along the path.
 
-        Step 1 (calib only): residualize the source state and the future
-        observation against C -> X_s^perp, P^perp.  Step 2: the source
-        component Q_s = ridge(X_s^perp -> P^perp) is fit on those residuals --
-        it is the source's OWN incremental predictive signal over C, so it is
-        never re-residualized later.  Step 3: at each downstream position the
-        paired-removal delta is likewise C-residualized on calib
-        (Delta^perp) and tested on the audit set for how much of the SAME Q_s
-        it recovers.  Gates: source signal above a within-strata shuffle null
-        (else the source is not identifiable and the line is not drawn),
-        identity ~1, remove-source (Delta=0) ~0, mismatched-delta ~0.  Points
-        are direct regressions against Q_s -- no chaining."""
+        The figure's question is: how much of a source node's useful signal
+        survives one/two/three recursive aggregations on the way to the root?
+        Q_s is fixed once at the source -- Q_s = ridge(X_s -> P) fit on calib,
+        where P is the root's future witness -- and is never re-estimated per
+        layer and never regressed against C.  The context C is NOT subtracted:
+        the paired keep/remove intervention happens on the SAME tree, so C is
+        held fixed by construction.  At each ancestor position the paired-
+        removal delta Delta_{s->k} (keep minus remove of that source) is
+        regressed onto the SAME Q_s, and retention is how much of Q_s a
+        held-out Delta recovers:
+            R_{s->k} = 1 - ||Q_s - Qhat_s||^2 / (||Q_s - mean Q_s||^2 + eps).
+        No chaining, no per-layer J ratios, no re-predicting the future at any
+        layer."""
         Xc = col(calib_rows_, spec["source_key"])
         Xa = col(audit_rows_, spec["source_key"])
         Pc = make_P(calib_rows_)
-        Cc = col(calib_rows_, "ctx")
+        Qc, Qa = rs.source_component(Xc, Pc, Xa, lam=args.lam)
 
-        XcR, XaR = resid_on_C(Cc, Xc, C_aud, Xa)
-        PcR, PaR = resid_on_C(Cc, Pc, C_aud, P_aud)
-        mpQ = rs.fit_ridge_map(XcR, PcR, lam=args.lam)
-        Qc = rs.apply_ridge_map(mpQ, XcR)
-        Qa = rs.apply_ridge_map(mpQ, XaR)
-
-        # ---- source signal (P^perp predicted by X^perp), paired-shuffle null
-        sig = rs.explained_var(PaR, Qa, eps=eps)
+        # ---- source signal: how much of the (non-residual) audit P does the
+        # fixed Q_s explain; gate = above the 95th pct of a within-strata
+        # shuffle null (permuting X_s destroys the source-future link).
+        sig = rs.explained_var(P_aud, Qa, eps=eps)
         rng_null = np.random.RandomState(FIXED_SEED + 5000 + s)
         nulls = []
         for _ in range(args.n_null):
-            Xp = rs.permute_within_strata(XaR, strata, rng_null)
-            nulls.append(rs.explained_var(PaR,
-                                          rs.apply_ridge_map(mpQ, Xp),
+            Xp = rs.permute_within_strata(Xa, strata, rng_null)
+            nulls.append(rs.explained_var(P_aud,
+                                          rs.apply_ridge_map(
+                                              rs.fit_ridge_map(
+                                                  Xc, Pc, lam=args.lam),
+                                              Xp),
                                           eps=eps))
         null_p95 = float(np.percentile(nulls, 95))
         sig_ok = bool(sig > null_p95)
 
-        # ---- identity at the source: X_s^perp recovers Q_s
-        mp_id = rs.fit_ridge_map(XcR, Qc, lam=args.lam_ret)
-        R_id = rs.retention_map_R(mp_id, Qa, XaR, eps=eps)
+        # ---- identity at the source: X_s itself recovers Q_s (~1) ----
+        mp_id = rs.fit_ridge_map(Xc, Qc, lam=args.lam_ret)
+        R_id = rs.retention_map_R(mp_id, Qa, Xa, eps=eps)
         id_ok = bool(R_id >= args.identity_min)
 
-        # ---- remove-source floor: Delta^perp = 0 must recover ~nothing
-        zero = np.zeros_like(XcR)
-        mp_floor = rs.fit_ridge_map(zero, Qc, lam=args.lam_ret)
-        R_floor = rs.retention_map_R(mp_floor, Qa, np.zeros_like(XaR),
+        # ---- remove-source floor: Delta = 0 recovers ~nothing ----
+        mp_floor = rs.fit_ridge_map(np.zeros_like(Xc), Qc,
+                                    lam=args.lam_ret)
+        R_floor = rs.retention_map_R(mp_floor, Qa, np.zeros_like(Xa),
                                      eps=eps)
         floor_ok = bool(abs(R_floor) <= args.floor_max)
 
-        # ---- per-point retention from residualized paired-removal deltas
+        # ---- per-point retention from the paired-removal deltas ----
         points = [{"phys": spec["origin_phys"], "delta": "source",
                    "R": float(R_id), "ci_lo": float(R_id),
                    "ci_hi": float(R_id), "ok": True}]
@@ -766,14 +761,13 @@ def main():
         for phys, dk in spec["points"]:
             Dc = col(calib_rows_, dk)
             Da = col(audit_rows_, dk)
-            DcR, DaR = resid_on_C(Cc, Dc, C_aud, Da)
             if first_dc is None:
-                first_dc, first_da = DcR, DaR
-            mp_k = rs.fit_ridge_map(DcR, Qc, lam=args.lam_ret)
-            R_k = rs.retention_map_R(mp_k, Qa, DaR, eps=eps)
+                first_dc, first_da = Dc, Da
+            mp_k = rs.fit_ridge_map(Dc, Qc, lam=args.lam_ret)
+            R_k = rs.retention_map_R(mp_k, Qa, Da, eps=eps)
             if do_ci:
                 boot = rs.retention_bootstrap(
-                    mp_k, Qa, DaR, np.arange(len(audit_rows_)),
+                    mp_k, Qa, Da, np.arange(len(audit_rows_)),
                     args.n_bootstrap, FIXED_SEED + 9000 + s * 10 + phys,
                     eps=eps)
                 lo, hi = rs.retention_ci(boot)
@@ -783,7 +777,7 @@ def main():
                            "R": float(R_k), "ci_lo": lo, "ci_hi": hi,
                            "ok": True})
 
-        # ---- mismatched-delta control (permuted Delta^perp recovers ~0)
+        # ---- mismatched-delta control (permuted Delta recovers ~0) ----
         if first_dc is not None:
             perm = rs.permute_within_strata(first_da, strata,
                                             np.random.RandomState(

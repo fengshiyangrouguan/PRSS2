@@ -32,19 +32,35 @@ historical edges' edge_feat/edge_time and node times, path-outside
 other-neighbor means, root/leaf ids).  The future event appears ONLY in the
 prediction target P (fixed witness phi_S).
 
-Retention (same-source fraction, bounded <= 1, no chaining).  For source depth
-s let X_s be its representation (3: U0, 2: Z1, 1: Z2) and Q_s the ridge
-prediction of the future witness P from X_s (fit on calib).  At each downstream
-position k of that source the paired-removal delta Delta_{s->k} is measured
-(keep minus remove; parent self and siblings cancel).  Retention
+Retention (source-specific predictive signal GIVEN context C; bounded <= 1,
+no chaining).  For source depth s let X_s be its representation (3: U0, 2: Z1,
+1: Z2).  The source component is built from the C-residualized source state
+and future observation -- never by re-residualizing an already-fitted Q_s:
+
+    X_s^perp = X_s - E[X_s | C]      (ridge on calib)
+    P^perp   = P    - E[P   | C]     (ridge on calib)
+    Q_s      = E[P^perp | X_s^perp]  (ridge on calib)
+
+so Q_s is the source node's OWN predictive signal over and above the context.
+At each downstream position k the paired-removal delta is also C-residualized
+on calib, Delta_{s->k}^perp = Delta_{s->k} - E[Delta_{s->k} | C], and retention
+is how much of the SAME Q_s the audit-set Delta^perp recovers:
 
     R_{s->k} = 1 - ||Q_s - Qhat_s||_F^2 / (||Q_s - mean Q_s||_F^2 + eps)
 
-where Qhat_s is a ridge prediction of the SAME Q_s from [Delta_{s->k}; C]
-fitted on calib and evaluated on audit.  Every point is an independent direct
-regression against the source component -- never a chain of local factors and
-never a ratio of unlike quantities.  SSE >= 0 makes R <= 1 by construction;
-negative values are reported honestly.
+with Qhat_s a ridge prediction of Q_s from Delta_{s->k}^perp alone.  Every
+point is an independent direct regression against the source component -- never
+a chain of local factors and never a ratio of unlike quantities.  SSE >= 0
+makes R <= 1 by construction; negative values are reported honestly.
+
+Gates run before plotting: source signal (explained variance of audit P^perp
+by Q_s) must exceed a within-strata shuffle null (95th pct) or the source is
+marked NOT IDENTIFIABLE and its line is not drawn; identity at the source ~1;
+remove-source (Delta^perp = 0) ~0; a mismatched (permuted) delta must not
+recover Q_s; memory parity is stored.  The figure only draws lines whose gates
+all pass.  Calibration for the MAIN result is the contiguous same-tail block
+(just before the audit block, silent gap between); a head-calibration ->
+tail-audit fit is kept only as a cross-temporal TRANSFER stress test.
 
 Gates run before plotting: source predictive signal above a matched-context
 shuffle null (95th pct), identity at the source ~1, delete-source (Delta = 0,

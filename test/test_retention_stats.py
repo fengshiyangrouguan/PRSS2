@@ -113,5 +113,56 @@ def test_cc_context_has_no_future_index_path():
     assert "fut.eidx" in _AUDIT_SRC
 
 
+def _given_C_signal(Xtr, Ptr, Ctr, Xte, Pte, Cte, lam=1e-2):
+    """Source-specific (given-C) predictive signal, mirroring the audit:
+    residualize X and P against C on the train split, then Q_s =
+    ridge(X^perp -> P^perp); return the held-out explained variance of P^perp
+    by Q_s."""
+    mpX = rs.fit_ridge_map(Ctr, Xtr, lam=lam)
+    Xr_tr = Xtr - rs.apply_ridge_map(mpX, Ctr)
+    Xr_te = Xte - rs.apply_ridge_map(mpX, Cte)
+    mpP = rs.fit_ridge_map(Ctr, Ptr, lam=lam)
+    Pr_tr = Ptr - rs.apply_ridge_map(mpP, Ctr)
+    Pr_te = Pte - rs.apply_ridge_map(mpP, Cte)
+    mpQ = rs.fit_ridge_map(Xr_tr, Pr_tr, lam=lam)
+    Qte = rs.apply_ridge_map(mpQ, Xr_te)
+    return rs.explained_var(Pr_te, Qte)
+
+
+def test_source_specific_signal_is_zero_when_source_only_carries_context():
+    """If X carries P purely through the context C, the given-C source signal
+    must be ~0 (the naive absolute X->P map would look positive)."""
+    n_tr, n_te = 4000, 3000
+    r = np.random.RandomState(3)
+    H = r.normal(size=(n_tr + n_te, 3))          # hidden context
+    A = r.normal(size=(3, 24))
+    W = r.normal(size=(3, 12))
+    P = H @ A + 0.2 * r.normal(size=(n_tr + n_te, 24))
+    X = H @ W + 0.2 * r.normal(size=(n_tr + n_te, 12))   # X depends on H only
+    C = H.copy()                                        # C spans the context
+    sig = _given_C_signal(X[:n_tr], P[:n_tr], C[:n_tr],
+                          X[n_tr:], P[n_tr:], C[n_tr:])
+    assert sig <= 0.05, sig
+
+
+def test_source_specific_signal_is_positive_when_source_adds_beyond_context():
+    """When X carries a component that predicts P beyond what C provides, the
+    given-C source signal must be clearly positive."""
+    n_tr, n_te = 4000, 3000
+    r = np.random.RandomState(4)
+    H = r.normal(size=(n_tr + n_te, 3))
+    S = r.normal(size=(n_tr + n_te, 2))          # true source-specific driver
+    A = r.normal(size=(3, 24))
+    B = r.normal(size=(2, 24))
+    W = r.normal(size=(5, 16))
+    P = H @ A + S @ B + 0.2 * r.normal(size=(n_tr + n_te, 24))
+    X = np.concatenate([H, S], axis=1) @ W + 0.1 * r.normal(
+        size=(n_tr + n_te, 16))
+    C = H + 0.1 * r.normal(size=(n_tr + n_te, 3))
+    sig = _given_C_signal(X[:n_tr], P[:n_tr], C[:n_tr],
+                          X[n_tr:], P[n_tr:], C[n_tr:])
+    assert sig >= 0.10, sig
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-q"]))

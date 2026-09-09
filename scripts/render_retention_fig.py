@@ -43,18 +43,19 @@ def main():
     dropped = []
     for s in sorted((int(k) for k in report["sources"])):
         src = report["sources"][str(s)]
+        main = src["same_tail"]               # main result: same-tail causal fit
         name, color = src["name"], LINE_COLORS[s]
-        pts = src["points"]
+        pts = main["points"]
         phys = [p["phys"] for p in pts]
         R = [max(-0.25, min(1.0, p["R"])) for p in pts]
         lo = [max(-0.25, min(1.0, p["ci_lo"])) for p in pts]
         hi = [max(-0.25, min(1.0, p["ci_hi"])) for p in pts]
-        if not src["line_ok"]:
+        if not main["line_ok"]:
             fails = []
-            for g, v in [("signal", src["signal"]),
-                         ("identity", src["identity"]),
-                         ("delete_floor", src["delete_floor"]),
-                         ("mismatch", src["mismatched_delta"])]:
+            for g, v in [("signal", main["signal"]),
+                         ("identity", main["identity"]),
+                         ("delete_floor", main["delete_floor"]),
+                         ("mismatch", main["mismatched_delta"])]:
                 if not v["ok"]:
                     fails.append("{}={:.3f}".format(g, v["value"]))
             dropped.append("{}hop {} ({})".format(s, name, ", ".join(fails)))
@@ -62,7 +63,7 @@ def main():
         ok.append((s, name, color, phys, R, lo, hi))
 
     if not ok:
-        ax.text(0.5, 0.5, "no source line passed the gates",
+        ax.text(0.5, 0.5, "no source line passed the same-tail gates",
                 ha="center", va="center", transform=ax.transAxes)
     for s, name, color, phys, R, lo, hi in ok:
         ax.plot(phys, R, "-o", color=color, lw=1.8, ms=4.5,
@@ -72,7 +73,7 @@ def main():
 
     ax.set_xlabel("position along the leaf-to-root path (compressions)")
     ax.set_ylabel("retention of source prediction component\n"
-                  "R = 1 - SSE / SST (same source, direct regression)")
+                  "R = 1 - SSE / SST (same-tail causal fit, direct regression)")
     ax.set_xticks(list(POS_LABELS.keys()))
     ax.set_xticklabels([POS_LABELS[k] for k in sorted(POS_LABELS)])
     ax.set_ylim(-0.3, 1.08)
@@ -81,7 +82,8 @@ def main():
     if ok:
         ax.legend(loc="lower left", fontsize=8, frameon=False)
     if dropped:
-        ax.text(0.02, -0.24, "not drawn (gates): " + "; ".join(dropped),
+        ax.text(0.02, -0.24, "not drawn (same-tail gates): "
+                + "; ".join(dropped),
                 transform=ax.transAxes, fontsize=7, color="#6a7178",
                 va="top")
     fig.tight_layout()

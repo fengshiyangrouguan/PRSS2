@@ -213,7 +213,16 @@ def main():
     ap.add_argument("--gpu", type=int, default=0)
     ap.add_argument("--bs", type=int, default=64)
     ap.add_argument("--audit-batches", type=int, default=200)
-    ap.add_argument("--calib-batches", type=int, default=60)
+    ap.add_argument("--calib-batches", type=int, default=60,
+                    help="same-tail calibration block length (contiguous, "
+                         "immediately before the audit block, separated by "
+                         "--gap-batches)")
+    ap.add_argument("--gap-batches", type=int, default=8,
+                    help="silent batches between the same-tail calib block "
+                         "and the audit block")
+    ap.add_argument("--transfer-batches", type=int, default=None,
+                    help="head calibration block length for the head->tail "
+                         "transfer stress test (default = --calib-batches)")
     ap.add_argument("--audit-start-batches", type=int, default=None,
                     help="override: start the audit window here (default: "
                          "train tail = --audit-batches worth of batches)")
@@ -549,27 +558,21 @@ def main():
             })
         return rows
 
-    def extract_window(start_batch, n_batches, label):
-        """One pass from a fresh memory: replay the prefix (real single-pass
-        keep-only forwards), then collect rows over the window with the
-        keep/remove scheme."""
-        if tgn.use_memory:
-            tgn.memory.__init_memory__()
-        rows = []
-        n_avail = len(train.sources) // bs
-        n_b = min(n_batches, max(0, n_avail - start_batch))
-        for b in range(start_batch):
-            silent_batch(b)
-            if (b + 1) % 200 == 0:
+    def _silent_batches(a, b, label):
+        for i, bb in enumerate(range(a, b)):
+            silent_batch(bb)
+            if (i + 1) % 200 == 0:
                 print("[{}] prefix replay {}/{}".format(
-                    label, b + 1, start_batch), flush=True)
-        for w in range(n_b):
-            bb = start_batch + w
+                    label, i + 1, b - a), flush=True)
+
+    def _collect_rows(a, b, label):
+        rows = []
+        for i, bb in enumerate(range(a, b)):
             keep, rm_snaps = window_batch(bb)
             rows += _rows_from(keep, rm_snaps)
-            if (w + 1) % 20 == 0:
+            if (i + 1) % 20 == 0:
                 print("[{}] batch {}/{} rows={}".format(
-                    label, w + 1, n_b, len(rows)), flush=True)
+                    label, i + 1, b - a, len(rows)), flush=True)
         return rows
 
     def mem_identical(bak_a, bak_b):
@@ -593,6 +596,18 @@ def main():
         audit_offset = max(0, n_train_batches - args.audit_batches)
     else:
         audit_offset = int(args.audit_start_batches)
+    # same-tail causal layout: audit block [audit_lo, audit_hi) is the held-out
+    # target; calibration is the CONTIGUOUS block just before it (no row-level
+    # interleaving), separated by a silent gap.  Memory is advanced by the real
+    # single-pass flow only.
+    audit_lo = audit_offset
+    audit_hi = min(n_train_batches, audit_lo + args.audit_batches)
+    gap = max(0, int(args.gap_batches))
+    calib_hi = max(0, audit_lo - gap)
+    calib_lo = max(0, calib_hi - args.calib_batches)
+    transfer_hi = min(n_train_batches, int(
+        args.transfer_batches if args.transfer_batches is not None
+        else args.calib_batches))
 
     # ---- memory-parity pre-check: the keep/remove window scheme must leave
     # memory bit-identical to a pristine keep-only single pass.  Run over the
@@ -622,14 +637,24 @@ def main():
             print("FATAL: memory parity check failed; aborting", flush=True)
             return
 
-    print("[audit] extracting audit set (train tail, {} prefix replay "
-          "batches) ...".format(audit_offset), flush=True)
-    audit_rows = extract_window(audit_offset, args.audit_batches, "audit")
-    print("[audit] audit rows:", len(audit_rows), flush=True)
-    print("[calib] extracting calibration set (train head) ...", flush=True)
-    calib_rows = extract_window(0, args.calib_batches, "calib")
-    print("[calib] calib rows:", len(calib_rows), flush=True)
-    if not audit_rows or not calib_rows:
+    print("[tail] one full prefix pass: silent replay 0..{}, then calib "
+          "[{},{}), silent gap, audit [{},{})".format(
+              calib_lo, calib_lo, calib_hi, audit_lo, audit_hi), flush=True)
+    if tgn.use_memory:
+        tgn.memory.__init_memory__()
+    _silent_batches(0, calib_lo, "tail")
+    calib_rows = _collect_rows(calib_lo, calib_hi, "calib")
+    _silent_batches(calib_hi, audit_lo, "gap")
+    audit_rows = _collect_rows(audit_lo, audit_hi, "audit")
+    print("[tail] same-tail calib rows:", len(calib_rows),
+          "audit rows:", len(audit_rows), flush=True)
+    # ---- head calibration block for the head->tail TRANSFER stress test
+    # (a second, independent pass from fresh memory over the stream head)
+    if tgn.use_memory:
+        tgn.memory.__init_memory__()
+    calib_h_rows = _collect_rows(0, transfer_hi, "head-calib")
+    print("[head] head calib rows:", len(calib_h_rows), flush=True)
+    if not audit_rows or not calib_rows or not calib_h_rows:
         print("FATAL: no leaf-to-root paths extracted", flush=True)
         return
 
@@ -644,12 +669,9 @@ def main():
     def col(rows_, key):
         return np.stack([r[key] for r in rows_])
 
-    P_cal = make_P(calib_rows)
-    P_aud = make_P(audit_rows)
-    C_cal = col(calib_rows, "ctx")
-    C_aud = col(audit_rows, "ctx")
+    def catF(D, C):
+        return np.concatenate([D, C], axis=1)
 
-    # source representation per line and the paired-removal deltas it leaves
     lines = {
         3: {"name": "U0", "source_key": "u0", "origin_phys": 0,
             "points": [(1, "d32"), (2, "d31"), (3, "d3r")]},
@@ -659,87 +681,76 @@ def main():
             "points": [(3, "d1r")]},
     }
 
+    P_aud = make_P(audit_rows)
+    C_aud = col(audit_rows, "ctx")
     # matched-context key = a historical node-time scalar in C (index 74:
     # root/leaf hashes and one node time precede the three edge times).
     strata = rs.strata_ids(C_aud[:, 74])
 
-    def catF(D, C):
-        return np.concatenate([D, C], axis=1)
-
-    results = {}
-    for s, spec in sorted(lines.items()):
-        Xc = col(calib_rows, spec["source_key"])
-        Xa = col(audit_rows, spec["source_key"])
-        Qc, Qa = rs.source_component(Xc, P_cal, Xa, lam=args.lam)
+    def compute_line(s, spec, calib_rows_, audit_rows_, do_ci):
+        """Fit Q_s and the retention maps on `calib_rows_`, score the
+        `audit_rows_` (same audit rows for both fits).  Every point is a direct
+        explained variance of the SAME source component Q_s (no chaining)."""
+        Xc = col(calib_rows_, spec["source_key"])
+        Xa = col(audit_rows_, spec["source_key"])
+        Pc = make_P(calib_rows_)
+        Cc = col(calib_rows_, "ctx")
+        Qc, Qa = rs.source_component(Xc, Pc, Xa, lam=args.lam)
 
         # ---- source signal vs matched-context shuffle null ----
         sig, null_p95 = rs.source_signal_and_null(
-            Xc, P_cal, Xa, P_aud, strata, FIXED_SEED, lam=args.lam,
+            Xc, Pc, Xa, P_aud, strata, FIXED_SEED, lam=args.lam,
             n_null=args.n_null, eps=eps)
         sig_ok = bool(sig > null_p95)
-        print("[line {}] source signal {:.4f} null p95 {:.4f} ok={}"
-              .format(s, sig, null_p95, sig_ok), flush=True)
 
         # ---- identity at the source position ----
-        Fid_c = catF(Xc, C_cal)
-        Fid_a = catF(Xa, C_aud)
-        mp_id = rs.fit_ridge_map(Fid_c, Qc, lam=args.lam_ret)
-        R_id = rs.retention_map_R(mp_id, Qa, Fid_a, eps=eps)
+        mp_id = rs.fit_ridge_map(catF(Xc, Cc), Qc, lam=args.lam_ret)
+        R_id = rs.retention_map_R(mp_id, Qa, catF(Xa, C_aud), eps=eps)
         id_ok = bool(R_id >= args.identity_min)
-        print("[line {}] identity R={:.4f} ok={}".format(s, R_id, id_ok),
-              flush=True)
 
         # ---- C-only floor (delete-source: Delta = 0) ----
-        mp_floor = rs.fit_ridge_map(C_cal, Qc, lam=args.lam_ret)
+        mp_floor = rs.fit_ridge_map(Cc, Qc, lam=args.lam_ret)
         R_floor = rs.retention_map_R(mp_floor, Qa, C_aud, eps=eps)
         floor_ok = bool(R_floor <= args.floor_max)
-        print("[line {}] delete-source floor R={:.4f} ok={}"
-              .format(s, R_floor, floor_ok), flush=True)
 
         # ---- mismatched-delta control (unrelated info must not recover Q) ----
         if spec["points"]:
             pk = spec["points"][0][1]
-            Da = col(audit_rows, pk)
-            Dc = col(calib_rows, pk)
+            Da = col(audit_rows_, pk)
+            Dc = col(calib_rows_, pk)
             perm = rs.permute_within_strata(Da, strata,
                                             np.random.RandomState(
                                                 FIXED_SEED + 7000 + s))
-            mp_perm = rs.fit_ridge_map(catF(Dc, C_cal), Qc,
-                                       lam=args.lam_ret)
-            R_perm = rs.retention_map_R(mp_perm, Qa,
-                                        catF(perm, C_aud), eps=eps)
+            mp_perm = rs.fit_ridge_map(catF(Dc, Cc), Qc, lam=args.lam_ret)
+            R_perm = rs.retention_map_R(mp_perm, Qa, catF(perm, C_aud),
+                                        eps=eps)
             perm_ok = bool(R_perm - R_floor <= 0.02)
-            print("[line {}] mismatched-delta R={:.4f} floor={:.4f} ok={}"
-                  .format(s, R_perm, R_floor, perm_ok), flush=True)
         else:
-            R_perm = float("nan")
-            perm_ok = True
+            R_perm, perm_ok = float("nan"), True
 
         # ---- per-point retention (direct, same Q_s, no chaining) ----
         points = [{"phys": spec["origin_phys"], "delta": "source",
                    "R": float(R_id), "ci_lo": float(R_id),
                    "ci_hi": float(R_id), "ok": True}]
         for phys, dk in spec["points"]:
-            Dc_k = col(calib_rows, dk)
-            Da_k = col(audit_rows, dk)
-            mp_k = rs.fit_ridge_map(catF(Dc_k, C_cal), Qc,
-                                    lam=args.lam_ret)
+            Dc_k = col(calib_rows_, dk)
+            Da_k = col(audit_rows_, dk)
+            mp_k = rs.fit_ridge_map(catF(Dc_k, Cc), Qc, lam=args.lam_ret)
             R_k = rs.retention_map_R(mp_k, Qa, catF(Da_k, C_aud), eps=eps)
-            boot = rs.retention_bootstrap(
-                mp_k, Qa, catF(Da_k, C_aud), np.arange(len(audit_rows)),
-                args.n_bootstrap, FIXED_SEED + 9000 + s * 10 + phys, eps=eps)
-            lo, hi = rs.retention_ci(boot)
+            if do_ci:
+                boot = rs.retention_bootstrap(
+                    mp_k, Qa, catF(Da_k, C_aud), np.arange(len(audit_rows_)),
+                    args.n_bootstrap, FIXED_SEED + 9000 + s * 10 + phys,
+                    eps=eps)
+                lo, hi = rs.retention_ci(boot)
+            else:
+                lo = hi = float(R_k)
             points.append({"phys": int(phys), "delta": dk,
                            "R": float(R_k), "ci_lo": lo, "ci_hi": hi,
                            "ok": True})
-            print("[line {}] pos {} delta {} R={:.4f} CI=[{:.4f},{:.4f}]"
-                  .format(s, phys, dk, R_k, lo, hi), flush=True)
-
         line_ok = bool(sig_ok and id_ok and floor_ok and perm_ok
                        and mem_parity["ok"])
-        results[str(s)] = {
-            "name": spec["name"], "source_key": spec["source_key"],
-            "origin_phys": spec["origin_phys"],
+        return {
             "signal": {"value": float(sig), "null_p95": float(null_p95),
                        "ok": sig_ok},
             "identity": {"value": float(R_id), "ok": id_ok},
@@ -748,13 +759,48 @@ def main():
             "points": points,
             "line_ok": line_ok,
         }
-        print("[line {}] line_ok={}".format(s, line_ok), flush=True)
+
+    results = {}
+    for s, spec in sorted(lines.items()):
+        same_tail = compute_line(s, spec, calib_rows, audit_rows, do_ci=True)
+        head_tail = compute_line(s, spec, calib_h_rows, audit_rows,
+                                 do_ci=False)
+        results[str(s)] = {
+            "name": spec["name"], "source_key": spec["source_key"],
+            "origin_phys": spec["origin_phys"],
+            "same_tail": same_tail,
+            "head_to_tail": head_tail,
+        }
+        st = same_tail
+        ht = head_tail
+        print("[line {}] same-tail sig {:.4f}(null {:.4f}) id {:.4f} "
+              "floor {:.4f} | head->tail sig {:.4f}(null {:.4f})".format(
+                  s, st["signal"]["value"], st["signal"]["null_p95"],
+                  st["identity"]["value"], st["delete_floor"]["value"],
+                  ht["signal"]["value"], ht["signal"]["null_p95"]),
+              flush=True)
+        for tag, res in (("same-tail", st), ("head->tail", ht)):
+            print("  [{}] line_ok={} points={}".format(
+                tag, res["line_ok"],
+                [(p["phys"], round(p["R"], 3)) for p in res["points"]]),
+                flush=True)
 
     report = {
-        "protocol": "same-source explained-variance retention, "
-                    "leak-free historical C, direct (non-chained) points",
+        "protocol": "same-source explained-variance retention, leak-free "
+                    "historical C, direct (non-chained) points; same-tail "
+                    "causal calibration is the main result, head->tail is a "
+                    "transfer stress test",
+        "layout": {
+            "audit_batches": args.audit_batches,
+            "audit_block": [audit_lo, audit_hi],
+            "calib_batches": args.calib_batches,
+            "same_tail_calib_block": [calib_lo, calib_hi],
+            "gap_batches": gap,
+            "head_calib_block": [0, transfer_hi],
+        },
         "n_audit_rows": len(audit_rows),
-        "n_calib_rows": len(calib_rows),
+        "n_same_tail_calib_rows": len(calib_rows),
+        "n_head_calib_rows": len(calib_h_rows),
         "lam": args.lam, "lam_ret": args.lam_ret, "eps": eps,
         "identity_min": args.identity_min, "floor_max": args.floor_max,
         "fixed_seed": FIXED_SEED,

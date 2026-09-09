@@ -65,6 +65,7 @@ class TGBPairLinkLoop:
                  kf_group_batches=56, kf_min_trees=896,
                  n_observations=2, trace_mode="evenly_spaced",
                  fail_below=False, train_neg_sampler=None,
+                 repr_every_batch=False,
                  audit_trace=False, aux_prefix_groups=None,
                  group_plan_sha=None, use_parent=None, mispaired=None,
                  context_mode="full", variant="full_balancing",
@@ -127,6 +128,8 @@ class TGBPairLinkLoop:
         # prefix-causal train negative sampler (root task only); when None a
         # uniform-over-destination-universe fallback is used.
         self.train_neg_sampler = train_neg_sampler
+        self.repr_every_batch = bool(repr_every_batch)
+
         self._dst_univ = None
         # shared group plan (spec §1.1-final): aux_prefix_groups = number of
         # leading macro groups eligible for the auxiliary windows; groups after
@@ -565,7 +568,8 @@ class TGBPairLinkLoop:
                 print("[audit-debug] group=%d keys=%d records=%d hits=%d"
                       % (group_start // self.kf_group_batches,
                          len(g_by_pos_all), _grp_recs, _grp_hits), flush=True)
-            if self.repr_optimizer is not None and self.repr_params:
+            if self.repr_optimizer is not None and self.repr_params \
+                    and not self.repr_every_batch:
                 for p in self.repr_params:
                     if p.grad is not None:
                         p.grad.div_(float(max(1, group_k)))
@@ -815,6 +819,12 @@ class TGBPairLinkLoop:
             self._clip(self.head_params)
             if not self.calibrate:
                 self.head_optimizer.step()
+            if self.repr_every_batch and self.repr_optimizer is not None \
+                    and self.repr_params:
+                self._clip(self.repr_params)
+                if not self.calibrate:
+                    self.repr_optimizer.step()
+                self.repr_optimizer.zero_grad(set_to_none=True)
             if self.tgn.use_memory:
                 self.tgn.memory.detach_memory()
             link_sum += float(link_loss.detach())

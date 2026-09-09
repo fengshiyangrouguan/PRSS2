@@ -1,0 +1,6 @@
+{
+  "status": "complete",
+  "best_epoch": 27,
+  "selection": "ap_all",
+  "stop_reason": "budget"
+}

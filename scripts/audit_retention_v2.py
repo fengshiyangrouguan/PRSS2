@@ -78,6 +78,7 @@ Usage:
 import argparse
 import json
 import os
+import pickle
 import sys
 from pathlib import Path
 
@@ -695,6 +696,13 @@ def main():
     if not audit_rows or not calib_rows or not calib_h_rows:
         print("FATAL: no leaf-to-root paths extracted", flush=True)
         return
+    # persist the extracted row matrices so a later statistics-only change can
+    # be recomputed without re-running the model (15 min -> seconds)
+    dump_path = Path(args.ckpt).parent / "retention_rows.pkl"
+    with open(dump_path, "wb") as f:
+        pickle.dump({"audit": audit_rows, "calib": calib_rows,
+                     "head": calib_h_rows}, f)
+    print("[dump] rows saved to", dump_path, flush=True)
 
     # ------------------------------------------------------------ statistics
     def col(rows_, key):
@@ -736,73 +744,79 @@ def main():
         """Retention of ONE fixed source signal Q_s along the path.
 
         Q_s is fixed once at the source as the top --n-dir PREDICTIVE
-        directions of the source state X_s for its own two-level boundary
-        future P_s=(Y_s,Y_p(s)): Q_s = A^T X_s with A estimated once on calib
-        from the whitened X_s<->P_s cross-covariance.  Only the predictable
-        part of the (noisy, high-dim) future is kept -- never the full
-        reconstruction of the random future vector.  Q_s is not re-estimated
-        per layer and never regressed against C.  At each ancestor position
-        the paired-removal delta Delta_{s->k} is regressed onto the SAME Q_s,
-        and retention is how much of Q_s a held-out Delta recovers:
-            R_{s->k} = 1 - ||Q_s - Qhat_s||^2 / (||Q_s - mean Q_s||^2 + eps).
-        No chaining, no per-layer J ratios, no re-predicting the future at any
-        layer."""
+        directions of X_s for its own two-level boundary future
+        P_s=(Y_s,Y_p(s)): Q_s = A^T X_s, A estimated once on calib from the
+        whitened X_s<->P_s cross-covariance (only the predictable part of the
+        noisy future is kept).  Q_s is not re-estimated per layer and never
+        regressed against C.
+
+        SOURCE GATE: audit-centered squared-canonical strength
+            J = tr[(Cpp+eps I)^-1 Cpx (Cqq+lam I)^-1 Cxq]
+        between the fixed Q_s and its held-out projected future Pq.  J >= 0
+        and is invariant to mean/scale drift, so cross-block drift cannot
+        produce a negative source signal.  The source is identifiable iff
+        J exceeds the 95th pct of the same-layer shuffle null.
+
+        DOWNSTREAM: each ancestor point is the centered, correlation-type
+        recoverability in [0,1] of the SAME Q_s from the paired-removal delta
+        (mean over directions of squared Pearson corr between Q_s and its
+        ridge recovery from Delta_{s->k}).  The raw cross-block explained
+        variance is kept only as a diagnostic.  No chaining, no per-layer J
+        ratios, no re-predicting the future at any layer."""
         Xc = col(calib_rows_, spec["source_key"])
         Xa = col(audit_rows_, spec["source_key"])
         k1, k2 = spec["target"]
         Pc = line_P(calib_rows_, k1, k2)
         Pa = line_P(audit_rows_, k1, k2)
 
-        # ---- fixed predictive subspace: only the top --n-dir directions of
-        # the local future P_s that the source state can predict (fit once on
-        # calib).  Q_s = A^T X_s carries the source's own useful component;
-        # the unpredictable noise of the full 256-d future vector is never
-        # required to be reconstructed.
         mpd = rs.canonical_dirs(Xc, Pc, args.n_dir, lam=args.lam, eps=eps)
         Qc = rs.predict_source_component(mpd, Xc)
         Qa = rs.predict_source_component(mpd, Xa)
         Pq_aud = rs.project_future(mpd, Pa)
 
-        # ---- source signal: explained variance of the held-out projected
-        # future Pq (along the fixed directions) by the fixed Q_s.  Gate:
-        # signal > 0 AND signal > null_p95.
-        sig = rs.explained_var(Pq_aud, Qa, eps=eps)
+        # ---- source signal: centered squared-canonical strength J ----
+        J = rs.centered_sq_corr_strength(Qa, Pq_aud, lam=args.lam, eps=eps)
+        ev_raw = rs.explained_var(Pq_aud, Qa, eps=eps)  # diagnostic only
         rng_null = np.random.RandomState(FIXED_SEED + 5000 + s)
         nulls = []
         for _ in range(args.n_null):
             Xp = rs.permute_within_strata(Xa, strata, rng_null)
-            nulls.append(rs.explained_var(
-                Pq_aud, rs.predict_source_component(mpd, Xp), eps=eps))
+            Qp = rs.predict_source_component(mpd, Xp)
+            nulls.append(rs.centered_sq_corr_strength(Qp, Pq_aud,
+                                                      lam=args.lam, eps=eps))
         null_p95 = float(np.percentile(nulls, 95))
-        sig_ok = bool(sig > 0.0 and sig > null_p95)
-        # bootstrap CI on the source signal (root-cluster resampling)
-        rng_ci = np.random.RandomState(FIXED_SEED + 300 + s)
+        sig_ok = bool(J > null_p95)
+        # bootstrap CI on J (root-cluster resampling)
         n_aud_l = len(audit_rows_)
-        sig_boot = []
-        for _ in range(args.n_bootstrap):
-            idx = rng_ci.choice(np.arange(n_aud_l), size=n_aud_l,
-                                replace=True)
-            sig_boot.append(rs.explained_var(
-                Pq_aud[idx], Qa[idx], eps=eps))
-        sig_lo, sig_hi = rs.retention_ci(np.asarray(sig_boot))
+        if do_ci:
+            rng_ci = np.random.RandomState(FIXED_SEED + 300 + s)
+            Jb = []
+            for _ in range(args.n_bootstrap):
+                idx = rng_ci.choice(np.arange(n_aud_l), size=n_aud_l,
+                                    replace=True)
+                Jb.append(rs.centered_sq_corr_strength(
+                    Qa[idx], Pq_aud[idx], lam=args.lam, eps=eps))
+            sig_lo, sig_hi = rs.retention_ci(np.asarray(Jb))
+        else:
+            sig_lo = sig_hi = float(J)
         sig_ci_ok = bool(sig_lo > 0.0)
 
-        # ---- identity at the source: X_s itself recovers Q_s (~1) ----
+        # ---- identity at the source: X_s recovers Q_s (corr² ~ 1) ----
         mp_id = rs.fit_ridge_map(Xc, Qc, lam=args.lam_ret)
-        R_id = rs.retention_map_R(mp_id, Qa, Xa, eps=eps)
+        R_id = rs.corr2_map_metric(mp_id, Qa, Xa)
         id_ok = bool(R_id >= args.identity_min)
 
-        # ---- remove-source floor: Delta = 0 recovers ~nothing ----
+        # ---- remove-source floor: Delta = 0 recovers ~0 ----
         mp_floor = rs.fit_ridge_map(np.zeros_like(Xc), Qc,
                                     lam=args.lam_ret)
-        R_floor = rs.retention_map_R(mp_floor, Qa, np.zeros_like(Xa),
-                                     eps=eps)
-        floor_ok = bool(abs(R_floor) <= args.floor_max)
+        R_floor = rs.corr2_map_metric(mp_floor, Qa, np.zeros_like(Xa))
+        floor_ok = bool(R_floor <= args.floor_max)
 
-        # ---- per-point retention from the paired-removal deltas ----
+        # ---- per-point retention (correlation-type recoverability) ----
         points = [{"phys": spec["origin_phys"], "delta": "source",
                    "R": float(R_id), "ci_lo": float(R_id),
-                   "ci_hi": float(R_id), "ok": True}]
+                   "ci_hi": float(R_id), "ev_raw": float(R_id),
+                   "ok": True}]
         first_dc = first_da = None
         for phys, dk in spec["points"]:
             Dc = col(calib_rows_, dk)
@@ -810,18 +824,17 @@ def main():
             if first_dc is None:
                 first_dc, first_da = Dc, Da
             mp_k = rs.fit_ridge_map(Dc, Qc, lam=args.lam_ret)
-            R_k = rs.retention_map_R(mp_k, Qa, Da, eps=eps)
+            R_k = rs.corr2_map_metric(mp_k, Qa, Da)
+            ev_k = rs.retention_map_R(mp_k, Qa, Da, eps=eps)  # diagnostic
             if do_ci:
-                boot = rs.retention_bootstrap(
-                    mp_k, Qa, Da, np.arange(len(audit_rows_)),
-                    args.n_bootstrap, FIXED_SEED + 9000 + s * 10 + phys,
-                    eps=eps)
+                boot = rs.corr2_bootstrap(mp_k, Qa, Da, args.n_bootstrap,
+                                          FIXED_SEED + 9000 + s * 10 + phys)
                 lo, hi = rs.retention_ci(boot)
             else:
                 lo = hi = float(R_k)
             points.append({"phys": int(phys), "delta": dk,
                            "R": float(R_k), "ci_lo": lo, "ci_hi": hi,
-                           "ok": True})
+                           "ev_raw": float(ev_k), "ok": True})
 
         # ---- mismatched-delta control (permuted Delta recovers ~0) ----
         if first_dc is not None:
@@ -829,7 +842,7 @@ def main():
                                             np.random.RandomState(
                                                 FIXED_SEED + 7000 + s))
             mp_perm = rs.fit_ridge_map(first_dc, Qc, lam=args.lam_ret)
-            R_perm = rs.retention_map_R(mp_perm, Qa, perm, eps=eps)
+            R_perm = rs.corr2_map_metric(mp_perm, Qa, perm)
             perm_ok = bool(R_perm - R_floor <= 0.02)
         else:
             R_perm, perm_ok = float("nan"), True
@@ -838,7 +851,8 @@ def main():
                        and mem_parity["ok"])
         return {
             "target": spec.get("target_label"),
-            "signal": {"value": float(sig), "null_p95": null_p95,
+            "signal": {"J": float(J), "ev_raw": float(ev_raw),
+                       "null_p95": null_p95,
                        "ci_lo": float(sig_lo), "ci_hi": float(sig_hi),
                        "ok": sig_ok, "ci_ok": sig_ci_ok},
             "identity": {"value": float(R_id), "ok": id_ok},

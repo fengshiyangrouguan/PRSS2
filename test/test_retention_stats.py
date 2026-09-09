@@ -187,5 +187,30 @@ def test_canonical_dirs_capture_only_predictable_source_signal():
     assert null < 0.05 and null < sig, (null, sig)
 
 
+def test_J_invariant_to_audit_mean_shift():
+    """The source-signal gate J must not move when only the audit-set mean of
+    the target changes (cross-block mean drift must not fake a loss)."""
+    r = np.random.RandomState(7)
+    A = r.normal(size=(400, 6))
+    W = r.normal(size=(6, 8))
+    B = A @ W + 0.5 * r.normal(size=(400, 8))
+    J0 = rs.centered_sq_corr_strength(A, B)
+    J1 = rs.centered_sq_corr_strength(A, B + 1000.0)
+    assert J0 >= 0
+    assert abs(J1 - J0) < 1e-6, (J0, J1)
+
+
+def test_corr2_recoverability_range_and_affine_invariance():
+    """corr² recoverability is in [0,1] and invariant to affine drift of the
+    recovery prediction."""
+    r = np.random.RandomState(8)
+    Q = r.normal(size=(400, 5))
+    Qhat = 0.9 * Q + 0.3 * r.normal(size=(400, 5))
+    R0 = rs.corr2_recoverability(Q, Qhat)
+    assert 0.0 <= R0 <= 1.0 + 1e-9
+    R1 = rs.corr2_recoverability(Q, 7.0 * Qhat + 3.0)   # scale+shift
+    assert abs(R1 - R0) < 1e-9, (R0, R1)
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-q"]))

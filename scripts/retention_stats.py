@@ -136,6 +136,69 @@ def retention_ci(arr):
     return (float(np.percentile(arr, 2.5)), float(np.percentile(arr, 97.5)))
 
 
+def centered_sq_corr_strength(A, B, lam=1e-2, eps=1e-6):
+    """Audit-centered squared-canonical-correlation energy J (>=0).
+
+    J = tr[(Cbb + eps I)^{-1} Cba (Caa + lam I)^{-1} Cab] on row-centered A,B
+    = sum of squared canonical correlations.  Mean/scale invariant (add a
+    constant to either audit set and J is unchanged), so cross-block drift
+    cannot push it negative -- unlike plain explained variance."""
+    A = A - A.mean(axis=0)
+    B = B - B.mean(axis=0)
+    n = len(A)
+    Caa = A.T @ A / n
+    Cbb = B.T @ B / n
+    Cab = A.T @ B / n
+    M = np.linalg.solve(Caa + lam * np.eye(A.shape[1]), Cab)
+    return float(np.trace(np.linalg.solve(Cbb + eps * np.eye(B.shape[1]),
+                                          Cab.T @ M)))
+
+
+def corr2_recoverability(Q, Qhat):
+    """Centered, correlation-type recoverability in [0, 1]: mean over the k
+    source directions of the squared Pearson correlation between Q_s and its
+    recovery Qhat.  Invariant to mean/scale drift of either set."""
+    Q = Q - Q.mean(axis=0)
+    Qh = Qhat - Qhat.mean(axis=0)
+    vq = np.sqrt((Q ** 2).mean(axis=0))
+    vh = np.sqrt((Qh ** 2).mean(axis=0))
+    den = vq * vh
+    good = den > 1e-12
+    vals = np.zeros(Q.shape[1])
+    vals[good] = ((Q * Qh).mean(axis=0)[good] / den[good]) ** 2
+    return float(vals.mean())
+
+
+def corr2_map_metric(mp, Qa, Fa):
+    """corr² recoverability of Q_s from features Fa using a pre-fitted map."""
+    return corr2_recoverability(Qa, apply_ridge_map(mp, Fa))
+
+
+def corr2_bootstrap(mp, Qa, Fa, n_boot, seed):
+    """Cluster-bootstrap CI for the corr² recoverability (map fit on calib)."""
+    rng = np.random.RandomState(seed)
+    n = len(Qa)
+    idx_all = np.arange(n)
+    out = []
+    for _ in range(n_boot):
+        idx = rng.choice(idx_all, size=n, replace=True)
+        out.append(corr2_map_metric(mp, Qa[idx], Fa[idx]))
+    return np.asarray(out)
+
+
+def j_strength_bootstrap(A, B, n_boot, seed, lam=1e-2, eps=1e-6):
+    """Cluster-bootstrap CI for the centered squared-canonical strength J."""
+    rng = np.random.RandomState(seed)
+    n = len(A)
+    idx_all = np.arange(n)
+    out = []
+    for _ in range(n_boot):
+        idx = rng.choice(idx_all, size=n, replace=True)
+        out.append(centered_sq_corr_strength(A[idx], B[idx], lam=lam,
+                                             eps=eps))
+    return np.asarray(out)
+
+
 # ------------------------------------------------------------------ source dirs
 def _chol_lower_inv(A):
     """Returns T = L^{-1} with A = L L^T (lower Cholesky)."""

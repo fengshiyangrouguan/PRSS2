@@ -245,6 +245,9 @@ def main():
                          "train tail = --audit-batches worth of batches)")
     ap.add_argument("--n-bootstrap", type=int, default=200)
     ap.add_argument("--n-null", type=int, default=200)
+    ap.add_argument("--n-dir", type=int, default=5,
+                    help="number of fixed predictive directions extracted for "
+                         "Q_s (top predictable part of the local future)")
     ap.add_argument("--memory-parity-batches", type=int, default=5)
     ap.add_argument("--lam", type=float, default=1e-2)
     ap.add_argument("--lam-ret", type=float, default=1e-2)
@@ -557,20 +560,18 @@ def main():
                    (dz3_2, dz3_1, dz3_r, dz2_1, dz2_r, dz1_r)):
                 continue
             # ---- per-node aligned boundary futures S_s=(Y_s, Y_p(s)).
-            # Each path node's own first strict-future event after ITS
-            # occurrence time; leaf time = its parent edge time.  Stored per
-            # node so every line builds its own two-level boundary target
-            # (never the root's future for all three lines).
+            # Every path-node state is computed with the same global memory /
+            # root query horizon, so ALL source futures are queried strictly
+            # after the ROOT query time (never after the leaf's historical edge
+            # time, which could count events already visible inside U0).
             leaf_node = int(st1["leaf"])
             a2_node = int(st1["node"])
             a1_node = int(st2["node"])
+            root_t = float(rec["t_root"])
             Y = {}
-            for k, (node, t) in [
-                    ("leaf", (leaf_node, float(st1["edge_time"]))),
-                    ("a2", (a2_node, float(st1["t"]))),
-                    ("a1", (a1_node, float(st2["t"]))),
-                    ("root", (root, float(rec["t_root"])))]:
-                q = fut.query(node, t)
+            for k, node in [("leaf", leaf_node), ("a2", a2_node),
+                            ("a1", a1_node), ("root", root)]:
+                q = fut.query(node, root_t)
                 if q is None:
                     break
                 j, dt, cp = q
@@ -734,16 +735,15 @@ def main():
     def compute_line(s, spec, calib_rows_, audit_rows_, do_ci):
         """Retention of ONE fixed source signal Q_s along the path.
 
-        The figure's question is: how much of a source node's useful signal
-        survives one/two/three recursive aggregations on the way to the root?
-        Q_s is fixed once at the source -- Q_s = ridge(X_s -> P) fit on calib,
-        where P is the root's future witness -- and is never re-estimated per
-        layer and never regressed against C.  The context C is NOT subtracted:
-        the paired keep/remove intervention happens on the SAME tree, so C is
-        held fixed by construction.  At each ancestor position the paired-
-        removal delta Delta_{s->k} (keep minus remove of that source) is
-        regressed onto the SAME Q_s, and retention is how much of Q_s a
-        held-out Delta recovers:
+        Q_s is fixed once at the source as the top --n-dir PREDICTIVE
+        directions of the source state X_s for its own two-level boundary
+        future P_s=(Y_s,Y_p(s)): Q_s = A^T X_s with A estimated once on calib
+        from the whitened X_s<->P_s cross-covariance.  Only the predictable
+        part of the (noisy, high-dim) future is kept -- never the full
+        reconstruction of the random future vector.  Q_s is not re-estimated
+        per layer and never regressed against C.  At each ancestor position
+        the paired-removal delta Delta_{s->k} is regressed onto the SAME Q_s,
+        and retention is how much of Q_s a held-out Delta recovers:
             R_{s->k} = 1 - ||Q_s - Qhat_s||^2 / (||Q_s - mean Q_s||^2 + eps).
         No chaining, no per-layer J ratios, no re-predicting the future at any
         layer."""
@@ -752,21 +752,27 @@ def main():
         k1, k2 = spec["target"]
         Pc = line_P(calib_rows_, k1, k2)
         Pa = line_P(audit_rows_, k1, k2)
-        mpQ = rs.fit_ridge_map(Xc, Pc, lam=args.lam)
-        Qc = rs.apply_ridge_map(mpQ, Xc)
-        Qa = rs.apply_ridge_map(mpQ, Xa)
 
-        # ---- source signal: explained variance of the line's OWN boundary
-        # target P_s=(Y_s,Y_p(s)) by the fixed Q_s.  Gate: signal > 0 AND
-        # signal > null_p95 -- a negative explained variance is never a
-        # usable source signal (the shuffle null is also negative).
-        sig = rs.explained_var(Pa, Qa, eps=eps)
+        # ---- fixed predictive subspace: only the top --n-dir directions of
+        # the local future P_s that the source state can predict (fit once on
+        # calib).  Q_s = A^T X_s carries the source's own useful component;
+        # the unpredictable noise of the full 256-d future vector is never
+        # required to be reconstructed.
+        mpd = rs.canonical_dirs(Xc, Pc, args.n_dir, lam=args.lam, eps=eps)
+        Qc = rs.predict_source_component(mpd, Xc)
+        Qa = rs.predict_source_component(mpd, Xa)
+        Pq_aud = rs.project_future(mpd, Pa)
+
+        # ---- source signal: explained variance of the held-out projected
+        # future Pq (along the fixed directions) by the fixed Q_s.  Gate:
+        # signal > 0 AND signal > null_p95.
+        sig = rs.explained_var(Pq_aud, Qa, eps=eps)
         rng_null = np.random.RandomState(FIXED_SEED + 5000 + s)
         nulls = []
         for _ in range(args.n_null):
             Xp = rs.permute_within_strata(Xa, strata, rng_null)
-            nulls.append(rs.explained_var(Pa, rs.apply_ridge_map(mpQ, Xp),
-                                          eps=eps))
+            nulls.append(rs.explained_var(
+                Pq_aud, rs.predict_source_component(mpd, Xp), eps=eps))
         null_p95 = float(np.percentile(nulls, 95))
         sig_ok = bool(sig > 0.0 and sig > null_p95)
         # bootstrap CI on the source signal (root-cluster resampling)
@@ -777,7 +783,7 @@ def main():
             idx = rng_ci.choice(np.arange(n_aud_l), size=n_aud_l,
                                 replace=True)
             sig_boot.append(rs.explained_var(
-                Pa[idx], rs.apply_ridge_map(mpQ, Xa[idx]), eps=eps))
+                Pq_aud[idx], Qa[idx], eps=eps))
         sig_lo, sig_hi = rs.retention_ci(np.asarray(sig_boot))
         sig_ci_ok = bool(sig_lo > 0.0)
 

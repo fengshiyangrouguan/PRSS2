@@ -164,5 +164,28 @@ def test_source_specific_signal_is_positive_when_source_adds_beyond_context():
     assert sig >= 0.10, sig
 
 
+def test_canonical_dirs_capture_only_predictable_source_signal():
+    """Top-k canonical directions recover a real source->future link and
+    ignore the unpredictable noise of the full high-dim future."""
+    n_tr, n_te, d, p, r = 6000, 4000, 20, 80, 3
+    rnd = np.random.RandomState(11)
+    X = rnd.normal(size=(n_tr + n_te, d))
+    Wt = rnd.normal(size=(d, r))
+    Vt = rnd.normal(size=(p, r))
+    signal = X @ Wt @ Vt.T                       # low-rank predictable part
+    noise = 3.0 * rnd.normal(size=(n_tr + n_te, p))
+    P = signal + noise
+    mp = rs.canonical_dirs(X[:n_tr], P[:n_tr], k=r, lam=1e-2, eps=1e-6)
+    Qa = rs.predict_source_component(mp, X[n_tr:])
+    Pq = rs.project_future(mp, P[n_tr:])
+    sig = rs.explained_var(Pq, Qa)
+    assert sig > 0.1, sig
+    # a permuted source (within-strata shuffle) must destroy the signal
+    strata = rs.strata_ids(X[n_tr:, 0])
+    perm = rs.permute_within_strata(X[n_tr:], strata, np.random.RandomState(5))
+    null = rs.explained_var(Pq, rs.predict_source_component(mp, perm))
+    assert null < 0.05 and null < sig, (null, sig)
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-q"]))

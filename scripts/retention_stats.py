@@ -134,3 +134,52 @@ def retention_bootstrap(mp, Qa, Fa, idx_all, n_boot, seed, eps=1e-6):
 
 def retention_ci(arr):
     return (float(np.percentile(arr, 2.5)), float(np.percentile(arr, 97.5)))
+
+
+# ------------------------------------------------------------------ source dirs
+def _chol_lower_inv(A):
+    """Returns T = L^{-1} with A = L L^T (lower Cholesky)."""
+    L = np.linalg.cholesky(A)
+    return np.linalg.inv(L)
+
+
+def canonical_dirs(Xc, Pc, k, lam=1e-2, eps=1e-6, scale_eps=1e-9):
+    """Top-k predictive directions between source state X_s and its local
+    future P_s, estimated once on the calibration set.
+
+    The whole P vector is dominated by unpredictable noise, so we only keep
+    the directions of P that X can actually predict (whitened cross-covariance
+    / canonical structure).  Returns everything needed to (a) form the fixed
+    source component Q_s = ((X - mx)/sx) @ W and (b) project the held-out
+    future onto the same directions Pq = ((P - mp)/sp) @ B.
+
+    Z = Tx @ Cxp @ Tp^T,  SVD Z = U S V^T ;   W = inv(Cxx) Cxp B,
+    B = Tp^T V[:, :k], where Tx/Tp are inverse Cholesky factors of Cxx/Cpp.
+    """
+    Xs = (Xc - Xc.mean(axis=0)) / (Xc.std(axis=0) + scale_eps)
+    Ps = (Pc - Pc.mean(axis=0)) / (Pc.std(axis=0) + scale_eps)
+    n = len(Xc)
+    Cxx = Xs.T @ Xs / n + lam * np.eye(Xs.shape[1])
+    Cpp = Ps.T @ Ps / n + eps * np.eye(Ps.shape[1])
+    Cxp = Xs.T @ Ps / n
+    Tx = _chol_lower_inv(Cxx)          # Cxx^{-1} = Tx^T Tx
+    Tp = _chol_lower_inv(Cpp)          # Cpp^{-1} = Tp^T Tp
+    Z = Tx @ Cxp @ Tp.T
+    U, S, Vt = np.linalg.svd(Z)
+    B = Tp.T @ Vt.T[:, :k]             # P-side directions (p x k)
+    W = Tx.T @ Tx @ Cxp @ B            # d x k  (Q = X_std W)
+    return {
+        "mx": Xc.mean(axis=0), "sx": Xc.std(axis=0) + scale_eps,
+        "mp": Pc.mean(axis=0), "sp": Pc.std(axis=0) + scale_eps,
+        "W": W, "B": B, "sv": S[:k],
+    }
+
+
+def predict_source_component(mp, Xa):
+    """Q_s = ((Xa-mx)/sx) @ W  -- the fixed source predictive component."""
+    return (Xa - mp["mx"]) / mp["sx"] @ mp["W"]
+
+
+def project_future(mp, Pa):
+    """Pq = ((Pa-mp)/sp) @ B  -- held-out future along the source directions."""
+    return (Pa - mp["mp"]) / mp["sp"] @ mp["B"]

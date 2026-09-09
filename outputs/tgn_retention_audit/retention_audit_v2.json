@@ -1,0 +1,375 @@
+{
+  "protocol": "same-source explained-variance retention, leak-free historical C, direct (non-chained) points; same-tail causal calibration is the main result, head->tail is a transfer stress test",
+  "layout": {
+    "audit_batches": 200,
+    "audit_block": [
+      1522,
+      1722
+    ],
+    "calib_batches": 60,
+    "same_tail_calib_block": [
+      1454,
+      1514
+    ],
+    "gap_batches": 8,
+    "head_calib_block": [
+      0,
+      60
+    ]
+  },
+  "n_audit_rows": 10817,
+  "n_same_tail_calib_rows": 3251,
+  "n_head_calib_rows": 2294,
+  "lam": 0.01,
+  "lam_ret": 0.01,
+  "eps": 1e-06,
+  "identity_min": 0.9,
+  "floor_max": 0.05,
+  "fixed_seed": 20260909,
+  "memory_parity": {
+    "ok": true,
+    "n_batches": 5,
+    "detail": "recomputed from saved rows (parity was verified at extraction)"
+  },
+  "sources": {
+    "1": {
+      "name": "Z2",
+      "source_key": "z2",
+      "origin_phys": 2,
+      "same_tail": {
+        "target": "(Y_{a1},Y_{a0})",
+        "signal": {
+          "J": 0.14815623439199488,
+          "ev_raw": -0.15834033258313873,
+          "null_p95": 0.0038667494108782247,
+          "ci_lo": 0.13530070476277878,
+          "ci_hi": 0.16403603477965045,
+          "ok": true,
+          "ci_ok": true
+        },
+        "identity": {
+          "value": 0.9999999870301233,
+          "ok": true
+        },
+        "delete_floor": {
+          "value": 0.0,
+          "ok": true
+        },
+        "mismatched_delta": {
+          "value": 9.99265285360639e-05,
+          "ok": true
+        },
+        "points": [
+          {
+            "phys": 2,
+            "delta": "source",
+            "R": 0.9999999870301233,
+            "ci_lo": 0.9999999870301233,
+            "ci_hi": 0.9999999870301233,
+            "ev_raw": 0.9999999870301233,
+            "ok": true
+          },
+          {
+            "phys": 3,
+            "delta": "d1r",
+            "R": 0.07633272149933186,
+            "ci_lo": 0.07127286637465312,
+            "ci_hi": 0.08161376012495253,
+            "ev_raw": 0.04814930633201564,
+            "ok": true
+          }
+        ],
+        "line_ok": true
+      },
+      "head_to_tail": {
+        "target": "(Y_{a1},Y_{a0})",
+        "signal": {
+          "J": 0.015464281209276495,
+          "ev_raw": -0.4138695468956526,
+          "null_p95": 0.003660279725466887,
+          "ci_lo": 0.015464281209276495,
+          "ci_hi": 0.015464281209276495,
+          "ok": true,
+          "ci_ok": true
+        },
+        "identity": {
+          "value": 0.9999999481361155,
+          "ok": true
+        },
+        "delete_floor": {
+          "value": 0.0,
+          "ok": true
+        },
+        "mismatched_delta": {
+          "value": 0.00016438760402735233,
+          "ok": true
+        },
+        "points": [
+          {
+            "phys": 2,
+            "delta": "source",
+            "R": 0.9999999481361155,
+            "ci_lo": 0.9999999481361155,
+            "ci_hi": 0.9999999481361155,
+            "ev_raw": 0.9999999481361155,
+            "ok": true
+          },
+          {
+            "phys": 3,
+            "delta": "d1r",
+            "R": 0.022493043250622013,
+            "ci_lo": 0.022493043250622013,
+            "ci_hi": 0.022493043250622013,
+            "ev_raw": -0.4832209991279195,
+            "ok": true
+          }
+        ],
+        "line_ok": true
+      }
+    },
+    "2": {
+      "name": "Z1",
+      "source_key": "z1",
+      "origin_phys": 1,
+      "same_tail": {
+        "target": "(Y_{a2},Y_{a1})",
+        "signal": {
+          "J": 0.1904417198015285,
+          "ev_raw": -0.12083542218161547,
+          "null_p95": 0.0036247763817866163,
+          "ci_lo": 0.17875889995577024,
+          "ci_hi": 0.20928789907843967,
+          "ok": true,
+          "ci_ok": true
+        },
+        "identity": {
+          "value": 0.9999999789135966,
+          "ok": true
+        },
+        "delete_floor": {
+          "value": 0.0,
+          "ok": true
+        },
+        "mismatched_delta": {
+          "value": 0.00018787795209298494,
+          "ok": true
+        },
+        "points": [
+          {
+            "phys": 1,
+            "delta": "source",
+            "R": 0.9999999789135966,
+            "ci_lo": 0.9999999789135966,
+            "ci_hi": 0.9999999789135966,
+            "ev_raw": 0.9999999789135966,
+            "ok": true
+          },
+          {
+            "phys": 2,
+            "delta": "d21",
+            "R": 0.1062006062649989,
+            "ci_lo": 0.09953281212358188,
+            "ci_hi": 0.11374022442517079,
+            "ev_raw": 0.07745476471191248,
+            "ok": true
+          },
+          {
+            "phys": 3,
+            "delta": "d2r",
+            "R": 0.006617510096480157,
+            "ci_lo": 0.0051859074477817345,
+            "ci_hi": 0.0084552355238456,
+            "ev_raw": -0.11245328627567064,
+            "ok": true
+          }
+        ],
+        "line_ok": true
+      },
+      "head_to_tail": {
+        "target": "(Y_{a2},Y_{a1})",
+        "signal": {
+          "J": 0.014373564770942829,
+          "ev_raw": -0.3471905884542643,
+          "null_p95": 0.003575313790825562,
+          "ci_lo": 0.014373564770942829,
+          "ci_hi": 0.014373564770942829,
+          "ok": true,
+          "ci_ok": true
+        },
+        "identity": {
+          "value": 0.999999929314448,
+          "ok": true
+        },
+        "delete_floor": {
+          "value": 0.0,
+          "ok": true
+        },
+        "mismatched_delta": {
+          "value": 3.547954076712853e-05,
+          "ok": true
+        },
+        "points": [
+          {
+            "phys": 1,
+            "delta": "source",
+            "R": 0.999999929314448,
+            "ci_lo": 0.999999929314448,
+            "ci_hi": 0.999999929314448,
+            "ev_raw": 0.999999929314448,
+            "ok": true
+          },
+          {
+            "phys": 2,
+            "delta": "d21",
+            "R": 0.01705386806386581,
+            "ci_lo": 0.01705386806386581,
+            "ci_hi": 0.01705386806386581,
+            "ev_raw": -0.37595293434148536,
+            "ok": true
+          },
+          {
+            "phys": 3,
+            "delta": "d2r",
+            "R": 0.0004943074436405405,
+            "ci_lo": 0.0004943074436405405,
+            "ci_hi": 0.0004943074436405405,
+            "ev_raw": -0.5148846927894961,
+            "ok": true
+          }
+        ],
+        "line_ok": true
+      }
+    },
+    "3": {
+      "name": "U0",
+      "source_key": "u0",
+      "origin_phys": 0,
+      "same_tail": {
+        "target": "(Y_{a3},Y_{a2})",
+        "signal": {
+          "J": 0.09876509399530958,
+          "ev_raw": -0.34150987556866164,
+          "null_p95": 0.0036405024696161263,
+          "ci_lo": 0.09244169105295068,
+          "ci_hi": 0.1125776286826728,
+          "ok": true,
+          "ci_ok": true
+        },
+        "identity": {
+          "value": 0.9999999990302169,
+          "ok": true
+        },
+        "delete_floor": {
+          "value": 0.0,
+          "ok": true
+        },
+        "mismatched_delta": {
+          "value": 0.00024336592202057984,
+          "ok": true
+        },
+        "points": [
+          {
+            "phys": 0,
+            "delta": "source",
+            "R": 0.9999999990302169,
+            "ci_lo": 0.9999999990302169,
+            "ci_hi": 0.9999999990302169,
+            "ev_raw": 0.9999999990302169,
+            "ok": true
+          },
+          {
+            "phys": 1,
+            "delta": "d32",
+            "R": 0.03439951457829025,
+            "ci_lo": 0.03151925779278541,
+            "ci_hi": 0.03836854362996835,
+            "ev_raw": -0.013896078151369062,
+            "ok": true
+          },
+          {
+            "phys": 2,
+            "delta": "d31",
+            "R": 0.00018190448701256774,
+            "ci_lo": 6.68020386443609e-05,
+            "ci_hi": 0.0006989971636751741,
+            "ev_raw": -0.1811915696173565,
+            "ok": true
+          },
+          {
+            "phys": 3,
+            "delta": "d3r",
+            "R": 0.00016202606700188143,
+            "ci_lo": 6.29412521352289e-05,
+            "ci_hi": 0.0008017694676814526,
+            "ev_raw": -2.006323300649023,
+            "ok": true
+          }
+        ],
+        "line_ok": true
+      },
+      "head_to_tail": {
+        "target": "(Y_{a3},Y_{a2})",
+        "signal": {
+          "J": 0.02322816696076501,
+          "ev_raw": -1.2720503022316612,
+          "null_p95": 0.0038052634111219496,
+          "ci_lo": 0.02322816696076501,
+          "ci_hi": 0.02322816696076501,
+          "ok": true,
+          "ci_ok": true
+        },
+        "identity": {
+          "value": 0.9999999982500173,
+          "ok": true
+        },
+        "delete_floor": {
+          "value": 0.0,
+          "ok": true
+        },
+        "mismatched_delta": {
+          "value": 3.991235797561531e-05,
+          "ok": true
+        },
+        "points": [
+          {
+            "phys": 0,
+            "delta": "source",
+            "R": 0.9999999982500173,
+            "ci_lo": 0.9999999982500173,
+            "ci_hi": 0.9999999982500173,
+            "ev_raw": 0.9999999982500173,
+            "ok": true
+          },
+          {
+            "phys": 1,
+            "delta": "d32",
+            "R": 0.017310858990264622,
+            "ci_lo": 0.017310858990264622,
+            "ci_hi": 0.017310858990264622,
+            "ev_raw": -0.5676326706430601,
+            "ok": true
+          },
+          {
+            "phys": 2,
+            "delta": "d31",
+            "R": 0.0006957472001099663,
+            "ci_lo": 0.0006957472001099663,
+            "ci_hi": 0.0006957472001099663,
+            "ev_raw": -1.2834955465079005,
+            "ok": true
+          },
+          {
+            "phys": 3,
+            "delta": "d3r",
+            "R": 0.00011011044925404827,
+            "ci_lo": 0.00011011044925404827,
+            "ci_hi": 0.00011011044925404827,
+            "ev_raw": -20.492305582900794,
+            "ok": true
+          }
+        ],
+        "line_ok": true
+      }
+    }
+  }
+}

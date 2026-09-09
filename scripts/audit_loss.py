@@ -10,7 +10,7 @@ import os, sys, argparse
 import numpy as np
 os.environ.setdefault("HF_ENDPOINT","https://hf-mirror.com"); os.environ.setdefault("HF_HUB_OFFLINE","1")
 os.environ.setdefault("LLAMA2_LOCAL_PATH","/root/autodl-tmp/Llama-2-7b-hf")
-sys.path.insert(0,"/root/autodl-tmp/vla"); sys.path.insert(0,"/root/autodl-tmp/libero-mem-code")
+sys.path.insert(0,"/root/autodl-tmp/vla")
 import torch
 from peft import LoraConfig, get_peft_model
 from vla import load_vla
@@ -123,11 +123,14 @@ for n, v in zip(names, pd):
 am.loss = orig_loss
 
 loss.backward()
-def gnorm(params, name):
-    gs = [p.grad.detach().float().norm()**2 for p in params if p.grad is not None]
+def gnorm(mods_or_params, name):
+    ps = []
+    for m in mods_or_params:
+        ps += (list(m.parameters()) if hasattr(m, "parameters") else [m])
+    gs = [p.grad.detach().float().norm()**2 for p in ps if p.grad is not None]
     n = torch.sqrt(sum(gs)).item() if gs else 0.0
-    ng = sum(1 for p in params if p.grad is not None)
-    print("grad_norm[%s]=%.4e (%d/%d)" % (name, n, ng, len(params)))
+    ng = sum(1 for p in ps if p.grad is not None)
+    print("grad_norm[%s]=%.4e (%d/%d)" % (name, n, ng, len(ps)))
 gnorm([vla.action_model], "action_model")
 gnorm(lora_params, "lora")
 gnorm([vla.cog_mem_bank], "cog_memory")

@@ -132,6 +132,14 @@ def retention_bootstrap(mp, Qa, Fa, idx_all, n_boot, seed, eps=1e-6):
     return np.asarray(out)
 
 
+def weighted_dir_sqcorr(A, B, weights):
+    """Weighted mean over columns of squared Pearson corr between A and B.
+
+    Used to score a (recovered) source component against the fixed root-target
+    directions: value in [0, 1], so it can be read as a percentage."""
+    return corr2_recoverability(A, B, weights=weights)
+
+
 def retention_ci(arr):
     return (float(np.percentile(arr, 2.5)), float(np.percentile(arr, 97.5)))
 

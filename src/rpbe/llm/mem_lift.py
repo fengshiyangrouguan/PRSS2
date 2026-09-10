@@ -96,3 +96,37 @@ class JMemLift(nn.Module):
             pair = torch.stack([k, v], dim=3)  # [B, H, R, 2, D]
             parts.append(pair.reshape(B, -1))
         return torch.cat(parts, dim=1)  # [B, full_dim]
+
+    def transpose(self, g_z: torch.Tensor) -> torch.Tensor:
+        """Fixed-transpose lift: g_s = J^T g_z, [B, z_dim] -> [B, full_dim].
+
+        Exact adjoint of the CountSketch forward (rows accumulate the
+        signed gradient of each mapped column).  Used by the LaMP
+        one-shot replay: g_s feeds the per-layer SUM-row pseudo-gradients
+        without re-running the 7B forward (L2)."""
+        if g_z.dim() != 2 or g_z.shape[1] != self.z_dim:
+            raise ValueError(
+                "transpose expects [B, {}], got {}".format(
+                    self.z_dim, tuple(g_z.shape)))
+        cols = self.sketch_cols.to(g_z.device)
+        rows = self.sketch_rows.to(g_z.device)
+        signs = self.sketch_signs.to(dtype=g_z.dtype, device=g_z.device)
+        out = torch.zeros(g_z.shape[0], self.full_dim, dtype=g_z.dtype,
+                          device=g_z.device)
+        out.index_add_(1, rows, g_z[:, cols] * signs)
+        return out * self.scale
+
+    @staticmethod
+    def unpack_sum_mem(g_s, *, n_layers, n_heads, n_slots, kv_pairs=2,
+                       head_dim=128):
+        """Inverse of pack_sum_mem for the ADJOINT: [B, full_dim] ->
+        lists of per-layer ([B, H, R, D] K grad, [B, H, R, D] V grad)."""
+        B = g_s.shape[0]
+        stride = int(n_heads * n_slots * kv_pairs * head_dim)
+        k_grads, v_grads = [], []
+        for i in range(int(n_layers)):
+            part = g_s[:, i * stride:(i + 1) * stride]
+            pair = part.reshape(B, n_heads, n_slots, kv_pairs, head_dim)
+            k_grads.append(pair[:, :, :, 0, :])
+            v_grads.append(pair[:, :, :, 1, :])
+        return k_grads, v_grads

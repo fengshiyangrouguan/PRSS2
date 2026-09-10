@@ -37,6 +37,7 @@ class CCMHostAdapter:
             raise ValueError("n_layers does not match the model")
         self.n_layers = int(n_layers)
         self.n_heads = int(n_heads)
+        self.n_slots = int(n_slots)
         self.head_dim = int(head_dim)
         # The CountSketch index tables (2.1M entries x 3) must live on the
         # model device: this class is NOT an nn.Module, so nothing moves
@@ -67,16 +68,18 @@ class CCMHostAdapter:
         """Lift the memory of the cut's SUM block to z_v.
 
         Args:
-            sum_positions: [B, 2] sequence positions of the cut block's
-                (S0, S1) tokens (per batch row; the collator metadata
-                provides these after padding).
+            sum_positions: [B, n_slots] sequence positions of the cut
+                block's SUM tokens (per batch row; the collator metadata
+                provides these after padding).  n_slots = 2 for the
+                dialog line, 4 for the LaMP one-shot merge.
 
         Returns:
             z_v [B, z_dim], gradient-connected to the merged K/V (and
             therefore to Gamma and the backbone projections).
         """
-        if sum_positions.dim() != 2 or sum_positions.shape[1] != SUM_PAIR:
-            raise ValueError("sum_positions must be [B, 2]")
+        if sum_positions.dim() != 2 or sum_positions.shape[1] != self.n_slots:
+            raise ValueError("sum_positions must be [B, {}]".format(
+                self.n_slots))
         k_parts: List[torch.Tensor] = []
         v_parts: List[torch.Tensor] = []
         for entry in self._cache:

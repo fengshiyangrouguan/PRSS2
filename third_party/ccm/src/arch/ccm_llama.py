@@ -173,32 +173,119 @@ class LlamaAttention(nn.Module):
             sum_attn_mask = sum_attn_mask.to(key_states.dtype)
 
             # (batch_size, n_heads, seq_length, dim_per_head)
-            key_comp_avg = torch.matmul(sum_attn_mask.unsqueeze(1), key_states)
-            value_comp_avg = torch.matmul(sum_attn_mask.unsqueeze(1), value_states)
+            # LaMP merge fast path (L2): the official LaMP mask pairs
+            # each SUM token with exactly ONE COMP token (slot pairing,
+            # tril-normalized weight == 1), so the merge is a pure copy
+            # and the [B,H,T,T,D] broadcast matmul (17GB per layer at
+            # T=1024) is strictly unnecessary.  Rows with >1 weight
+            # (dialog merge_recur) keep the exact original matmul path,
+            # bit-identical behavior for the dialog line.
+            row_nnz = (sum_attn_mask > 0).sum(-1)  # [B, T]
+            # Sparse weighted sum on the SUM rows only (L2).  The LaMP
+            # one-shot merge aggregates the 16 same-slot COMP tokens per
+            # SUM row (row_nnz == 16), so the single-COMP fast path is
+            # wrong; this path is math-equivalent to the [B,H,T,T,D]
+            # broadcast matmul for ANY mask (zero rows stay zero, SUM
+            # rows are the same weighted sums) and is enabled only on
+            # the Gamma-onetime host (dialog recur keeps the exact
+            # original matmul, bit-identical behavior).
+            use_sparse = bool(getattr(self, "_gamma_onetime", False)) \
+                or bool((row_nnz <= 1).all())
+            if use_sparse:
+                key_comp_avg = torch.zeros_like(key_states)
+                value_comp_avg = torch.zeros_like(value_states)
+                for _b in range(key_states.shape[0]):
+                    _spos = row_nnz[_b].nonzero(as_tuple=False).flatten()
+                    if len(_spos) == 0:
+                        continue
+                    _m = sum_attn_mask[_b, _spos]  # [S, T]
+                    _kk = torch.einsum('st,htd->hsd', _m, key_states[_b])
+                    _vv = torch.einsum('st,htd->hsd', _m, value_states[_b])
+                    key_comp_avg[_b, :, _spos, :] = \
+                        _kk.to(dtype=key_comp_avg.dtype)
+                    value_comp_avg[_b, :, _spos, :] = \
+                        _vv.to(dtype=value_comp_avg.dtype)
+
+                #####################################################
+                ##### RPBE modification (L2, LaMP): onetime Gamma #####
+                # One-shot merge (t_max == 1): SUM_k = avg(COMP_k) +
+                # R(SUM_k, pool(SUM_1..4)) with the zero-init residual
+                # (Review round 7 init: step 0 is the exact official
+                # merge).  Gradient flows to Gamma through the
+                # gather/scatter; the dialog recur scan (t_max >= 2) is
+                # a separate block and never runs here.
+                if getattr(self, "_gamma_onetime", False) \
+                        and self.gamma is not None \
+                        and sum_row_pos is not None \
+                        and int(sum_row_pos.shape[1]) == 1:
+                    bsz, n_heads, seq_len, head_dim = key_states.shape
+                    n_slots = int(sum_row_pos.shape[2])
+                    idx_s = sum_row_pos[:, 0].unsqueeze(1)
+                    idx_s = idx_s.expand(bsz, n_heads, n_slots)
+                    idx_s = idx_s.unsqueeze(-1).expand(-1, -1, -1, head_dim)
+                    k_sum_rows = torch.gather(key_comp_avg, 2, idx_s)
+                    v_sum_rows = torch.gather(value_comp_avg, 2, idx_s)
+                    # Gamma params live in fp32; the residual is cast back
+                    # to the merge dtype before the scatter (autocast
+                    # keeps key_comp_avg in fp16).
+                    res_k = self.gamma(k_sum_rows, k_sum_rows).to(
+                        dtype=key_states.dtype)
+                    res_v = self.gamma(v_sum_rows, v_sum_rows).to(
+                        dtype=key_states.dtype)
+                    # Scatter residuals onto the SUM rows WITHOUT inplace
+                    # writes on key_comp_avg (it already entered the graph
+                    # through the gathers above): build a zero buffer and
+                    # rebind the merge result as a new tensor.
+                    res_full_k = torch.zeros_like(key_comp_avg)
+                    res_full_v = torch.zeros_like(value_comp_avg)
+                    for _b in range(bsz):
+                        res_full_k[_b, :, sum_row_pos[_b, 0], :] = res_k[_b]
+                        res_full_v[_b, :, sum_row_pos[_b, 0], :] = res_v[_b]
+                    key_comp_avg = key_comp_avg + res_full_k
+                    value_comp_avg = value_comp_avg + res_full_v
+                    # Detached replay cache for the local Gamma replay
+                    # (L2): the training script clones it per microbatch;
+                    # the window close replays Gamma on these inputs and
+                    # back-propagates the adjoint WITHOUT re-running the
+                    # 7B forward.
+                    self._lamp_cache = (k_sum_rows.detach(),
+                                        v_sum_rows.detach(),
+                                        sum_row_pos.clone())
+                #####################################################
+            else:
+                key_comp_avg = torch.matmul(sum_attn_mask.unsqueeze(1),
+                                            key_states)
+                value_comp_avg = torch.matmul(sum_attn_mask.unsqueeze(1),
+                                              value_states)
 
             # (batch_size, 1, seq_length, 1)
             no_sum_mask = (1 - sum_mask).to(key_states.dtype).unsqueeze(1).unsqueeze(-1)
 
             #####################################################
             ##### RPBE modification (L2): Gamma residual ######
-            # Gather the SUM rows ONCE ([B, H, T, 2, D]); the previous
-            # memory mean is base_{t-1} (the running mean one turn back,
-            # free by index shift), and cur = t*base - (t-1)*prev is the
-            # exact h_t.  This replaces the per-turn mask matmuls of the
-            # first L2 version (strictly equivalent; L6.5 perf).
-            if self.gamma is not None:
+            # Gather the SUM rows ONCE ([B, H, T, n_slots, D]); the
+            # previous memory mean is base_{t-1} (the running mean one
+            # turn back, free by index shift), and cur = t*base -
+            # (t-1)*prev is the exact h_t.  This replaces the per-turn
+            # mask matmuls of the first L2 version (strictly equivalent;
+            # L6.5 perf).  The dialog recur scan needs >= 2 turns; the
+            # LaMP one-shot merge (t_max == 1) applies its own onetime
+            # residual in the fast path instead (L2).
+            if self.gamma is not None and sum_row_pos is not None \
+                    and int(sum_row_pos.shape[1]) >= 2:
                 bsz, n_heads, seq_len, head_dim = key_states.shape
+                n_slots = int(sum_row_pos.shape[2])
                 t_max = int(sum_row_pos.shape[1])
-                n_rows = t_max * 2
+                n_rows = t_max * n_slots
                 idx = sum_row_pos.reshape(bsz, n_rows).unsqueeze(1)
                 idx = idx.expand(bsz, n_heads, n_rows)
                 idx = idx.unsqueeze(-1).expand(-1, -1, -1, head_dim)
                 k_sum = torch.gather(key_states, 2, idx)
                 v_sum = torch.gather(value_states, 2, idx)
                 k_base = torch.gather(key_comp_avg, 2, idx).reshape(
-                    bsz, n_heads, t_max, 2, head_dim)
+                    bsz, n_heads, t_max, n_slots, head_dim)
                 v_base = torch.gather(value_comp_avg, 2, idx).reshape(
-                    bsz, n_heads, t_max, 2, head_dim)
+                    bsz, n_heads, t_max, n_slots, head_dim)
                 t = torch.arange(1, t_max + 1,
                                  device=key_states.device).float()
                 t = t.view(1, 1, t_max, 1, 1)
@@ -227,19 +314,23 @@ class LlamaAttention(nn.Module):
             ##### RPBE modification (L2): Gamma recurrence scan ######
             # M_t = mean(h_1..h_t) + R_theta(M_{t-1}, h_t, t).  The
             # per-turn loop runs on the gathered SUM rows only (one
-            # [B, H, 2, D] call per turn per layer), carrying the
+            # [B, H, n_slots, D] call per turn per layer), carrying the
             # previous turn's residual in a register; turn-1 rows keep
             # the pure mean.  Eager mode; torch.compile disabled on all
-            # three arms (plan L2).
-            if self.gamma is not None:
-                res_prev_k = torch.zeros(bsz, n_heads, 2, head_dim,
+            # three arms (plan L2).  Dialog recur only (t_max >= 2);
+            # the LaMP one-shot merge applies its residual in the fast
+            # path (L2).
+            if self.gamma is not None and sum_row_pos is not None \
+                    and int(sum_row_pos.shape[1]) >= 2:
+                n_slots = int(sum_row_pos.shape[2])
+                res_prev_k = torch.zeros(bsz, n_heads, n_slots, head_dim,
                                          dtype=key_states.dtype,
                                          device=key_states.device)
                 res_prev_v = torch.zeros_like(res_prev_k)
                 res_all_k = torch.zeros_like(k_base)
                 res_all_v = torch.zeros_like(v_base)
                 valid = sum_row_valid.to(key_states.dtype).unsqueeze(1)
-                valid = valid.unsqueeze(-1)  # [B, 1, T, 2, 1]
+                valid = valid.unsqueeze(-1)  # [B, 1, T, n_slots, 1]
                 for t_i in range(2, t_max + 1):
                     tt = torch.full((bsz, 1), t_i, dtype=torch.float32,
                                     device=key_states.device)
@@ -252,12 +343,12 @@ class LlamaAttention(nn.Module):
                         v_base[:, :, t_i - 2] + res_prev_v,
                         v_cur[:, :, t_i - 1], tt) * valid[:, :, t_i - 1]
                     if _CCM_AUDIT_GAMMA:
-                        kb = k_base[0, :, t_i - 2]   # [H, 2, D]
+                        kb = k_base[0, :, t_i - 2]   # [H, n_slots, D]
                         vb = v_base[0, :, t_i - 2]
-                        rk = res_t_k[0]              # [H, 2, D]
+                        rk = res_t_k[0]              # [H, n_slots, D]
                         rv = res_t_v[0]
                         for _h in range(n_heads):
-                            for _s in range(2):
+                            for _s in range(n_slots):
                                 _AUDIT_BUFFER.append({
                                     "layer": self.layer_idx, "t": int(t_i),
                                     "head": _h, "slot": _s,
@@ -562,10 +653,13 @@ class LlamaModelCCM(LlamaPreTrainedModel):
                 #####################################################
                 ##### RPBE modification (L2/L6.5): Gamma row index ######
                 if self._gamma_attached:
-                    # Per-slot SUM positions in turn order -> [B, T, 2].
+                    # Per-slot SUM positions in turn order ->
+                    # [B, T, n_slots] (n_slots = 2 for the dialog line,
+                    # 4 for the LaMP one-shot merge; L2).
+                    n_slots = len(self.sum_token)
                     per_slot = []
                     t_max = 0
-                    for k in range(len(self.sum_token)):
+                    for k in range(n_slots):
                         loc = (input_ids == self.sum_token[k]).nonzero()
                         by_batch = {}
                         for b, p in loc.tolist():
@@ -573,10 +667,10 @@ class LlamaModelCCM(LlamaPreTrainedModel):
                         per_slot.append(by_batch)
                         t_max = max(t_max, max(
                             (len(v) for v in by_batch.values()), default=0))
-                    sum_row_pos = torch.zeros(batch_size, t_max, 2,
+                    sum_row_pos = torch.zeros(batch_size, t_max, n_slots,
                                               dtype=torch.long,
                                               device=input_ids.device)
-                    sum_row_valid = torch.zeros(batch_size, t_max, 2,
+                    sum_row_valid = torch.zeros(batch_size, t_max, n_slots,
                                                 dtype=torch.bool,
                                                 device=input_ids.device)
                     for k, by_batch in enumerate(per_slot):

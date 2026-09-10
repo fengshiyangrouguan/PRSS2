@@ -18,6 +18,7 @@ import struct
 from typing import List
 
 from .gamma_residual import GammaResidual
+from .gamma_onetime import GammaOnetime
 
 N_TOK_LOCK = 2  # every run explicitly pins n_tok = 2 (plan L2)
 
@@ -67,6 +68,40 @@ def attach_gamma(model, *, head_dim=None, hidden=64, time_dim=16,
             head_dim = attn.head_dim
         attn.gamma = GammaResidual(head_dim, time_dim=time_dim, hidden=hidden,
                                    init_scale=init_scale).to(device)
+        modules.append(attn.gamma)
+    base._gamma_attached = True
+    return modules
+
+
+def attach_gamma_onetime(model, *, head_dim=None, hidden=64,
+                         init_scale=0.02) -> List[GammaOnetime]:
+    """LaMP one-shot merge Gamma (L2): one GammaOnetime per layer.
+
+    SUM_k = COMP_k + R(COMP_k, pool(COMP_1..4)); U zero-initialized, so
+    step 0 is the exact official copy.  Call after ``update_comp_token``
+    and after PEFT wrapping.  Requires n_tok = 4 (LaMP merge-ntok4).
+    """
+    base = _base_model(model)
+    comp = getattr(base, "comp_token", None)
+    sums = getattr(base, "sum_token", None)
+    if comp is None or sums is None:
+        raise ValueError("set comp/sum tokens (update_comp_token) before "
+                         "attaching Gamma")
+    if len(comp) != 4 or len(sums) != 4:
+        raise ValueError(
+            "GammaOnetime requires n_tok == 4 (LaMP merge-ntok4), got "
+            "comp={}, sum={}".format(len(comp), len(sums)))
+    modules = []
+    device = next(base.parameters()).device
+    for layer in base.layers:
+        attn = layer.self_attn
+        if getattr(attn, "gamma", None) is not None:
+            raise ValueError("Gamma already attached to this model")
+        if head_dim is None:
+            head_dim = attn.head_dim
+        attn.gamma = GammaOnetime(head_dim, hidden=hidden,
+                                  init_scale=init_scale).to(device)
+        attn._gamma_onetime = True
         modules.append(attn.gamma)
     base._gamma_attached = True
     return modules

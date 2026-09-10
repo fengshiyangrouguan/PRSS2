@@ -125,7 +125,8 @@ class Llmmaps(nn.Module):
         chi is the CONTEXT measurement, phi the FUTURE measurement and
         b_L^r the fixed depth signature.  chi [d_chi] or [B, d_chi],
         phi [d_phi] (input); output [n_branches, m] for single inputs or
-        [B, n_branches, m]."""
+        [B, n_branches, m].  L=None skips the depth bucket (LaMP line:
+        no depth stratification)."""
         single = chi.dim() == 1
         if single:
             chi = chi.unsqueeze(0)
@@ -136,8 +137,11 @@ class Llmmaps(nn.Module):
                                          device=chi.device), chi], dim=1)
             outs = []
             for r in range(self.n_branches):
-                phi_r = phi + self._bucket(r, L).to(
-                    dtype=phi.dtype, device=phi.device)
+                if L is None:
+                    phi_r = phi
+                else:
+                    phi_r = phi + self._bucket(r, L).to(
+                        dtype=phi.dtype, device=phi.device)
                 prod = torch.einsum("bd,bf->bdf", body, phi_r).reshape(
                     chi.shape[0], -1)
                 cols = getattr(self, "sketch_cols_{}".format(r)).to(

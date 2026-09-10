@@ -93,13 +93,25 @@ def parse_args() -> argparse.Namespace:
                    help="base seed for the independent per-row augment RNG "
                         "(derived as aug_seed+epoch+eid+t; never touches the "
                         "global diffusion RNG stream)")
-    p.add_argument("--dim-weight", type=int, default=1,
-                   help="1 = per-dim weighted diffusion loss (x/y=1.5,z=2.0,"
-                        "rot=0.5,grip=1.0); 0 = plain mean MSE (equal-weight "
-                        "restart control experiment)")
+    p.add_argument("--dim-weight", type=int, default=0,
+                   help="0 (DEFAULT, review 2026-09-10: weighted-loss line "
+                        "abandoned) = plain equal-weight diffusion MSE; "
+                        "1 = per-dim weighted loss (x/y=1.5,z=2.0,rot=0.5,"
+                        "grip=1.0) -- deprecated, invalidated control")
+    p.add_argument("--limit-episodes", type=int, default=0,
+                   help="train on only the first N train demos (0 = all); "
+                        "single-demo overfit / coverage diagnostics")
+    p.add_argument("--opt-audit", type=int, default=0,
+                   help="verbose optimizer-closure audit (coverage + per-group "
+                        "grad/update norms) for the first N DENSE steps, then "
+                        "stop training (0 = off)")
     p.add_argument("--lr", type=float, default=2e-5)
     p.add_argument("--warmup-steps", type=int, default=100,
                    help="warmup in OPTIMIZER steps")
+    p.add_argument("--sched", choices=["cosine", "const"], default="cosine",
+                   help="LR schedule for the task optimizer: cosine (legacy) "
+                        "or const (official MemoryVLA: constant 2e-5, "
+                        "warmup ignored)")
     p.add_argument("--grad-clip", type=float, default=1.0)
     p.add_argument("--lora-rank", type=int, default=32)
     p.add_argument("--lora-alpha", type=int, default=32)
@@ -114,6 +126,17 @@ def parse_args() -> argparse.Namespace:
                         "checkpoint and start training at opt 0 with fresh "
                         "optimizer/scheduler/RNG/memory.  NOT a resumption -- "
                         "never splice its output onto the prior run.")
+    p.add_argument("--resume-full", default="",
+                   help="TRUE continuation: load a full-state checkpoint "
+                        "(weights + optimizer + schedulers + step counters + "
+                        "CPU/CUDA/numpy RNG) and continue.  Training must be "
+                        "resumed with the SAME max_steps/batch/grad_accum "
+                        "that produced it.  Data stream restarts from a fresh "
+                        "epoch (deterministic seed) -- not bitwise cursor "
+                        "continuation.")
+    p.add_argument("--snapshot-steps", default="30000,35000,40000",
+                   help="optimizer steps (of THIS run) at which to also write "
+                        "a weights-only snapshot_<step>.pt for offline eval")
     # RPBE
     p.add_argument("--kf-variant", choices=["full_dual", "diag"],
                    default="full_dual")
@@ -207,6 +230,11 @@ def main() -> None:
             task_filter=args.task_filter,
             image_aug=bool(args.image_aug), aug_seed=args.aug_seed))
     print("train episodes:", len(train_dataset), flush=True)
+    if args.limit_episodes:
+        train_dataset.episodes = train_dataset.episodes[:args.limit_episodes]
+        print(f"[data] LIMIT to first {len(train_dataset.episodes)} train "
+              f"episodes: {[e['demo_key'] for e in train_dataset.episodes]}",
+              flush=True)
     n_train_rows = sum(max(0, ep["T"]) for ep in train_dataset.episodes)
     print(f"train rows/epoch (dense): {n_train_rows}", flush=True)
 
@@ -380,7 +408,13 @@ def main() -> None:
 
     # cosine decay w/ warmup in OPTIMIZER-step units for the dense (task+LoRA)
     # optimizer.
+    # LR schedule: official MemoryVLA = CONSTANT (warmup ignored); legacy runs
+    # used cosine-with-warmup.  Under --sched const BOTH optimizers hold base
+    # lr for the whole run (gamma cosine would otherwise anneal gamma to LR 0
+    # after repr_total_steps, freezing it mid-40k).
     def lr_lambda_task(t):
+        if args.sched == "const":
+            return 1.0
         if t < args.warmup_steps:
             return t / max(1, args.warmup_steps)
         progress = (t - args.warmup_steps) / max(
@@ -390,6 +424,8 @@ def main() -> None:
     sched_task = torch.optim.lr_scheduler.LambdaLR(opt_task, lr_lambda_task)
     # gamma scheduler indexed by param_version (gamma step count).
     def lr_lambda_gamma(rs):
+        if args.sched == "const":
+            return 1.0
         if rs < args.repr_warmup_steps:
             return rs / max(1, args.repr_warmup_steps)
         progress = (rs - args.repr_warmup_steps) / max(
@@ -403,6 +439,79 @@ def main() -> None:
     print(f"task params: {sum(p.numel() for p in task_params)/1e6:.2f}M | "
           f"gamma params: {sum(p.numel() for p in gamma_params)/1e6:.2f}M",
           flush=True)
+
+    # ---- optimizer-closure audit (--opt-audit N) ----
+    audit_groups = {
+        "other_task": [p for p in task_params if id(p) not in lora_ids],
+        "lora": lora_params,
+        "gamma": gamma_params,
+    }
+
+    def _audit_once():
+        """Print coverage/membership invariants once before the first step."""
+        all_tr = [p for p in vla.parameters() if p.requires_grad]
+        cov = {id(p) for p in task_params} | gamma_ids
+        missing = [(n, id(p)) for n, p in vla.named_parameters()
+                   if p.requires_grad and id(p) not in cov]
+        lora_leak = lora_ids - task_ids
+        print(f"[audit] trainable={len(all_tr)} covered={len(cov)} "
+              f"missing={len(missing)} lora_not_in_task={len(lora_leak)} "
+              f"gamma_overlap={len(task_ids & gamma_ids)}", flush=True)
+        for n, pid in missing[:20]:
+            print(f"[audit]   MISSING {n}", flush=True)
+        return missing
+
+    def _audit_snapshot():
+        snap = {}
+        for gname, ps in audit_groups.items():
+            g2 = 0.0
+            for p in ps:
+                if p.grad is not None:
+                    g2 += float(p.grad.detach().float().pow(2).sum())
+            snap[gname] = (math.sqrt(g2), [(p, p.detach().clone())
+                                           for p in ps])
+        return snap
+
+    def _audit_report(step, snap):
+        cov = {id(p) for p in task_params} | gamma_ids
+        miss = sum(1 for p in vla.parameters()
+                   if p.requires_grad and id(p) not in cov)
+        for gname, (gnorm, pairs) in snap.items():
+            upd2 = 0.0
+            dev = set()
+            for p, p0 in pairs:
+                upd2 += float((p.detach() - p0).float().pow(2).sum())
+                dev.add(str(p.device))
+            if gname == "gamma" and opt_gamma is not None:
+                lr = opt_gamma.param_groups[-1]["lr"]
+            else:
+                lr = opt_task.param_groups[-1]["lr"]
+            print(f"[audit {step}] {gname:10s} n={len(pairs)} "
+                  f"grad={gnorm:.3e} upd={math.sqrt(upd2):.3e} "
+                  f"lr={lr:.2e} dev={sorted(dev)}", flush=True)
+        # optimizer state device sample (lazy AdamW state after step).
+        # Flag ANY param whose state lives on a different device than itself
+        # (the CPU-poisoning hazard the closure audit is meant to catch).
+        id2name = {id(p): n for n, p in vla.named_parameters()}
+        off = []
+        devs = set()
+        for g in opt_task.param_groups:
+            for p in g["params"]:
+                if p in opt_task.state:
+                    for st in opt_task.state[p].values():
+                        if torch.is_tensor(st):
+                            devs.add(str(st.device))
+                            if str(st.device) != str(p.device):
+                                off.append((id2name.get(id(p), "?"),
+                                            str(p.device), str(st.device)))
+        print(f"[audit {step}] coverage: missing={miss} "
+              f"opt_task_state_dev={sorted(devs)}", flush=True)
+        for nm, pd_, sd in off[:30]:
+            print(f"[audit {step}]   OFFDEVICE {nm} param={pd_} state={sd}",
+                  flush=True)
+
+    if args.opt_audit > 0:
+        _audit_once()
 
     # ---- RPBE machinery (gamma arms only) ----
     rpbe_cfg = EmbodiedRPBConfig(
@@ -596,7 +705,27 @@ def main() -> None:
         }
         return payload
 
+    def _full_dict():
+        """FULL-STATE checkpoint: weights + Adam + schedulers + step counters
+        + CPU/CUDA/numpy RNG, for TRUE continuation (--resume-full).  A single
+        rolling fullstate.pt per run (Adam fp32 state makes it ~4-5x weights)."""
+        payload = _ckpt_dict()
+        payload["weights_snapshot_only"] = False
+        payload["full_state"] = True
+        payload["opt_task"] = opt_task.state_dict()
+        payload["opt_gamma"] = (opt_gamma.state_dict()
+                                if opt_gamma is not None else None)
+        payload["sched_task"] = sched_task.state_dict()
+        payload["sched_gamma"] = (sched_gamma.state_dict()
+                                  if sched_gamma is not None else None)
+        payload["rng_cuda"] = torch.cuda.get_rng_state()
+        payload["rng_cpu"] = torch.get_rng_state()
+        payload["rng_np"] = np.random.get_state()
+        return payload
+
     best_val = float("inf")
+    snapshot_set = {int(x) for x in args.snapshot_steps.split(",") if x.strip()}
+    snapshot_saved = set()
     if args.init_from_weights:
         ck = torch.load(args.init_from_weights, map_location="cpu",
                         weights_only=False)
@@ -616,6 +745,35 @@ def main() -> None:
               f"{args.init_from_weights} (unexpected keys: {unexpected}); "
               f"training starts at opt 0 with fresh optimizer/scheduler/RNG",
               flush=True)
+
+    if args.resume_full:
+        assert not args.init_from_weights, \
+            "use EITHER --init-from-weights OR --resume-full, not both"
+        ck = torch.load(args.resume_full, map_location="cpu",
+                        weights_only=False)
+        named = dict(vla.named_parameters())
+        for n, t in ck["model"].items():
+            if n in named and named[n].requires_grad:
+                named[n].data.copy_(t.to(named[n].dtype))
+        opt_task.load_state_dict(ck["opt_task"])
+        if opt_gamma is not None:
+            assert ck["opt_gamma"] is not None, "full ckpt has no gamma state"
+            opt_gamma.load_state_dict(ck["opt_gamma"])
+        sched_task.load_state_dict(ck["sched_task"])
+        if sched_gamma is not None:
+            sched_gamma.load_state_dict(ck["sched_gamma"])
+        optimizer_step = int(ck.get("optimizer_step", ck["step"]))
+        micro_step = int(ck["micro_step"])
+        vla.cog_mem_bank.param_version = int(ck["param_version"])
+        torch.set_rng_state(ck["rng_cpu"])
+        torch.cuda.set_rng_state(ck["rng_cuda"])
+        np.random.set_state(ck["rng_np"])
+        print(f"[resume-full] TRUE continuation from {args.resume_full} at "
+              f"opt {optimizer_step}/{args.max_steps} micro {micro_step} "
+              f"pv {vla.cog_mem_bank.param_version}.  Data stream restarts a "
+              f"fresh epoch (deterministic seed); bank/queue reset.", flush=True)
+        assert optimizer_step < args.max_steps, \
+            "resume point already at/past --max-steps; raise --max-steps"
 
     # ---- main loop ----
     it = iter(train_loader)
@@ -687,11 +845,20 @@ def main() -> None:
 
         # dense optimizer step every grad_accum micro-batches
         if micro_step % args.grad_accum == 0:
+            audit_snap = (_audit_snapshot()
+                          if args.opt_audit and optimizer_step < args.opt_audit
+                          else None)
             torch.nn.utils.clip_grad_norm_(task_params, args.grad_clip)
             opt_task.step()
             opt_task.zero_grad()
             sched_task.step()
             optimizer_step += 1
+            if audit_snap is not None:
+                _audit_report(optimizer_step, audit_snap)
+            if args.opt_audit and optimizer_step >= args.opt_audit:
+                print(f"[opt-audit] DONE after {optimizer_step} dense steps",
+                      flush=True)
+                break
 
             if args.log_every > 0 and optimizer_step % args.log_every == 0:
                 dt = time.time() - t0
@@ -715,7 +882,21 @@ def main() -> None:
             if args.checkpoint_every > 0 and \
                     optimizer_step % args.checkpoint_every == 0:
                 torch.save(_ckpt_dict(), run_dir / "latest.pt")
-                print(f"latest saved @ opt {optimizer_step}", flush=True)
+                torch.save(_full_dict(), run_dir / "fullstate.pt")
+                print(f"latest+fullstate saved @ opt {optimizer_step}", flush=True)
+
+            if optimizer_step in snapshot_set and \
+                    optimizer_step not in snapshot_saved:
+                snapshot_saved.add(optimizer_step)
+                torch.save(_ckpt_dict(),
+                           run_dir / f"snapshot_{optimizer_step}.pt")
+                print(f"weights snapshot saved @ opt {optimizer_step}",
+                      flush=True)
+
+    if args.opt_audit:
+        print("[opt-audit] audit complete; skipping final checkpoint save",
+              flush=True)
+        sys.exit(0)
 
     torch.save(_ckpt_dict(), run_dir / "checkpoint.pt")
     with open(run_dir / "dataset_statistics.json", "w") as f:

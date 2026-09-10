@@ -222,12 +222,14 @@ class EmbodiedRPBEWindow:
         self.closed = True
         return n
 
-    def close(self, merge_fn=None):
+    def close(self, merge_fn=None, n_perm: int = 0):
         """Returns (j_float, g_by_cut, replay_inputs, diag).
 
         replay_inputs[cut_id] = (child_left, child_right) rebuilt with the
         CURRENT Gamma by recursing the fixed merge trace, so the caller can
         replay <g, Gamma(child_left, child_right)> without any shared registry.
+        n_perm > 0 runs a CUT-BLOCK permutation null (both horizon rows of a
+        cut move together); 0 disables it (formal training).
         """
         assert not self.closed
         self.closed = True
@@ -269,24 +271,34 @@ class EmbodiedRPBEWindow:
         fn = (dual_latent_z_adjoint if self.variant == "full_dual"
               else diag_latent_z_adjoint)
         j, g_by_cut, diag = fn(z, p, w, cut_ids, eps=self.eps, strict=self.strict)
-        # null-signal check (reviewer): J of a row-shuffled p, and a small
-        # permutation null p95, to show RPBE's J_real carries real signal.
-        try:
-            scoring = (dual_full_score if self.variant == "full_dual"
-                       else diag_score)
-            g = torch.Generator().manual_seed(12345)
-            null = []
-            for _ in range(8):
-                perm = torch.randperm(p.shape[0], generator=g)
-                jn, _ = scoring(z, p[perm], w, cut_ids, eps=self.eps, strict=False)
-                null.append(float(jn))
-            null.sort()
-            diag["J_real"] = float(j)
-            diag["J_shuffled"] = float(sum(null) / len(null))
-            diag["J_perm_p95"] = float(null[-1])
-            diag["J_gap"] = float(j) - float(sum(null) / len(null))
-        except Exception as e:  # never let the diagnostic break training
-            diag["null_failed"] = str(e)
+        # null-signal check with a CUT-BLOCK permutation (both horizon rows of
+        # a cut move together).  Disabled (n_perm=0) in formal training to
+        # avoid the CPU Cholesky cost; calibration uses n_perm>=128.
+        if n_perm > 0:
+            try:
+                scoring = (dual_full_score if self.variant == "full_dual"
+                           else diag_score)
+                groups = {}
+                for i, cid in enumerate(cut_ids):
+                    groups.setdefault(cid, []).append(i)
+                bundles = list(groups.values())
+                g = torch.Generator().manual_seed(12345)
+                null = []
+                for _ in range(int(n_perm)):
+                    order = torch.randperm(len(bundles), generator=g).tolist()
+                    idx = [i for c in order for i in bundles[c]]
+                    jn, _ = scoring(z, p[idx], w, cut_ids, eps=self.eps,
+                                    strict=False)
+                    null.append(float(jn))
+                null.sort()
+                diag["J_real"] = float(j)
+                diag["J_shuffled"] = float(sum(null) / len(null))
+                diag["J_perm_p95"] = float(null[min(len(null) - 1,
+                                                    int(0.95 * len(null)))])
+                diag["J_gap"] = float(j) - float(sum(null) / len(null))
+                diag["n_perm"] = int(n_perm)
+            except Exception as e:  # never let the diagnostic break training
+                diag["null_failed"] = str(e)
         diag["n_rows"] = len(rs)
         diag["n_unique_cuts"] = self.n_unique_cuts
         diag["n_unique_episodes"] = self.n_unique_episodes

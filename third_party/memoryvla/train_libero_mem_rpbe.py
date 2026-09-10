@@ -169,6 +169,10 @@ def parse_args() -> argparse.Namespace:
                    help="number of finished episodes accumulated into ONE RPBE "
                         "statistics window before closing it (RPBE clock, "
                         "decoupled from the Gamma task clock).")
+    p.add_argument("--perm-null", type=int, default=0,
+                   help="cut-block permutation null repetitions for the J gap "
+                        "(calibration: >=128; formal training: 0 = off, avoids "
+                        "the CPU Cholesky cost).")
     return p.parse_args()
 
 
@@ -627,7 +631,8 @@ def main() -> None:
         if (window is not None and window.n_unique_cuts > 0
                 and rpbe_window_episodes >= args.rpbe_stats_episodes):
             if window.ready():
-                j, g_by_cut, rpbe_inputs, diag = window.close(merge_fn=_merge_fn)
+                j, g_by_cut, rpbe_inputs, diag = window.close(
+                    merge_fn=_merge_fn, n_perm=args.perm_null)
                 if g_by_cut:
                     # key by cut_id directly; replay inputs are rebuilt with
                     # the CURRENT Gamma (no shared registry needed)
@@ -668,6 +673,35 @@ def main() -> None:
         rpbe_keys = ([rpbe_keys[i] for i in rng.permutation(len(rpbe_keys))]
                      if rpbe_keys else [])
         B = max(1, args.gamma_replay_batch_size)
+        # Blocker A: a boundary with no task keys must be skipped by BOTH arms
+        # (never let the rpbe arm take a pure-RPBE step).  In formal training
+        # ntask>0 always holds; a skip here means a degenerate episode.
+        if not task_keys:
+            print("[gamma] no task keys at this boundary -> skip both arms",
+                  flush=True)
+            task_cotangents = {}
+            rpbe_cotangents = {}
+            rpbe_input_map = {}
+            rpbe_pending_loss = []
+            return
+        # audit: alpha / ||U|| / residual (Gamma vs Avg) on a key sample
+        if opt_gamma is not None:
+            with torch.no_grad():
+                gm = vla.gamma
+                ga = float(gm.alpha.detach())
+                umag = sum(float(p.detach().float().pow(2).sum())
+                           for p in gm.parameters() if p is not gm.alpha) ** 0.5
+                kk = task_keys[:min(32, len(task_keys))]
+                a_ = torch.stack([merge_registry[k].left_state
+                                  for k in kk]).to("cuda", dtype=torch.bfloat16)
+                b_ = torch.stack([merge_registry[k].right_state
+                                  for k in kk]).to("cuda", dtype=torch.bfloat16)
+                mavg = (a_.float() + b_.float()) / 2
+                zg = gm(a_, b_).float()
+                res = float(((zg - mavg).pow(2).sum() /
+                             (mavg.pow(2).sum() + 1e-8)) ** 0.5)
+            print(f"[gamma audit] alpha={ga:.4f} |U|={umag:.4f} "
+                  f"residual={res:.4f}", flush=True)
         # Blocker 2: opt_gamma step count is set by the TASK key count ALONE,
         # so gamma-task and gamma-rpbe step in lockstep; the rpbe keys are
         # distributed round-robin into those same n_mb buckets.

@@ -190,22 +190,19 @@ class EmbodiedRPBEWindow:
     def add(self, rows: List[EmbodiedCutRow]) -> None:
         assert not self.closed
         for r in rows:
-            # review ruling B5: a statistics window must never mix merge
-            # states written by different parameter versions.  Rows whose
-            # merge was written under an OLDER version (their futures
-            # matured across a repr boundary) are dropped -- their window
-            # already closed at the boundary.
-            if self.rows:
-                existing_v = next(iter(self.rows.values())).param_version
-                if r.param_version != existing_v:
-                    self.n_dropped_version += 1
-                    continue
+            # Stage5-R: rows may carry merged states from DIFFERENT Gamma
+            # versions; close() rebuilds them with the CURRENT Gamma from the
+            # raw leaf states, so cross-version mixing is safe here.
             key = r.cut_id + (r.horizon,)
             self.rows[key] = r   # row_id dedup: distinct horizons both stay
 
     @property
     def n_unique_cuts(self) -> int:
         return len({r.cut_id for r in self.rows.values()})
+
+    @property
+    def n_unique_episodes(self) -> int:
+        return len({r.cut_id[0] for r in self.rows.values()})
 
     def ready(self) -> bool:
         # review ruling B5: the gate is exactly min_abs (the min_ratio * m
@@ -219,16 +216,25 @@ class EmbodiedRPBEWindow:
         self.closed = True
         return n
 
-    def close(self) -> Tuple[float, Dict[tuple, torch.Tensor], dict]:
-        """Assemble thin rows -> adjoint -> (j_float, g_by_cut, diagnostics)."""
+    def close(self, rebuild_fn=None) -> Tuple[float, Dict[tuple, torch.Tensor], dict]:
+        """Assemble thin rows -> adjoint -> (j_float, g_by_cut, diagnostics).
+
+        Stage5-R: if rebuild_fn is given, the merged state of every row is
+        REBUILT from its raw leaf states with the CURRENT Gamma, so a window
+        spanning multiple Gamma versions carries no version skew."""
         assert not self.closed
         self.closed = True
         rs = list(self.rows.values())
         if not rs:
             return 0.0, {}, {"failed": "empty_window"}
-        # window statistics run on CPU fp64 (rows come from GPU detach or
-        # CPU futures; N x 4096 is tiny)
-        z = torch.stack([r.z.detach().cpu() for r in rs])
+        if rebuild_fn is not None and all(
+                r.left_state is not None and r.right_state is not None
+                for r in rs):
+            left = torch.stack([r.left_state.detach().cpu() for r in rs])
+            right = torch.stack([r.right_state.detach().cpu() for r in rs])
+            z = rebuild_fn(left, right).detach().cpu()
+        else:
+            z = torch.stack([r.z.detach().cpu() for r in rs])
         p = torch.stack([r.outcome.detach().cpu() for r in rs])
         w = torch.tensor([r.weight for r in rs], dtype=torch.float64)
         cut_ids = [r.cut_id for r in rs]

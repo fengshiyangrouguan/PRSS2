@@ -57,15 +57,22 @@ class PendingMerge:
 
 @dataclass
 class EmbodiedCutRow:
-    """Thin row: the only thing that enters the RPBE window (plan §21)."""
+    """Thin row: the only thing that enters the RPBE window (plan §21).
+
+    Stage5-R: carries the RAW leaf states (left_state/right_state) so the
+    window can REBUILD the merged state with the CURRENT Gamma at close time
+    (never mixes merged states produced under older Gamma versions).  `z` is
+    kept as the write-time merged state for backward compatibility / debug."""
     cut_id: tuple
     horizon: int
-    z: torch.Tensor                # [4096] detached
+    z: torch.Tensor                # [4096] detached (write-time merged)
     context: dict                  # {horizon, delta_s, instruction, vision_feat}
     outcome: torch.Tensor          # [112] normalized action chunk (replaced by
                                    # the fixed map P at window-add time)
     weight: float
     param_version: int = 0         # LoRA+Gamma version at merge write time
+    left_state: Optional[torch.Tensor] = None    # [4096] raw leaf, detached
+    right_state: Optional[torch.Tensor] = None   # [4096] raw leaf, detached
 
 
 class PendingMergeQueue:
@@ -171,6 +178,8 @@ class PendingMergeQueue:
                 outcome=y,
                 weight=base * self.horizon_weights[h - 1],
                 param_version=rec.param_version,
+                left_state=rec.left_state,
+                right_state=rec.right_state,
             ))
         return rows
 

@@ -108,10 +108,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--lr", type=float, default=2e-5)
     p.add_argument("--warmup-steps", type=int, default=100,
                    help="warmup in OPTIMIZER steps")
-    p.add_argument("--sched", choices=["cosine", "const"], default="cosine",
-                   help="LR schedule for the task optimizer: cosine (legacy) "
-                        "or const (official MemoryVLA: constant 2e-5, "
-                        "warmup ignored)")
+    p.add_argument("--sched", choices=["cosine", "const"], default="const",
+                   help="LR schedule for the task optimizer: const (official "
+                        "MemoryVLA default: constant 2e-5, warmup ignored) or "
+                        "cosine (legacy)")
     p.add_argument("--grad-clip", type=float, default=1.0)
     p.add_argument("--lora-rank", type=int, default=32)
     p.add_argument("--lora-alpha", type=int, default=32)
@@ -153,6 +153,22 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--repr-total-steps", type=int, default=1200,
                    help="cosine denominator for the gamma scheduler in gamma "
                         "steps (dense: ~1 gamma step per episode)")
+    # --- Stage5-R structural fix (reviewer 2026-09-10) ---
+    p.add_argument("--gamma-lr", type=float, default=-1.0,
+                   help="AdamW lr for the Gamma merge operator (opt_gamma). "
+                        "<0 = use --lr.  Calibrated, not guessed.")
+    p.add_argument("--gamma-replay-batch-size", type=int, default=64,
+                   help="episode-end Gamma replay: split the episode's replay "
+                        "keys into minibatches of this many cuts and take one "
+                        "opt_gamma.step() per minibatch (Gamma stays fixed "
+                        "WITHIN an episode; more updates per episode).")
+    p.add_argument("--gamma-task-boundary-episodes", type=int, default=1,
+                   help="number of finished episodes that trigger one Gamma "
+                        "task-replay boundary (Gamma task clock).")
+    p.add_argument("--rpbe-stats-episodes", type=int, default=1,
+                   help="number of finished episodes accumulated into ONE RPBE "
+                        "statistics window before closing it (RPBE clock, "
+                        "decoupled from the Gamma task clock).")
     return p.parse_args()
 
 
@@ -398,11 +414,12 @@ def main() -> None:
     task_ids = {id(p) for p in task_params}
     overlap = task_ids & gamma_ids
     assert not overlap, f"gamma/task param overlap: {len(overlap)}"
-    opt_task = torch.optim.AdamW(task_params, lr=args.lr,
+    gamma_lr = args.gamma_lr if args.gamma_lr > 0 else args.lr
+    opt_task = torch.optim.AdamW(task_params, lr=args.lr, weight_decay=0.0,
                              foreach=False)
     if gamma_params:
-        opt_gamma = torch.optim.AdamW(gamma_params, lr=args.lr,
-                               foreach=False)
+        opt_gamma = torch.optim.AdamW(gamma_params, lr=gamma_lr,
+                               weight_decay=0.0, foreach=False)
     else:
         opt_gamma = None
 
@@ -527,10 +544,13 @@ def main() -> None:
     rpbe_pending_loss: list = []
     merge_registry: dict = {}
     merge_id_map: dict = {}
+    rpbe_window_episodes = 0   # finished episodes added to the RPBE window
+                               # since its last close (rpbe_stats_episodes)
 
     optimizer_step = 0
     micro_step = 0
     episodes_since_boundary = 0
+    episodes_seen = 0         # total finished episodes (budget lock)
     window_micro = 0          # micro-backwards since last gamma boundary
     boundary_pending = False  # repr threshold crossed; fire at fresh-episode top
     last_eid = None
@@ -541,7 +561,8 @@ def main() -> None:
         """Consume merge_log -> queue.register; offer current-decision
         futures; drain finished episodes.  Causal order: register this
         batch's merges first, then offer, then drain completed episodes."""
-        nonlocal last_eid, episodes_since_boundary
+        nonlocal last_eid, episodes_since_boundary, rpbe_window_episodes
+        nonlocal episodes_seen
         bank = vla.cog_mem_bank
         eids = [int(e) for e in batch["episode_ids"]]
         for rec in bank.merge_log:
@@ -573,9 +594,11 @@ def main() -> None:
                     for r in rows:
                         r.outcome = maps.pv(r.context, r.outcome)
                     window.add(rows)
+                    rpbe_window_episodes += 1
                 n_done += 1
             last_eid = eid
         episodes_since_boundary += n_done
+        episodes_seen += n_done
 
     def _gamma_boundary(scale):
         """One gamma macro-boundary update.  scale = grad_accum/window_micro
@@ -584,12 +607,26 @@ def main() -> None:
         replay adds its contribution, keeping the RPBE-vs-task relative
         weight independent of episode length under the dense protocol."""
         nonlocal window, task_cotangents, rpbe_cotangents, rpbe_pending_loss
+        nonlocal rpbe_window_episodes
         if not IS_GAMMA or vla.gamma is None:
             return
-        # close RPBE statistics window -> cache cotangents
-        if window is not None and window.n_unique_cuts > 0:
+
+        def _rebuild_merged(left, right):
+            # rebuild merged states with the CURRENT Gamma (Stage5-R): the
+            # window may span several Gamma versions, so never reuse a
+            # write-time merged state.
+            with torch.no_grad():
+                md = next(vla.gamma.parameters()).dtype
+                z = vla.gamma(left.to("cuda", dtype=md),
+                              right.to("cuda", dtype=md))
+            return z.float()
+
+        # close the RPBE statistics window ONLY once enough finished episodes
+        # have accumulated (RPBE clock, decoupled from the Gamma task clock)
+        if (window is not None and window.n_unique_cuts > 0
+                and rpbe_window_episodes >= args.rpbe_stats_episodes):
             if window.ready():
-                j, g_by_cut, diag = window.close()
+                j, g_by_cut, diag = window.close(rebuild_fn=_rebuild_merged)
                 if g_by_cut:
                     for k, g in g_by_cut.items():
                         eid, mid, _ = k
@@ -609,44 +646,79 @@ def main() -> None:
             window = EmbodiedRPBEWindow(
                 variant=rpbe_cfg.kf_variant, eps=rpbe_cfg.ridge_eps,
                 min_abs=rpbe_cfg.kf_min_abs)
-        # task replay (independent key set from RPBE); scale the summed
-        # leaf cotangents to a per-micro mean (reviewer normalization fix)
-        keys = [k for k in task_cotangents if k in merge_registry]
-        if keys and scale != 1.0:
+            rpbe_window_episodes = 0
+        # --- episode-end minibatch replay (Stage5-R) ---
+        # Scale the summed leaf cotangents to a per-micro mean BEFORE any
+        # replay adds its own contribution (normalization protocol).
+        if task_cotangents and scale != 1.0:
             task_cotangents = {k: v * scale for k, v in task_cotangents.items()}
-        if keys:
-            m_a = torch.stack(
-                [merge_registry[k].left_state for k in keys]
-            ).to("cuda", dtype=torch.bfloat16)
-            m_b = torch.stack(
-                [merge_registry[k].right_state for k in keys]
-            ).to("cuda", dtype=torch.bfloat16)
-            l_task = gamma_replay_loss(vla.gamma, m_a, m_b, task_cotangents,
-                                       keys)
-            l_task.backward()
-            print(f"[gamma step] task replay {l_task.item():.4f}",
-                  flush=True)
-        # rpbe replay (independent key set)
-        rkeys = [k for k in rpbe_cotangents if k in merge_registry]
-        if rkeys and args.lambda_rpbe > 0:
-            m_a_r = torch.stack(
-                [merge_registry[k].left_state for k in rkeys]
-            ).to("cuda", dtype=torch.bfloat16)
-            m_b_r = torch.stack(
-                [merge_registry[k].right_state for k in rkeys]
-            ).to("cuda", dtype=torch.bfloat16)
-            l_rpbe = gamma_replay_loss(vla.gamma, m_a_r, m_b_r,
-                                       rpbe_cotangents, rkeys)
-            # RPBE maximizes J (loss.py docstring: rpbe part -<g,z_hat>),
-            # so the sign is NEGATIVE -- gradient ascent on J.
-            (-args.lambda_rpbe * l_rpbe).backward()
-            print(f"[gamma step] rpbe replay "
-                  f"{-args.lambda_rpbe * l_rpbe.item():.4f}", flush=True)
-        if opt_gamma is not None:
-            torch.nn.utils.clip_grad_norm_(gamma_params, args.grad_clip)
-            opt_gamma.step()
-            opt_gamma.zero_grad()
-            sched_gamma.step()
+        task_keys = [k for k in task_cotangents if k in merge_registry]
+        rpbe_keys = ([k for k in rpbe_cotangents if k in merge_registry]
+                     if args.lambda_rpbe > 0 else [])
+        # Deterministic per-episode shuffle -> the TASK replay minibatch
+        # partition is identical for gamma-task and gamma-rpbe; the rpbe arm
+        # only ADDS rpbe gradients (clean attribution).
+        rng = np.random.default_rng(
+            args.seed * 131 + int(vla.cog_mem_bank.param_version))
+        task_keys = ([task_keys[i] for i in rng.permutation(len(task_keys))]
+                     if task_keys else [])
+        rpbe_keys = ([rpbe_keys[i] for i in rng.permutation(len(rpbe_keys))]
+                     if rpbe_keys else [])
+        B = max(1, args.gamma_replay_batch_size)
+        n_mb = max((len(task_keys) + B - 1) // B,
+                   (len(rpbe_keys) + B - 1) // B, 1)
+        n_opt = 0
+        def _gm():
+            return [p.grad.detach().clone() if p.grad is not None else None
+                    for p in gamma_params]
+
+        for i in range(n_mb):
+            t_sl = task_keys[i * B:(i + 1) * B]
+            r_sl = rpbe_keys[i * B:(i + 1) * B]
+            if opt_gamma is not None:
+                opt_gamma.zero_grad()
+            if t_sl:
+                m_a = torch.stack([merge_registry[k].left_state
+                                   for k in t_sl]).to("cuda", dtype=torch.bfloat16)
+                m_b = torch.stack([merge_registry[k].right_state
+                                   for k in t_sl]).to("cuda", dtype=torch.bfloat16)
+                l_task = gamma_replay_loss(vla.gamma, m_a, m_b,
+                                           task_cotangents, t_sl)
+                l_task.backward()
+            g_t = _gm() if opt_gamma is not None else []
+            if opt_gamma is not None:
+                opt_gamma.zero_grad()
+            if r_sl:
+                m_ar = torch.stack([merge_registry[k].left_state
+                                    for k in r_sl]).to("cuda", dtype=torch.bfloat16)
+                m_br = torch.stack([merge_registry[k].right_state
+                                    for k in r_sl]).to("cuda", dtype=torch.bfloat16)
+                l_rpbe = gamma_replay_loss(vla.gamma, m_ar, m_br,
+                                           rpbe_cotangents, r_sl)
+                # RPBE maximizes J -> negative sign (gradient ascent on J).
+                (-args.lambda_rpbe * l_rpbe).backward()
+            g_r = _gm() if opt_gamma is not None else []
+            if opt_gamma is not None:
+                nt2 = nr2 = dot = 0.0
+                for p, a, b in zip(gamma_params, g_t, g_r):
+                    av = a if a is not None else torch.zeros_like(p)
+                    bv = b if b is not None else torch.zeros_like(p)
+                    p.grad = av + bv
+                    fa = av.float(); fb = bv.float()
+                    nt2 += float(fa.pow(2).sum()); nr2 += float(fb.pow(2).sum())
+                    dot += float((fa * fb).sum())
+                nt = nt2 ** 0.5; nr = nr2 ** 0.5
+                cos = dot / (nt * nr + 1e-12)
+                print(f"[gamma audit] pv={vla.cog_mem_bank.param_version} "
+                      f"mb={i} |g_task|={nt:.3e} |g_rpbe|={nr:.3e} "
+                      f"cos={cos:.3f} r_eff={nr/(nt+1e-12):.3f}", flush=True)
+                torch.nn.utils.clip_grad_norm_(gamma_params, args.grad_clip)
+                opt_gamma.step()
+                sched_gamma.step()
+                n_opt += 1
+        print(f"[gamma] episode replay: {len(task_keys)} task / "
+              f"{len(rpbe_keys)} rpbe keys -> {n_opt} opt_gamma steps "
+              f"(mb<= {B})", flush=True)
         vla.cog_mem_bank.param_version += 1
         task_cotangents = {}
         rpbe_cotangents = {}
@@ -701,6 +773,19 @@ def main() -> None:
             "seed": args.seed,
             "task_filter": args.task_filter,
             "best_val": best_val,
+            "episodes_seen": episodes_seen,
+            "config": {
+                "sched": args.sched, "lr": args.lr,
+                "gamma_lr": (args.gamma_lr if args.gamma_lr > 0 else args.lr),
+                "weight_decay": 0.0, "batch_size": args.batch_size,
+                "grad_accum": args.grad_accum,
+                "gamma_replay_batch_size": args.gamma_replay_batch_size,
+                "gamma_task_boundary_episodes": args.gamma_task_boundary_episodes,
+                "rpbe_stats_episodes": args.rpbe_stats_episodes,
+                "mem_length": args.mem_length, "kf_min_abs": args.kf_min_abs,
+                "lambda_rpbe": args.lambda_rpbe,
+                "image_aug": args.image_aug, "dim_weight": args.dim_weight,
+            },
             "weights_snapshot_only": True,
         }
         return payload
@@ -764,6 +849,27 @@ def main() -> None:
             sched_gamma.load_state_dict(ck["sched_gamma"])
         optimizer_step = int(ck.get("optimizer_step", ck["step"]))
         micro_step = int(ck["micro_step"])
+        episodes_seen = int(ck.get("episodes_seen", 0))
+        # verify the run config the checkpoint was produced under (reviewer:
+        # resume must not silently change the recipe)
+        if "config" in ck:
+            want = {
+                "sched": args.sched, "batch_size": args.batch_size,
+                "grad_accum": args.grad_accum,
+                "gamma_replay_batch_size": args.gamma_replay_batch_size,
+                "gamma_task_boundary_episodes": args.gamma_task_boundary_episodes,
+                "rpbe_stats_episodes": args.rpbe_stats_episodes,
+                "lambda_rpbe": args.lambda_rpbe, "mem_length": args.mem_length,
+                "kf_min_abs": args.kf_min_abs,
+            }
+            bad = {k: (ck["config"].get(k), v) for k, v in want.items()
+                   if ck["config"].get(k) != v}
+            if bad:
+                raise SystemExit(f"[resume-full] CONFIG MISMATCH {bad}")
+            print("[resume-full] config verified against checkpoint", flush=True)
+        else:
+            print("[resume-full] WARNING: checkpoint has no config block",
+                  flush=True)
         vla.cog_mem_bank.param_version = int(ck["param_version"])
         torch.set_rng_state(ck["rng_cpu"])
         torch.cuda.set_rng_state(ck["rng_cuda"])
@@ -840,7 +946,7 @@ def main() -> None:
             feed_merges_and_futures(batch)
             # threshold crossed -> fire at the TOP of the next batch (fresh
             # episode edge), never version-splitting an in-progress episode.
-            if episodes_since_boundary >= args.repr_boundary_episodes:
+            if episodes_since_boundary >= args.gamma_task_boundary_episodes:
                 boundary_pending = True
 
         # dense optimizer step every grad_accum micro-batches

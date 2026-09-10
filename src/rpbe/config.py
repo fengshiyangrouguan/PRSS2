@@ -10,6 +10,10 @@ else configures the fixed measurement and the Ky Fan training term.
 from dataclasses import dataclass, field
 from typing import Dict, List, Mapping, Optional
 
+from rpbe.records import (SUPERVISION_PRODUCTION, SUPERVISION_1OBS,
+                          SUPERVISION_2OBS_ALIGNED,
+                          SUPERVISION_2OBS_MISPAIRED)
+
 
 @dataclass
 class RPBConfig:
@@ -44,7 +48,21 @@ class RPBConfig:
     # 1 = one local task observation (Y1 only); 2 = the two-observation
     # pullback refinement (Y1 and Y2).  Both keep per-tree total weight 1.
     n_observations: int = 2
+    # Structural-supervision arms (paper Part III), only meaningful with
+    # n_observations=2.  "" / "production" keeps the historical cut-builder
+    # behaviour exactly; "1obs", "2obs_aligned", "2obs_mispaired" run the
+    # ablation arms on the shared Y1+Y2-valid cut set.
+    supervision_mode: str = SUPERVISION_PRODUCTION
     rpbe_seed: int = 0                   # fixed-measurement seed (independent of host)
+    # Dense future supervision (review verdict, Part II fix): the default
+    # phi_Y encodes only the sparse 0/1 outcome, so a mispaired swap that
+    # keeps outcome=0 leaves phi_Y (and the whole joint test) unchanged —
+    # the mispaired ablation is vacuous on ~0.14%-positive node labels.
+    # When True, phi_Y additionally encodes the real next-hop event identity:
+    # hashed counterpart, role, and an RFF of the time-to-event, using
+    # INDEPENDENT fixed tables (seed offset), so different real events yield
+    # different phi_Y with probability ~1 even under outcome=0.
+    dense_future: bool = False
 
     def __post_init__(self):
         self.state_dims = dict(self.state_dims)
@@ -69,6 +87,17 @@ class RPBConfig:
             raise ValueError("unknown kf_variant {}".format(self.kf_variant))
         if self.n_observations not in (1, 2):
             raise ValueError("n_observations must be 1 or 2")
+        structural = (SUPERVISION_1OBS, SUPERVISION_2OBS_ALIGNED,
+                      SUPERVISION_2OBS_MISPAIRED)
+        if self.supervision_mode not in (
+                (SUPERVISION_PRODUCTION,) + structural):
+            raise ValueError("unknown supervision_mode {}".format(
+                self.supervision_mode))
+        if self.supervision_mode in structural and \
+                int(self.n_observations) != 2:
+            raise ValueError(
+                "supervision_mode={} requires n_observations=2".format(
+                    self.supervision_mode))
         if self.kf_taus is not None:
             bad = set(self.kf_taus) - set(self.state_dims)
             if bad:
@@ -97,5 +126,7 @@ class RPBConfig:
             "kf_taus": list(self.kf_taus) if self.kf_taus is not None else None,
             "kf_variant": self.kf_variant,
             "n_observations": self.n_observations,
+            "supervision_mode": self.supervision_mode,
             "rpbe_seed": self.rpbe_seed,
+            "dense_future": self.dense_future,
         }

@@ -1,4 +1,4 @@
-"""RPBE adapter for the official twitter-research TGN host.
+﻿"""RPBE adapter for the official twitter-research TGN host.
 
 The host's recursive aggregation remains intact.  Gamma is inserted only at
 an *internal aggregated state* that is passed to another aggregation:
@@ -24,9 +24,12 @@ import numpy as np
 import torch
 
 from rpbe.hosts.base import HostAdapter
-from rpbe.state import CompactCutTrace, CutCandidate
+from rpbe.state import CompactCutTrace, ConsumedPairCandidate, CutCandidate
 
 TAU_TEMPLATE = "tjo:layer{}"
+
+NEIGHBOR_REL = 1
+SELF_REL = 0
 
 
 def jodie_preagg_dim(host_dim: int, time_dim: int, edge_dim: int,
@@ -40,7 +43,7 @@ class JodieTGNAdapter(HostAdapter):
     """Wrap the official ``GraphEmbedding.compute_embedding`` surface."""
 
     def __init__(self, host_embedding, compressor=None, n_neighbors: int = 10,
-                 edge_tables=None):
+                 edge_tables=None, trace_pairs_per_parent: int = 0):
         super().__init__()
         if not hasattr(host_embedding, "aggregate"):
             raise ValueError(
@@ -82,10 +85,24 @@ class JodieTGNAdapter(HostAdapter):
         # Global across queries, so CutRecord identities cannot collide when
         # a lagged moment window spans batches or epochs.
         self._next_oid = 0
+        # Consumed child-parent pair tracing (paper recursive-closure
+        # supervision): per traced parent occurrence, deterministically record
+        # up to ``trace_pairs_per_parent`` neighbor-slot consumptions.
+        # 0 disables pair tracing (default keeps the historical SELF-spine
+        # behaviour bit-for-bit).  The slot selection seed advances per batch
+        # from the loop so exact replay reconstructs identical pairs.
+        self.trace_pairs_per_parent = int(trace_pairs_per_parent)
+        self._trace_batch = 0
+        self._next_pair_id = 0
 
     # ------------------------------------------------------------ tracing hooks
     def set_trace_source_rows(self, rows: Sequence[int]) -> None:
         self._trace_top_rows = set(int(x) for x in rows)
+
+    def set_trace_batch(self, batch_index: int) -> None:
+        """Advance the deterministic pair-selection seed (called by the
+        training loop once per batch, before the forward)."""
+        self._trace_batch = int(batch_index)
 
     def clear_trace(self) -> None:
         self._trace_top_rows = set()
@@ -142,16 +159,21 @@ class JodieTGNAdapter(HostAdapter):
             self._trace = None
             paths = {}
         return self._compute(memory, source_nodes, timestamps,
-                             int(n_layers), int(n_neighbors), paths)
+                             int(n_layers), int(n_neighbors), paths)[0]
 
     def _compute(self, memory, source_nodes, timestamps, layer, n_neighbors,
                  trace_paths):
-        """Recursive host query plus a SELF-spine trace token dictionary.
+        """Recursive host query returning ``(state, pre_gamma)`` per SELF row.
 
-        ``trace_paths`` maps rows in this recursion call to their top-level
-        structural path.  Tokens go only through ``source_lower``.  The
-        neighbor recursion receives no tokens, which removes full-tree trace
-        allocation without changing any embedding computation.
+        ``state`` is the tensor handed UP to the parent aggregation (compressed
+        at internal layers, vanilla at root/leaf); ``pre_gamma`` is the child's
+        vanilla aggregate BEFORE Gamma — needed so a consuming parent can trace
+        the child's pre-compression ``u`` for the Reconstruction aux (P1)
+        without an extra tree walk.  ``trace_paths`` maps rows in this
+        recursion call to their top-level structural path.  Tokens go only
+        through ``source_lower``.  The neighbor recursion receives no tokens,
+        which removes full-tree trace allocation without changing any
+        embedding computation.
         """
         device = self.device
         source_nodes_t = torch.from_numpy(source_nodes).long().to(device)
@@ -163,12 +185,12 @@ class JodieTGNAdapter(HostAdapter):
 
         # A leaf has no child aggregation, so Gamma is undefined here.
         if layer == 0:
-            return raw_source
+            return raw_source, raw_source
 
         source_paths = {
             int(row): list(path) + [(0, 0.0)]
             for row, path in trace_paths.items()}
-        source_lower = self._compute(
+        src_low_z, _src_low_u = self._compute(
             memory, source_nodes, timestamps, layer - 1, n_neighbors,
             source_paths)
 
@@ -182,16 +204,82 @@ class JodieTGNAdapter(HostAdapter):
         flat_neighbors = neighbors.reshape(-1)
         repeated_times = np.repeat(timestamps, n_neighbors)
         # Neighbor states are computed exactly as before; only trace tokens
-        # are absent, so no neighbor occurrence objects are retained.
-        neighbor_lower = self._compute(
+        # are absent, so no neighbor occurrence objects are retained.  Both the
+        # compressed child state (fed to aggregate / traced as z) and the
+        # child's pre-Gamma aggregate (traced as u) come from ONE recursion.
+        neigh_low_z, neigh_low_u = self._compute(
             memory, flat_neighbors, repeated_times, layer - 1, n_neighbors,
             {})
-        neighbor_lower = neighbor_lower.view(len(source_nodes), n_neighbors, -1)
+        neighbor_lower = neigh_low_z.view(len(source_nodes), n_neighbors, -1)
+        neighbor_u = neigh_low_u.view(len(source_nodes), n_neighbors, -1)
         edge_time = self.host.time_encoder(edge_deltas)
         edge_features = self.host.edge_features[edge_idxs]
         mask = neighbors_t == 0
+        # -------- consumed child-parent pair tracing (recursive closure) ----
+        # For each traced PARENT occurrence (row present in trace_paths) whose
+        # aggregation consumes a compressible internal NEIGHBOR child at
+        # layer-1, record up to trace_pairs_per_parent non-padding slots.
+        # child_time = parent query time (repeated_times); the historical
+        # edge_time is kept separately as relation_time (NEVER used as the
+        # child's query time — that would leak edge_time..t into z).
+        if self._trace is not None and self.trace_pairs_per_parent > 0 \
+                and trace_paths and 0 < layer - 1 < self.n_layers:
+            parent_layer = layer
+            child_layer = layer - 1
+            child_layer_int = int(child_layer)
+            child_tau = TAU_TEMPLATE.format(child_layer_int)
+            for prow, path in trace_paths.items():
+                pnode = int(source_nodes[prow])
+                if pnode == 0:
+                    continue
+                ptime = float(timestamps[prow])
+                # deterministic slot selection depends only on
+                # (batch, prow, parent_layer) — never global RNG — so exact
+                # replay reconstructs the same slots.
+                nonpad = [s for s in range(n_neighbors)
+                          if int(neighbors[prow, s]) != 0]
+                if not nonpad:
+                    continue
+                # mask to 32 bits: `_trace_batch` is a cumulative global
+                # step that grows past 2**32/1000003 after a few epochs,
+                # which would make RandomState raise (seed must be < 2**32).
+                # The mask is the identity for all values reached so far.
+                rng = np.random.RandomState(
+                    ((self._trace_batch * 1000003) ^ (int(prow) * 104729)
+                     ^ (int(parent_layer) * 7919)) & 0xFFFFFFFF)
+                k = min(self.trace_pairs_per_parent, len(nonpad))
+                slots = [nonpad[i] for i in
+                         rng.choice(len(nonpad), size=k, replace=False)]
+                for slot in slots:
+                    child_node = int(neighbors[prow, slot])
+                    rel_edge_id = int(edge_idxs_np[prow, slot])
+                    rel_time = float(edge_times[prow, slot])
+                    child_z = neighbor_lower[prow, slot]
+                    child_u = neighbor_u[prow, slot]
+                    child_path = tuple(list(path) + [(NEIGHBOR_REL,
+                                                      ptime - rel_time)])
+                    pair_id = (self._next_pair_id, int(prow),
+                               int(parent_layer), int(slot))
+                    self._trace.add_pair(ConsumedPairCandidate(
+                        pair_id=pair_id,
+                        root_row=int(prow),
+                        tau=child_tau,
+                        child_layer=child_layer_int,
+                        parent_layer=int(parent_layer),
+                        child_node=child_node,
+                        child_time=ptime,
+                        parent_node=pnode,
+                        parent_time=ptime,
+                        relation_time=rel_time,
+                        relation_edge_id=rel_edge_id,
+                        relation_lag=ptime - rel_time,
+                        relation_slot=int(slot),
+                        path=child_path,
+                        z=child_z,
+                        u=child_u))
+                    self._next_pair_id += 1
         vanilla = self.host.aggregate(
-            layer, source_lower, source_time, neighbor_lower, edge_time,
+            layer, src_low_z, source_time, neighbor_lower, edge_time,
             edge_features, mask)
 
         # Only an internal aggregate is passed upward to another tree node.
@@ -199,8 +287,10 @@ class JodieTGNAdapter(HostAdapter):
             tau = TAU_TEMPLATE.format(layer)
             z = self.compressor.compress(
                 tau=tau, own_input=raw_source, aggregate_output=vanilla)
+            u = vanilla
         else:
             z = vanilla
+            u = vanilla
 
         # Root and leaf are deliberately absent.  Each selected query emits
         # at most one graph-connected state for this internal interface.
@@ -222,4 +312,4 @@ class JodieTGNAdapter(HostAdapter):
                     u=vanilla[row],
                     path=list(path)))
                 self._next_oid += 1
-        return z
+        return z, u

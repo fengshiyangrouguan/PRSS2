@@ -53,7 +53,8 @@ def _covs(zc: torch.Tensor, pc: torch.Tensor, den: float,
 
 def _score_from_covs(czz: torch.Tensor, czp: torch.Tensor,
                      cpp: torch.Tensor, eps: float,
-                     variant: str = "full_balancing"):
+                     variant: str = "full_balancing",
+                     scale_bounds: bool = False):
     """Scale-normalized Ky Fan score with gradient; ``(J, diag)``.
 
     Variants (paper Table 2):
@@ -70,6 +71,10 @@ def _score_from_covs(czz: torch.Tensor, czp: torch.Tensor,
       pre-compression U in the Z slot and Z in the P slot): only the Z
       side is whitened; the U side is left untouched (PCA-equivalent for
       a linear encoder).
+    * ``unbalanced`` — ``J_unbal = ||S_ZP||_F^2 / (tr(S_ZZ) tr(S_PP) + eps)``:
+      NO per-direction whitening is applied; the same centered weighted
+      covariances and ridge/eps configuration are kept, and the trace
+      normalization keeps the score scale-free in the whole matrix (spec B1).
 
     ``diag["failed"]`` is ``None`` on success, else a short code.
     """
@@ -102,21 +107,39 @@ def _score_from_covs(czz: torch.Tensor, czp: torch.Tensor,
                           "scale_p": float(sp.detach())}
         w = torch.linalg.solve_triangular(lz, c, upper=False)
         k = torch.linalg.solve_triangular(lp, w.t(), upper=False).t()
-        return k.square().sum(), {"failed": None,
-                                  "scale_z": float(sz.detach()),
-                                  "scale_p": float(sp.detach())}
+        j = k.square().sum()
+        if scale_bounds:
+            # Fairness (§final #2): whitened ||.||_F^2 is bounded by
+            # min(d_z, m); dividing puts full_balancing ~[0,1].
+            j = j / float(min(r, q))
+        return j, {"failed": None,
+                   "scale_z": float(sz.detach()),
+                   "scale_p": float(sp.detach())}
     if variant == "diagonal":
         # Diagonal whitening only: D_Z^-1/2 S_ZP D_P^-1/2.
         dz = czz.diagonal()
         dp = cpp.diagonal()
         if float((dz > 0).all().detach()) and                 float((dp > 0).all().detach()):
             c = czp / torch.sqrt(dz[:, None] * dp[None, :])
-            return c.square().sum(), {"failed": None,
-                                      "scale_z": float(sz.detach()),
-                                      "scale_p": float(sp.detach())}
+            j = c.square().sum()
+            if scale_bounds:
+                # natural upper bound of a per-entry-normalized matrix: d_z * m
+                j = j / float(czz.shape[0] * cpp.shape[0])
+            return j, {"failed": None,
+                       "scale_z": float(sz.detach()),
+                       "scale_p": float(sp.detach())}
         return None, {"failed": "nonpositive_scale",
                       "scale_z": float(sz.detach()),
                       "scale_p": float(sp.detach())}
+    if variant == "unbalanced":
+        # Spec B1: no whitening at all; trace-normalized squared dependence is
+        # already ~[0,1] by Cauchy-Schwarz, so NO further normalization.
+        num = czp.square().sum()
+        den = czz.diagonal().sum() * cpp.diagonal().sum() + eps
+        return num / den.clamp(min=1e-30), {
+            "failed": None,
+            "scale_z": float(sz.detach()),
+            "scale_p": float(sp.detach())}
     if variant == "reconstruction":
         # Review form: J_rec = tr(C_UZ (C_ZZ + eps I)^-1 C_ZU) /
         # (tr(C_UU) + eps), Z trainable and U the DETACHED
@@ -238,7 +261,8 @@ def kf_vjp_batch(z_b: torch.Tensor, p_b: torch.Tensor, w_b: torch.Tensor,
 
 
 def latent_z_adjoint(z_rows, p_rows, w, cut_ids, mu_z, mu_p, D,
-                     eps, strict=False):
+                     eps, strict=False, variant="full_balancing",
+                     scale_bounds=False):
     """Contract the moment adjoint onto CUT-LEVEL z-adjoints.
 
     At window close, the whole-window score F(S) is replayed on the
@@ -254,6 +278,12 @@ def latent_z_adjoint(z_rows, p_rows, w, cut_ids, mu_z, mu_p, D,
     moment-adjoint form, but pass 2 needs NO p, NO moments and NO
     re-walk: just index the traced z and take dot products.
 
+    ``variant`` is forwarded to ``_score_from_covs`` so the adjoint uses the
+    SAME score variant as the window (diagonal / reconstruction / full
+    balancing).  Omitting it silently fell back to full balancing for every
+    variant — harmless for the current full-balancing arms, but wrong for
+    any future diagonal/reconstruction exact-replay ablation.
+
     Returns ``(j_float, g_by_cut, score_diag)``; ``g_by_cut`` maps the
     cut_id tuple to the merged gradient tensor [r].
     """
@@ -264,7 +294,8 @@ def latent_z_adjoint(z_rows, p_rows, w, cut_ids, mu_z, mu_p, D,
     mzz = (zc * sw).t() @ (zc * sw)
     mzp = (zc * sw).t() @ (pc * sw)
     mpp = (pc * sw).t() @ (pc * sw)
-    j, score_diag = _score_from_covs(mzz / D, mzp / D, mpp / D, eps)
+    j, score_diag = _score_from_covs(mzz / D, mzp / D, mpp / D, eps,
+                                     variant, scale_bounds)
     if score_diag["failed"] is not None:
         if strict:
             raise RuntimeError("latent_z_adjoint close failed: {}"
@@ -553,7 +584,7 @@ class KFLaggedWindow:
                  strict: bool = False, variant: str = "full_balancing"):
         if fixed_maps is None:
             raise ValueError("KFLaggedWindow requires fixed_maps")
-        if variant not in ("full_balancing", "diagonal", "reconstruction"):
+        if variant not in ("full_balancing", "diagonal", "reconstruction", "unbalanced"):
             raise ValueError("unknown kf_variant {}".format(variant))
         self.variant = str(variant)
         self.state_dims = dict(state_dims)
@@ -831,7 +862,7 @@ class KFMomentWindow:
                  min_abs: int = 64, eps: float = 1e-4, fixed_maps=None,
                  strict: bool = False, autoclose: bool = True,
                  variant: str = "full_balancing"):
-        if variant not in ("full_balancing", "diagonal", "reconstruction"):
+        if variant not in ("full_balancing", "diagonal", "reconstruction", "unbalanced"):
             raise ValueError("unknown kf_variant {}".format(variant))
         self.variant = str(variant)
         self.state_dims = dict(state_dims)
@@ -1060,7 +1091,8 @@ class KFMomentWindow:
             r = wf.result()
             j, g_by_cut, score_diag = latent_z_adjoint(
                 z_all, p_all, w, win["cut_ids_list"],
-                r["mu_z"], r["mu_p"], r["D"], self.eps, self.strict)
+                r["mu_z"], r["mu_p"], r["D"], self.eps, self.strict,
+                variant=self.variant)
             if j is None:
                 closed[tau] = 0.0
                 replay_plan[tau] = {"by_batch": [[]]}

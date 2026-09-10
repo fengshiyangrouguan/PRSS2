@@ -46,7 +46,7 @@ from rpbe.hosts.jodie_tgn import JodieTGNAdapter, TAU_TEMPLATE
 from rpbe.hosts.official_tgn import MLP, TGN, get_neighbor_finder
 from rpbe.maps import FixedMaps
 from rpbe.monitoring import MonitorWriter
-from rpbe.records import NODE_CLASS
+from rpbe.records import NODE_CLASS, SUPERVISION_PRODUCTION
 from rpbe.training.checkpoint import CheckpointManager
 from rpbe.training.jodie_loop import JodieNodeClassificationLoop
 
@@ -106,10 +106,28 @@ def parse_args():
                    help="Table-2 ablation variant (paper spec section 4)")
     p.add_argument("--n-observations", type=int, default=2, choices=[1, 2],
                    help="1 = Y1 only; 2 = two-observation pullback")
+    p.add_argument("--dense-future", action="store_true",
+                   help="encode phi_Y as the real next-hop event identity "
+                        "(hashed counterpart + role + RFF(time-to-event)) "
+                        "instead of only the sparse 0/1 outcome; the "
+                        "mispaired ablation is vacuous on outcome-only "
+                        "signatures (review verdict)")
+    p.add_argument("--supervision-mode", default=SUPERVISION_PRODUCTION,
+                   choices=["production", "1obs", "2obs_aligned",
+                            "2obs_mispaired"],
+                   help="structural-supervision arm (paper Part III); "
+                        "'production' keeps the historical cut-builder "
+                        "behaviour; the three ablation arms run on the "
+                        "shared Y1+Y2-valid cut set.  Requires "
+                        "--n-observations 2.")
     p.add_argument("--repr-lr", type=float, default=None,
                    help="separate representation-group learning rate "
                         "(defaults to --lr); the macro schedule updates "
                         "these params ~32x less often than the head")
+    p.add_argument("--kf-fail-below-threshold", action="store_true",
+                   help="abort the run if any macro group closes a window "
+                        "below the KF tree threshold (fail-fast for the "
+                        "structural ablations; default off)")
     p.add_argument("--ridge-eps", type=float, default=1e-4)
     p.add_argument("--rpbe-seed", type=int, default=0)
     p.add_argument("--trace-roots", type=int, default=32)
@@ -286,6 +304,8 @@ def build_components(args, device, dataset):
             kf_group_batches=args.kf_group_batches,
             kf_variant=args.kf_variant,
             n_observations=args.n_observations,
+            supervision_mode=args.supervision_mode,
+            dense_future=getattr(args, "dense_future", False),
             kf_taus=list(taus[:-1]),
             rpbe_seed=args.rpbe_seed)
         compressor = RecursiveCompressor(rpbe_cfg).to(device)
@@ -377,7 +397,8 @@ def main():
         trace_roots=args.trace_roots,
         trace_mode=args.trace_mode,
         train_eval_auc=args.train_eval_auc,
-        kf_estimator=args.kf_estimator)
+        kf_estimator=args.kf_estimator,
+        kf_fail_below_threshold=args.kf_fail_below_threshold)
 
     save_json(out / "config.json", {
         "data": args.data,

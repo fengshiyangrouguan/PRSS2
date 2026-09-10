@@ -171,8 +171,12 @@ def diag_latent_z_adjoint(
 
 
 class EmbodiedRPBEWindow:
-    """Thin-row window (plan §21): store detached rows; assemble Z,P,W at
-    close; dispatch to full_dual / diag adjoint.  Gate on unique merges."""
+    """Window over detached cut rows PLUS, per episode, the full merge DAG
+    (edges + raw leaf inputs) so at close the merged state of every cut is
+    REBUILT by recursively replaying the FIXED merge trace with the CURRENT
+    Gamma -- no cross-version merged-state is ever reused, and multi-episode
+    windows keep every episode's replay records (never dropped via a shared
+    registry that a task boundary would clear)."""
 
     def __init__(self, variant: str = "full_dual", eps: float = 1e-4,
                  min_ratio: float = 2.0, min_abs: int = 128,
@@ -186,15 +190,21 @@ class EmbodiedRPBEWindow:
         self.rows: Dict[tuple, EmbodiedCutRow] = {}
         self.closed = False
         self.n_dropped_version = 0
+        self.edges: Dict[tuple, tuple] = {}      # (eid,node) -> (left_id, right_id)
+        self.leaf_state: Dict[tuple, torch.Tensor] = {}  # (eid,node) -> raw input
+
+    def add_records(self, recs) -> None:
+        """Retain an episode's full merge DAG (edges + child inputs) so its
+        cuts can be replayed after later task boundaries clear any registry."""
+        for rec in recs:
+            self.edges[(rec.episode_id, rec.node_id)] = (rec.left_id, rec.right_id)
+            self.leaf_state.setdefault((rec.episode_id, rec.left_id), rec.left_state)
+            self.leaf_state.setdefault((rec.episode_id, rec.right_id), rec.right_state)
 
     def add(self, rows: List[EmbodiedCutRow]) -> None:
         assert not self.closed
         for r in rows:
-            # Stage5-R: rows may carry merged states from DIFFERENT Gamma
-            # versions; close() rebuilds them with the CURRENT Gamma from the
-            # raw leaf states, so cross-version mixing is safe here.
-            key = r.cut_id + (r.horizon,)
-            self.rows[key] = r   # row_id dedup: distinct horizons both stay
+            self.rows[r.cut_id + (r.horizon,)] = r
 
     @property
     def n_unique_cuts(self) -> int:
@@ -205,34 +215,52 @@ class EmbodiedRPBEWindow:
         return len({r.cut_id[0] for r in self.rows.values()})
 
     def ready(self) -> bool:
-        # review ruling B5: the gate is exactly min_abs (the min_ratio * m
-        # product made --kf-min-abs misleading; that coupling is removed)
         return self.n_unique_cuts >= self.min_abs
 
     def discard(self) -> int:
-        """Drop an underfull window (review ruling B5: windows never span
-        parameter versions; the trainer discards them at repr boundaries)."""
         n = self.n_unique_cuts
         self.closed = True
         return n
 
-    def close(self, rebuild_fn=None) -> Tuple[float, Dict[tuple, torch.Tensor], dict]:
-        """Assemble thin rows -> adjoint -> (j_float, g_by_cut, diagnostics).
+    def close(self, merge_fn=None):
+        """Returns (j_float, g_by_cut, replay_inputs, diag).
 
-        Stage5-R: if rebuild_fn is given, the merged state of every row is
-        REBUILT from its raw leaf states with the CURRENT Gamma, so a window
-        spanning multiple Gamma versions carries no version skew."""
+        replay_inputs[cut_id] = (child_left, child_right) rebuilt with the
+        CURRENT Gamma by recursing the fixed merge trace, so the caller can
+        replay <g, Gamma(child_left, child_right)> without any shared registry.
+        """
         assert not self.closed
         self.closed = True
         rs = list(self.rows.values())
         if not rs:
-            return 0.0, {}, {"failed": "empty_window"}
-        if rebuild_fn is not None and all(
-                r.left_state is not None and r.right_state is not None
-                for r in rs):
-            left = torch.stack([r.left_state.detach().cpu() for r in rs])
-            right = torch.stack([r.right_state.detach().cpu() for r in rs])
-            z = rebuild_fn(left, right).detach().cpu()
+            return 0.0, {}, {}, {"failed": "empty_window"}
+        replay_inputs: Dict[tuple, tuple] = {}
+        if merge_fn is not None and self.edges:
+            memo: Dict[tuple, torch.Tensor] = {}
+
+            def build(eid, nid):
+                k = (eid, nid)
+                if k in memo:
+                    return memo[k]
+                if k in self.edges:
+                    li, ri = self.edges[k]
+                    m = merge_fn(build(eid, li), build(eid, ri))
+                else:
+                    m = self.leaf_state[k]
+                memo[k] = m
+                return m
+
+            zs = []
+            for r in rs:
+                eid = r.cut_id[0]
+                if (eid, r.node_id) in self.edges:
+                    li, ri = self.edges[(eid, r.node_id)]
+                    cl = build(eid, li); cr = build(eid, ri)
+                    replay_inputs.setdefault(r.cut_id, (cl, cr))
+                    zs.append(merge_fn(cl, cr))
+                else:
+                    zs.append(r.z)
+            z = torch.stack([t.detach().float().cpu() for t in zs])
         else:
             z = torch.stack([r.z.detach().cpu() for r in rs])
         p = torch.stack([r.outcome.detach().cpu() for r in rs])
@@ -241,10 +269,28 @@ class EmbodiedRPBEWindow:
         fn = (dual_latent_z_adjoint if self.variant == "full_dual"
               else diag_latent_z_adjoint)
         j, g_by_cut, diag = fn(z, p, w, cut_ids, eps=self.eps, strict=self.strict)
+        # null-signal check (reviewer): J of a row-shuffled p, and a small
+        # permutation null p95, to show RPBE's J_real carries real signal.
+        try:
+            scoring = (dual_full_score if self.variant == "full_dual"
+                       else diag_score)
+            g = torch.Generator().manual_seed(12345)
+            null = []
+            for _ in range(8):
+                perm = torch.randperm(p.shape[0], generator=g)
+                jn, _ = scoring(z, p[perm], w, cut_ids, eps=self.eps, strict=False)
+                null.append(float(jn))
+            null.sort()
+            diag["J_real"] = float(j)
+            diag["J_shuffled"] = float(sum(null) / len(null))
+            diag["J_perm_p95"] = float(null[-1])
+            diag["J_gap"] = float(j) - float(sum(null) / len(null))
+        except Exception as e:  # never let the diagnostic break training
+            diag["null_failed"] = str(e)
         diag["n_rows"] = len(rs)
         diag["n_unique_cuts"] = self.n_unique_cuts
-        diag["n_unique_episodes"] = len({r.cut_id[0] for r in rs})
-        return j, g_by_cut, diag
+        diag["n_unique_episodes"] = self.n_unique_episodes
+        return j, g_by_cut, replay_inputs, diag
 
 
 def gamma_replay_loss(gamma, m_a: torch.Tensor, m_b: torch.Tensor,

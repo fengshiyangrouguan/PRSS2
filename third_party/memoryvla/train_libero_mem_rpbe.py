@@ -541,6 +541,7 @@ def main() -> None:
         min_abs=rpbe_cfg.kf_min_abs) if IS_RPBE else None
     task_cotangents: dict = {}
     rpbe_cotangents: dict = {}
+    rpbe_input_map: dict = {}   # cut_id -> (child_left, child_right) rebuilt
     rpbe_pending_loss: list = []
     merge_registry: dict = {}
     merge_id_map: dict = {}
@@ -589,6 +590,10 @@ def main() -> None:
         n_done = 0
         for eid in eids:
             if last_eid is not None and eid != last_eid:
+                if window is not None:
+                    window.add_records(
+                        [merge_registry[k] for k in list(merge_registry)
+                         if k[0] == last_eid])
                 rows = queue.drain_episode(last_eid)
                 if window is not None and rows:
                     for r in rows:
@@ -607,36 +612,34 @@ def main() -> None:
         replay adds its contribution, keeping the RPBE-vs-task relative
         weight independent of episode length under the dense protocol."""
         nonlocal window, task_cotangents, rpbe_cotangents, rpbe_pending_loss
-        nonlocal rpbe_window_episodes
+        nonlocal rpbe_input_map, rpbe_window_episodes
         if not IS_GAMMA or vla.gamma is None:
             return
 
-        def _rebuild_merged(left, right):
-            # rebuild merged states with the CURRENT Gamma (Stage5-R): the
-            # window may span several Gamma versions, so never reuse a
-            # write-time merged state.
+        def _merge_fn(l, r):
+            # single-node current-Gamma merge for fixed-trace rebuild
             with torch.no_grad():
                 md = next(vla.gamma.parameters()).dtype
-                z = vla.gamma(left.to("cuda", dtype=md),
-                              right.to("cuda", dtype=md))
-            return z.float()
+                return vla.gamma(l.to("cuda", dtype=md), r.to("cuda", dtype=md))
 
         # close the RPBE statistics window ONLY once enough finished episodes
         # have accumulated (RPBE clock, decoupled from the Gamma task clock)
         if (window is not None and window.n_unique_cuts > 0
                 and rpbe_window_episodes >= args.rpbe_stats_episodes):
             if window.ready():
-                j, g_by_cut, diag = window.close(rebuild_fn=_rebuild_merged)
+                j, g_by_cut, rpbe_inputs, diag = window.close(merge_fn=_merge_fn)
                 if g_by_cut:
-                    for k, g in g_by_cut.items():
-                        eid, mid, _ = k
-                        nid = merge_id_map.get((eid, mid))
-                        if nid is not None:
-                            rpbe_cotangents[(eid, nid)] = g
+                    # key by cut_id directly; replay inputs are rebuilt with
+                    # the CURRENT Gamma (no shared registry needed)
+                    rpbe_cotangents.update(g_by_cut)
+                    for cid, (cl, cr) in rpbe_inputs.items():
+                        rpbe_input_map[cid] = (cl, cr)
                     rpbe_pending_loss.append(j)
-                print(f"[window close] J={j:.4f} "
+                print(f"[window close] J={j:.4f} J_gap={diag.get('J_gap')} "
+                      f"J_p95={diag.get('J_perm_p95')} "
                       f"cuts={diag.get('n_unique_cuts')} "
                       f"episodes={diag.get('n_unique_episodes')} "
+                      f"rebuild_inputs={len(rpbe_inputs)} "
                       f"censored={queue.n_censored}", flush=True)
             else:
                 n_discard = window.discard()
@@ -653,7 +656,7 @@ def main() -> None:
         if task_cotangents and scale != 1.0:
             task_cotangents = {k: v * scale for k, v in task_cotangents.items()}
         task_keys = [k for k in task_cotangents if k in merge_registry]
-        rpbe_keys = ([k for k in rpbe_cotangents if k in merge_registry]
+        rpbe_keys = (list(rpbe_cotangents.keys())
                      if args.lambda_rpbe > 0 else [])
         # Deterministic per-episode shuffle -> the TASK replay minibatch
         # partition is identical for gamma-task and gamma-rpbe; the rpbe arm
@@ -665,16 +668,22 @@ def main() -> None:
         rpbe_keys = ([rpbe_keys[i] for i in rng.permutation(len(rpbe_keys))]
                      if rpbe_keys else [])
         B = max(1, args.gamma_replay_batch_size)
-        n_mb = max((len(task_keys) + B - 1) // B,
-                   (len(rpbe_keys) + B - 1) // B, 1)
+        # Blocker 2: opt_gamma step count is set by the TASK key count ALONE,
+        # so gamma-task and gamma-rpbe step in lockstep; the rpbe keys are
+        # distributed round-robin into those same n_mb buckets.
+        n_mb = max(1, (len(task_keys) + B - 1) // B)
+        rpbe_buckets = [[] for _ in range(n_mb)]
+        for i, k in enumerate(rpbe_keys):
+            rpbe_buckets[i % n_mb].append(k)
         n_opt = 0
+
         def _gm():
             return [p.grad.detach().clone() if p.grad is not None else None
                     for p in gamma_params]
 
         for i in range(n_mb):
             t_sl = task_keys[i * B:(i + 1) * B]
-            r_sl = rpbe_keys[i * B:(i + 1) * B]
+            r_sl = rpbe_buckets[i]
             if opt_gamma is not None:
                 opt_gamma.zero_grad()
             if t_sl:
@@ -689,16 +698,17 @@ def main() -> None:
             if opt_gamma is not None:
                 opt_gamma.zero_grad()
             if r_sl:
-                m_ar = torch.stack([merge_registry[k].left_state
-                                    for k in r_sl]).to("cuda", dtype=torch.bfloat16)
-                m_br = torch.stack([merge_registry[k].right_state
-                                    for k in r_sl]).to("cuda", dtype=torch.bfloat16)
+                m_ar = torch.stack([rpbe_input_map[k][0].to("cuda", dtype=torch.bfloat16)
+                                    for k in r_sl])
+                m_br = torch.stack([rpbe_input_map[k][1].to("cuda", dtype=torch.bfloat16)
+                                    for k in r_sl])
                 l_rpbe = gamma_replay_loss(vla.gamma, m_ar, m_br,
                                            rpbe_cotangents, r_sl)
                 # RPBE maximizes J -> negative sign (gradient ascent on J).
                 (-args.lambda_rpbe * l_rpbe).backward()
             g_r = _gm() if opt_gamma is not None else []
             if opt_gamma is not None:
+                pre = [p.detach().clone() for p in gamma_params]
                 nt2 = nr2 = dot = 0.0
                 for p, a, b in zip(gamma_params, g_t, g_r):
                     av = a if a is not None else torch.zeros_like(p)
@@ -709,19 +719,27 @@ def main() -> None:
                     dot += float((fa * fb).sum())
                 nt = nt2 ** 0.5; nr = nr2 ** 0.5
                 cos = dot / (nt * nr + 1e-12)
-                print(f"[gamma audit] pv={vla.cog_mem_bank.param_version} "
-                      f"mb={i} |g_task|={nt:.3e} |g_rpbe|={nr:.3e} "
-                      f"cos={cos:.3f} r_eff={nr/(nt+1e-12):.3f}", flush=True)
-                torch.nn.utils.clip_grad_norm_(gamma_params, args.grad_clip)
+                clip = torch.nn.utils.clip_grad_norm_(gamma_params,
+                                                      args.grad_clip)
                 opt_gamma.step()
                 sched_gamma.step()
+                upd = sum(float((p.detach() - p0).float().pow(2).sum())
+                          for p, p0 in zip(gamma_params, pre)) ** 0.5
+                print(f"[gamma audit] pv={vla.cog_mem_bank.param_version} "
+                      f"mb={i} ntask={len(t_sl)} nrpbe={len(r_sl)} "
+                      f"|g_task|={nt:.3e} |g_rpbe|={nr:.3e} cos={cos:.3f} "
+                      f"r_eff={nr/(nt+1e-12):.3f} clip={float(clip):.3f} "
+                      f"|dgamma|={upd:.3e}", flush=True)
                 n_opt += 1
+        assert n_opt == n_mb, (
+            f"gamma step count {n_opt} != expected task-replay steps {n_mb}")
         print(f"[gamma] episode replay: {len(task_keys)} task / "
               f"{len(rpbe_keys)} rpbe keys -> {n_opt} opt_gamma steps "
               f"(mb<= {B})", flush=True)
         vla.cog_mem_bank.param_version += 1
         task_cotangents = {}
         rpbe_cotangents = {}
+        rpbe_input_map = {}
         rpbe_pending_loss = []
         # free replay bookkeeping for episodes whose merges have all drained
         # (no longer pending futures).  Their records are not needed again:

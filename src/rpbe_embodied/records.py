@@ -65,14 +65,15 @@ class EmbodiedCutRow:
     kept as the write-time merged state for backward compatibility / debug."""
     cut_id: tuple
     horizon: int
+    node_id: int                   # merged node id (for fixed-trace rebuild)
     z: torch.Tensor                # [4096] detached (write-time merged)
     context: dict                  # {horizon, delta_s, instruction, vision_feat}
     outcome: torch.Tensor          # [112] normalized action chunk (replaced by
                                    # the fixed map P at window-add time)
     weight: float
     param_version: int = 0         # LoRA+Gamma version at merge write time
-    left_state: Optional[torch.Tensor] = None    # [4096] raw leaf, detached
-    right_state: Optional[torch.Tensor] = None   # [4096] raw leaf, detached
+    left_state: Optional[torch.Tensor] = None    # [4096] raw input (may be a
+    right_state: Optional[torch.Tensor] = None   # merged state of the child)
 
 
 class PendingMergeQueue:
@@ -173,6 +174,7 @@ class PendingMergeQueue:
             rows.append(EmbodiedCutRow(
                 cut_id=rec.cut_id(),
                 horizon=h,
+                node_id=rec.node_id,
                 z=rec.merged_state,
                 context=ctx,
                 outcome=y,

@@ -79,7 +79,8 @@ LAM=$($PY -c "print(0.088 * 0.15 * float('$LAM0'))")
 echo "LAMBDA=$LAM (lambda0=$LAM0) $(date '+%H:%M:%S')" >> "$ROOT/run.log"
 
 run_ours() {
-  local seed="$1" out="$ROOT/seed${seed}_TGN_3hop/ours"
+  local seed="$1"
+  local out="$ROOT/seed${seed}_TGN_3hop/ours"
   skip_or_busy "$out" "train_uci_link.*seed${seed}_TGN_3hop/ours" "ours s$seed" && return 0
   mkdir -p "$out"
   echo "START ours seed=$seed lam=$LAM $(date '+%H:%M:%S') commit=$(git rev-parse --short HEAD)" \
@@ -95,7 +96,8 @@ run_ours() {
 }
 
 run_taskonly() {
-  local seed="$1" out="$ROOT/seed${seed}_TGN_3hop/taskonly"
+  local seed="$1"
+  local out="$ROOT/seed${seed}_TGN_3hop/taskonly"
   skip_or_busy "$out" "train_uci_link.*seed${seed}_TGN_3hop/taskonly" "taskonly s$seed" && return 0
   mkdir -p "$out"
   echo "START taskonly seed=$seed $(date '+%H:%M:%S') commit=$(git rev-parse --short HEAD)" \
@@ -111,7 +113,8 @@ run_taskonly() {
 }
 
 run_vanilla() {
-  local seed="$1" out="$ROOT/seed${seed}_TGN_3hop/vanilla"
+  local seed="$1"
+  local out="$ROOT/seed${seed}_TGN_3hop/vanilla"
   skip_or_busy "$out" "official_uci_vanilla.*seed ${seed}\b" "vanilla s$seed" && return 0
   mkdir -p "$out/log" "$out/results" "$out/saved_checkpoints" "$out/saved_models"
   local prefix="uci-vanilla-s${seed}"

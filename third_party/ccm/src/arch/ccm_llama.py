@@ -244,10 +244,13 @@ class LlamaAttention(nn.Module):
                     key_comp_avg = key_comp_avg + res_full_k
                     value_comp_avg = value_comp_avg + res_full_v
                     # Detached replay cache for the local Gamma replay
-                    # (L2): the training script clones it per microbatch;
-                    # the window close replays Gamma on these inputs and
-                    # back-propagates the adjoint WITHOUT re-running the
-                    # 7B forward.
+                    # (L2, explicit design): the training script clones
+                    # it per microbatch; the window close replays Gamma
+                    # on these detached leaves and back-propagates the
+                    # adjoint WITHOUT re-running the 7B forward.  The
+                    # RPBE gradient therefore updates Gamma only (the
+                    # backbone projections keep task-gradient-only
+                    # training by design).
                     self._lamp_cache = (k_sum_rows.detach(),
                                         v_sum_rows.detach(),
                                         sum_row_pos.clone())

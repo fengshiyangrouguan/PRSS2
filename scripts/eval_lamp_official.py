@@ -114,10 +114,21 @@ def build_host(args, device):
         _p.requires_grad_(False)
     if args.ckpt:
         # Overlay a train_lamp.py checkpoint (trainable state only:
-        # comp_embeddings + conditional LoRA) over the official adapter.
+        # comp_embeddings + conditional LoRA [+ Gamma when --with_gamma])
+        # over the official adapter.
         payload = torch.load(args.ckpt, map_location="cpu",
                              weights_only=False)
         state = payload["model"]
+        model_names = set(dict(model.named_parameters()).keys())
+        # Review fix: fail on UNUSED checkpoint keys instead of silently
+        # dropping them (e.g. gamma params loaded into a no-gamma host
+        # used to evaluate silently with the wrong structure).
+        unused = [k for k in state if k not in model_names]
+        if unused:
+            raise RuntimeError(
+                "checkpoint has {} params the host does not own (gamma "
+                "present but --with_gamma missing?): {}".format(
+                    len(unused), unused[:4]))
         missing, applied = [], 0
         for _n, _p in model.named_parameters():
             if _n in state:

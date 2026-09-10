@@ -1,20 +1,25 @@
 """LaMP-2 cut records: one sample -> one RPBE row (1Obs, L2).
 
+LaMP's official structure has exactly ONE future per user (the single
+query answer), so this is a deliberate 1Obs protocol (NOT the dialog
+line's 2Obs): one cut -> one row with weight 1.0.  Re-samplings of the
+same user (different profile subsets) are DIFFERENT cuts; they share
+the tree gate (tree_id = user id) but do not form the two future
+observations of one cut.
+
 The official LaMP training sample is a single legal cut: the SUM memory
 state (4 slots, one-shot merge of the 16 profile COMP blocks) is
 supervised by the strictly future answer:
 
     row: (z_v, p_v, w=1.0, cut_id)   p = Sketch([1; chi] (x) phi)
 
-where chi = chi(query) (the condition of the answer, a frozen
-UtteranceEmbed sketch) and phi = phi(answer) (the future answer text,
-frozen sketch).  The answer logprob (from the training forward's
-logits) is recorded in ``outcome`` for the statistical report; it does
-not enter the covariance (dialog-line convention: the P side carries
-the future content, the outcome is a record field).
-
-``tree_id`` = the LaMP user id (one user = one independent history);
-rows from the SAME user's re-samplings share the tree gate.
+where chi = chi(whole prompt: profiles + query, special tokens masked)
+(the condition of the answer, a frozen UtteranceEmbed sketch) and
+phi = phi(answer) (the future answer text, frozen sketch).  The answer
+logprob (from the training forward's logits) is recorded in ``outcome``
+for the statistical report; it does NOT enter the covariance — the P
+side carries the future content (dialog-line convention), the outcome
+is a record field.
 """
 
 from dataclasses import dataclass

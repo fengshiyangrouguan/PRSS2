@@ -231,13 +231,14 @@ def build_rpbe_components(model, args, device):
     """ours-arm RPBE stack: 4-slot z adapter, 4x32 sketch ensemble,
     frozen chi/phi embeds, LampCutBuilder, OAS branch windows."""
     from rpbe.hosts.ccm.adapter import CCMHostAdapter
-    from rpbe.hosts.ccm.ccm_patch import attach_gamma_onetime
     from rpbe.llm.dialogue_records import Llmmaps
     from rpbe.llm.lamp_records import LampCutBuilder
     from rpbe.llm.utterance_embed import UtteranceEmbed
     from rpbe.loss import KFMomentWindow
 
-    gammas = attach_gamma_onetime(model, hidden=args.gamma_hidden)
+    # GammaOnetime must already be attached (both arms carry it; review
+    # fix for structure parity).
+    gammas = [attn.gamma for attn in _gamma_attns(model)]
     cfg = model.model.config
     n_layers = cfg.num_hidden_layers
     n_heads = cfg.num_attention_heads
@@ -413,9 +414,17 @@ def _gamma_attns(model):
 
 def gamma_replay_surrogate(rpbe, by_oid, mb_rows_oids, mb_caches, lam,
                            device):
-    """Local Gamma replay (L2): g_z -> J^T -> per-layer SUM-row pseudo
-    grads -> <g, Gamma(x, pool)> surrogate (numerically zero, exact
-    first-order gradient).  Never re-runs the 7B forward."""
+    """Local Gamma replay (L2, explicit design): g_z -> J^T -> per-layer
+    SUM-row pseudo grads -> <g, Gamma(x, pool)> surrogate (numerically
+    zero; first-order gradient EXACT for the Gamma parameters because
+    J_mem is a fixed linear sketch and the cached inputs are detached
+    leaves).  The RPBE gradient scope is DELIBERATELY Gamma-only: comp
+    embeddings and LoRA receive the task gradient alone (a cleaner
+    attribution than the dialog line's whole-model replay; the dialog
+    line keeps its own replay protocol).  Gamma's own forward runs in
+    fp32 on both paths (GammaOnetime casts its inputs), so the numerical
+    precision path matches the main forward's Gamma call.  Never re-runs
+    the 7B forward."""
     from rpbe.llm.mem_lift import JMemLift
     aux = torch.zeros((), device=device)
     n_terms = 0
@@ -469,11 +478,16 @@ def main():
 
     use_rpbe = args.arm == "ours"
     rpbe = None
+    if args.arm in ("ours", "task_only"):
+        # Review fix: BOTH arms carry GammaOnetime (identical merge
+        # structure); only `ours` adds the RPBE window/loss.  task_only
+        # is the dialog line's gamma_task_only arm.
+        from rpbe.hosts.ccm.ccm_patch import attach_gamma_onetime
+        gammas = attach_gamma_onetime(model, hidden=args.gamma_hidden)
+        print(f"[lamp-train] GammaOnetime attached to BOTH arms' host "
+              f"({sum(g.n_params() for g in gammas)} params)", flush=True)
     if use_rpbe:
         rpbe = build_rpbe_components(model, args, device)
-        gammas = rpbe["gammas"]
-        print(f"[lamp-train] GammaOnetime attached: "
-              f"{sum(g.n_params() for g in gammas)} params", flush=True)
 
     params = [p for p in model.parameters() if p.requires_grad]
     n_params = sum(p.numel() for p in params)
@@ -565,14 +579,16 @@ def main():
     sum_ids = tokenizer.sum_token_id
     pad_id = tokenizer.pad_token_id
     eos_id = tokenizer.eos_token_id
-    gamma_params = ([p for g in rpbe["gammas"] for p in g.parameters()]
-                    if use_rpbe else [])
     embed_tokens = model.get_input_embeddings()
     mb_rows_oids = []   # per mb: [oid per batch row]
     mb_caches = []      # per mb: per-layer gamma cache clones
     win_stats = {"closed": 0, "below": 0, "failed": 0}
     last_j = float("nan")
 
+    # Review fix: the data iterator spans steps (one continuous stream per
+    # epoch; 64 microbatches per optimizer step ADVANCE the stream instead
+    # of re-reading the same shuffle prefix every step).
+    dataloader_iter = iter(dataloader)
     while step < total_steps:
         step += 1  # global step (HF Trainer semantics: advances even on
                    # AMP skip)
@@ -582,7 +598,10 @@ def main():
         step_tokens = 0
         micros = 0
         t0 = time.perf_counter()
-        dataloader_iter = iter(dataloader)
+        # Review fix: zero the grads before accumulating this step's 64
+        # microbatches.  Without it, the previous step's unscaled+clipped
+        # gradients were silently carried into the next backward pass.
+        optimizer.zero_grad(set_to_none=True)
         for mb in range(args.accum_steps):
             try:
                 batch = next(dataloader_iter)
@@ -623,15 +642,18 @@ def main():
             else:
                 win_stats["closed"] += 1
                 last_j = j_closed
-                # Lambda calibration: snapshot the Gamma task grads (CE,
-                # accumulated over this step's microbatches) BEFORE the
-                # RPBE surrogate backward; r_eff = ||g_rpbe|| / ||g_task||.
+                # Lambda calibration (review fix, R8 protocol): snapshot
+                # the task grads of ALL trainable params (CE, accumulated
+                # over this step's microbatches) BEFORE the RPBE surrogate
+                # backward; r_eff = ||g_rpbe||_2 / ||g_task||_2 with the
+                # JOINT (concatenated) L2 norm, measured at theta_0 with
+                # no parameter update (the step is skipped above).
                 g_task = None
                 if args.calibrate_lambda:
                     g_task = [p.grad.detach().clone()
                               if p.grad is not None
                               else torch.zeros_like(p)
-                              for p in gamma_params]
+                              for p in params]
                 aux, aux_terms = gamma_replay_surrogate(
                     rpbe, by_oid, mb_rows_oids, mb_caches,
                     args.kf_lambda, device)
@@ -639,10 +661,12 @@ def main():
                     scaler.scale(aux).backward()
                 if args.calibrate_lambda and g_task is not None:
                     g_total = [p.grad.detach().clone()
-                               for p in gamma_params]
-                    n_task = sum(g.float().norm() for g in g_task)
-                    n_rpbe = sum((t - g0).float().norm()
-                                 for t, g0 in zip(g_total, g_task))
+                               for p in params]
+                    n_task = torch.cat(
+                        [g.flatten().float() for g in g_task]).norm()
+                    n_rpbe = torch.cat(
+                        [(t - g0).flatten().float()
+                         for t, g0 in zip(g_total, g_task)]).norm()
                     r_eff = float(n_rpbe / max(n_task, 1e-12))
                     with log_path.open("a") as f:
                         f.write(json.dumps({
@@ -667,12 +691,23 @@ def main():
         if not grad_ok:
             amp_skipped_steps += 1
             skip_this = True
+        elif args.calibrate_lambda:
+            # Review fix: calibrate mode measures r_eff at theta_0 with
+            # NO parameter update (the R8 protocol).  scaler.update()
+            # still runs to restore AMP state.
+            skip_this = True
         else:
             torch.nn.utils.clip_grad_norm_(params, 1.0)
             scaler.step(optimizer)
             scaler.update()
             scheduler.step()
             opt_took = True
+        if skip_this:
+            # Review fix: AMP protocol requires scaler.update() after
+            # every unscale, even on a skip (overflow needs the scale to
+            # step DOWN; calibrate mode consumed scaled grads without a
+            # step).
+            scaler.update()
         if opt_took:
             optimizer_steps_executed += 1
             total_loss_sum += step_loss

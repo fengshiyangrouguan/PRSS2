@@ -575,6 +575,23 @@ class MemoryVLA(nn.Module):
             per_token_size=per_token_size,
         )
 
+        # Stage7: shared DETERMINISTIC regression action head (optional; used
+        # when self.use_reg_head is set by the trainer).  Input = concat of
+        # cog_post [cog_token_size] and mean-pooled per_post [per_token_size];
+        # output = K*7 (first 6 dims = normalized delta, dim 6 = gripper logit).
+        # Built under a saved/restored RNG so shared init across arms is intact.
+        _rng = torch.get_rng_state()
+        self.use_reg_head = False
+        self._reg_k = future_action_window_size + 1
+        _d_in = self.cog_token_size + per_token_size
+        self.reg_head = torch.nn.Sequential(
+            torch.nn.Linear(_d_in, 1024), torch.nn.GELU(),
+            torch.nn.Linear(1024, 1024), torch.nn.GELU(),
+            torch.nn.Linear(1024, 1024), torch.nn.GELU(),
+            torch.nn.Linear(1024, self._reg_k * 7),
+        )
+        torch.set_rng_state(_rng)
+
         # Gamma merger (review ruling B1/B2): created AFTER all shared
         # modules so shared init is identical across arms; init uses a
         # LOCAL generator (rpbe_seed-derived) and never consumes the
@@ -707,6 +724,27 @@ class MemoryVLA(nn.Module):
 
         per_tokens_repeated = per_tokens.repeat(
             repeated_diffusion_steps, 1, 1)
+
+        # Stage7: deterministic regression head (6DoF equal-weight SmoothL1 +
+        # independent gripper BCE).  Uses cog_post + mean-pooled per_post; the
+        # diffusion head is bypassed for the loss.
+        if getattr(self, "use_reg_head", False):
+            B = actions_future.shape[0]
+            per_pool = per_tokens.mean(dim=1)                # [B, per_token_size]
+            feats = torch.cat([cog_tokens.reshape(B, -1), per_pool], dim=-1)
+            wdt = self.reg_head[0].weight.dtype
+            out = self.reg_head(feats.to(wdt)).view(B, self._reg_k, 7).float()
+            K = self._reg_k
+            m = (action_masks[:, -K:].float() if action_masks is not None
+                 else torch.ones(B, K, device=out.device))
+            tgt = actions_future.float()
+            cont = torch.nn.functional.smooth_l1_loss(
+                out[..., :6], tgt[..., :6], reduction="none").sum(-1)
+            loss = (cont * m).sum() / (m.sum() * 6 + 1e-8)
+            grip = torch.nn.functional.binary_cross_entropy_with_logits(
+                out[..., 6], tgt[..., 6], reduction="none")
+            loss = loss + (grip * m).sum() / (m.sum() + 1e-8)
+            return loss, output
 
         # per-dim weighted, padding-masked diffusion loss (2026-09-09 review):
         # per-dim weighted / action-mask masking toggle.  Set vla.use_dim_weight
@@ -979,6 +1017,27 @@ class MemoryVLA(nn.Module):
             episode_ids=episode_ids,
             timesteps=timesteps,
         )
+
+        if getattr(self, "use_reg_head", False):
+            # Stage7 deterministic regression decode (no diffusion sampling)
+            B = cog_tokens.shape[0]
+            per_pool = per_tokens.mean(dim=1)
+            feats = torch.cat([cog_tokens.reshape(B, -1), per_pool], dim=-1)
+            wdt = self.reg_head[0].weight.dtype
+            raw = self.reg_head(feats.to(wdt)).view(B, -1, 7).float()
+            normalized_actions = raw[0].cpu().numpy()
+            gprob = 1.0 / (1.0 + np.exp(-normalized_actions[:, 6]))
+            action_norm_stats = self.get_action_stats(unnorm_key)
+            mask = action_norm_stats.get(
+                "mask", np.ones_like(action_norm_stats["q01"], dtype=bool))
+            action_high = np.array(action_norm_stats["q99"])
+            action_low = np.array(action_norm_stats["q01"])
+            normalized_actions = np.clip(normalized_actions, -1, 1)
+            normalized_actions[:, 6] = (gprob >= 0.5).astype(np.float32)
+            actions = np.where(mask,
+                               0.5 * (normalized_actions + 1) * (action_high - action_low) + action_low,
+                               normalized_actions)
+            return actions, normalized_actions
 
         # Sample random noise
         B = cog_tokens.shape[0]

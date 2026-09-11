@@ -105,6 +105,10 @@ def parse_args() -> argparse.Namespace:
                    help="verbose optimizer-closure audit (coverage + per-group "
                         "grad/update norms) for the first N DENSE steps, then "
                         "stop training (0 = off)")
+    p.add_argument("--reg-head", type=int, default=0,
+                   help="Stage7: 1 = use the shared deterministic regression "
+                        "action head (6DoF equal-weight SmoothL1 + gripper "
+                        "BCE) instead of the diffusion loss")
     p.add_argument("--lr", type=float, default=2e-5)
     p.add_argument("--warmup-steps", type=int, default=100,
                    help="warmup in OPTIMIZER steps")
@@ -235,6 +239,7 @@ def main() -> None:
     # per-dim weighted loss toggle (reviewer: default on; off = equal-weight
     # restart control experiment)
     vla.use_dim_weight = bool(args.dim_weight)
+    vla.use_reg_head = bool(args.reg_head)
     vla.train()
 
     tokenizer = vla.vlm.llm_backbone.get_tokenizer()
@@ -414,6 +419,9 @@ def main() -> None:
                    if p.requires_grad and id(p) not in lora_ids
                    and id(p) not in gamma_ids]
     task_params += lora_params
+    if getattr(vla, "reg_head", None) is not None:
+        task_params += [p for p in vla.reg_head.parameters()
+                        if p.requires_grad and id(p) not in gamma_ids]
     # disjointness guarantee (reviewer): no trainable param in both optimizers
     task_ids = {id(p) for p in task_params}
     overlap = task_ids & gamma_ids
@@ -837,6 +845,7 @@ def main() -> None:
                 "mem_length": args.mem_length, "kf_min_abs": args.kf_min_abs,
                 "lambda_rpbe": args.lambda_rpbe,
                 "image_aug": args.image_aug, "dim_weight": args.dim_weight,
+                "reg_head": args.reg_head,
             },
             "weights_snapshot_only": True,
         }

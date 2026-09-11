@@ -55,23 +55,27 @@ def arm_kf_on(arm: str, lambda_kf: float) -> bool:
     return arm != "gamma_task_only" and lambda_kf > 0.0
 
 
-def _flat_grad(gs):
-    """Flatten a ``autograd.grad`` list into one vector (None entries are
-    absent — those params carry no gradient on this path)."""
+def _flat_grad(gs, params):
+    """Flatten an ``autograd.grad`` list into one vector aligned with
+    ``params``; a None entry becomes zeros so the task and aux components
+    (which may touch different parameter subsets) stay dimension-matched."""
     parts = []
-    for g in gs:
+    for g, p in zip(gs, params):
         if g is None:
+            parts.append(torch.zeros_like(p, device="cpu",
+                                          dtype=torch.float32).reshape(-1))
             continue
-        parts.append(g.detach().reshape(-1).float())
+        parts.append(g.detach().reshape(-1).float().cpu())
     if not parts:
         return None
     return torch.cat(parts)
 
 
-def _grad_cosine(g1, g2):
-    """Cosine between two flat gradient lists; (cos, has1, has2)."""
-    a = _flat_grad(g1)
-    b = _flat_grad(g2)
+def _grad_cosine(params, g1, g2):
+    """Cosine between two flat gradient lists aligned on ``params``;
+    returns (cos, has1, has2)."""
+    a = _flat_grad(g1, params)
+    b = _flat_grad(g2, params)
     if a is None or b is None:
         return 0.0, False, False
     an = float(a.norm())
@@ -611,9 +615,9 @@ class TGBPairLinkLoop:
                     g_a = torch.autograd.grad(
                         auxiliary, self.repr_params,
                         retain_graph=True, allow_unused=True)
-                    cos, _h1, _h2 = _grad_cosine(g_t, g_a)
-                    ft = _flat_grad(g_t)
-                    fa = _flat_grad(g_a)
+                    cos, _h1, _h2 = _grad_cosine(self.repr_params, g_t, g_a)
+                    ft = _flat_grad(g_t, self.repr_params)
+                    fa = _flat_grad(g_a, self.repr_params)
                     nt = float(ft.norm()) if ft is not None else 0.0
                     na = float(fa.norm()) if fa is not None else 0.0
                     ratio = na / nt if nt > 1e-12 else float("nan")

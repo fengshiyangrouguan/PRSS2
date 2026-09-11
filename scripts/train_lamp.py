@@ -572,7 +572,7 @@ def treewise_feasibility_projection(g_task_gamma, gamma_params, G, kappa,
     diag["proj_n_active_init"] = int((cos_init < -kappa).sum())
     diag["proj_cos_min"] = float(cos_init.min())
     diag["proj_max_viol_before"] = float(
-        torch.clamp(cos_init + kappa, min=0.0).max())
+        torch.clamp(-cos_init - kappa, min=0.0).max())
     Q = Gv @ Gv.t()
     c = b - Gt
     mu = _fista_nonneg(Q, c, iters)

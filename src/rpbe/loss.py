@@ -85,12 +85,13 @@ def _oas_shrink(czz: torch.Tensor, czp: torch.Tensor,
     """Paired OAS covariance shrinkage (review round 8).
 
     Keeps the joint covariance CONSISTENT while damping the small-sample
-    over-correlation: each side shrinks toward its own identity and the
-    cross term is rescaled by the geometric mean of the two retained
-    masses:
+    over-correlation: each side shrinks toward the SCALED identity
+    (review 2 fix: the standard OAS target mu*I with mu = tr(C)/d — a
+    plain identity breaks scale invariance and rewards memory-magnitude
+    growth; scikit-learn's _shrunk_covariance uses the same mu*I target):
 
-        C_ZZ' = (1 - a_Z) C_ZZ + a_Z I
-        C_PP' = (1 - a_P) C_PP + a_P I
+        C_ZZ' = (1 - a_Z) C_ZZ + a_Z mu_Z I
+        C_PP' = (1 - a_P) C_PP + a_P mu_P I
         C_ZP' = sqrt((1 - a_Z)(1 - a_P)) C_ZP
 
     Returns the shrunk triple plus ``{"alpha_z", "alpha_p"}`` for the
@@ -99,9 +100,11 @@ def _oas_shrink(czz: torch.Tensor, czp: torch.Tensor,
     """
     az = _oas_alpha(czz, n)
     ap = _oas_alpha(cpp, n)
-    czz_s = (1.0 - az) * czz + az * torch.eye(
+    mu_z = torch.trace(czz) / float(czz.shape[0])
+    mu_p = torch.trace(cpp) / float(cpp.shape[0])
+    czz_s = (1.0 - az) * czz + az * mu_z * torch.eye(
         czz.shape[0], dtype=czz.dtype, device=czz.device)
-    cpp_s = (1.0 - ap) * cpp + ap * torch.eye(
+    cpp_s = (1.0 - ap) * cpp + ap * mu_p * torch.eye(
         cpp.shape[0], dtype=cpp.dtype, device=cpp.device)
     czp_s = ((1.0 - az) * (1.0 - ap)) ** 0.5 * czp
     return czz_s, czp_s, cpp_s, {"alpha_z": az, "alpha_p": ap}

@@ -47,13 +47,20 @@ class GammaOnetime(nn.Module):
 
         Returns:
             Residual [B, H, N, D]; exactly zero at init.
+
+        The V/U linears run with autocast DISABLED (review 2 fix): the
+        main forward executes under the trainer's autocast where Linear
+        may run fp16, while the local replay runs outside autocast — the
+        two paths would drift numerically.  Pinning the Gamma math to
+        fp32 on BOTH paths removes the mismatch.
         """
-        mean_p = pool.mean(dim=2, keepdim=True).expand_as(x)
-        max_p = pool.amax(dim=2, keepdim=True).expand_as(x)
-        wd = self.V.weight.dtype
-        feat = torch.cat([x.to(dtype=wd), mean_p.to(dtype=wd),
-                          max_p.to(dtype=wd)], dim=-1)
-        return self.U(torch.tanh(self.V(feat)))
+        with torch.cuda.amp.autocast(enabled=False):
+            mean_p = pool.mean(dim=2, keepdim=True).expand_as(x)
+            max_p = pool.amax(dim=2, keepdim=True).expand_as(x)
+            wd = self.V.weight.dtype
+            feat = torch.cat([x.to(dtype=wd), mean_p.to(dtype=wd),
+                              max_p.to(dtype=wd)], dim=-1)
+            return self.U(torch.tanh(self.V(feat)))
 
     def n_params(self) -> int:
         return sum(p.numel() for p in self.parameters())

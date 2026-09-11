@@ -579,6 +579,13 @@ def main():
     sum_ids = tokenizer.sum_token_id
     pad_id = tokenizer.pad_token_id
     eos_id = tokenizer.eos_token_id
+    # Review 2 diagnostics: per-window Gamma grad ratio/angle and the
+    # memory magnitude (z norm) so scale-growth or gradient-conflict
+    # hypotheses can be checked from the logs.
+    gamma_params = ([p for g in rpbe["gammas"] for p in g.parameters()]
+                    if use_rpbe else [])
+    z_norm_acc = 0.0
+    z_norm_n = 0
     embed_tokens = model.get_input_embeddings()
     mb_rows_oids = []   # per mb: [oid per batch row]
     mb_caches = []      # per mb: per-layer gamma cache clones
@@ -625,6 +632,9 @@ def main():
                 rpbe["window"].add(rows)
                 mb_rows_oids.append(oids)
                 mb_caches.append(cache)
+                z_norm_acc += float(
+                    sum(r.z.detach().float().norm() for r in rows))
+                z_norm_n += len(rows)
             scaler.scale(loss).backward()
             micros += 1
         # Window close (ours arm): adjoint + local Gamma replay.
@@ -642,49 +652,83 @@ def main():
             else:
                 win_stats["closed"] += 1
                 last_j = j_closed
-                # Lambda calibration (review fix, R8 protocol): snapshot
-                # the task grads of ALL trainable params (CE, accumulated
-                # over this step's microbatches) BEFORE the RPBE surrogate
-                # backward; r_eff = ||g_rpbe||_2 / ||g_task||_2 with the
-                # JOINT (concatenated) L2 norm, measured at theta_0 with
-                # no parameter update (the step is skipped above).
-                g_task = None
-                if args.calibrate_lambda:
-                    g_task = [p.grad.detach().clone()
-                              if p.grad is not None
-                              else torch.zeros_like(p)
-                              for p in params]
+                # Gradient snapshot BEFORE the RPBE surrogate backward
+                # (review 2 diagnostics): per-window Gamma task/aux grad
+                # ratio and angle; calibrate mode additionally reports
+                # the all-params r_eff at theta_0 (no param update).
+                g_task_all = None
+                g_task_gamma = None
+                if args.calibrate_lambda or gamma_params:
+                    g_task_all = [p.grad.detach().clone()
+                                  if p.grad is not None
+                                  else torch.zeros_like(p)
+                                  for p in params]
+                    g_task_gamma = [p.grad.detach().clone()
+                                    if p.grad is not None
+                                    else torch.zeros_like(p)
+                                    for p in gamma_params]
                 aux, aux_terms = gamma_replay_surrogate(
                     rpbe, by_oid, mb_rows_oids, mb_caches,
                     args.kf_lambda, device)
                 if aux_terms:
                     scaler.scale(aux).backward()
-                if args.calibrate_lambda and g_task is not None:
-                    g_total = [p.grad.detach().clone()
-                               for p in params]
+                calib = {}
+                gdiag = {}
+                if g_task_gamma:
+                    g_tot_gamma = [p.grad.detach().clone()
+                                   for p in gamma_params]
+                    g_aux_gamma = [(t - g0).flatten().float()
+                                   for t, g0 in zip(g_tot_gamma,
+                                                    g_task_gamma)]
+                    g_task_g = torch.cat(
+                        [g.flatten().float() for g in g_task_gamma])
+                    g_aux_g = torch.cat(g_aux_gamma)
+                    n_task_g = g_task_g.norm()
+                    n_aux_g = g_aux_g.norm()
+                    cos_g = float((g_task_g * g_aux_g).sum()
+                                  / max(n_task_g * n_aux_g, 1e-12)) \
+                        if n_task_g > 0 and n_aux_g > 0 else float("nan")
+                    gdiag = {
+                        "g_gamma_task": float(n_task_g),
+                        "g_gamma_aux": float(n_aux_g),
+                        "g_gamma_ratio": float(
+                            n_aux_g / max(n_task_g, 1e-12)),
+                        "g_gamma_cos": cos_g,
+                    }
+                if args.calibrate_lambda and g_task_all is not None:
+                    g_total = [p.grad.detach().clone() for p in params]
                     n_task = torch.cat(
-                        [g.flatten().float() for g in g_task]).norm()
+                        [g.flatten().float() for g in g_task_all]).norm()
                     n_rpbe = torch.cat(
                         [(t - g0).flatten().float()
-                         for t, g0 in zip(g_total, g_task)]).norm()
-                    r_eff = float(n_rpbe / max(n_task, 1e-12))
-                    with log_path.open("a") as f:
-                        f.write(json.dumps({
-                            "step": step, "event": "calibrate",
-                            "r_eff": r_eff, "n_task": float(n_task),
-                            "n_rpbe": float(n_rpbe),
-                        }) + "\n")
+                         for t, g0 in zip(g_total, g_task_all)]).norm()
+                    calib = {
+                        "r_eff": float(n_rpbe / max(n_task, 1e-12)),
+                        "n_task": float(n_task),
+                        "n_rpbe": float(n_rpbe),
+                    }
                 with log_path.open("a") as f:
-                    f.write(json.dumps({
+                    rec = {
                         "step": step, "event": "window_close",
                         "J_ens": j_closed, "aux_terms": aux_terms,
                         "M_unique_trees": d0.get("M_unique_trees"),
                         "alpha_z": d0.get("alpha_z"),
                         "alpha_p": d0.get("alpha_p"),
                         "J_branches": d0.get("J_branches"),
-                    }) + "\n")
+                        "J_shuffled": d0.get("J_shuffled"),
+                        "J_real_minus_shuffled":
+                            d0.get("J_real_minus_shuffled"),
+                        "z_norm_mean": float(
+                            z_norm_acc / max(z_norm_n, 1)),
+                    }
+                    rec.update(gdiag)
+                    if calib:
+                        rec.update(calib)
+                    f.write(json.dumps(rec) + "\n")
             mb_rows_oids.clear()
             mb_caches.clear()
+            z_norm_acc = 0.0
+            z_norm_n = 0
         scaler.unscale_(optimizer)
         grad_ok = all(p.grad is None or torch.isfinite(p.grad).all()
                       for p in params)

@@ -1,0 +1,15 @@
+{
+  "data": "uci",
+  "seed": 1,
+  "arm": "2obs_aligned",
+  "best_epoch": 24,
+  "best_ap_all": 0.8926243001814627,
+  "selection": "ap_all",
+  "stop_reason": "budget",
+  "extended": false,
+  "test": {
+    "ap": 0.8822891206798497,
+    "auc": 0.8739213350376207,
+    "n_pos": 8976
+  }
+}

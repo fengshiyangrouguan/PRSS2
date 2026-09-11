@@ -1,0 +1,6 @@
+{"group_batches": 40, "tau": "tjo:layer2", "M_unique_trees": 1166, "threshold": 896, "n_records": 2262, "epoch": 0}
+{"group_batches": 40, "tau": "tjo:layer2", "M_unique_trees": 1251, "threshold": 896, "n_records": 2453, "epoch": 0}
+{"group_batches": 40, "tau": "tjo:layer2", "M_unique_trees": 1182, "threshold": 896, "n_records": 2335, "epoch": 0}
+{"group_batches": 40, "tau": "tjo:layer2", "M_unique_trees": 1235, "threshold": 896, "n_records": 2417, "epoch": 0}
+{"group_batches": 40, "tau": "tjo:layer2", "M_unique_trees": 1136, "threshold": 896, "n_records": 2192, "epoch": 0}
+{"group_batches": 10, "tau": "tjo:layer2", "M_unique_trees": 157, "threshold": 896, "n_records": 275, "epoch": 0}

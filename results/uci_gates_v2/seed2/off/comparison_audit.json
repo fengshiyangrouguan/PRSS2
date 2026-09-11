@@ -1,0 +1,36 @@
+{
+  "commit": "0446aaacf0ecaacb3d499f7430bb7462da5fbfa0",
+  "config_hash": "2c2af64b1b67e3697b4ca95da1c7acf5",
+  "fixed_feature": {
+    "rpbe_seed": 0,
+    "sketch_dim": 64,
+    "width_D": 128,
+    "d_ctx": 32,
+    "d_event": 32
+  },
+  "counts": {
+    "population": 235256,
+    "pairing": 0,
+    "valid_cut": 235256,
+    "y1": 235256,
+    "y2": 235256,
+    "closed": 0,
+    "replay": 0
+  },
+  "digests": {
+    "data_flow": "31f3f98f27cae46c31598ee830eaddeb",
+    "valid_cut": "2e9be78bba3f404c",
+    "occurrence_order": "8a0f30de708704ba66c41d6c2a0ce094",
+    "y1_multiset": "c2e7a6f029a2a6f2",
+    "y2_multiset": "a632f42d39cad6f8",
+    "pairing": "cae66941d9efbd404e4d88758ea67670",
+    "closed_window": "cae66941d9efbd404e4d88758ea67670",
+    "replay_pairing": "cae66941d9efbd404e4d88758ea67670"
+  },
+  "replay_debug": {
+    "n_missing": 0,
+    "n_extra": 0,
+    "first_missing": [],
+    "first_extra": []
+  }
+}

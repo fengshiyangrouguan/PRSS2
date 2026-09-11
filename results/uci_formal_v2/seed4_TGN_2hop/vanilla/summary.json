@@ -1,0 +1,13 @@
+{
+  "status": "complete",
+  "seed": 4,
+  "rc": 0,
+  "protocol": "official-tgn",
+  "n_layer": 2,
+  "n_degree": 10,
+  "best_epoch": 0,
+  "best_val_ap": 0.867076091953951,
+  "test_ap": 0.8722543515073231,
+  "n_epochs_run": 4,
+  "test_auc": 0.8670441850321395
+}

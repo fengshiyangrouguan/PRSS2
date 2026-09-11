@@ -20,8 +20,12 @@ find outputs -type f \( \
   ! -path '*/lambda_calib*' \
   ! -path '*/window_spectrum_diag/*' \
   | while read -r f; do
-      mkdir -p "results/$(dirname "$f")"
-      cp "$f" "results/$f"
+      # strip the leading "outputs/" component: the .gitignore rule
+      # "outputs/" matches at ANY depth, so results/outputs/... would still
+      # be ignored.
+      rel="${f#outputs/}"
+      mkdir -p "results/$(dirname "$rel")"
+      cp "$f" "results/$rel"
     done
 
 echo "files: $(find results -type f | wc -l)"

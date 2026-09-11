@@ -1,0 +1,3 @@
+{"epoch": 0, "repr_step": 6, "selection": "ap_all", "ap_all": 0.8133527347874592, "auc_all": 0.7775334952397948, "nll_all": NaN, "paired_acc": NaN, "ap_hist": NaN, "auc_hist": NaN, "nll_hist": NaN, "n_hist": 0, "n_random": 8975}
+{"epoch": 1, "repr_step": 12, "selection": "ap_all", "ap_all": 0.8024846591341495, "auc_all": 0.7690720773426649, "nll_all": NaN, "paired_acc": NaN, "ap_hist": NaN, "auc_hist": NaN, "nll_hist": NaN, "n_hist": 0, "n_random": 8975}
+{"epoch": 2, "repr_step": 18, "selection": "ap_all", "ap_all": 0.8350872542358343, "auc_all": 0.8148227341501075, "nll_all": NaN, "paired_acc": NaN, "ap_hist": NaN, "auc_hist": NaN, "nll_hist": NaN, "n_hist": 0, "n_random": 8975}

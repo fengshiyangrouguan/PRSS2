@@ -953,6 +953,137 @@ class TGBPairLinkLoop:
             g0 = g1
         return groups
 
+    # --------------------------------------------------- channel probe (A/B/C)
+    def channel_probe(self, train, *, n_groups=1, sample_trees=20):
+        """Audit (NO optimizer update) channel-direction probe.
+
+        For each macro group: ONE grad-enabled task forward (no memory mutation
+        between masks), u_task = -grad_Gamma L_task; then for A=[h,r,0],
+        B=[0,0,m], C=[h,r,m] (block mask only, same host state / random map)
+        u_RPBE = +grad_Gamma sum(g . z), where g is the window adjoint under
+        that mask.  Records group-level cos(u_RPBE,u_task) and per-tree paired
+        deltas.  Returns raw arrays.
+        """
+        import math as _math
+        assert getattr(self.adapter, "compressor", None) is not None, \
+            "channel probe needs a compressor (Gamma)"
+        gamma = [p for p in self.adapter.compressor.parameters()
+                 if p.requires_grad]
+        masks = {"A": (1.0, 1.0, 0.0), "B": (0.0, 0.0, 1.0),
+                 "C": (1.0, 1.0, 1.0)}
+        self.reset_memory()
+        self.tgn.eval()
+        num_batch = _math.ceil(len(train.sources) / self.batch_size)
+        out = {"group_cos": {k: [] for k in masks},
+               "tree_cos": {k: [] for k in masks},
+               "tree_delta_CA": [], "tree_delta_BA": [],
+               "n_groups": 0, "n_trees": 0, "gamma_params": len(gamma)}
+
+        def _g(scalar):
+            gs = torch.autograd.grad(scalar, gamma, retain_graph=True,
+                                     allow_unused=True)
+            return [torch.zeros_like(p) if g is None else g
+                    for g, p in zip(gs, gamma)]
+
+        def _cos(a, b):
+            s = 0.0
+            for x, y in zip(a, b):
+                s += float((x * y).sum())
+            na = sum(float((x * x).sum()) for x in a) ** 0.5
+            nb = sum(float((y * y).sum()) for y in b) ** 0.5
+            return s / (na * nb + 1e-30)
+
+        for gi in range(int(n_groups)):
+            g0 = gi * self.kf_group_batches
+            g1 = min(g0 + self.kf_group_batches, num_batch)
+            if g0 >= g1:
+                break
+            gs = g0
+            state = self._save_group_state()
+            recs = self._collect_pass1_records(train, g0, g1, gs, epoch=0)
+            fea = feasible_positions(recs, seed=self.seed, batch_seed=gs) \
+                if recs else []
+            if not fea:
+                self._restore_group_state(state)
+                continue
+            recs_f = [recs[i] for i in fea]
+            self._restore_group_state(state)
+            # --- single grad forward (task state); no step, no memory reset
+            z_map = {}
+            L = None
+            for b in range(g0, g1):
+                res = self._run_batch(train, b, gs + (b - g0),
+                                      grad_enabled=True, epoch=0)
+                if res is None:
+                    continue
+                ll, recs2 = res
+                L = ll if L is None else L + ll
+                for r in recs2:
+                    z_map[int(r.pair_id)] = r.z
+            if L is None:
+                continue
+            u_task = _g(-L)
+            # --- per-mask windows (same host state; masks change only p_v)
+            g_by_mask = {}
+            for mk, mv in masks.items():
+                self.boundary_maps.set_block_mask(*mv)
+                gmap = {}
+                by_tau = {}
+                for r in recs_f:
+                    by_tau.setdefault(r.tau, []).append(r)
+                for tau, rl in by_tau.items():
+                    win = self._win(tau)
+                    win.reset()
+                    for r in rl:
+                        win.add(r)
+                    j, g_pos, _ = win.close_replay(_MapsAdapter(self, tau))
+                    if j is None:
+                        continue
+                    for pos, g in g_pos.items():
+                        gmap[int(rl[pos].pair_id)] = g
+                g_by_mask[mk] = gmap
+            self.boundary_maps.clear_block_mask()
+            # --- group-level
+            for mk in masks:
+                j = None
+                for pid, g in g_by_mask[mk].items():
+                    z = z_map.get(pid)
+                    if z is None:
+                        continue
+                    term = (g.to(z.dtype) * z).sum()
+                    j = term if j is None else j + term
+                out["group_cos"][mk].append(_cos(_g(j), u_task) if j is not None
+                                            else float("nan"))
+            # --- tree-level (paired)
+            pid2tree = {int(r.pair_id): int(r.root_row) for r in recs_f}
+            trees = sorted({pid2tree[p] for mk in masks
+                            for p in g_by_mask[mk] if p in pid2tree})
+            if len(trees) > int(sample_trees):
+                step = max(1, len(trees) // int(sample_trees))
+                trees = trees[::step][:int(sample_trees)]
+            for t in trees:
+                cs = {}
+                for mk in masks:
+                    j = None
+                    for pid, g in g_by_mask[mk].items():
+                        if pid2tree.get(pid) != t:
+                            continue
+                        z = z_map.get(pid)
+                        if z is None:
+                            continue
+                        term = (g.to(z.dtype) * z).sum()
+                        j = term if j is None else j + term
+                    cs[mk] = _cos(_g(j), u_task) if j is not None \
+                        else float("nan")
+                out["tree_cos"]["A"].append(cs["A"])
+                out["tree_cos"]["B"].append(cs["B"])
+                out["tree_cos"]["C"].append(cs["C"])
+                out["tree_delta_CA"].append(cs["C"] - cs["A"])
+                out["tree_delta_BA"].append(cs["B"] - cs["A"])
+            out["n_groups"] += 1
+            out["n_trees"] = len(out["tree_cos"]["A"])
+        return out
+
 
 class _MapsAdapter:
     """Adapts the PairKFWindow close to build one p row per record."""

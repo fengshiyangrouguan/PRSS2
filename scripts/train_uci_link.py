@@ -174,6 +174,11 @@ def parse_args():
                    choices=["", "pm1", "normal"],
                    help="msg projection distribution; '' = auto (pm1 for "
                         "legacy, normal for blocknorm)")
+    p.add_argument("--probe-channels", type=int, default=0,
+                   help="audit channel probe: run N macro-groups with NO "
+                        "optimizer update and dump A/B/C cos(u_RPBE,u_task) "
+                        "stats to channel_probe.json, then exit")
+    p.add_argument("--probe-trees", type=int, default=20)
     return p.parse_args()
 
 
@@ -495,6 +500,53 @@ def main():
         "group_plan_sha": plan_sha,
         "maps_sha": c["boundary_maps"].isolation_fingerprint()["sha256"],
         "opt_split": c["opt_split"], "cli": vars(args)})
+
+    # ---- audit channel probe (no optimizer update), then exit ----------
+    if args.probe_channels > 0:
+        import statistics as _st
+
+        def _clean(a):
+            return [float(x) for x in a if x == x]
+
+        def _stats(a):
+            a = _clean(a)
+            if not a:
+                return {}
+            s = sorted(a)
+            return {"n": len(a), "mean": _st.mean(a), "median": _st.median(a),
+                    "p5": s[int(0.05 * (len(a) - 1))],
+                    "p95": s[int(0.95 * (len(a) - 1))],
+                    "frac_pos": sum(1 for x in a if x > 0) / len(a),
+                    "frac_neg": sum(1 for x in a if x < 0) / len(a),
+                    "frac_lt_-0.05": sum(1 for x in a if x < -0.05) / len(a)}
+
+        def _boot(a, n=2000, seed=0):
+            a = _clean(a)
+            if not a:
+                return None
+            import random as _r
+            rng = _r.Random(seed)
+            N = len(a)
+            ms = sorted(sum(a[rng.randrange(N)] for _ in range(N)) / N
+                        for _ in range(n))
+            return [ms[int(0.025 * n)], ms[int(0.975 * n)]]
+
+        res = loop.channel_probe(train, n_groups=args.probe_channels,
+                                 sample_trees=args.probe_trees)
+        summ = {
+            "meas_norm": args.meas_norm, "n_groups": res["n_groups"],
+            "n_trees": res["n_trees"], "gamma_params": res["gamma_params"],
+            "group_cos": {k: _stats(res["group_cos"][k]) for k in ("A", "B", "C")},
+            "tree_cos": {k: _stats(res["tree_cos"][k]) for k in ("A", "B", "C")},
+            "delta_CA": _stats(res["tree_delta_CA"]),
+            "delta_BA": _stats(res["tree_delta_BA"]),
+            "delta_CA_ci95": _boot(res["tree_delta_CA"]),
+            "delta_BA_ci95": _boot(res["tree_delta_BA"]),
+        }
+        save_json(out / "channel_probe.json", summ)
+        print("CHANNEL_PROBE " + json.dumps(summ, allow_nan=True), flush=True)
+        save_json(out / "_SUCCESS.json", {"status": "probe"})
+        return
 
     # ---- UCI negatives: official RandEdgeSampler semantics.  Train draws
     # from the unique train-dst pool (the loop's default path); val/test use

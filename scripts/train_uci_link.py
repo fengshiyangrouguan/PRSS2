@@ -124,6 +124,13 @@ def parse_args():
                    help="val selection must beat best by >= this AP to reset")
     p.add_argument("--budget-cap", type=int, default=60,
                    help="hard cap when a run is budget-censored (spec §6)")
+    p.add_argument("--resume", default="",
+                   help="path to a last.pt checkpoint to warm-start from. "
+                        "Loads model weights only (optimizer / KF-window / "
+                        "batch-RNG state re-initialize except global_step, "
+                        "which is restored from the last metrics row); appends "
+                        "metrics/val_history and continues from "
+                        "epoch = ckpt.epoch + 1.")
     p.add_argument("--bs", type=int, default=200)
     p.add_argument("--lr", type=float, default=1e-4)
     p.add_argument("--grad-align-diag", action="store_true",
@@ -562,19 +569,60 @@ def main():
         return
 
     metrics_path = out / "metrics.jsonl"
-    metrics_path.unlink(missing_ok=True)
-
     val_history_path = out / "val_history.jsonl"
-    val_history_path.unlink(missing_ok=True)
+    win_diag_path = out / "window_diag.jsonl"
+
     best_val = -1e9
     bad = 0
     best_epoch = -1
     gs = 0
     repr_cum = 0
     closed_cum = 0
-    win_diag_path = out / "window_diag.jsonl"
-
     start_epoch = 0
+
+    # ---- warm-start resume: load model weights from a prior last.pt and
+    # continue from ckpt.epoch + 1.  Weights-only (the checkpoint stores no
+    # optimizer or KF-window state, so those re-initialize); global_step and
+    # the cumulative repr/closed counters are restored from the last metrics
+    # row so the batch seed sequence and the curve x-axis stay contiguous.
+    # metrics/val_history are appended, not truncated, to keep one curve.
+    if args.resume:
+        resume_path = Path(args.resume)
+        if not resume_path.exists():
+            raise FileNotFoundError(
+                "resume checkpoint not found: " + str(resume_path))
+        ck = torch.load(resume_path, map_location=device)
+        c["tgn"].load_state_dict(ck["model"]["tgn"])
+        if c["compressor"] is not None and "compressor" in ck["model"]:
+            c["compressor"].load_state_dict(ck["model"]["compressor"])
+        if aux_heads is not None and "aux_heads" in ck:
+            aux_heads.load_state_dict(ck["aux_heads"])
+        start_epoch = int(ck["epoch"]) + 1
+        best_val = float(ck["score"])
+        lastm = None
+        if metrics_path.exists():
+            with metrics_path.open() as _f:
+                for _line in _f:
+                    _line = _line.strip()
+                    if _line:
+                        lastm = json.loads(_line)
+        if lastm is not None:
+            gs = int(lastm.get("global_step", 0))
+            repr_cum = int(lastm.get("repr_step", 0))
+            closed_cum = int(lastm.get("closed_window_step", 0))
+        best_path = out / "best.pt"
+        if best_path.exists():
+            _best = torch.load(best_path, map_location=device)
+            best_epoch = int(_best["epoch"])
+        print(json.dumps(
+            {"resume": str(resume_path), "start_epoch": start_epoch,
+             "best_val": best_val, "best_epoch": best_epoch,
+             "gs": gs, "repr_cum": repr_cum, "closed_cum": closed_cum}),
+            flush=True)
+    else:
+        metrics_path.unlink(missing_ok=True)
+        val_history_path.unlink(missing_ok=True)
+
     epoch_aps = []
     budget = args.epochs if args.epochs > 0 else args.budget_cap
     extended = False

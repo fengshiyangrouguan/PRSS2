@@ -13,8 +13,8 @@ ROOT=/root/autodl-tmp/PRSS2_uci_v2/outputs/uci_formal_v2
 DATA_DIR=/root/autodl-tmp/benchtemp/data_uci
 LR=1e-4
 REPR_LR=3e-4
-EPOCHS=50
-PAT=50
+EPOCHS=80
+PAT=80
 LAM=0.00937285625636343
 KAPPA=0.05
 mkdir -p "$ROOT/logs"
@@ -62,11 +62,11 @@ skip_or_busy() {
 
 run_ours_cstr() {
   local seed="$1"
-  local out="$ROOT/seed${seed}_TGN_3hop/ours_cstr_e50"
-  skip_or_busy "$out" "train_uci_link.*seed${seed}_TGN_3hop/ours_cstr_e50" "ours_cstr s$seed" && return 0
+  local out="$ROOT/seed${seed}_TGN_3hop/ours_cstr_e80"
+  skip_or_busy "$out" "train_uci_link.*seed${seed}_TGN_3hop/ours_cstr_e80" "ours_cstr s$seed" && return 0
   mkdir -p "$out"
   echo "START ours_cstr seed=$seed kappa=$KAPPA $(date '+%H:%M:%S') commit=$(git rev-parse --short HEAD)" \
-    > "$ROOT/logs/seed${seed}_ours_cstr_e50.log"
+    > "$ROOT/logs/seed${seed}_ours_cstr_e80.log"
   $PY -m scripts.train_uci_link \
     --arm 2obs_aligned --lambda-kf "$LAM" \
     --rpbe-constrain --rpbe-kappa "$KAPPA" \
@@ -74,29 +74,29 @@ run_ours_cstr() {
     --epochs "$EPOCHS" --budget-cap "$EPOCHS" --patience "$PAT" \
     --kf-group-batches 40 --n-neighbors 10 --n-layers 3 \
     --lr "$LR" --repr-lr "$REPR_LR" \
-    --seed "$seed" --output "$out" >> "$ROOT/logs/seed${seed}_ours_cstr_e50.log" 2>&1
-  echo "DONE_ours_cstr_s${seed} rc=$? $(date '+%H:%M:%S')" >> "$ROOT/logs/seed${seed}_ours_cstr_e50.log"
+    --seed "$seed" --output "$out" >> "$ROOT/logs/seed${seed}_ours_cstr_e80.log" 2>&1
+  echo "DONE_ours_cstr_s${seed} rc=$? $(date '+%H:%M:%S')" >> "$ROOT/logs/seed${seed}_ours_cstr_e80.log"
 }
 
 run_taskonly() {
   local seed="$1"
-  local out="$ROOT/seed${seed}_TGN_3hop/taskonly_cstr_e50"
-  skip_or_busy "$out" "train_uci_link.*seed${seed}_TGN_3hop/taskonly_cstr_e50" "taskonly_cstr s$seed" && return 0
+  local out="$ROOT/seed${seed}_TGN_3hop/taskonly_cstr_e80"
+  skip_or_busy "$out" "train_uci_link.*seed${seed}_TGN_3hop/taskonly_cstr_e80" "taskonly_cstr s$seed" && return 0
   mkdir -p "$out"
   echo "START taskonly_cstr seed=$seed $(date '+%H:%M:%S') commit=$(git rev-parse --short HEAD)" \
-    > "$ROOT/logs/seed${seed}_taskonly_cstr_e50.log"
+    > "$ROOT/logs/seed${seed}_taskonly_cstr_e80.log"
   $PY -m scripts.train_uci_link \
     --config P0 \
     --data-dir "$DATA_DIR" --gpu 0 \
     --epochs "$EPOCHS" --budget-cap "$EPOCHS" --patience "$PAT" \
     --kf-group-batches 40 --n-neighbors 10 --n-layers 3 \
     --lr "$LR" --repr-lr "$REPR_LR" \
-    --seed "$seed" --output "$out" >> "$ROOT/logs/seed${seed}_taskonly_cstr_e50.log" 2>&1
-  echo "DONE_taskonly_cstr_s${seed} rc=$? $(date '+%H:%M:%S')" >> "$ROOT/logs/seed${seed}_taskonly_cstr_e50.log"
+    --seed "$seed" --output "$out" >> "$ROOT/logs/seed${seed}_taskonly_cstr_e80.log" 2>&1
+  echo "DONE_taskonly_cstr_s${seed} rc=$? $(date '+%H:%M:%S')" >> "$ROOT/logs/seed${seed}_taskonly_cstr_e80.log"
 }
 
 # ---- phase 1: ours (constrained), 3 seeds x 3 parallel ----
-for s in 0 1 2; do
+for s in 1 2; do
   wait_gpu 6000
   before=$(gpu_used_mb)
   run_ours_cstr "$s" & pid=$!

@@ -102,7 +102,10 @@ class TGBPairLinkLoop:
                  aux_lambda=None, calibrate_groups=0,
                  memory_grad_probe=False,
                  grad_align_diag=False,
-                 rpbe_constrain=False, rpbe_kappa=0.05):
+                 rpbe_constrain=False, rpbe_kappa=0.05,
+                 rpbe_constrain_mode="treewise",
+                 rpbe_constrain_scope="gamma",
+                 rpbe_constrain_probe=False):
         self.tgn = tgn
         self.device = device
         self.batch_size = int(batch_size)
@@ -190,6 +193,26 @@ class TGBPairLinkLoop:
         self._cstr_active = 0
         self._cstr_groups = 0
         self._cstr_corr_ratios = []
+        # --- tree-wise constrained RPBE (final spec) -----------------------
+        # The aggregate projection flattens every tree/interface into ONE
+        # half-space, so tree-level conflicts cancel (g_1 + g_2 ~ 0) and the
+        # trigger never fires on the pair that actually violates.  The
+        # finalised form keeps every per-(tree, interface) RPBE direction
+        # g_{i,tau} separate and solves the multi-half-space QP
+        #     min_d 1/2 ||d - t||^2
+        #     s.t.  g_{i,tau}^T d >= -kappa ||g_{i,tau}|| ||t||  for all i,tau
+        # whose dual is a small projected-gradient problem over
+        # lambda >= 0.  The correction is restricted to Gamma/compressor
+        # params; every OTHER host param keeps the plain task gradient
+        # (RPBE never pollutes them).
+        self.rpbe_constrain_mode = str(rpbe_constrain_mode)
+        self.rpbe_constrain_scope = str(rpbe_constrain_scope)
+        self.rpbe_constrain_probe = bool(rpbe_constrain_probe)
+        self._cstr_scope_snap = None   # per-batch scope task-grad snapshot
+        self._cstr_scope_task = None   # aggregate task grad on scope params
+        self._cstr_tree_aux = {}       # (root_row, tau) -> [grad per scope p]
+        self._cstr_last_diag = None    # last group diagnostics (metrics)
+        self._cstr_epoch = []          # per-group diags of the current epoch
         self.kf_on = self.aux_kind in ("kyfan", "rec", "pred") \
             and self.lambda_kf > 0
         self.fail_below = bool(fail_below)
@@ -220,6 +243,12 @@ class TGBPairLinkLoop:
         # gradient gauges (fairness gates): compressor grad norms / param delta
         comp = getattr(self.adapter, "compressor", None)
         self._comp_params = list(comp.parameters()) if comp is not None else []
+        # correction scope for the constrained RPBE projection: Gamma /
+        # compressor when asked for (and present), else the whole repr group.
+        if self.rpbe_constrain_scope == "gamma" and self._comp_params:
+            self._cstr_scope_params = list(self._comp_params)
+        else:
+            self._cstr_scope_params = list(self.repr_params)
         self._gauge_group_aux = []
         self._gauge_group_task = []
         self._gauge_param_delta = None
@@ -393,6 +422,7 @@ class TGBPairLinkLoop:
     # ------------------------------------------------------------ train epoch
     def train_epoch(self, epoch, global_step, train, max_batches=None):
         self.reset_memory()
+        self._cstr_epoch = []
         self.tgn.train(True)
         if self.train_neg_sampler is None and self._dst_univ is None:
             self._dst_univ = np.unique(np.asarray(train.destinations))
@@ -603,6 +633,7 @@ class TGBPairLinkLoop:
                 link_loss, records = out
                 auxiliary = torch.zeros((), device=self.device)
                 terms = []  # reset per batch (stale-terms bug fix)
+                term_keys = []  # parallel to terms: (root_row, tau) tree id
                 if self.kf_on and records and g_by_pos_all:
                     for r in records:
                         _grp_recs += 1
@@ -614,6 +645,12 @@ class TGBPairLinkLoop:
                         z = r.z
                         gd = g.detach()
                         terms.append((gd * z).sum() - (gd * z.detach()).sum())
+                        # global tree id: pass-2 records carry a BATCH-LOCAL
+                        # root_row (the pass-1 remap does not apply here), so
+                        # fold in the batch index exactly as pass 1 does.
+                        term_keys.append(
+                            (int(b) * self.batch_size + int(r.root_row),
+                             str(r.tau)))
                     if terms:
                         coeff = -self.lambda_kf * float(group_k)
                         auxiliary = coeff * sum(terms)
@@ -662,31 +699,44 @@ class TGBPairLinkLoop:
                         _tn, an = self.gauge_comp(link_loss, auxiliary)
                         self._gauge_group_aux.append(an)
                 if self.rpbe_constrain:
-                    # Plan B: separate the two components so the group-end
-                    # projection can write back g_t + mu*g_a.  Task backward
-                    # first, snapshot repr grads, then the aux backward whose
-                    # repr delta is the aux component.  The straight-line
+                    # Final spec: separate task and RPBE components so the
+                    # group-end projection can write back d.  The straight-line
                     # surrogate is 0-valued, so the loss VALUE is unchanged;
-                    # lambda cancels in the projection (scale-invariant).
+                    # the lambda coefficient cancels in the projection.
                     if self._cstr_task_acc is None:
                         self._cstr_reset()
-                    link_loss.backward(retain_graph=True)  # shared z->repr
-                    # subgraph must survive for the aux backward below
-                    for i, p in enumerate(self.repr_params):
-                        g = p.grad
-                        if g is None:
-                            self._cstr_snap[i] = None
-                            continue
-                        self._cstr_task_acc[i].add_(g)
-                        self._cstr_snap[i] = g.detach().clone()
-                    if terms:
-                        auxiliary.backward()
+                    if self.rpbe_constrain_probe:
+                        # record-only: keep the ORDINARY link+aux update
+                        # exactly as the unconstrained arm (so the recorded
+                        # cosines characterise the real training trajectory)
+                        # and additionally collect the per-(tree, interface)
+                        # RPBE directions for the kappa curve.
+                        loss.backward(retain_graph=True)
+                        self._cstr_accum_scope_task()
+                        if terms:
+                            self._cstr_accum_tree_dirs(terms, term_keys)
+                    else:
+                        link_loss.backward(retain_graph=True)  # shared z->repr
+                        # subgraph must survive for the aux backward below
                         for i, p in enumerate(self.repr_params):
                             g = p.grad
-                            if g is None or self._cstr_snap[i] is None:
+                            if g is None:
+                                self._cstr_snap[i] = None
                                 continue
-                            self._cstr_aux_acc[i].add_(
-                                g - self._cstr_snap[i])
+                            self._cstr_task_acc[i].add_(g)
+                            self._cstr_snap[i] = g.detach().clone()
+                        self._cstr_accum_scope_task()
+                        if terms:
+                            if self.rpbe_constrain_mode == "treewise":
+                                self._cstr_accum_tree_dirs(terms, term_keys)
+                            else:
+                                auxiliary.backward()
+                                for i, p in enumerate(self.repr_params):
+                                    g = p.grad
+                                    if g is None or self._cstr_snap[i] is None:
+                                        continue
+                                    self._cstr_aux_acc[i].add_(
+                                        g - self._cstr_snap[i])
                 else:
                     loss.backward()
                 self._probe_memory_grad()
@@ -704,39 +754,10 @@ class TGBPairLinkLoop:
                          len(g_by_pos_all), _grp_recs, _grp_hits), flush=True)
             if self.repr_optimizer is not None and self.repr_params:
                 if self.rpbe_constrain and self._cstr_task_acc is not None:
-                    # Plan-B group-end projection on the accumulated
-                    # components (lambda-invariant; see __init__ note):
-                    #   trigger iff g_a^T g_t < -kappa ||g_a|| ||g_t||
-                    #   g_write = g_t + mu*g_a with
-                    #   mu = (-kappa||ga||||gt|| - ga^T gt) / ||ga||^2
-                    # otherwise g_write = g_t (aux discarded — d = t).
-                    gt = torch.cat([a.reshape(-1).float()
-                                    for a in self._cstr_task_acc])
-                    ga = torch.cat([a.reshape(-1).float()
-                                    for a in self._cstr_aux_acc])
-                    nt = float(gt.norm())
-                    na = float(ga.norm())
-                    s = float((ga * gt).sum())
-                    self._cstr_groups += 1
-                    active = False
-                    mu = 0.0
-                    if (na > 1e-12 and nt > 1e-12
-                            and s < -self.rpbe_kappa * na * nt):
-                        mu = (-self.rpbe_kappa * na * nt - s) / (na * na)
-                        active = True
-                        self._cstr_active += 1
-                        self._cstr_corr_ratios.append(
-                            float(mu * na / nt))
-                        print("[rpbe-constrain] group=%d kappa=%.2f "
-                              "cos=%.4f mu=%.3e corr/task=%.4f"
-                              % (group_start // self.kf_group_batches,
-                                 self.rpbe_kappa, s / (na * nt),
-                                 mu, mu * na / nt), flush=True)
-                    for a_t, a_a, p in zip(self._cstr_task_acc,
-                                           self._cstr_aux_acc,
-                                           self.repr_params):
-                        if p.grad is not None:
-                            p.grad.copy_(a_t + mu * a_a)
+                    if self.rpbe_constrain_mode == "treewise":
+                        self._cstr_group_close_treewise(group_start)
+                    else:
+                        self._cstr_group_close_aggregate(group_start)
                     self._cstr_reset()
                 for p in self.repr_params:
                     if p.grad is not None:
@@ -771,6 +792,9 @@ class TGBPairLinkLoop:
             "grad_align": self._grad_align_summary(),
             "rpbe_constrain": {
                 "enabled": bool(self.rpbe_constrain),
+                "mode": self.rpbe_constrain_mode,
+                "scope": self.rpbe_constrain_scope,
+                "probe": bool(self.rpbe_constrain_probe),
                 "kappa": self.rpbe_kappa,
                 "groups": self._cstr_groups,
                 "active": self._cstr_active,
@@ -778,8 +802,278 @@ class TGBPairLinkLoop:
                                 / max(1, self._cstr_groups)),
                 "mean_corr_ratio": (float(np.mean(self._cstr_corr_ratios))
                                     if self._cstr_corr_ratios else None),
+                "last_group": self._cstr_last_diag,
+                "epoch_summary": self._cstr_epoch_summary(),
             },
         }
+
+    def _cstr_accum_scope_task(self):
+        """Accumulate the per-batch task gradient on the correction scope.
+
+        repr grads are zeroed once per group, so ``p.grad`` is the running
+        total — accumulate the DELTA, not ``p.grad`` itself (the legacy
+        aggregate path added the running total, which triangularly reweighted
+        the batches).
+        """
+        for k, p in enumerate(self._cstr_scope_params):
+            if p.grad is None:
+                self._cstr_scope_snap[k] = None
+                continue
+            prev = self._cstr_scope_snap[k]
+            if prev is None:
+                self._cstr_scope_task[k].add_(p.grad)
+            else:
+                self._cstr_scope_task[k].add_(p.grad - prev)
+            self._cstr_scope_snap[k] = p.grad.detach().clone()
+
+    def _cstr_accum_tree_dirs(self, terms, term_keys):
+        """One VJP per (tree, interface): keep the RPBE directions SEPARATE
+        so tree-level conflicts (g_1 + g_2 ~ 0) cannot cancel out.
+
+        The per-record `terms` are the RAW surrogate pieces; the scalar
+        carrying them into the loss is ``auxiliary = coeff * sum(terms)``
+        with ``coeff = -lambda_kf * group_k < 0``.  The legacy aggregate
+        path therefore works with ``g_a = grad auxiliary = coeff * grad(sum
+        terms)``.  Negate here so the per-tree directions live in the SAME
+        sign convention as ``g_a`` — otherwise the half space
+        ``g_j^T d >= -kappa ||g_j|| ||t||`` is inverted.  (Only the sign
+        matters: the QP is scale-invariant in ||g_j||.)
+        """
+        by_tree: Dict[tuple, list] = {}
+        for _k, key in enumerate(term_keys):
+            by_tree.setdefault(key, []).append(_k)
+        for key, idxs in by_tree.items():
+            sub = terms[idxs[0]]
+            for _j in idxs[1:]:
+                sub = sub + terms[_j]
+            sub = -sub                       # coeff < 0: match g_a's sign
+            gs = torch.autograd.grad(
+                sub, self._cstr_scope_params,
+                retain_graph=True, allow_unused=True)
+            acc = self._cstr_tree_aux.get(key)
+            if acc is None:
+                acc = [torch.zeros_like(p, device=self.device)
+                       for p in self._cstr_scope_params]
+                self._cstr_tree_aux[key] = acc
+            for _k2, gg in enumerate(gs):
+                if gg is not None:
+                    acc[_k2].add_(gg)
+
+    def _cstr_group_close_aggregate(self, group_start):
+        """Legacy plan-B group-end projection on the accumulated components
+        (lambda-invariant; see __init__ note):
+          trigger iff g_a^T g_t < -kappa ||g_a|| ||g_t||
+          g_write = g_t + mu*g_a,  mu = (-kappa||ga||||gt|| - ga^T gt)/||ga||^2
+        otherwise g_write = g_t (aux discarded — d = t)."""
+        gt = torch.cat([a.reshape(-1).float()
+                        for a in self._cstr_task_acc])
+        ga = torch.cat([a.reshape(-1).float()
+                        for a in self._cstr_aux_acc])
+        nt = float(gt.norm())
+        na = float(ga.norm())
+        s = float((ga * gt).sum())
+        self._cstr_groups += 1
+        mu = 0.0
+        if (na > 1e-12 and nt > 1e-12
+                and s < -self.rpbe_kappa * na * nt):
+            mu = (-self.rpbe_kappa * na * nt - s) / (na * na)
+            self._cstr_active += 1
+            self._cstr_corr_ratios.append(float(mu * na / nt))
+            print("[rpbe-constrain] group=%d kappa=%.2f "
+                  "cos=%.4f mu=%.3e corr/task=%.4f"
+                  % (group_start // self.kf_group_batches,
+                     self.rpbe_kappa, s / (na * nt),
+                     mu, mu * na / nt), flush=True)
+        for a_t, a_a, p in zip(self._cstr_task_acc,
+                               self._cstr_aux_acc,
+                               self.repr_params):
+            if p.grad is not None:
+                p.grad.copy_(a_t + mu * a_a)
+
+    def _cstr_group_close_treewise(self, group_start):
+        """Final-spec group close: multi-half-space QP over the per-(tree,
+        interface) RPBE directions, restricted to the correction scope.
+
+        Every direction g_j = g_{i,tau} stays SEPARATE, so tree-level
+        conflicts (g_1 + g_2 ~ 0) cannot cancel.  With t the aggregate task
+        gradient on the same scope, solve
+
+            min_d 1/2 ||d - t||^2
+            s.t.  g_j^T d >= -kappa ||g_j|| ||t||
+
+        via its dual
+
+            max_{lam >= 0} -1/2 lam^T K lam + lam^T c,
+            K = A A^T, c = b - A t, b_j = -kappa ||g_j|| ||t||
+
+        by projected gradient, then write d = t + A^T lam into the scope
+        params' .grad.  The directions scale with the surrogate coefficient
+        lambda, which cancels from the normalised constraints.
+
+        Probe mode records the per-(tree, interface) cosine distribution
+        WITHOUT writing d back (used to choose kappa).
+        """
+        dev = self.device
+        scope = self._cstr_scope_params
+        t = torch.cat([a.reshape(-1).float() for a in self._cstr_scope_task])
+        nt = float(t.norm())
+        keys = sorted(self._cstr_tree_aux.keys())
+        self._cstr_groups += 1
+        diag = {"n_dirs": len(keys), "task_norm": nt, "active": 0,
+                "corr_ratio": None, "cos_mean": None, "cos_med": None,
+                "cos_p5": None, "cos_min": None, "frac_below": None,
+                "frac_below_grid": None, "n_viol": None, "max_viol": None,
+                "feasible_d0": None, "d_norm_ratio": None}
+
+        def _write_task_only():
+            # scope params already carry the cumulative task grad; rewrite it
+            # explicitly from the tracked accumulation so probe / degenerate
+            # closes are exact regardless of .grad bookkeeping.
+            for a_t, p in zip(self._cstr_scope_task, scope):
+                if p.grad is None:
+                    p.grad = torch.zeros_like(p, device=dev)
+                p.grad.copy_(a_t)
+
+        if not keys or nt <= 1e-12:
+            diag["note"] = "no_dirs_or_zero_task"
+            self._cstr_last_diag = diag
+            self._cstr_print_diag(group_start, diag)
+            _write_task_only()
+            return
+        A = torch.stack([torch.cat([a.reshape(-1).float()
+                                    for a in self._cstr_tree_aux[k]])
+                         for k in keys])                    # [N, P]
+        gn = A.norm(dim=1)                                  # [N]
+        keep = gn > 1e-12
+        A = A[keep]
+        gn = gn[keep]
+        if int(A.shape[0]) == 0:
+            diag["note"] = "all_zero_dirs"
+            self._cstr_last_diag = diag
+            self._cstr_print_diag(group_start, diag)
+            _write_task_only()
+            return
+        cos = (A @ t) / (gn * nt)                            # [N]
+        c_np = cos.detach().cpu().numpy()
+        diag["n_dirs"] = int(A.shape[0])
+        diag["cos_mean"] = float(np.mean(c_np))
+        diag["cos_med"] = float(np.median(c_np))
+        diag["cos_p5"] = float(np.percentile(c_np, 5.0))
+        diag["cos_min"] = float(np.min(c_np))
+        diag["frac_below"] = float(np.mean(c_np < -self.rpbe_kappa))
+        diag["frac_below_grid"] = {
+            ("%.2f" % kk): float(np.mean(c_np < -kk))
+            for kk in (0.0, 0.02, 0.05, 0.1, 0.15, 0.2, 0.3)}
+        diag["feasible_d0"] = bool(np.all(c_np >= -self.rpbe_kappa))
+        self._cstr_epoch.append(dict(diag))
+        if self.rpbe_constrain_probe:
+            # probe: leave .grad as the ordinary link+aux group sum — the
+            # update must stay identical to the unconstrained arm.
+            self._cstr_last_diag = diag
+            self._cstr_print_diag(group_start, diag)
+            return
+        # ---- multi-half-space QP via the dual -------------------------
+        # max_{lam>=0} -1/2 lam^T K lam + lam^T c.  FISTA (accelerated
+        # projected gradient) with the spectral step 1/lam_max(K) from a
+        # power iteration; a plain projected gradient with a conservative
+        # step under-converges and leaves violated constraints inactive.
+        b = -self.rpbe_kappa * gn * nt                       # [N]
+        K = A @ A.t()                                        # [N, N]
+        cvec = b - (A @ t)
+        lam = torch.zeros(int(A.shape[0]), device=dev)
+        with torch.no_grad():
+            v = torch.randn(int(A.shape[0]), device=dev)
+            v = v / (v.norm() + 1e-30)
+            lam_max = 1.0
+            for _ in range(30):
+                v = K @ v
+                nv = float(v.norm())
+                if nv <= 1e-30:
+                    break
+                v = v / nv
+                lam_max = nv
+        eta = 1.0 / (lam_max + 1e-12)
+        y = lam
+        tk = 1.0
+        for _ in range(2000):
+            lam_new = torch.clamp(y + eta * (cvec - K @ y), min=0.0)
+            tk_new = 0.5 * (1.0 + math.sqrt(1.0 + 4.0 * tk * tk))
+            y = lam_new + ((tk - 1.0) / tk_new) * (lam_new - lam)
+            lam = lam_new
+            tk = tk_new
+        corr = A.t() @ lam                                   # [P]
+        d = t + corr
+        active = int((lam > 1e-9).sum().item())
+        # primal residual: how many constraints are still violated at d
+        viol = b - (A @ d)                                   # [N] (>0 = violated)
+        rel = viol / (gn * nt + 1e-30)
+        diag["active"] = active
+        diag["n_viol"] = int((rel > 1e-6).sum().item())
+        diag["max_viol"] = float(rel.max()) if rel.numel() else 0.0
+        diag["corr_ratio"] = float(corr.norm()) / (nt + 1e-30)
+        diag["d_norm_ratio"] = float(d.norm()) / (nt + 1e-30)
+        if active > 0:
+            self._cstr_active += 1
+            self._cstr_corr_ratios.append(float(diag["corr_ratio"]))
+        self._cstr_print_diag(group_start, diag)
+        off = 0
+        for p in scope:
+            n = int(p.numel())
+            if p.grad is None:
+                p.grad = torch.zeros_like(p, device=dev)
+            p.grad.copy_(d[off:off + n].reshape(p.shape).to(p.dtype))
+            off += n
+        self._cstr_last_diag = diag
+
+    def _cstr_print_diag(self, group_start, diag):
+        """One compact per-group line (probe and solve paths alike)."""
+        def _f(v):
+            return "nan" if v is None else "%.3f" % float(v)
+
+        print("[rpbe-treewise] group=%d kappa=%.2f N=%d active=%d "
+              "cos_mean/p5/min=%s/%s/%s below=%s corr/task=%s viol=%s%s"
+              % (group_start // self.kf_group_batches, self.rpbe_kappa,
+                 int(diag.get("n_dirs", 0)), int(diag.get("active", 0)),
+                 _f(diag.get("cos_mean")), _f(diag.get("cos_p5")),
+                 _f(diag.get("cos_min")), _f(diag.get("frac_below")),
+                 _f(diag.get("corr_ratio")),
+                 ("-" if diag.get("n_viol") is None
+                  else "%d(%s)" % (diag["n_viol"], _f(diag.get("max_viol")))),
+                 "  [PROBE: update untouched]"
+                 if self.rpbe_constrain_probe
+                 else ("  note=%s" % diag["note"] if diag.get("note")
+                       else "")),
+              flush=True)
+
+    def _cstr_epoch_summary(self):
+        """Aggregate the per-group tree-wise diagnostics over one epoch.
+
+        ``frac_below_grid_mean`` is the mean over groups of the fraction of
+        per-(tree, interface) directions with cos(g_j, t) < -kappa, for a
+        grid of kappa — the curve used to pick the UCI kappa.
+        """
+        ds = [d for d in self._cstr_epoch if d.get("n_dirs")]
+        if not ds:
+            return None
+
+        def _agg(key, fn):
+            vals = [d[key] for d in ds if d.get(key) is not None]
+            return float(fn(vals)) if vals else None
+
+        grid = {}
+        for kk in ("0.00", "0.02", "0.05", "0.10", "0.15", "0.20", "0.30"):
+            vals = [d["frac_below_grid"][kk] for d in ds
+                    if d.get("frac_below_grid") and kk in d["frac_below_grid"]]
+            if vals:
+                grid[kk] = float(np.mean(vals))
+        return {"n_groups": len(ds),
+                "n_dirs_mean": _agg("n_dirs", np.mean),
+                "cos_mean": _agg("cos_mean", np.mean),
+                "cos_p5_mean": _agg("cos_p5", np.mean),
+                "cos_p5_min": _agg("cos_p5", np.min),
+                "cos_min_min": _agg("cos_min", np.min),
+                "frac_below_mean": _agg("frac_below", np.mean),
+                "frac_below_grid_mean": grid}
 
     def _cstr_reset(self):
         """Zero the per-group task/aux gradient accumulators (plan B)."""
@@ -789,6 +1083,11 @@ class TGBPairLinkLoop:
         self._cstr_aux_acc = [torch.zeros_like(p, device=dev)
                               for p in self.repr_params]
         self._cstr_snap = [None] * len(self.repr_params)
+        # tree-wise state: scope task accumulation + per-(tree, tau) dirs
+        self._cstr_scope_task = [torch.zeros_like(p, device=dev)
+                                 for p in self._cstr_scope_params]
+        self._cstr_scope_snap = [None] * len(self._cstr_scope_params)
+        self._cstr_tree_aux = {}
 
     def _grad_align_summary(self):
         """Distribution summary of update-direction cosines (reviewer item

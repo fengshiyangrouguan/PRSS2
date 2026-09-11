@@ -150,6 +150,24 @@ def parse_args():
     p.add_argument("--rpbe-kappa", type=float, default=0.05,
                    help="dimensionless margin for --rpbe-constrain "
                         "(0 = hard constraint; 0.05 = default gate).")
+    p.add_argument("--rpbe-constrain-mode", default="treewise",
+                   choices=["aggregate", "treewise"],
+                   help="aggregate = legacy single-half-space projection on "
+                        "the flattened group gradient (tree conflicts cancel); "
+                        "treewise = final spec: keep the per-(tree, interface) "
+                        "RPBE directions separate and solve the multi-half-"
+                        "space QP  min_d 1/2||d-t||^2 s.t. g_j^T d >= "
+                        "-kappa||g_j||||t||.")
+    p.add_argument("--rpbe-constrain-scope", default="gamma",
+                   choices=["gamma", "repr"],
+                   help="params the projection may correct: gamma = "
+                        "Gamma/compressor only (final spec — every other host "
+                        "param keeps the plain task gradient); repr = the whole "
+                        "repr group (legacy).")
+    p.add_argument("--rpbe-constrain-probe", action="store_true",
+                   help="record-only: compute the per-(tree, interface) "
+                        "cosines / QP diagnostics but DO NOT modify the update "
+                        "(used to choose kappa).")
     p.add_argument("--repr-lr", type=float, default=None,
                    help="learning rate for the repr optimizer (host encoder + "
                         "Gamma + compressor + memory).  The repr group is "
@@ -499,7 +517,10 @@ def main():
         memory_grad_probe=(not args.no_memory),
         grad_align_diag=args.grad_align_diag,
         rpbe_constrain=args.rpbe_constrain,
-        rpbe_kappa=args.rpbe_kappa)
+        rpbe_kappa=args.rpbe_kappa,
+        rpbe_constrain_mode=args.rpbe_constrain_mode,
+        rpbe_constrain_scope=args.rpbe_constrain_scope,
+        rpbe_constrain_probe=args.rpbe_constrain_probe)
 
     save_json(out / "config.json", {
         "data": "uci", "seed": args.seed, "arm": eff_arm,

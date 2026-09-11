@@ -55,6 +55,32 @@ def arm_kf_on(arm: str, lambda_kf: float) -> bool:
     return arm != "gamma_task_only" and lambda_kf > 0.0
 
 
+def _flat_grad(gs):
+    """Flatten a ``autograd.grad`` list into one vector (None entries are
+    absent — those params carry no gradient on this path)."""
+    parts = []
+    for g in gs:
+        if g is None:
+            continue
+        parts.append(g.detach().reshape(-1).float())
+    if not parts:
+        return None
+    return torch.cat(parts)
+
+
+def _grad_cosine(g1, g2):
+    """Cosine between two flat gradient lists; (cos, has1, has2)."""
+    a = _flat_grad(g1)
+    b = _flat_grad(g2)
+    if a is None or b is None:
+        return 0.0, False, False
+    an = float(a.norm())
+    bn = float(b.norm())
+    if an < 1e-12 or bn < 1e-12:
+        return 0.0, False, False
+    return float((a * b).sum() / (an * bn)), True, True
+
+
 class TGBPairLinkLoop:
     """One recursive TGN host + pair exact-replay trainer for one arm."""
 
@@ -70,7 +96,8 @@ class TGBPairLinkLoop:
                  context_mode="full", variant="full_balancing",
                  aux_kind="kyfan", aux_heads=None, aux_optimizer=None,
                  aux_lambda=None, calibrate_groups=0,
-                 memory_grad_probe=False):
+                 memory_grad_probe=False,
+                 conflict_gate=False, conflict_tau=0.0):
         self.tgn = tgn
         self.device = device
         self.batch_size = int(batch_size)
@@ -123,6 +150,18 @@ class TGBPairLinkLoop:
         self._mem_probe_done = False
         self._mem_probe_batches = 0
         self._mem_grad_norm = 0.0
+        # Conflict gate (reviewer item 5): when the auxiliary (RPBE) gradient
+        # on the repr params points AGAINST the task gradient, respect the
+        # task — the gate closes and the aux term contributes no gradient
+        # for the NEXT macro group.  Measured on the last batch of each
+        # group via autograd.grad on the (still-live) graphs; the straight-
+        # line surrogate is 0-valued but carries the adjoint direction, so
+        # both components are separable without a second backward.
+        self.conflict_gate = bool(conflict_gate)
+        self.conflict_tau = float(conflict_tau)
+        self._gate_open = True
+        self._gate_checks = 0
+        self._gate_conflicts = 0
         self.kf_on = self.aux_kind in ("kyfan", "rec", "pred") \
             and self.lambda_kf > 0
         self.fail_below = bool(fail_below)
@@ -536,7 +575,9 @@ class TGBPairLinkLoop:
                 link_loss, records = out
                 auxiliary = torch.zeros((), device=self.device)
                 terms = []  # reset per batch (stale-terms bug fix)
-                if self.kf_on and records and g_by_pos_all:
+                gate_aux = (self.kf_on and records and g_by_pos_all
+                            and (not self.conflict_gate or self._gate_open))
+                if gate_aux:
                     for r in records:
                         _grp_recs += 1
                         g = g_by_pos_all.get(r.pair_id)
@@ -553,6 +594,32 @@ class TGBPairLinkLoop:
                         n_aux_batches += 1
                         aux_terms_total += len(terms)
                         total_aux += float(auxiliary.detach())
+                # ---- conflict-gate probe: last batch of the group, BEFORE
+                # the backward, while both graphs are still live.  The
+                # straight-line surrogate is 0-valued, so the task and aux
+                # components separate cleanly through two autograd.grad
+                # calls (no .grad mutation, retain_graph keeps the graph
+                # for the real backward below).  The verdict applies to the
+                # NEXT macro group (one-group lag; conflict state is slow).
+                if (self.conflict_gate and self.kf_on and terms
+                        and b == group_end - 1 and self.repr_params):
+                    self._gate_checks += 1
+                    g_t = torch.autograd.grad(
+                        link_loss, self.repr_params,
+                        retain_graph=True, allow_unused=True)
+                    g_a = torch.autograd.grad(
+                        auxiliary, self.repr_params,
+                        retain_graph=True, allow_unused=True)
+                    cos, _h1, _h2 = _grad_cosine(g_t, g_a)
+                    self._gate_open = cos >= self.conflict_tau
+                    if not self._gate_open:
+                        self._gate_conflicts += 1
+                    print("[conflict-gate] group=%d cos=%.4f open=%s "
+                          "conflicts=%d/%d"
+                          % (group_start // self.kf_group_batches, cos,
+                             "T" if self._gate_open else "F",
+                             self._gate_conflicts, self._gate_checks),
+                          flush=True)
                 loss = link_loss + auxiliary
                 if self._comp_params:
                     if not _g_task_done and b == group_start:
@@ -613,6 +680,15 @@ class TGBPairLinkLoop:
             "comp_param_delta": gsum["comp_param_delta"],
             "mem_grad_norm": self._mem_grad_norm,
             "window_diag": list(self.window_diag),
+            "conflict_gate": {
+                "enabled": self.conflict_gate,
+                "tau": self.conflict_tau,
+                "checks": self._gate_checks,
+                "conflicts": self._gate_conflicts,
+                "open_rate": (1.0 - self._gate_conflicts
+                              / max(1, self._gate_checks))
+                if self._gate_checks else 1.0,
+            },
         }
 
     def _clip(self, params):

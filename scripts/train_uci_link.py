@@ -133,6 +133,16 @@ def parse_args():
                         "direction (-grad surrogate = +grad J) on the same "
                         "repr params; no gating, no modification of the "
                         "training update.")
+    p.add_argument("--rpbe-constrain", action="store_true",
+                   help="plan B (task-primary constrained RPBE): at each "
+                        "macro-group boundary project the task update into "
+                        "the RPBE half space — trigger iff cos(d_task, "
+                        "d_rpbe) < -kappa, then g_write = g_t + mu*g_a; "
+                        "otherwise the aux gradient is DISCARDED (pure task "
+                        "step).  Lambda-invariant.")
+    p.add_argument("--rpbe-kappa", type=float, default=0.05,
+                   help="dimensionless margin for --rpbe-constrain "
+                        "(0 = hard constraint; 0.05 = default gate).")
     p.add_argument("--repr-lr", type=float, default=None,
                    help="learning rate for the repr optimizer (host encoder + "
                         "Gamma + compressor + memory).  The repr group is "
@@ -480,7 +490,9 @@ def main():
         aux_kind=aux_kind, aux_heads=aux_heads,
         aux_optimizer=aux_optimizer, aux_lambda=aux_lambda,
         memory_grad_probe=(not args.no_memory),
-        grad_align_diag=args.grad_align_diag)
+        grad_align_diag=args.grad_align_diag,
+        rpbe_constrain=args.rpbe_constrain,
+        rpbe_kappa=args.rpbe_kappa)
 
     save_json(out / "config.json", {
         "data": "uci", "seed": args.seed, "arm": eff_arm,

@@ -101,7 +101,8 @@ class TGBPairLinkLoop:
                  aux_kind="kyfan", aux_heads=None, aux_optimizer=None,
                  aux_lambda=None, calibrate_groups=0,
                  memory_grad_probe=False,
-                 grad_align_diag=False):
+                 grad_align_diag=False,
+                 rpbe_constrain=False, rpbe_kappa=0.05):
         self.tgn = tgn
         self.device = device
         self.batch_size = int(batch_size)
@@ -170,6 +171,25 @@ class TGBPairLinkLoop:
         self.grad_align_diag = bool(grad_align_diag)
         self._ga_cos = []      # per-group update-direction cosines
         self._ga_ratios = []   # per-group ||d_rpbe|| / ||d_task||
+        # Plan B (task-primary constrained RPBE, reviewer-approved): at each
+        # macro-group boundary the task update direction t = -g_t is
+        # projected into the half space {(grad J)^T d >= -kappa||g_a||||g_t||}
+        # where g_a = grad L_aux = -lambda*group_k * grad J, so the trigger
+        #   g_a^T g_t < -kappa ||g_a|| ||g_t||
+        # and the write-back
+        #   g_write = g_t + mu * g_a,  mu = (-kappa||ga||||gt|| - ga^T gt)/||ga||^2
+        # are lambda-INVARIANT (the two lambda factors cancel).  When the
+        # trigger does not fire, the aux component is DISCARDED and the pure
+        # task gradient is used (d = t) — the orthogonal RPBE updates no
+        # longer pollute the step.  Head params never see the projection.
+        self.rpbe_constrain = bool(rpbe_constrain)
+        self.rpbe_kappa = float(rpbe_kappa)
+        self._cstr_task_acc = None   # per-repr-param task grad accumulators
+        self._cstr_aux_acc = None    # per-repr-param aux grad accumulators
+        self._cstr_snap = None       # per-batch task snapshot (aux = delta)
+        self._cstr_active = 0
+        self._cstr_groups = 0
+        self._cstr_corr_ratios = []
         self.kf_on = self.aux_kind in ("kyfan", "rec", "pred") \
             and self.lambda_kf > 0
         self.fail_below = bool(fail_below)
@@ -641,7 +661,33 @@ class TGBPairLinkLoop:
                               if terms else "", flush=True)
                         _tn, an = self.gauge_comp(link_loss, auxiliary)
                         self._gauge_group_aux.append(an)
-                loss.backward()
+                if self.rpbe_constrain:
+                    # Plan B: separate the two components so the group-end
+                    # projection can write back g_t + mu*g_a.  Task backward
+                    # first, snapshot repr grads, then the aux backward whose
+                    # repr delta is the aux component.  The straight-line
+                    # surrogate is 0-valued, so the loss VALUE is unchanged;
+                    # lambda cancels in the projection (scale-invariant).
+                    if self._cstr_task_acc is None:
+                        self._cstr_reset()
+                    link_loss.backward()
+                    for i, p in enumerate(self.repr_params):
+                        g = p.grad
+                        if g is None:
+                            self._cstr_snap[i] = None
+                            continue
+                        self._cstr_task_acc[i].add_(g)
+                        self._cstr_snap[i] = g.detach().clone()
+                    if terms:
+                        auxiliary.backward()
+                        for i, p in enumerate(self.repr_params):
+                            g = p.grad
+                            if g is None or self._cstr_snap[i] is None:
+                                continue
+                            self._cstr_aux_acc[i].add_(
+                                g - self._cstr_snap[i])
+                else:
+                    loss.backward()
                 self._probe_memory_grad()
                 self._clip(self.head_params)
                 if not self.calibrate:
@@ -656,6 +702,41 @@ class TGBPairLinkLoop:
                       % (group_start // self.kf_group_batches,
                          len(g_by_pos_all), _grp_recs, _grp_hits), flush=True)
             if self.repr_optimizer is not None and self.repr_params:
+                if self.rpbe_constrain and self._cstr_task_acc is not None:
+                    # Plan-B group-end projection on the accumulated
+                    # components (lambda-invariant; see __init__ note):
+                    #   trigger iff g_a^T g_t < -kappa ||g_a|| ||g_t||
+                    #   g_write = g_t + mu*g_a with
+                    #   mu = (-kappa||ga||||gt|| - ga^T gt) / ||ga||^2
+                    # otherwise g_write = g_t (aux discarded — d = t).
+                    gt = torch.cat([a.reshape(-1).float()
+                                    for a in self._cstr_task_acc])
+                    ga = torch.cat([a.reshape(-1).float()
+                                    for a in self._cstr_aux_acc])
+                    nt = float(gt.norm())
+                    na = float(ga.norm())
+                    s = float((ga * gt).sum())
+                    self._cstr_groups += 1
+                    active = False
+                    mu = 0.0
+                    if (na > 1e-12 and nt > 1e-12
+                            and s < -self.rpbe_kappa * na * nt):
+                        mu = (-self.rpbe_kappa * na * nt - s) / (na * na)
+                        active = True
+                        self._cstr_active += 1
+                        self._cstr_corr_ratios.append(
+                            float(mu * na / nt))
+                        print("[rpbe-constrain] group=%d kappa=%.2f "
+                              "cos=%.4f mu=%.3e corr/task=%.4f"
+                              % (group_start // self.kf_group_batches,
+                                 self.rpbe_kappa, s / (na * nt),
+                                 mu, mu * na / nt), flush=True)
+                    for a_t, a_a, p in zip(self._cstr_task_acc,
+                                           self._cstr_aux_acc,
+                                           self.repr_params):
+                        if p.grad is not None:
+                            p.grad.copy_(a_t + mu * a_a)
+                    self._cstr_reset()
                 for p in self.repr_params:
                     if p.grad is not None:
                         p.grad.div_(float(max(1, group_k)))
@@ -687,7 +768,26 @@ class TGBPairLinkLoop:
             "mem_grad_norm": self._mem_grad_norm,
             "window_diag": list(self.window_diag),
             "grad_align": self._grad_align_summary(),
+            "rpbe_constrain": {
+                "enabled": bool(self.rpbe_constrain),
+                "kappa": self.rpbe_kappa,
+                "groups": self._cstr_groups,
+                "active": self._cstr_active,
+                "active_rate": (self._cstr_active
+                                / max(1, self._cstr_groups)),
+                "mean_corr_ratio": (float(np.mean(self._cstr_corr_ratios))
+                                    if self._cstr_corr_ratios else None),
+            },
         }
+
+    def _cstr_reset(self):
+        """Zero the per-group task/aux gradient accumulators (plan B)."""
+        dev = self.device
+        self._cstr_task_acc = [torch.zeros_like(p, device=dev)
+                               for p in self.repr_params]
+        self._cstr_aux_acc = [torch.zeros_like(p, device=dev)
+                              for p in self.repr_params]
+        self._cstr_snap = [None] * len(self.repr_params)
 
     def _grad_align_summary(self):
         """Distribution summary of update-direction cosines (reviewer item

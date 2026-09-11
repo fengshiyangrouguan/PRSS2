@@ -268,6 +268,7 @@ class EmbodiedRPBEWindow:
         p = torch.stack([r.outcome.detach().cpu() for r in rs])
         w = torch.tensor([r.weight for r in rs], dtype=torch.float64)
         cut_ids = [r.cut_id for r in rs]
+        self.last_zpw = (z, p, w, cut_ids)   # kept for the mode-level audit
         fn = (dual_latent_z_adjoint if self.variant == "full_dual"
               else diag_latent_z_adjoint)
         j, g_by_cut, diag = fn(z, p, w, cut_ids, eps=self.eps, strict=self.strict)
@@ -303,6 +304,54 @@ class EmbodiedRPBEWindow:
         diag["n_unique_cuts"] = self.n_unique_cuts
         diag["n_unique_episodes"] = self.n_unique_episodes
         return j, g_by_cut, replay_inputs, diag
+
+
+def _mat_sqrt(A: torch.Tensor) -> torch.Tensor:
+    w, V = torch.linalg.eigh(A)
+    w = w.clamp(min=0.0)
+    return V @ torch.diag(w.sqrt()) @ V.t()
+
+
+def dual_latent_z_adjoint_modes(
+    z_detached: torch.Tensor, p: torch.Tensor, w: torch.Tensor,
+    cut_ids: List[tuple], eps: float = 1e-4, n_modes: int = 8,
+    strict: bool = False,
+):
+    """Component-wise decomposition of J into PREDICTIVE MODES.
+
+    J = tr(H_Z H_P) is decomposed as the spectrum of the symmetric
+    S = H_Z^{1/2} H_P H_Z^{1/2}: the eigenvalues J_k = rho_k^2 are the squared
+    canonical correlations between the memory states z and the future
+    outcomes p (the "predictive modes").  Returns
+    (modes, J) with modes[k] = (J_k, g_by_cut_k) where g_by_cut_k = dJ_k/dz
+    summed per cut.  Used to audit cos(g_{J_k}, g_task) per mode.
+    """
+    z = z_detached.clone().double().requires_grad_(True)
+    Xt, Qt, s_Z, s_P, D = _weighted_center_and_scale(z, p, w, cut_ids)
+    K_Z = Xt @ Xt.t()
+    K_P = Qt @ Qt.t()
+    H_Z = _hat(K_Z, eps, strict)
+    H_P = _hat(K_P, eps, strict)
+    if H_Z is None or H_P is None:
+        return {}, 0.0, {"failed": "cholesky"}
+    HZh = _mat_sqrt(H_Z)
+    S = HZh @ H_P @ HZh
+    lam, _ = torch.linalg.eigh(S)              # ascending, real
+    order = torch.argsort(lam, descending=True)
+    modes = {}
+    nm = min(n_modes, lam.shape[0])
+    for m in range(nm):
+        Jk = lam[order[m]]
+        try:
+            (g,) = torch.autograd.grad(Jk, z, retain_graph=True)
+        except Exception:
+            continue
+        g = g.detach().float()
+        gbc: Dict[tuple, torch.Tensor] = {}
+        for cid, gi in zip(cut_ids, g):
+            gbc[cid] = gbc.get(cid, torch.zeros_like(gi)) + gi
+        modes[m] = (float(Jk.detach()), gbc)
+    return modes, float(lam.clamp(min=0).sum().detach()), {"n_modes": len(modes)}
 
 
 def gamma_replay_loss(gamma, m_a: torch.Tensor, m_b: torch.Tensor,

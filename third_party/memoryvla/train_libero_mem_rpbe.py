@@ -51,7 +51,7 @@ from vla.datasets.hdf5_dataset import (  # noqa: E402
 
 from rpbe_embodied import (  # noqa: E402
     EmbodiedFixedMaps, EmbodiedRPBConfig, EmbodiedRPBEWindow,
-    PendingMergeQueue, gamma_replay_loss,
+    PendingMergeQueue, gamma_replay_loss, dual_latent_z_adjoint_modes,
 )
 
 
@@ -177,6 +177,11 @@ def parse_args() -> argparse.Namespace:
                    help="cut-block permutation null repetitions for the J gap "
                         "(calibration: >=128; formal training: 0 = off, avoids "
                         "the CPU Cholesky cost).")
+    p.add_argument("--rpbe-comp-audit", type=int, default=0,
+                   help="component-wise RPBE audit: for the first K RPBE "
+                        "window closes, decompose J into predictive modes "
+                        "(squared canonical correlations) and log "
+                        "cos(g_{J_k}, g_task) per mode.")
     return p.parse_args()
 
 
@@ -564,6 +569,7 @@ def main() -> None:
     micro_step = 0
     episodes_since_boundary = 0
     episodes_seen = 0         # total finished episodes (budget lock)
+    comp_audit_done = 0       # RPBE component-audit windows completed
     window_micro = 0          # micro-backwards since last gamma boundary
     boundary_pending = False  # repr threshold crossed; fire at fresh-episode top
     last_eid = None
@@ -625,8 +631,10 @@ def main() -> None:
         weight independent of episode length under the dense protocol."""
         nonlocal window, task_cotangents, rpbe_cotangents, rpbe_pending_loss
         nonlocal rpbe_input_map, rpbe_window_episodes
+        nonlocal comp_audit_done
         if not IS_GAMMA or vla.gamma is None:
             return
+        comp_zpw = None
 
         def _merge_fn(l, r):
             # single-node current-Gamma merge for fixed-trace rebuild
@@ -641,6 +649,7 @@ def main() -> None:
             if window.ready():
                 j, g_by_cut, rpbe_inputs, diag = window.close(
                     merge_fn=_merge_fn, n_perm=args.perm_null)
+                comp_zpw = getattr(window, "last_zpw", None)
                 if g_by_cut:
                     # key by cut_id directly; replay inputs are rebuilt with
                     # the CURRENT Gamma (no shared registry needed)
@@ -713,6 +722,70 @@ def main() -> None:
         # Blocker 2: opt_gamma step count is set by the TASK key count ALONE,
         # so gamma-task and gamma-rpbe step in lockstep; the rpbe keys are
         # distributed round-robin into those same n_mb buckets.
+        # ---- component-wise RPBE gradient-alignment audit ----
+        if (args.rpbe_comp_audit > 0 and comp_audit_done < args.rpbe_comp_audit
+                and comp_zpw is not None and rpbe_keys and task_keys):
+            z_, p_, w_, cids_ = comp_zpw
+            modes, Jsum, _md = dual_latent_z_adjoint_modes(
+                z_, p_, w_, cids_, eps=rpbe_cfg.ridge_eps, n_modes=8)
+            opt_gamma.zero_grad()
+            m_a = torch.stack([merge_registry[k].left_state
+                               for k in task_keys]).to("cuda", dtype=torch.bfloat16)
+            m_b = torch.stack([merge_registry[k].right_state
+                               for k in task_keys]).to("cuda", dtype=torch.bfloat16)
+            gamma_replay_loss(vla.gamma, m_a, m_b,
+                              task_cotangents, task_keys).backward()
+            gt = [p.grad.detach().clone() if p.grad is not None else None
+                  for p in gamma_params]
+            opt_gamma.zero_grad()
+            gt_n = sum(float(g.float().pow(2).sum())
+                       for g in gt if g is not None) ** 0.5
+            for mi, (Jk, gbc) in modes.items():
+                rk = [k for k in rpbe_keys if k in gbc]
+                if not rk:
+                    continue
+                m_ar = torch.stack([rpbe_input_map[k][0].to("cuda", dtype=torch.bfloat16)
+                                    for k in rk])
+                m_br = torch.stack([rpbe_input_map[k][1].to("cuda", dtype=torch.bfloat16)
+                                    for k in rk])
+                opt_gamma.zero_grad()
+                gamma_replay_loss(vla.gamma, m_ar, m_br, gbc, rk).backward()
+                gk = [p.grad.detach().clone() if p.grad is not None else None
+                      for p in gamma_params]
+                dot = sum(float((a.float() * b.float()).sum())
+                          for a, b in zip(gk, gt)
+                          if a is not None and b is not None)
+                gn = sum(float(a.float().pow(2).sum())
+                         for a in gk if a is not None) ** 0.5
+                cos = dot / (gn * gt_n + 1e-12)
+                print(f"[comp-audit] pv={vla.cog_mem_bank.param_version} "
+                      f"mode={mi} Jk={Jk:.5f} |gJk|={gn:.3e} "
+                      f"rel={gn/(gt_n+1e-12):.3f} cos_task={cos:+.3f}",
+                      flush=True)
+                # second-order intervention: theta += ±eps*ghat_k, measure task loss
+                if gn > 0 and fixed_batch is not None:
+                    eps = 0.05
+                    theta0 = [p.detach().clone() for p in gamma_params]
+                    L0 = _task_loss_on_batch(fixed_batch)
+                    for p, a in zip(gamma_params, gk):
+                        if a is not None:
+                            p.data.copy_(p.data + eps * a.float() / gn)
+                    Lp = _task_loss_on_batch(fixed_batch)
+                    for i, (p, a) in enumerate(zip(gamma_params, gk)):
+                        if a is not None:
+                            p.data.copy_(theta0[i] - eps * a.float() / gn)
+                    Lm = _task_loss_on_batch(fixed_batch)
+                    for i, p in enumerate(gamma_params):
+                        p.data.copy_(theta0[i])
+                    D2 = Lp + Lm - 2.0 * L0
+                    print(f"[interv] mode={mi} L0={L0:.6f} L+={Lp:.6f} "
+                          f"L-={Lm:.6f} D2={D2:+.6f}", flush=True)
+            opt_gamma.zero_grad()
+            comp_audit_done += 1
+            print(f"[comp-audit] window {comp_audit_done}/"
+                  f"{args.rpbe_comp_audit} J={Jsum:.3f} nmode={len(modes)}",
+                  flush=True)
+
         n_mb = max(1, (len(task_keys) + B - 1) // B)
         rpbe_buckets = [[] for _ in range(n_mb)]
         for i, k in enumerate(rpbe_keys):
@@ -941,6 +1014,38 @@ def main() -> None:
               f"fresh epoch (deterministic seed); bank/queue reset.", flush=True)
         assert optimizer_step < args.max_steps, \
             "resume point already at/past --max-steps; raise --max-steps"
+
+    # ---- fixed independent batch + task-loss evaluator (RPBE mode intervention) ----
+    fixed_batch = None
+
+    def _task_loss_on_batch(batch):
+        """Reg-head task loss on a FIXED batch under the CURRENT gamma params
+        (memory banks reset; no grad).  Used for the second-order intervention
+        along RPBE mode directions."""
+        vla.cog_mem_bank.reset(); vla.per_mem_bank.reset()
+        pv = batch["pixel_values"]
+        if isinstance(pv, dict):
+            pv = {k: v.to("cuda", dtype=torch.bfloat16) for k, v in pv.items()}
+        else:
+            pv = pv.to("cuda", dtype=torch.bfloat16)
+        with torch.no_grad():
+            with torch.autocast("cuda", dtype=torch.bfloat16, enabled=True):
+                loss, _ = vla(input_ids=batch["input_ids"].to("cuda"),
+                    attention_mask=batch["attention_mask"].to("cuda"),
+                    actions=batch["actions"].to("cuda", dtype=torch.bfloat16),
+                    action_masks=batch["action_masks"].to("cuda"),
+                    pixel_values=pv, labels=batch["labels"].to("cuda"),
+                    timesteps=batch["timesteps"], episode_ids=batch["episode_ids"],
+                    output_hidden_states=True, repeated_diffusion_steps=1)
+        return float(loss.item())
+
+    if args.rpbe_comp_audit > 0:
+        _ei = min(3, len(train_dataset.episodes) - 1)
+        _rows = [r for i, r in zip(range(args.batch_size),
+                                    train_dataset.iter_episode(_ei))]
+        fixed_batch = collator(_rows)
+        print(f"[interv] fixed eval batch: {len(_rows)} rows from episode {_ei}",
+              flush=True)
 
     # ---- main loop ----
     it = iter(train_loader)

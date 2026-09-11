@@ -10,6 +10,7 @@ from .loss import (  # noqa: F401
     diag_score,
     dual_full_score,
     dual_latent_z_adjoint,
+    dual_latent_z_adjoint_modes,
     gamma_replay_loss,
 )
 from .maps import EmbodiedFixedMaps  # noqa: F401

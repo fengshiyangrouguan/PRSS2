@@ -71,7 +71,18 @@ def parse_args():
     p.add_argument("--kappa", type=float, default=0.05,
                    help="project mode: per-tree dimensionless margin; a tree "
                         "with cos(g_i, -g_task) < -kappa is protected.  "
-                        "kappa=0 = hard per-tree constraint.")
+                        "kappa=0 = hard per-tree constraint (STRICTEST); "
+                        "kappa>=1 = never binds (== pure task).")
+    p.add_argument("--kappa-anneal-start", type=int, default=-1,
+                   help="project mode: step from which kappa starts to move "
+                        "(default -1 = never anneal).  Before it kappa=--kappa.")
+    p.add_argument("--kappa-anneal-end", type=int, default=-1,
+                   help="project mode: step at which kappa reaches "
+                        "--kappa-anneal-to (linear in between).")
+    p.add_argument("--kappa-anneal-to", type=float, default=1.0,
+                   help="project mode: kappa value at --kappa-anneal-end. "
+                        "Larger kappa = LOOSER (>=1 never binds == pure "
+                        "task); 0 would be the STRICTEST.")
     p.add_argument("--proj_iters", type=int, default=400,
                    help="project mode: FISTA iterations for the dual N x N QP.")
     p.add_argument("--z_dim", type=int, default=128)
@@ -532,6 +543,25 @@ def tree_wise_influence_grads(rpbe, by_oid, mb_rows_oids, mb_caches, device):
     return torch.stack(rows), len(rows)
 
 
+def kappa_at(step, kappa_max, start, end, kappa_to=1.0):
+    """kappa schedule for the per-tree guardrail.
+
+    kappa_max (e.g. 0.05) until ``start`` (step), then LINEARLY to ``kappa_to``
+    at ``end``.  NOTE the direction: in ``g_i.d >= -kappa*||g_i||*||t||`` a
+    LARGER kappa is LOOSER; kappa >= 1 never binds (== pure task), kappa = 0 is
+    the strictest.  start < 0 disables annealing (constant kappa_max)."""
+    if start is None or start < 0:
+        return float(kappa_max)
+    if step < start:
+        return float(kappa_max)
+    if end is None or end <= start:
+        return float(kappa_to)
+    if step >= end:
+        return float(kappa_to)
+    f = (float(step) - float(start)) / float(end - start)
+    return float(kappa_max) + f * (float(kappa_to) - float(kappa_max))
+
+
 def treewise_feasibility_projection(g_task_gamma, gamma_params, G, kappa,
                                     iters=400, min_norm=1e-9):
     """Tree-wise RPBE Feasibility Projection (final algorithm).
@@ -823,9 +853,14 @@ def main():
                         G, n_trees = tree_wise_influence_grads(
                             rpbe, by_oid, mb_rows_oids, mb_caches, device)
                         aux_terms = n_trees
+                        kap = kappa_at(step, args.kappa,
+                                       args.kappa_anneal_start,
+                                       args.kappa_anneal_end,
+                                       args.kappa_anneal_to)
                         proj = treewise_feasibility_projection(
-                            g_task_gamma, gamma_params, G, args.kappa,
+                            g_task_gamma, gamma_params, G, kap,
                             iters=args.proj_iters)
+                        proj["proj_kappa"] = float(kap)
                         g_vec = (G.sum(0) if G is not None
                                  else torch.zeros(1, device=device))
                         cos_g = float((torch.cat(

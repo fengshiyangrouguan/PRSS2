@@ -23,8 +23,9 @@ def _load(names):
     return ns
 
 
-_NS = _load({"treewise_feasibility_projection", "_fista_nonneg"})
+_NS = _load({"treewise_feasibility_projection", "_fista_nonneg", "kappa_at"})
 PROJ = _NS["treewise_feasibility_projection"]
+KAPPA_AT = _NS["kappa_at"]
 
 
 def _mk(n_trees, dim, seed, conflict):
@@ -123,6 +124,19 @@ def test_kappa_zero_is_hard_per_tree():
     assert float(slack.min()) > -1e-4
     if active.any():
         assert float(slack[active].abs().max()) < 1e-3, "hard: g.d = 0"
+
+
+def test_kappa_anneal_schedule():
+    """kappa holds until `start`, then goes LINEARLY to `to` at `end`.
+    Direction reminder: larger kappa = looser (>=1 never binds = pure task)."""
+    assert KAPPA_AT(0, 0.05, -1, -1) == 0.05          # no anneal
+    assert KAPPA_AT(69, 0.05, 70, 120, 1.0) == 0.05   # before start
+    assert abs(KAPPA_AT(95, 0.05, 70, 120, 1.0)
+               - (0.05 + 0.5 * 0.95)) < 1e-9          # midpoint
+    assert KAPPA_AT(120, 0.05, 70, 120, 1.0) == 1.0   # at end
+    assert KAPPA_AT(300, 0.05, 70, 120, 1.0) == 1.0   # after end
+    assert KAPPA_AT(95, 0.05, 70, 120, 0.0) < 0.05    # annealing DOWN is stricter
+    assert KAPPA_AT(200, 0.05, 70, 60, 1.0) == 1.0    # degenerate end<=start
 
 
 if __name__ == "__main__":

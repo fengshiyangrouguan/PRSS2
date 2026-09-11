@@ -1019,7 +1019,7 @@ class TGBPairLinkLoop:
                 ll, recs2 = res
                 L = ll if L is None else L + ll
                 for r in recs2:
-                    z_map[int(r.pair_id)] = r.z
+                    z_map[r.pair_id] = r.z
             if L is None:
                 continue
             u_task = _g(-L)
@@ -1040,7 +1040,7 @@ class TGBPairLinkLoop:
                     if j is None:
                         continue
                     for pos, g in g_pos.items():
-                        gmap[int(rl[pos].pair_id)] = g
+                        gmap[rl[pos].pair_id] = g
                 g_by_mask[mk] = gmap
             self.boundary_maps.clear_block_mask()
             # --- group-level
@@ -1055,7 +1055,7 @@ class TGBPairLinkLoop:
                 out["group_cos"][mk].append(_cos(_g(j), u_task) if j is not None
                                             else float("nan"))
             # --- tree-level (paired)
-            pid2tree = {int(r.pair_id): int(r.root_row) for r in recs_f}
+            pid2tree = {r.pair_id: int(r.root_row) for r in recs_f}
             trees = sorted({pid2tree[p] for mk in masks
                             for p in g_by_mask[mk] if p in pid2tree})
             if len(trees) > int(sample_trees):

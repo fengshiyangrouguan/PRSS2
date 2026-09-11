@@ -165,6 +165,15 @@ def parse_args():
                    help="abort at the FIRST below-threshold KF window "
                         "(fail-fast; calibration runs leave it off so "
                         "window_diag.jsonl records real yields)")
+    p.add_argument("--meas-norm", default="legacy",
+                   choices=["legacy", "blocknorm"],
+                   help="legacy = msg block scaled by 1e-3 (old default); "
+                        "blocknorm = per-block train-stat normalization + "
+                        "variance-normalized W_m (msg_scale->1.0)")
+    p.add_argument("--msg-proj-dist", default="",
+                   choices=["", "pm1", "normal"],
+                   help="msg projection distribution; '' = auto (pm1 for "
+                        "legacy, normal for blocknorm)")
     return p.parse_args()
 
 
@@ -296,10 +305,18 @@ def build_model(args, device):
     d_msg = int(ds.msg_dim)
     boundary_maps = BoundaryMaps(
         d_ctx=int(rpbe_cfg.d_c), d_event=int(rpbe_cfg.d_f), m=int(rpbe_cfg.m),
-        d_msg=d_msg, delta_t_scale=1.0, msg_scale=1e-3,
+        d_msg=d_msg, delta_t_scale=1.0,
+        msg_scale=(None if args.meas_norm == "blocknorm" else 1e-3),
+        scaling=args.meas_norm,
+        msg_proj_dist=(args.msg_proj_dist or None),
         num_counter_bins=4096, seed=int(args.rpbe_seed)).to(device)
     boundary_maps.message_for = lambda eid: torch.as_tensor(
         ds.edge_features[int(eid)], dtype=torch.float32, device=device)
+    if args.meas_norm == "blocknorm":
+        cal = boundary_maps.calibrate_block_scales(
+            train.destinations, train.timestamps, train.edge_idxs,
+            ds.edge_features)
+        print("block-norm calibration: {}".format(cal), flush=True)
     link_future_index = LinkFutureIndex(
         train.sources, train.destinations, train.timestamps,
         train.edge_idxs)

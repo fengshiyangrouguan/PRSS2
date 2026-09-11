@@ -72,9 +72,10 @@ def parse_args():
                         "correction fires only when cos(gJ, -g_task) < -kappa. "
                         "kappa=0 is the hard constraint.")
     p.add_argument("--j_floor", type=float, default=None,
-                   help="project mode: optional preservation floor J>=j_floor; "
-                        "boundary b=(j_floor-J_t)/lr.  Default None = pure "
-                        "local guardrail (no active raise).")
+                   help="project mode EXPERIMENTAL: optional extra hard floor "
+                        "S^2*(j_floor-J_t)/lr combined as "
+                        "b=max(b_kappa,b_floor).  Off by default; the kappa "
+                        "guardrail is the validated path.")
     p.add_argument("--z_dim", type=int, default=128)
     p.add_argument("--gamma_hidden", type=int, default=64)
     p.add_argument("--rpbe_seed", type=int, default=0)
@@ -484,11 +485,14 @@ def project_fp_guardrail(g_task_gamma, gamma_params, g_rpbe, boundary,
         d = t + mu*g,   mu = (boundary - g.t) / ||g||^2   if g.t < boundary
         d = t                                            otherwise,
 
-    written back as ``p.grad = g_task - mu*g`` so the optimizer's
-    ``theta -= lr*grad`` implements ``theta += lr*d``.  boundary =
-    -kappa*||g||*||t|| (local guardrail) or (j_floor - J_t)/lr (floor).
-    No +eps in the denominator (that would leave a systematic residual);
-    ||g|| too small -> no-op.  Returns diagnostics for the log."""
+    written back as ``p.grad = g_task - mu*g``.  This is a PRE-OPTIMIZER
+    GRADIENT guardrail: it constrains the raw gradient combination, NOT the
+    realized parameter step (AdamW's momentum and per-coordinate
+    preconditioning can change the actual displacement, so no post-optimizer
+    half-space is claimed).  boundary = -kappa*||g||*||t|| (scale-invariant)
+    or the S^2-scaled (j_floor - J_t)/lr (grads are still GradScaler-scaled by
+    S at this point).  No +eps in the denominator (that would leave a systematic
+    residual); ||g|| too small -> no-op.  Returns diagnostics for the log."""
     t = torch.cat([-x.flatten().float() for x in g_task_gamma])
     g = torch.cat([x.flatten().float() for x in g_rpbe])
     normg2 = float((g * g).sum())
@@ -525,6 +529,12 @@ def project_fp_guardrail(g_task_gamma, gamma_params, g_rpbe, boundary,
 
 def main():
     args = parse_args()
+    if args.rpbe_mode == "project" and args.calibrate_lambda:
+        raise ValueError(
+            "--calibrate_lambda is additive-mode only: it skips the optimizer "
+            "step and reports r_eff, and under --rpbe_mode project the "
+            "gradient delta is the projection correction, not an RPBE "
+            "gradient.  Use them separately.")
     seed_all(args.seed)
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
     out = Path(args.output)
@@ -759,10 +769,21 @@ def main():
                             if n_task_g > 0 and n_aux_g > 0 \
                             else float("nan")
                         lr_now = optimizer.param_groups[0]["lr"]
-                        boundary = (-args.kappa * float(n_task_g)
-                                    * float(n_aux_g)) \
-                            if args.j_floor is None else \
-                            (args.j_floor - j_closed) / max(lr_now, 1e-12)
+                        # grads are still GradScaler-scaled (loss*S -> grad*S),
+                        # so g.t and ||g||*||t|| are S^2-scaled.  The kappa
+                        # boundary is scale-invariant, but an absolute J_floor
+                        # must be scaled by S^2 to compare on the same footing
+                        # (otherwise it is silently shrunk by S^2).  j_floor is
+                        # an ADDITIONAL hard floor on top of the kappa guardrail:
+                        # b = max(b_kappa, b_floor).
+                        b_kappa = -args.kappa * float(n_task_g) \
+                            * float(n_aux_g)
+                        b_floor = float("-inf")
+                        if args.j_floor is not None:
+                            s2 = float(scaler.get_scale()) ** 2
+                            b_floor = s2 * (args.j_floor - j_closed) \
+                                / max(lr_now, 1e-12)
+                        boundary = max(b_kappa, b_floor)
                         proj = project_fp_guardrail(
                             g_task_gamma, gamma_params, g_rpbe, boundary)
                     else:

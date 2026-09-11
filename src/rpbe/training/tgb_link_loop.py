@@ -670,7 +670,8 @@ class TGBPairLinkLoop:
                     # lambda cancels in the projection (scale-invariant).
                     if self._cstr_task_acc is None:
                         self._cstr_reset()
-                    link_loss.backward()
+                    link_loss.backward(retain_graph=True)  # shared z->repr
+                    # subgraph must survive for the aux backward below
                     for i, p in enumerate(self.repr_params):
                         g = p.grad
                         if g is None:

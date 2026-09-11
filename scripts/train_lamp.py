@@ -59,7 +59,22 @@ def parse_args():
     p.add_argument("--max_length", type=int, default=1024)
     p.add_argument("--k", type=int, default=16)
     p.add_argument("--kf_lambda", type=float, default=0.0,
-                   help="RPBE lambda (ours arm); calibrated by r_eff rule")
+                   help="RPBE lambda (ours arm, additive mode); calibrated by "
+                        "r_eff rule")
+    p.add_argument("--rpbe_mode", choices=["additive", "project"],
+                   default="additive",
+                   help="additive = loss += -lambda*J (current); project = "
+                        "task-primary half-space guardrail: Gamma task grad is "
+                        "projected so gJ.d >= b (b=-kappa|g||t|, or the "
+                        "J_floor boundary).  Only Gamma (repr) is projected.")
+    p.add_argument("--kappa", type=float, default=0.05,
+                   help="project mode: dimensionless guardrail margin; the "
+                        "correction fires only when cos(gJ, -g_task) < -kappa. "
+                        "kappa=0 is the hard constraint.")
+    p.add_argument("--j_floor", type=float, default=None,
+                   help="project mode: optional preservation floor J>=j_floor; "
+                        "boundary b=(j_floor-J_t)/lr.  Default None = pure "
+                        "local guardrail (no active raise).")
     p.add_argument("--z_dim", type=int, default=128)
     p.add_argument("--gamma_hidden", type=int, default=64)
     p.add_argument("--rpbe_seed", type=int, default=0)
@@ -459,6 +474,55 @@ def gamma_replay_surrogate(rpbe, by_oid, mb_rows_oids, mb_caches, lam,
     return -lam * aux, n_terms
 
 
+def project_fp_guardrail(g_task_gamma, gamma_params, g_rpbe, boundary,
+                         min_norm2=1e-24):
+    """Plan B: task-primary half-space guardrail on the Gamma (repr) scope.
+
+    t = -g_task is the task descent direction; g = g_rpbe is the RPBE ascent
+    gradient (dJ/dGamma, obtained from the surrogate with lam=1).  Choose
+
+        d = t + mu*g,   mu = (boundary - g.t) / ||g||^2   if g.t < boundary
+        d = t                                            otherwise,
+
+    written back as ``p.grad = g_task - mu*g`` so the optimizer's
+    ``theta -= lr*grad`` implements ``theta += lr*d``.  boundary =
+    -kappa*||g||*||t|| (local guardrail) or (j_floor - J_t)/lr (floor).
+    No +eps in the denominator (that would leave a systematic residual);
+    ||g|| too small -> no-op.  Returns diagnostics for the log."""
+    t = torch.cat([-x.flatten().float() for x in g_task_gamma])
+    g = torch.cat([x.flatten().float() for x in g_rpbe])
+    normg2 = float((g * g).sum())
+    ng = float(g.norm())
+    nt = float(t.norm())
+    s = float((g * t).sum())                     # g.t  (gJ_dot_d_before)
+    diag = {
+        "proj_s": s,
+        "proj_boundary": float(boundary),
+        "proj_norm_t": nt,
+        "proj_norm_g": ng,
+        "proj_cos": (s / (ng * nt)) if (ng > 0 and nt > 0) else float("nan"),
+        "proj_active": False,
+        "proj_mu": 0.0,
+        "proj_corr_ratio": 0.0,
+        "proj_gJ_dot_d_before": s,
+        "proj_gJ_dot_d_after": s,                # == g.t when inactive
+        "proj_task_dot_d_after": nt * nt,
+    }
+    if normg2 <= min_norm2 or ng == 0.0:
+        return diag
+    if s < boundary:
+        mu = (boundary - s) / normg2             # > 0
+        with torch.no_grad():
+            for p, gt, gj in zip(gamma_params, g_task_gamma, g_rpbe):
+                p.grad = gt - mu * gj
+        diag["proj_active"] = True
+        diag["proj_mu"] = float(mu)
+        diag["proj_corr_ratio"] = float(mu * ng / max(nt, 1e-12))
+        diag["proj_gJ_dot_d_after"] = float(s + mu * normg2)   # == boundary
+        diag["proj_task_dot_d_after"] = float(nt * nt + mu * s)
+    return diag
+
+
 def main():
     args = parse_args()
     seed_all(args.seed)
@@ -658,7 +722,8 @@ def main():
                 # the all-params r_eff at theta_0 (no param update).
                 g_task_all = None
                 g_task_gamma = None
-                if args.calibrate_lambda or gamma_params:
+                if args.calibrate_lambda or gamma_params \
+                        or args.rpbe_mode == "project":
                     g_task_all = [p.grad.detach().clone()
                                   if p.grad is not None
                                   else torch.zeros_like(p)
@@ -667,27 +732,50 @@ def main():
                                     if p.grad is not None
                                     else torch.zeros_like(p)
                                     for p in gamma_params]
+                # additive: loss += -lam*J.  project: use lam=1 only to get
+                # g = dJ/dGamma, then overwrite the Gamma grad below.
+                lam_aux = 1.0 if args.rpbe_mode == "project" \
+                    else args.kf_lambda
                 aux, aux_terms = gamma_replay_surrogate(
-                    rpbe, by_oid, mb_rows_oids, mb_caches,
-                    args.kf_lambda, device)
+                    rpbe, by_oid, mb_rows_oids, mb_caches, lam_aux, device)
                 if aux_terms:
                     scaler.scale(aux).backward()
                 calib = {}
                 gdiag = {}
+                proj = {}
                 if g_task_gamma:
-                    g_tot_gamma = [p.grad.detach().clone()
-                                   for p in gamma_params]
-                    g_aux_gamma = [(t - g0).flatten().float()
-                                   for t, g0 in zip(g_tot_gamma,
-                                                    g_task_gamma)]
-                    g_task_g = torch.cat(
-                        [g.flatten().float() for g in g_task_gamma])
-                    g_aux_g = torch.cat(g_aux_gamma)
-                    n_task_g = g_task_g.norm()
-                    n_aux_g = g_aux_g.norm()
-                    cos_g = float((g_task_g * g_aux_g).sum()
-                                  / max(n_task_g * n_aux_g, 1e-12)) \
-                        if n_task_g > 0 and n_aux_g > 0 else float("nan")
+                    n_task_g = torch.cat(
+                        [g.flatten().float() for g in g_task_gamma]).norm()
+                    if args.rpbe_mode == "project":
+                        # g_rpbe = dJ/dGamma  (p.grad = g_task - lam_aux*g)
+                        g_rpbe = [g0 - p.grad.detach().clone()
+                                  for g0, p in zip(g_task_gamma,
+                                                   gamma_params)]
+                        gG = torch.cat([x.flatten().float() for x in g_rpbe])
+                        n_aux_g = gG.norm()
+                        cos_g = float((torch.cat(
+                            [(-g).flatten().float() for g in g_task_gamma])
+                            * gG).sum() / max(n_task_g * n_aux_g, 1e-12)) \
+                            if n_task_g > 0 and n_aux_g > 0 \
+                            else float("nan")
+                        lr_now = optimizer.param_groups[0]["lr"]
+                        boundary = (-args.kappa * float(n_task_g)
+                                    * float(n_aux_g)) \
+                            if args.j_floor is None else \
+                            (args.j_floor - j_closed) / max(lr_now, 1e-12)
+                        proj = project_fp_guardrail(
+                            g_task_gamma, gamma_params, g_rpbe, boundary)
+                    else:
+                        g_aux = torch.cat([(p.grad.detach().clone()
+                                            - g0).flatten().float()
+                                           for g0, p in zip(g_task_gamma,
+                                                            gamma_params)])
+                        n_aux_g = g_aux.norm()
+                        cos_g = float((torch.cat(
+                            [g.flatten().float() for g in g_task_gamma])
+                            * g_aux).sum() / max(n_task_g * n_aux_g, 1e-12)) \
+                            if n_task_g > 0 and n_aux_g > 0 \
+                            else float("nan")
                     gdiag = {
                         "g_gamma_task": float(n_task_g),
                         "g_gamma_aux": float(n_aux_g),
@@ -717,6 +805,7 @@ def main():
                     rec = {
                         "step": step, "event": "window_close",
                         "J_ens": j_closed, "aux_terms": aux_terms,
+                        "rpbe_mode": args.rpbe_mode,
                         "M_unique_trees": d0.get("M_unique_trees"),
                         "alpha_z": d0.get("alpha_z"),
                         "alpha_p": d0.get("alpha_p"),
@@ -728,6 +817,8 @@ def main():
                             z_norm_acc / max(z_norm_n, 1)),
                     }
                     rec.update(gdiag)
+                    if proj:
+                        rec.update(proj)
                     if calib:
                         rec.update(calib)
                     f.write(json.dumps(rec) + "\n")

@@ -64,18 +64,16 @@ def parse_args():
     p.add_argument("--rpbe_mode", choices=["additive", "project"],
                    default="additive",
                    help="additive = loss += -lambda*J (current); project = "
-                        "task-primary half-space guardrail: Gamma task grad is "
-                        "projected so gJ.d >= b (b=-kappa|g||t|, or the "
-                        "J_floor boundary).  Only Gamma (repr) is projected.")
+                        "Tree-wise RPBE Feasibility Projection: per-tree "
+                        "influence grads g_i give N half-space constraints "
+                        "g_i.d >= -kappa*||g_i||*||t|| solved jointly; only "
+                        "Gamma (.grad) is replaced.")
     p.add_argument("--kappa", type=float, default=0.05,
-                   help="project mode: dimensionless guardrail margin; the "
-                        "correction fires only when cos(gJ, -g_task) < -kappa. "
-                        "kappa=0 is the hard constraint.")
-    p.add_argument("--j_floor", type=float, default=None,
-                   help="project mode EXPERIMENTAL: optional extra hard floor "
-                        "S^2*(j_floor-J_t)/lr combined as "
-                        "b=max(b_kappa,b_floor).  Off by default; the kappa "
-                        "guardrail is the validated path.")
+                   help="project mode: per-tree dimensionless margin; a tree "
+                        "with cos(g_i, -g_task) < -kappa is protected.  "
+                        "kappa=0 = hard per-tree constraint.")
+    p.add_argument("--proj_iters", type=int, default=400,
+                   help="project mode: FISTA iterations for the dual N x N QP.")
     p.add_argument("--z_dim", type=int, default=128)
     p.add_argument("--gamma_hidden", type=int, default=64)
     p.add_argument("--rpbe_seed", type=int, default=0)
@@ -475,55 +473,119 @@ def gamma_replay_surrogate(rpbe, by_oid, mb_rows_oids, mb_caches, lam,
     return -lam * aux, n_terms
 
 
-def project_fp_guardrail(g_task_gamma, gamma_params, g_rpbe, boundary,
-                         min_norm2=1e-24):
-    """Plan B: task-primary half-space guardrail on the Gamma (repr) scope.
+def _fista_nonneg(Q, c, iters):
+    """min_{mu>=0} 1/2 mu^T Q mu - c^T mu  (Q PSD) by accelerated projected GD.
 
-    t = -g_task is the task descent direction; g = g_rpbe is the RPBE ascent
-    gradient (dJ/dGamma, obtained from the surrogate with lam=1).  Choose
+    Tiny (N x N, N~128) dual of the tree-wise feasibility QP."""
+    L = float(torch.linalg.eigvalsh(Q).max().clamp(min=1e-12))
+    mu = torch.zeros_like(c)
+    y = mu.clone()
+    tk = 1.0
+    for _ in range(iters):
+        grad = Q @ y - c
+        mu_new = torch.clamp(y - grad / L, min=0.0)
+        tk_new = 0.5 * (1.0 + math.sqrt(1.0 + 4.0 * tk * tk))
+        y = mu_new + ((tk - 1.0) / tk_new) * (mu_new - mu)
+        mu, tk = mu_new, tk_new
+    return mu
 
-        d = t + mu*g,   mu = (boundary - g.t) / ||g||^2   if g.t < boundary
-        d = t                                            otherwise,
 
-    written back as ``p.grad = g_task - mu*g``.  This is a PRE-OPTIMIZER
-    GRADIENT guardrail: it constrains the raw gradient combination, NOT the
-    realized parameter step (AdamW's momentum and per-coordinate
-    preconditioning can change the actual displacement, so no post-optimizer
-    half-space is claimed).  boundary = -kappa*||g||*||t|| (scale-invariant)
-    or the S^2-scaled (j_floor - J_t)/lr (grads are still GradScaler-scaled by
-    S at this point).  No +eps in the denominator (that would leave a systematic
-    residual); ||g|| too small -> no-op.  Returns diagnostics for the log."""
+def tree_wise_influence_grads(rpbe, by_oid, mb_rows_oids, mb_caches, device):
+    """Per-tree RPBE influence gradients g_i = (dz_i/dGamma)^T a_i.
+
+    The window's J is estimated JOINTLY (4-branch mean over the 128 trees);
+    each tree's adjoint a_i comes from that jointly-estimated window (it is the
+    tree's effect ON the joint J, not its own J_i).  The Gamma gradient is then
+    taken per tree -- never summed -- so the pair-wise geometry between trees
+    survives.  Returns a [N, |Gamma|] fp32 tensor (or None, 0)."""
+    from rpbe.llm.mem_lift import JMemLift
+    gammas = rpbe["gammas"]
+    gparams = [p for g in gammas for p in g.parameters()]
+    n_layers = rpbe["n_layers"]
+    rows = []
+    for mb_idx, oids in enumerate(mb_rows_oids):
+        for b, oid in enumerate(oids):
+            g = by_oid.get(oid)
+            if g is None:
+                continue
+            g_s = rpbe["adapter"].j_mem.transpose(g.unsqueeze(0))
+            k_g, v_g = JMemLift.unpack_sum_mem(
+                g_s, n_layers=n_layers, n_heads=rpbe["n_heads"],
+                n_slots=N_TOK, kv_pairs=2, head_dim=rpbe["head_dim"])
+            cache = mb_caches[mb_idx]
+            term = None
+            for li in range(n_layers):
+                x_k, x_v, _pos = cache[li]
+                res_k = gammas[li](x_k[b:b + 1], x_k[b:b + 1])
+                res_v = gammas[li](x_v[b:b + 1], x_v[b:b + 1])
+                part = (k_g[li] * res_k).sum() + (v_g[li] * res_v).sum()
+                term = part if term is None else term + part
+            if term is None:
+                continue
+            grads = torch.autograd.grad(term, gparams, retain_graph=False,
+                                        allow_unused=True)
+            rows.append(torch.cat([
+                (gr if gr is not None else torch.zeros_like(p)).reshape(-1)
+                for gr, p in zip(grads, gparams)]))
+    if not rows:
+        return None, 0
+    return torch.stack(rows), len(rows)
+
+
+def treewise_feasibility_projection(g_task_gamma, gamma_params, G, kappa,
+                                    iters=400, min_norm=1e-9):
+    """Tree-wise RPBE Feasibility Projection (final algorithm).
+
+    One global task direction t = -g_task; each valid tree i contributes a
+    half-space g_i.d >= -kappa*||g_i||*||t||.  Solve
+
+        d* = argmin_d 1/2||d - t||^2   s.t.  G d >= b,  b_i=-kappa||g_i||.||t||
+
+    through the N x N dual (mu >= 0): d* = t + sum_i mu_i g_i.  Writes ONLY
+    Gamma: p.grad = -d* = g_task - sum_i mu_i g_i.
+
+    This is a PRE-OPTIMIZER constraint on the raw gradient combination; it does
+    NOT claim AdamW's realized displacement lies in the half-space.  All
+    constraints enter the QP (a repair for tree 1 may otherwise push tree 7
+    into violation); inactive ones simply get mu=0."""
+    sizes = [p.numel() for p in gamma_params]
     t = torch.cat([-x.flatten().float() for x in g_task_gamma])
-    g = torch.cat([x.flatten().float() for x in g_rpbe])
-    normg2 = float((g * g).sum())
-    ng = float(g.norm())
     nt = float(t.norm())
-    s = float((g * t).sum())                     # g.t  (gJ_dot_d_before)
-    diag = {
-        "proj_s": s,
-        "proj_boundary": float(boundary),
-        "proj_norm_t": nt,
-        "proj_norm_g": ng,
-        "proj_cos": (s / (ng * nt)) if (ng > 0 and nt > 0) else float("nan"),
-        "proj_active": False,
-        "proj_mu": 0.0,
-        "proj_corr_ratio": 0.0,
-        "proj_gJ_dot_d_before": s,
-        "proj_gJ_dot_d_after": s,                # == g.t when inactive
-        "proj_task_dot_d_after": nt * nt,
-    }
-    if normg2 <= min_norm2 or ng == 0.0:
+    diag = {"proj_n_trees": int(G.shape[0]) if G is not None else 0,
+            "proj_n_valid": 0, "proj_n_active_init": 0, "proj_n_mu_pos": 0,
+            "proj_norm_t": nt, "proj_corr_ratio": 0.0, "proj_cos_min": 0.0,
+            "proj_min_slack_after": float("nan"),
+            "proj_max_viol_before": 0.0}
+    if G is None or G.numel() == 0 or nt == 0.0:
         return diag
-    if s < boundary:
-        mu = (boundary - s) / normg2             # > 0
-        with torch.no_grad():
-            for p, gt, gj in zip(gamma_params, g_task_gamma, g_rpbe):
-                p.grad = gt - mu * gj
-        diag["proj_active"] = True
-        diag["proj_mu"] = float(mu)
-        diag["proj_corr_ratio"] = float(mu * ng / max(nt, 1e-12))
-        diag["proj_gJ_dot_d_after"] = float(s + mu * normg2)   # == boundary
-        diag["proj_task_dot_d_after"] = float(nt * nt + mu * s)
+    Gf = G.flatten(1).float()
+    ng = Gf.norm(dim=1)
+    valid = ng > min_norm
+    if not bool(valid.any()):
+        return diag
+    Gv = Gf[valid]
+    ngv = ng[valid]
+    Gt = Gv @ t
+    b = -kappa * ngv * nt
+    cos_init = Gt / (ngv * nt)
+    diag["proj_n_valid"] = int(Gv.shape[0])
+    diag["proj_n_active_init"] = int((cos_init < -kappa).sum())
+    diag["proj_cos_min"] = float(cos_init.min())
+    diag["proj_max_viol_before"] = float(
+        torch.clamp(cos_init + kappa, min=0.0).max())
+    Q = Gv @ Gv.t()
+    c = b - Gt
+    mu = _fista_nonneg(Q, c, iters)
+    corr = Gv.t() @ mu                 # = sum_i mu_i g_i  (= d* - t)
+    d = t + corr
+    with torch.no_grad():
+        for p, cp, gt in zip(gamma_params, torch.split(corr, sizes),
+                             g_task_gamma):
+            p.grad = gt - cp.view_as(p)   # grad = -d* = g_task - sum_i mu_i g_i
+    slack = Gv @ d - b
+    diag["proj_n_mu_pos"] = int((mu > 1e-8).sum())
+    diag["proj_min_slack_after"] = float(slack.min())
+    diag["proj_corr_ratio"] = float((d - t).norm() / max(nt, 1e-12))
     return diag
 
 
@@ -742,14 +804,15 @@ def main():
                                     if p.grad is not None
                                     else torch.zeros_like(p)
                                     for p in gamma_params]
-                # additive: loss += -lam*J.  project: use lam=1 only to get
-                # g = dJ/dGamma, then overwrite the Gamma grad below.
-                lam_aux = 1.0 if args.rpbe_mode == "project" \
-                    else args.kf_lambda
-                aux, aux_terms = gamma_replay_surrogate(
-                    rpbe, by_oid, mb_rows_oids, mb_caches, lam_aux, device)
-                if aux_terms:
-                    scaler.scale(aux).backward()
+                # additive: loss += -lam*J.  project: per-tree influence
+                # gradients -> tree-wise feasibility projection (no aux loss).
+                aux_terms = 0
+                if args.rpbe_mode == "additive":
+                    aux, aux_terms = gamma_replay_surrogate(
+                        rpbe, by_oid, mb_rows_oids, mb_caches,
+                        args.kf_lambda, device)
+                    if aux_terms:
+                        scaler.scale(aux).backward()
                 calib = {}
                 gdiag = {}
                 proj = {}
@@ -757,46 +820,32 @@ def main():
                     n_task_g = torch.cat(
                         [g.flatten().float() for g in g_task_gamma]).norm()
                     if args.rpbe_mode == "project":
-                        # g_rpbe = dJ/dGamma  (p.grad = g_task - lam_aux*g)
-                        g_rpbe = [g0 - p.grad.detach().clone()
-                                  for g0, p in zip(g_task_gamma,
-                                                   gamma_params)]
-                        gG = torch.cat([x.flatten().float() for x in g_rpbe])
-                        n_aux_g = gG.norm()
+                        G, n_trees = tree_wise_influence_grads(
+                            rpbe, by_oid, mb_rows_oids, mb_caches, device)
+                        aux_terms = n_trees
+                        proj = treewise_feasibility_projection(
+                            g_task_gamma, gamma_params, G, args.kappa,
+                            iters=args.proj_iters)
+                        g_vec = (G.sum(0) if G is not None
+                                 else torch.zeros(1, device=device))
                         cos_g = float((torch.cat(
                             [(-g).flatten().float() for g in g_task_gamma])
-                            * gG).sum() / max(n_task_g * n_aux_g, 1e-12)) \
-                            if n_task_g > 0 and n_aux_g > 0 \
+                            * g_vec).sum()
+                            / max(n_task_g * g_vec.norm(), 1e-12)) \
+                            if n_task_g > 0 and g_vec.norm() > 0 \
                             else float("nan")
-                        lr_now = optimizer.param_groups[0]["lr"]
-                        # grads are still GradScaler-scaled (loss*S -> grad*S),
-                        # so g.t and ||g||*||t|| are S^2-scaled.  The kappa
-                        # boundary is scale-invariant, but an absolute J_floor
-                        # must be scaled by S^2 to compare on the same footing
-                        # (otherwise it is silently shrunk by S^2).  j_floor is
-                        # an ADDITIONAL hard floor on top of the kappa guardrail:
-                        # b = max(b_kappa, b_floor).
-                        b_kappa = -args.kappa * float(n_task_g) \
-                            * float(n_aux_g)
-                        b_floor = float("-inf")
-                        if args.j_floor is not None:
-                            s2 = float(scaler.get_scale()) ** 2
-                            b_floor = s2 * (args.j_floor - j_closed) \
-                                / max(lr_now, 1e-12)
-                        boundary = max(b_kappa, b_floor)
-                        proj = project_fp_guardrail(
-                            g_task_gamma, gamma_params, g_rpbe, boundary)
                     else:
-                        g_aux = torch.cat([(p.grad.detach().clone()
+                        g_vec = torch.cat([(p.grad.detach().clone()
                                             - g0).flatten().float()
                                            for g0, p in zip(g_task_gamma,
                                                             gamma_params)])
-                        n_aux_g = g_aux.norm()
                         cos_g = float((torch.cat(
                             [g.flatten().float() for g in g_task_gamma])
-                            * g_aux).sum() / max(n_task_g * n_aux_g, 1e-12)) \
-                            if n_task_g > 0 and n_aux_g > 0 \
+                            * g_vec).sum()
+                            / max(n_task_g * g_vec.norm(), 1e-12)) \
+                            if n_task_g > 0 and g_vec.norm() > 0 \
                             else float("nan")
+                    n_aux_g = g_vec.norm()
                     gdiag = {
                         "g_gamma_task": float(n_task_g),
                         "g_gamma_aux": float(n_aux_g),

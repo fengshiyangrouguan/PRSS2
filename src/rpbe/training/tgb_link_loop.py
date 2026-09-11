@@ -97,7 +97,7 @@ class TGBPairLinkLoop:
                  aux_kind="kyfan", aux_heads=None, aux_optimizer=None,
                  aux_lambda=None, calibrate_groups=0,
                  memory_grad_probe=False,
-                 conflict_gate=False, conflict_tau=0.0):
+                 grad_align_diag=False):
         self.tgn = tgn
         self.device = device
         self.batch_size = int(batch_size)
@@ -150,18 +150,22 @@ class TGBPairLinkLoop:
         self._mem_probe_done = False
         self._mem_probe_batches = 0
         self._mem_grad_norm = 0.0
-        # Conflict gate (reviewer item 5): when the auxiliary (RPBE) gradient
-        # on the repr params points AGAINST the task gradient, respect the
-        # task — the gate closes and the aux term contributes no gradient
-        # for the NEXT macro group.  Measured on the last batch of each
-        # group via autograd.grad on the (still-live) graphs; the straight-
-        # line surrogate is 0-valued but carries the adjoint direction, so
-        # both components are separable without a second backward.
-        self.conflict_gate = bool(conflict_gate)
-        self.conflict_tau = float(conflict_tau)
-        self._gate_open = True
-        self._gate_checks = 0
-        self._gate_conflicts = 0
+        # Gradient-alignment DIAGNOSTIC (reviewer item 5, phase 3 — record
+        # only, never gate).  Measures, per macro group, the cosine between
+        # the TASK update direction and the RPBE update direction on the
+        # same repr params, same batch, same theta:
+        #
+        #   d_task  = -g_t            (L_link is minimized)
+        #   d_rpbe  = -g_a ∝ +grad J  (the surrogate minimizes -lambda*J;
+        #                               g_a = -lambda*group_k * grad_theta J)
+        #
+        # Both objectives are MINIMIZED, so cos(d_task, d_rpbe) equals
+        # cos(g_t, g_a) — the two sign flips cancel — and we record
+        # cos(g_t, g_a) directly.  Do NOT read this cosine as
+        # cos(grad L_task, grad J): that pair would flip the sign.
+        self.grad_align_diag = bool(grad_align_diag)
+        self._ga_cos = []      # per-group update-direction cosines
+        self._ga_ratios = []   # per-group ||d_rpbe|| / ||d_task||
         self.kf_on = self.aux_kind in ("kyfan", "rec", "pred") \
             and self.lambda_kf > 0
         self.fail_below = bool(fail_below)
@@ -575,9 +579,7 @@ class TGBPairLinkLoop:
                 link_loss, records = out
                 auxiliary = torch.zeros((), device=self.device)
                 terms = []  # reset per batch (stale-terms bug fix)
-                gate_aux = (self.kf_on and records and g_by_pos_all
-                            and (not self.conflict_gate or self._gate_open))
-                if gate_aux:
+                if self.kf_on and records and g_by_pos_all:
                     for r in records:
                         _grp_recs += 1
                         g = g_by_pos_all.get(r.pair_id)
@@ -594,16 +596,15 @@ class TGBPairLinkLoop:
                         n_aux_batches += 1
                         aux_terms_total += len(terms)
                         total_aux += float(auxiliary.detach())
-                # ---- conflict-gate probe: last batch of the group, BEFORE
-                # the backward, while both graphs are still live.  The
-                # straight-line surrogate is 0-valued, so the task and aux
-                # components separate cleanly through two autograd.grad
-                # calls (no .grad mutation, retain_graph keeps the graph
-                # for the real backward below).  The verdict applies to the
-                # NEXT macro group (one-group lag; conflict state is slow).
-                if (self.conflict_gate and self.kf_on and terms
+                # ---- grad-align probe: last batch of the group, BEFORE the
+                # backward, while both graphs are still live.  The
+                # straight-line surrogate is 0-valued but carries the
+                # adjoint direction, so the two components separate through
+                # two autograd.grad calls (no .grad mutation; retain_graph
+                # keeps the graphs for the real backward below).  Record
+                # only — the training update is never modified.
+                if (self.grad_align_diag and self.kf_on and terms
                         and b == group_end - 1 and self.repr_params):
-                    self._gate_checks += 1
                     g_t = torch.autograd.grad(
                         link_loss, self.repr_params,
                         retain_graph=True, allow_unused=True)
@@ -611,15 +612,16 @@ class TGBPairLinkLoop:
                         auxiliary, self.repr_params,
                         retain_graph=True, allow_unused=True)
                     cos, _h1, _h2 = _grad_cosine(g_t, g_a)
-                    self._gate_open = cos >= self.conflict_tau
-                    if not self._gate_open:
-                        self._gate_conflicts += 1
-                    print("[conflict-gate] group=%d cos=%.4f open=%s "
-                          "conflicts=%d/%d"
+                    ft = _flat_grad(g_t)
+                    fa = _flat_grad(g_a)
+                    nt = float(ft.norm()) if ft is not None else 0.0
+                    na = float(fa.norm()) if fa is not None else 0.0
+                    ratio = na / nt if nt > 1e-12 else float("nan")
+                    self._ga_cos.append(cos)
+                    self._ga_ratios.append(ratio)
+                    print("[grad-align] group=%d cos=%.4f ratio=%.4f"
                           % (group_start // self.kf_group_batches, cos,
-                             "T" if self._gate_open else "F",
-                             self._gate_conflicts, self._gate_checks),
-                          flush=True)
+                             ratio), flush=True)
                 loss = link_loss + auxiliary
                 if self._comp_params:
                     if not _g_task_done and b == group_start:
@@ -680,15 +682,33 @@ class TGBPairLinkLoop:
             "comp_param_delta": gsum["comp_param_delta"],
             "mem_grad_norm": self._mem_grad_norm,
             "window_diag": list(self.window_diag),
-            "conflict_gate": {
-                "enabled": self.conflict_gate,
-                "tau": self.conflict_tau,
-                "checks": self._gate_checks,
-                "conflicts": self._gate_conflicts,
-                "open_rate": (1.0 - self._gate_conflicts
-                              / max(1, self._gate_checks))
-                if self._gate_checks else 1.0,
-            },
+            "grad_align": self._grad_align_summary(),
+        }
+
+    def _grad_align_summary(self):
+        """Distribution summary of update-direction cosines (reviewer item
+        5: mean / median / P(>0) / P(<0) / three bins / norm ratios)."""
+        if not self._ga_cos:
+            return {"enabled": bool(self.grad_align_diag), "checks": 0}
+        cs = np.asarray(self._ga_cos, dtype=np.float64)
+        rs = np.asarray(self._ga_ratios, dtype=np.float64)
+        rs_f = rs[~np.isnan(rs)]
+        return {
+            "enabled": True,
+            "checks": int(len(cs)),
+            "mean_cos": round(float(cs.mean()), 4),
+            "median_cos": round(float(np.median(cs)), 4),
+            "p_pos": round(float((cs > 0).mean()), 4),
+            "p_neg": round(float((cs < 0).mean()), 4),
+            "n_lt_m01": int((cs < -0.1).sum()),
+            "n_mid_01": int((np.abs(cs) <= 0.1).sum()),
+            "n_gt_p01": int((cs > 0.1).sum()),
+            "norm_ratio_mean": (round(float(rs_f.mean()), 4)
+                                if rs_f.size else None),
+            "norm_ratio_median": (round(float(np.median(rs_f)), 4)
+                                  if rs_f.size else None),
+            "group_cos": [round(float(c), 4) for c in cs],
+            "group_ratios": [round(float(r), 4) for r in rs],
         }
 
     def _clip(self, params):

@@ -126,15 +126,13 @@ def parse_args():
                    help="hard cap when a run is budget-censored (spec §6)")
     p.add_argument("--bs", type=int, default=200)
     p.add_argument("--lr", type=float, default=1e-4)
-    p.add_argument("--conflict-gate", action="store_true",
-                   help="reviewer item 5: measure cos(g_aux, g_task) on the "
-                        "repr params at the last batch of each macro group; "
-                        "when it drops below --conflict-tau the aux term "
-                        "contributes NO gradient for the next group (task "
-                        "gradient wins).")
-    p.add_argument("--conflict-tau", type=float, default=0.0,
-                   help="cosine threshold for --conflict-gate (default 0.0: "
-                        "close the gate on any anti-aligned aux).")
+    p.add_argument("--grad-align-diag", action="store_true",
+                   help="reviewer item 5 (phase 3, record only): per macro "
+                        "group, measure the cosine between the task update "
+                        "direction (-grad L_link) and the RPBE update "
+                        "direction (-grad surrogate = +grad J) on the same "
+                        "repr params; no gating, no modification of the "
+                        "training update.")
     p.add_argument("--repr-lr", type=float, default=None,
                    help="learning rate for the repr optimizer (host encoder + "
                         "Gamma + compressor + memory).  The repr group is "
@@ -482,7 +480,7 @@ def main():
         aux_kind=aux_kind, aux_heads=aux_heads,
         aux_optimizer=aux_optimizer, aux_lambda=aux_lambda,
         memory_grad_probe=(not args.no_memory),
-        conflict_gate=args.conflict_gate, conflict_tau=args.conflict_tau)
+        grad_align_diag=args.grad_align_diag)
 
     save_json(out / "config.json", {
         "data": "uci", "seed": args.seed, "arm": eff_arm,

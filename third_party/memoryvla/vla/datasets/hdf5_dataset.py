@@ -99,12 +99,11 @@ class HDF5BatchTransform:
     aug_seed: int = 0
 
     def _augment(self, img: Image.Image, key: Tuple[int, int, int, int]):
-        """Official OpenVLA-style augment, deterministic per
-        (seed, epoch, episode_id, t) via a LOCAL numpy RNG.
-
-        RandomResizedCrop preserves 90% AREA (side = sqrt(0.9)); brightness
-        is ADDITIVE in [-0.2, 0.2] (matches official), contrast/saturation
-        multiplicative, hue additive -- in official order."""
+        """Stage6: FIXED center 90%-area crop (no random crop position -- the
+        random window injected label noise into precise xy localization; the
+        actor is highly pixel-sensitive, cf. the 5.3%->12.3% centre-crop fix).
+        Photometric jitter (brightness/contrast/saturation/hue) is kept and
+        made deterministic per (seed, epoch, episode_id, t) via a LOCAL RNG."""
         import torchvision.transforms.functional as F
         seed, epoch, eid, t = key
         rng = np.random.default_rng(
@@ -113,8 +112,8 @@ class HDF5BatchTransform:
         crop_ratio = math.sqrt(0.9)     # side keeps 90% area
         ch = int(round(H * crop_ratio))
         cw = int(round(W * crop_ratio))
-        top = int(rng.integers(0, H - ch + 1))
-        left = int(rng.integers(0, W - cw + 1))
+        top = (H - ch) // 2             # FIXED centre (matches eval preprocess)
+        left = (W - cw) // 2
         img = F.resized_crop(img, top, left, ch, cw, (H, W),
                              interpolation=Image.BILINEAR)
         # additive brightness delta in [-0.2, 0.2] on the [0,255] image

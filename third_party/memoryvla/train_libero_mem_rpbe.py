@@ -435,7 +435,7 @@ def main() -> None:
     # after repr_total_steps, freezing it mid-40k).
     def lr_lambda_task(t):
         if args.sched == "const":
-            return 1.0
+            return min(1.0, t / max(1, args.warmup_steps))  # warmup then const
         if t < args.warmup_steps:
             return t / max(1, args.warmup_steps)
         progress = (t - args.warmup_steps) / max(
@@ -446,7 +446,7 @@ def main() -> None:
     # gamma scheduler indexed by param_version (gamma step count).
     def lr_lambda_gamma(rs):
         if args.sched == "const":
-            return 1.0
+            return min(1.0, rs / max(1, args.repr_warmup_steps))  # warmup->const
         if rs < args.repr_warmup_steps:
             return rs / max(1, args.repr_warmup_steps)
         progress = (rs - args.repr_warmup_steps) / max(

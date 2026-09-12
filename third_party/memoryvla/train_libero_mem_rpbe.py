@@ -22,11 +22,14 @@ Arms:
   gamma-rpbe  : Gamma merge + task replay + the TGN-isomorphic multi-halfspace
                 feasibility projection (--rpbe-mode project, DEFAULT).  One
                 accumulated task direction t = -g_task and one half-space
-                g_i.d >= -kappa||g_i||||t|| per memory interface i; the QP
-                d* = argmin 1/2||d - t||^2 s.t. G d >= b replaces ONLY the
+                g_i.d >= -kappa||g_i||||t|| per memory interface i; a
+                cutting-plane QP CHECKS EVERY interface and replaces ONLY the
                 Gamma gradient (p.grad = g_task - sum_i mu_i g_i), then ONE
-                clip + ONE AdamW step.  --rpbe-mode additive is the RETIRED
-                L_task - lambda*J formulation, kept for old runs.
+                clip + ONE AdamW step.  If the dimensionless max violation
+                cannot be brought under --proj-tau the boundary is ABORTED (no
+                Gamma step) rather than applied infeasibly.
+                --rpbe-mode additive is the RETIRED L_task - lambda*J
+                formulation, kept for old runs.
 
 Ruling (2026-09-12, B3): RPBE is a CONSTRAINT, not a second objective.  The
 compaudit showed J's predictive modes are first-order orthogonal AND
@@ -65,7 +68,8 @@ from vla.datasets.hdf5_dataset import (  # noqa: E402
 from rpbe_embodied import (  # noqa: E402
     EmbodiedFixedMaps, EmbodiedRPBConfig, EmbodiedRPBEWindow,
     PendingMergeQueue, gamma_replay_loss, dual_latent_z_adjoint_modes,
-    kappa_at, per_cut_influence_grads, treewise_feasibility_projection,
+    apply_gamma_boundary_update, boundary_config, kappa_at,
+    verify_resume_config,
 )
 
 
@@ -177,21 +181,36 @@ def parse_args() -> argparse.Namespace:
                         "constraint (STRICTEST); kappa>=1 = never binds "
                         "(== pure task).")
     p.add_argument("--kappa-anneal-start", type=int, default=-1,
-                   help="project mode: step from which kappa starts to move "
-                        "(default -1 = never anneal).  Before it kappa=--kappa.")
+                   help="project mode: GAMMA-BOUNDARY clock (param_version) at "
+                        "which kappa starts to move (default -1 = never "
+                        "anneal).  Before it kappa=--kappa.")
     p.add_argument("--kappa-anneal-end", type=int, default=-1,
-                   help="project mode: step at which kappa reaches "
+                   help="project mode: boundary clock at which kappa reaches "
                         "--kappa-anneal-to (linear in between).")
     p.add_argument("--kappa-anneal-to", type=float, default=1.0,
                    help="project mode: kappa value at --kappa-anneal-end. "
                         "Larger kappa = LOOSER (>=1 never binds == pure task).")
     p.add_argument("--proj-iters", type=int, default=400,
-                   help="project mode: FISTA iterations for the N x N dual of "
-                        "the feasibility QP.")
-    p.add_argument("--proj-max-rows", type=int, default=256,
-                   help="project mode: cap on interfaces entering the QP "
-                        "(deterministic subsample; P~0.574M so n=256 is ~0.6GB "
-                        "fp32).  0 = no cap.")
+                   help="project mode: FISTA iterations per cutting-plane round.")
+    p.add_argument("--proj-tau", type=float, default=1e-3,
+                   help="project mode: feasibility tolerance on the "
+                        "DIMENSIONLESS violation v_i = max(0, b_i - g_i.d)/"
+                        "(||g_i||||t||).  v_max must be <= tau or the boundary "
+                        "is aborted (no Gamma step).")
+    p.add_argument("--proj-max-rounds", type=int, default=8,
+                   help="project mode: cutting-plane rounds per boundary.")
+    p.add_argument("--proj-max-active", type=int, default=2048,
+                   help="project mode: cap on the ACTIVE set (worst violators "
+                        "enter first; ALL interfaces are always checked).")
+    p.add_argument("--proj-add-per-round", type=int, default=512,
+                   help="project mode: new violators added to the active set "
+                        "per cutting-plane round.")
+    p.add_argument("--migrate-legacy-gamma-state", type=int, default=0,
+                   help="allow --resume-full from a Stage7 checkpoint (no "
+                        "rpbe_mode in its config): the Gamma optimizer state is "
+                        "RESET (old additive -lambda*J Adam moments must never "
+                        "seed a feasibility-projection run).  0 = refuse (the "
+                        "default).")
     # macro boundary: with dense protocol one episode already yields many cuts,
     # so every finished episode is one boundary.
     p.add_argument("--repr-boundary-episodes", type=int, default=1)
@@ -277,6 +296,16 @@ def build_vla(args: argparse.Namespace):
 
 def main() -> None:
     args = parse_args()
+    # kappa is a cosine margin: it must be a finite, non-negative number.  A
+    # negative kappa would flip the sense of g_i.d >= -kappa||g_i||||t||.
+    if not math.isfinite(args.kappa) or args.kappa < 0:
+        raise SystemExit(f"--kappa must be finite and >= 0, got {args.kappa}")
+    if not math.isfinite(args.kappa_anneal_to) or args.kappa_anneal_to < 0:
+        raise SystemExit("--kappa-anneal-to must be finite and >= 0, got "
+                         f"{args.kappa_anneal_to}")
+    if args.proj_tau <= 0 or not math.isfinite(args.proj_tau):
+        raise SystemExit(f"--proj-tau must be finite and > 0, got "
+                         f"{args.proj_tau}")
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
     flags = arm_flags(args.arm)
@@ -904,64 +933,44 @@ def main() -> None:
                   f"(mb<= {B})", flush=True)
         else:
             # ---- TGN-isomorphic single update (default) ----
-            # RPBE is a CONSTRAINT, not an objective.  Build ONE global task
-            # direction (the accumulated task-replay gradient) and one
-            # half-space per memory interface, solve the feasibility QP, and
-            # write back ONLY the Gamma gradient.  gamma-task runs the SAME
-            # single-accumulated-step protocol with no rpbe rows, so the two
-            # arms differ ONLY by the projection.
-            opt_gamma.zero_grad()
-            for i in range(n_mb):
-                t_sl = task_keys[i * B:(i + 1) * B]
-                if not t_sl:
-                    continue
-                m_a = torch.stack([merge_registry[k].left_state
-                                   for k in t_sl]).to("cuda", dtype=torch.bfloat16)
-                m_b = torch.stack([merge_registry[k].right_state
-                                   for k in t_sl]).to("cuda", dtype=torch.bfloat16)
-                gamma_replay_loss(vla.gamma, m_a, m_b,
-                                  task_cotangents, t_sl).backward()
-            # p.grad now holds g_task -- also the fallback when no constraint
-            # is written (empty G / all-zero rows).
-            g_task_gamma = [p.grad.detach().clone() if p.grad is not None
-                            else torch.zeros_like(p) for p in gamma_params]
-            n_task_g = float(torch.cat([g.flatten().float()
-                                        for g in g_task_gamma]).norm())
-            proj = {}
-            used = []
-            if IS_RPBE and rpbe_keys:
-                G, used = per_cut_influence_grads(
-                    vla.gamma, rpbe_cotangents, rpbe_input_map, rpbe_keys,
-                    params=gamma_params, device="cuda",
-                    max_rows=args.proj_max_rows, seed=args.seed)
-                kap = kappa_at(optimizer_step, args.kappa,
-                               args.kappa_anneal_start, args.kappa_anneal_end,
-                               args.kappa_anneal_to)
-                proj = treewise_feasibility_projection(
-                    g_task_gamma, gamma_params, G, kap, iters=args.proj_iters)
-                proj["proj_kappa"] = float(kap)
+            # RPBE is a CONSTRAINT, not an objective: ONE accumulated task
+            # direction, one half-space per memory interface, a cutting-plane
+            # projection that CHECKS EVERY interface, then ONE clip + ONE
+            # opt_gamma.step().  gamma-task runs the SAME protocol with no rpbe
+            # rows, so the two arms differ ONLY by the projection.  An
+            # infeasible projection aborts the boundary (no Gamma step).
+            task_pairs = [(merge_registry[k].left_state,
+                           merge_registry[k].right_state) for k in task_keys]
+            task_cots = [task_cotangents[k] for k in task_keys]
+            r_pairs = [rpbe_input_map[k] for k in rpbe_keys] if rpbe_keys else []
+            r_cots = [rpbe_cotangents[k] for k in rpbe_keys] if rpbe_keys else []
+            # kappa anneals on the GAMMA-BOUNDARY clock (param_version), not on
+            # dense optimizer steps: a TGN-style schedule in optimizer steps
+            # would be over before the first few projections.
+            kap = kappa_at(vla.cog_mem_bank.param_version, args.kappa,
+                           args.kappa_anneal_start, args.kappa_anneal_end,
+                           args.kappa_anneal_to)
             pre = [p.detach().clone() for p in gamma_params]
-            clip = torch.nn.utils.clip_grad_norm_(gamma_params, args.grad_clip)
-            opt_gamma.step()
-            sched_gamma.step()
-            n_opt += 1
+            diag = apply_gamma_boundary_update(
+                gamma=vla.gamma, gamma_params=gamma_params,
+                optimizer=opt_gamma, scheduler=sched_gamma,
+                task_pairs=task_pairs, task_cotangents=task_cots,
+                rpbe_pairs=r_pairs, rpbe_cotangents=r_cots,
+                kappa=kap, proj_iters=args.proj_iters, tau_feas=args.proj_tau,
+                max_rounds=args.proj_max_rounds,
+                max_active=args.proj_max_active,
+                add_per_round=args.proj_add_per_round,
+                grad_clip=args.grad_clip, minibatch=B, device="cuda")
+            diag["proj_kappa"] = float(kap)
+            n_opt += diag["gamma_steps"]
             upd = sum(float((p.detach() - p0).float().pow(2).sum())
                       for p, p0 in zip(gamma_params, pre)) ** 0.5
-            corr_ratio = proj.get("proj_corr_ratio", 0.0)
+            shown = " ".join(f"{k}={v}" for k, v in diag.items()
+                             if not k.startswith("_"))
             print(f"[gamma proj] pv={vla.cog_mem_bank.param_version} "
-                  f"ntask={len(task_keys)} nproj={len(used)} "
-                  f"|g_task|={n_task_g:.3e} "
-                  f"kappa={proj.get('proj_kappa', float('nan')):.4f} "
-                  f"nvalid={proj.get('proj_n_valid', 0)} "
-                  f"nmu={proj.get('proj_n_mu_pos', 0)} "
-                  f"cos_min={proj.get('proj_cos_min', 0.0):+.3f} "
-                  f"corr={corr_ratio:.3f} "
-                  f"slack={proj.get('proj_min_slack_after', float('nan')):.3e} "
-                  f"clip={float(clip):.3f} |dgamma|={upd:.3e}", flush=True)
-            if proj:
-                print("[gamma proj] diag "
-                      + " ".join(f"{k}={v}" for k, v in proj.items()),
-                      flush=True)
+                  f"steps={diag['gamma_steps']} "
+                  f"aborted={diag['gamma_aborted']} |dgamma|={upd:.3e} "
+                  f"{shown}", flush=True)
         vla.cog_mem_bank.param_version += 1
         task_cotangents = {}
         rpbe_cotangents = {}
@@ -1028,8 +1037,7 @@ def main() -> None:
                 "rpbe_stats_episodes": args.rpbe_stats_episodes,
                 "mem_length": args.mem_length, "kf_min_abs": args.kf_min_abs,
                 "lambda_rpbe": args.lambda_rpbe,
-                "rpbe_mode": args.rpbe_mode, "kappa": args.kappa,
-                "proj_iters": args.proj_iters,
+                **boundary_config(args),
                 "image_aug": args.image_aug, "dim_weight": args.dim_weight,
                 "reg_head": args.reg_head,
             },
@@ -1088,11 +1096,46 @@ def main() -> None:
             if n in named and named[n].requires_grad:
                 named[n].data.copy_(t.to(named[n].dtype))
         opt_task.load_state_dict(ck["opt_task"])
+        # verify the run config the checkpoint was produced under BEFORE any
+        # optimizer state is restored (reviewer: resume must not silently
+        # change the boundary recipe, and Stage7->Stage8 must be explicit)
+        reset_gamma_state = False
+        legacy_gamma_ckpt = False
+        if "config" in ck:
+            want = {
+                "sched": args.sched, "batch_size": args.batch_size,
+                "grad_accum": args.grad_accum,
+                "gamma_replay_batch_size": args.gamma_replay_batch_size,
+                "gamma_task_boundary_episodes": args.gamma_task_boundary_episodes,
+                "rpbe_stats_episodes": args.rpbe_stats_episodes,
+                "lambda_rpbe": args.lambda_rpbe, "mem_length": args.mem_length,
+                "kf_min_abs": args.kf_min_abs,
+                **boundary_config(args),
+            }
+            bad, legacy_gamma_ckpt = verify_resume_config(
+                ck["config"], want,
+                allow_legacy_gamma=bool(args.migrate_legacy_gamma_state))
+            if bad:
+                raise SystemExit(f"[resume-full] CONFIG MISMATCH {bad}")
+            if legacy_gamma_ckpt:
+                reset_gamma_state = True
+                print("[resume-full] LEGACY Stage7 checkpoint (no rpbe_mode): "
+                      "allowing migration -- Gamma optimizer state (Adam "
+                      "moments from the retired additive -lambda*J objective) "
+                      "is RESET, and the Gamma scheduler restarts at "
+                      "param_version.", flush=True)
+            else:
+                print("[resume-full] config verified against checkpoint",
+                      flush=True)
+        else:
+            print("[resume-full] WARNING: checkpoint has no config block",
+                  flush=True)
         if opt_gamma is not None:
             assert ck["opt_gamma"] is not None, "full ckpt has no gamma state"
-            opt_gamma.load_state_dict(ck["opt_gamma"])
+            if not reset_gamma_state:
+                opt_gamma.load_state_dict(ck["opt_gamma"])
         sched_task.load_state_dict(ck["sched_task"])
-        if sched_gamma is not None:
+        if sched_gamma is not None and not reset_gamma_state:
             sched_gamma.load_state_dict(ck["sched_gamma"])
         optimizer_step = int(ck.get("optimizer_step", ck["step"]))
         micro_step = int(ck["micro_step"])

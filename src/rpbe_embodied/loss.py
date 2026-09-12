@@ -429,66 +429,240 @@ def kappa_at(step: int, kappa_max: float, start: int, end: int,
     return float(kappa_max) + f * (float(kappa_to) - float(kappa_max))
 
 
-def per_cut_influence_grads(
+def _rows_chunk(gamma, m_a, m_b, C, params, device):
+    """One vmap'd backward for a chunk of interfaces -> [c, P] fp32 rows."""
+    n = C.shape[0]
+    try:
+        z = gamma(m_a, m_b)
+        grads = torch.autograd.grad(z.float(), params, grad_outputs=C,
+                                    is_grads_batched=True, allow_unused=True)
+        return torch.cat([
+            (g if g is not None else torch.zeros(
+                (n,) + p.shape, device=device, dtype=torch.float32)
+             ).reshape(n, -1).float() for g, p in zip(grads, params)], dim=1)
+    except Exception:
+        # fallback: one independent forward+VJP per interface (robust, slower)
+        rows = []
+        for i in range(n):
+            zi = gamma(m_a[i:i + 1], m_b[i:i + 1])[0]
+            gs = torch.autograd.grad((C[i] * zi.float()).sum(), params,
+                                     allow_unused=True)
+            rows.append(torch.cat([
+                (g if g is not None else torch.zeros_like(p)
+                 ).reshape(-1).float() for g, p in zip(gs, params)]))
+        return torch.stack(rows)
+
+
+def interface_influence_rows(
     gamma, cotangents: Dict[tuple, torch.Tensor],
     input_map: Dict[tuple, Tuple[torch.Tensor, torch.Tensor]],
     keys: List[tuple], params: Optional[List[torch.Tensor]] = None,
-    device: str = "cuda", max_rows: int = 0, seed: int = 0,
+    device: str = "cuda", chunk: int = 128,
 ) -> Tuple[Optional[torch.Tensor], List[tuple]]:
-    """Interface-wise RPBE influence gradients, ONE ROW PER INTERFACE.
+    """Interface-wise RPBE influence gradients, ONE ROW PER INTERFACE, fp32.
 
     g_i = (dz_i/dGamma)^T a_i, where a_i = dJ/dz_i is the window adjoint for
     interface i (``cotangents[cut_id]``).  Rows are taken SEPARATELY -- never
-    summed -- so the interface-interface geometry (e.g. g_1 ~ -g_2) survives
-    into the feasibility QP instead of cancelling.  This is the exact VLA
-    analogue of ``tree_wise_influence_grads`` in the TGN trainer.
+    summed -- so interface-interface geometry (e.g. g_1 ~ -g_2) survives into
+    the feasibility QP instead of cancelling.  This is the exact VLA analogue
+    of ``tree_wise_influence_grads`` in the TGN trainer.
 
     The window's J is still estimated JOINTLY (one ``dual_latent_z_adjoint``
     over the whole window), so each a_i is interface i's effect ON THE JOINT J.
 
-    Returns (G [n, P] fp32 on ``device``, used_keys).  ``max_rows`` > 0
-    deterministically subsamples the interfaces to bound memory: P ~ 0.574M
-    for the 2-token merge operator, so n=256 already costs ~0.6 GB fp32.
+    IMPORTANT: every interface is returned.  There is deliberately NO row cap
+    or subsampling -- each row is an inequality that must be enforced, so
+    dropping rows at random has no unbiased-constraint interpretation.
+    Memory is bounded instead by (a) batching the VJPs per ``chunk`` and
+    (b) keeping rows in CPU fp32 (P ~ 0.574M -> 2.3 MB/row); VRAM never holds
+    more than one chunk.  Non-finite rows are DROPPED here (an Inf row would
+    poison Q and eigvalsh) and reported via ``used_keys``.
     """
     if params is None:
         params = list(gamma.parameters())
     cand = [k for k in keys if k in cotangents and k in input_map]
-    if max_rows and len(cand) > max_rows:
-        g = torch.Generator().manual_seed(int(seed))
-        order = torch.randperm(len(cand), generator=g).tolist()[:max_rows]
-        cand = [cand[i] for i in order]
     if not cand or not params:
         return None, []
     md = params[0].dtype
-    rows: List[torch.Tensor] = []
+    out: List[torch.Tensor] = []
     used: List[tuple] = []
     with torch.autocast("cuda", enabled=False):
-        m_a = torch.stack([input_map[k][0] for k in cand]).to(device, dtype=md)
-        m_b = torch.stack([input_map[k][1] for k in cand]).to(device, dtype=md)
-        z = gamma(m_a, m_b)                                   # [n, dim]
-        C = torch.stack([cotangents[k].reshape(-1) for k in cand]).to(
-            device, dtype=torch.float32)
-        n = z.shape[0]
-        for i in range(n):
-            # share ONE forward; N separate VJPs keep the rows independent.
-            # upcast z (differentiable) so the fp32 adjoint is not quantised.
-            term = (C[i] * z[i].float()).sum()
-            grads = torch.autograd.grad(term, params,
-                                        retain_graph=(i < n - 1),
-                                        allow_unused=True)
-            rows.append(torch.cat([
-                (gr if gr is not None else torch.zeros_like(p)
-                 ).reshape(-1).float() for gr, p in zip(grads, params)]))
-            used.append(cand[i])
-    return torch.stack(rows), used
+        for c0 in range(0, len(cand), chunk):
+            sl = cand[c0:c0 + chunk]
+            rows = _rows_chunk(
+                gamma,
+                torch.stack([input_map[k][0] for k in sl]).to(device, dtype=md),
+                torch.stack([input_map[k][1] for k in sl]).to(device, dtype=md),
+                torch.stack([cotangents[k].reshape(-1) for k in sl]).to(
+                    device, dtype=torch.float32),
+                params, device)
+            fin = torch.isfinite(rows).all(dim=1)
+            if bool(fin.all()):
+                out.append(rows.cpu())
+                used.extend(sl)
+            else:
+                out.append(rows[fin].cpu())
+                used.extend([k for k, ok in zip(sl, fin.tolist()) if ok])
+    if not out:
+        return None, []
+    G = torch.cat(out, dim=0)
+    return (G if G.numel() else None), used
+
+
+def _norm_and_dot(G_cpu: torch.Tensor, v_cpu: torch.Tensor,
+                  chunk: int = 256) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Chunked ``||g_i||`` and ``g_i . v`` for every CPU row (no GPU peak)."""
+    n = G_cpu.shape[0]
+    ng = torch.empty(n, dtype=torch.float32)
+    gd = torch.empty(n, dtype=torch.float32)
+    for i in range(0, n, chunk):
+        Gc = G_cpu[i:i + chunk]
+        ng[i:i + chunk] = Gc.norm(dim=1)
+        gd[i:i + chunk] = Gc @ v_cpu
+    return ng, gd
+
+
+def _row_dot(G_cpu: torch.Tensor, v_cpu: torch.Tensor,
+             chunk: int = 256) -> torch.Tensor:
+    """Chunked ``g_i . v`` for every CPU row (norms already known)."""
+    n = G_cpu.shape[0]
+    gd = torch.empty(n, dtype=torch.float32)
+    for i in range(0, n, chunk):
+        gd[i:i + chunk] = G_cpu[i:i + chunk] @ v_cpu
+    return gd
+
+
+def active_set_feasibility_projection(
+    g_task_gamma: List[torch.Tensor], gamma_params: List[torch.Tensor],
+    G_cpu: Optional[torch.Tensor], kappa: float, iters: int = 400,
+    tau_feas: float = 1e-3, max_rounds: int = 8, max_active: int = 2048,
+    add_per_round: int = 512, min_norm: float = 1e-9,
+) -> dict:
+    """Cutting-plane feasibility projection over EVERY interface.
+
+    One global task direction t = -g_task; each interface i contributes the
+    half-space g_i.d >= -kappa*||g_i||*||t||.  Unlike the single-shot QP this
+    CHECKS ALL interfaces: round 0 ranks every interface by its violation at
+    d = t, the worst enter the active set, then each round solves the QP on the
+    active set and RE-SCANS every interface at the new d, adding new violators,
+    until the dimensionless max violation
+
+        v_i = max(0, b_i - g_i.d) / (||g_i|| ||t|| + eps)
+
+    is <= ``tau_feas`` (or ``max_rounds``/``max_active`` is exhausted).
+
+    Writes ONLY Gamma (p.grad = g_task - sum_i mu_i g_i) and ONLY when the
+    result is feasible.  On failure nothing is written and
+    diag["proj_feasible"] is False so the caller can ABORT the boundary
+    instead of stepping with a violated preservation constraint.
+
+    VRAM holds only the active rows; ``G_cpu`` stays in host memory.
+    """
+    sizes = [p.numel() for p in gamma_params]
+    # t lives on the Gamma params' device; the full-interface scans run on the
+    # CPU-resident G rows, and only the active rows ever reach `dev`.
+    t = torch.cat([-x.detach().flatten().float() for x in g_task_gamma])
+    dev = t.device
+    t_cpu = t.detach().cpu()
+    nt = float(t.norm())
+    diag = {
+        "proj_n_interfaces": int(G_cpu.shape[0]) if G_cpu is not None else 0,
+        "proj_n_checked": 0, "proj_n_valid": 0, "proj_n_candidates": 0,
+        "proj_n_active": 0, "proj_n_active_init": 0, "proj_n_mu_pos": 0,
+        "proj_rounds": 0, "proj_coverage": 1.0, "proj_norm_t": nt,
+        "proj_cos_min": 0.0, "proj_max_viol_before": 0.0,
+        "proj_max_viol_after": 0.0, "proj_min_slack_after": float("nan"),
+        "proj_corr_ratio": 0.0, "proj_kappa": float(kappa),
+        "proj_feasible": True,
+    }
+    if G_cpu is None or G_cpu.numel() == 0 or nt == 0.0:
+        return diag
+    ng, Gt = _norm_and_dot(G_cpu, t_cpu)
+    valid = (ng > min_norm) & torch.isfinite(ng) & torch.isfinite(Gt)
+    diag["proj_n_valid"] = int(valid.sum())
+    diag["proj_n_checked"] = int(G_cpu.shape[0])
+    if not bool(valid.any()):
+        return diag
+    scale = ng * nt
+    cos = torch.where(valid, Gt / (scale + 1e-30), torch.ones_like(Gt))
+    viol = torch.clamp(-cos - kappa, min=0.0)
+    diag["proj_cos_min"] = float(cos[valid].min())
+    diag["proj_max_viol_before"] = float(viol.max())
+    n_cand = int((viol > 0).sum())
+    diag["proj_n_candidates"] = n_cand
+    active = [i for i in torch.argsort(viol, descending=True).tolist()[:max_active]
+              if viol[i] > 0]
+    active_set = set(active)
+    diag["proj_n_active_init"] = len(active)
+    corr = torch.zeros(t.numel(), dtype=torch.float32, device=dev)
+    mu = None
+    vmax = float(viol.max())
+    rnd = 0
+    for rnd in range(1, max_rounds + 1):
+        if active:
+            idx = torch.tensor(active, dtype=torch.long)
+            Ga = G_cpu[idx].to(dev, dtype=torch.float32)
+            b = -kappa * ng[idx].to(dev) * nt
+            c = b - Gt[idx].to(dev)
+            mu = _fista_nonneg(Ga @ Ga.t(), c, iters)
+            corr = (mu[:, None] * Ga).sum(0)
+            d = t + corr
+        else:
+            corr = torch.zeros_like(corr)
+            d = t
+        # RE-CHECK every interface at the new d (not just the active set)
+        Gd = _row_dot(G_cpu, d.cpu())
+        vv = torch.where(valid, torch.clamp(-kappa * scale - Gd, min=0.0)
+                         / (scale + 1e-30), torch.zeros_like(Gt))
+        vmax = float(vv.max())
+        if vmax <= tau_feas:
+            break
+        added = 0
+        for i in torch.argsort(vv, descending=True).tolist():
+            if len(active) >= max_active or added >= add_per_round:
+                break
+            if vv[i] > tau_feas and i not in active_set:
+                active.append(i); active_set.add(i); added += 1
+        if added == 0:
+            break
+    diag["proj_rounds"] = int(rnd)
+    diag["proj_n_active"] = len(active)
+    # coverage = share of ALL checked interfaces that carry an enforced
+    # constraint.  n_candidates (violators at d = t) can be smaller than
+    # n_active because a cutting-plane round may add an interface that only
+    # violates at the new d.
+    diag["proj_coverage"] = len(active) / max(1, int(G_cpu.shape[0]))
+    diag["proj_max_viol_after"] = vmax
+    diag["proj_feasible"] = bool(vmax <= tau_feas)
+    diag["proj_corr_ratio"] = float(corr.norm() / max(nt, 1e-12))
+    if mu is not None:
+        diag["proj_n_mu_pos"] = int((mu > 1e-8).sum())
+    if active:
+        idx = torch.tensor(active, dtype=torch.long)
+        Ga = G_cpu[idx].to(dev, dtype=torch.float32)
+        slack = Ga @ (t + corr) - (-kappa * ng[idx].to(dev) * nt)
+        diag["proj_min_slack_after"] = float(slack.min())
+    # internal (test-only) handles; the trainer never logs keys starting "_"
+    diag["_active"] = active
+    diag["_mu"] = None if mu is None else mu.detach().cpu()
+    if diag["proj_feasible"]:
+        with torch.no_grad():
+            for p, cp, gt in zip(gamma_params, torch.split(corr, sizes),
+                                 g_task_gamma):
+                p.grad = (gt.reshape(-1).float() - cp).to(p.dtype).view_as(p)
+    return diag
 
 
 def treewise_feasibility_projection(
     g_task_gamma: List[torch.Tensor], gamma_params: List[torch.Tensor],
     G: Optional[torch.Tensor], kappa: float, iters: int = 400,
-    min_norm: float = 1e-9,
+    min_norm: float = 1e-9, tau_feas: float = 1e-3,
 ) -> dict:
     """Interface-wise RPBE Feasibility Projection (TGN final algorithm).
+
+    REFERENCE / single-shot solver.  The trainer uses
+    ``active_set_feasibility_projection`` (all-interface cutting plane); this
+    one keeps the TGN definition in one place and is the test oracle.
 
     One global task direction t = -g_task; each valid interface i contributes a
     half-space g_i.d >= -kappa*||g_i||*||t||.  Solve
@@ -507,16 +681,17 @@ def treewise_feasibility_projection(
     sizes = [p.numel() for p in gamma_params]
     t = torch.cat([-x.flatten().float() for x in g_task_gamma])
     nt = float(t.norm())
-    diag = {"proj_n_trees": int(G.shape[0]) if G is not None else 0,
+    diag = {"proj_n_interfaces": int(G.shape[0]) if G is not None else 0,
             "proj_n_valid": 0, "proj_n_active_init": 0, "proj_n_mu_pos": 0,
             "proj_norm_t": nt, "proj_corr_ratio": 0.0, "proj_cos_min": 0.0,
             "proj_min_slack_after": float("nan"),
-            "proj_max_viol_before": 0.0}
+            "proj_max_viol_before": 0.0, "proj_max_viol_after": 0.0,
+            "proj_feasible": True}
     if G is None or G.numel() == 0 or nt == 0.0:
         return diag
     Gf = G.flatten(1).float()
     ng = Gf.norm(dim=1)
-    valid = ng > min_norm
+    valid = (ng > min_norm) & torch.isfinite(Gf).all(dim=1) & torch.isfinite(ng)
     if not bool(valid.any()):
         return diag
     Gv = Gf[valid]
@@ -542,5 +717,10 @@ def treewise_feasibility_projection(
     slack = Gv @ d - b
     diag["proj_n_mu_pos"] = int((mu > 1e-8).sum())
     diag["proj_min_slack_after"] = float(slack.min())
+    diag["proj_max_viol_after"] = float(
+        torch.clamp(-slack, min=0.0).div(
+            (ngv * nt + 1e-30)).max())
+    diag["proj_feasible"] = bool(diag["proj_max_viol_after"] <= tau_feas)
     diag["proj_corr_ratio"] = float((d - t).norm() / max(nt, 1e-12))
+    diag["_mu"] = mu.detach().cpu()
     return diag

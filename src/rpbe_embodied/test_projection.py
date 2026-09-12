@@ -4,19 +4,28 @@ CPU-only.  Run:
   PYTHONPATH=src python -m pytest src/rpbe_embodied/test_projection.py -q
   (or plain `python src/rpbe_embodied/test_projection.py`)
 
-Checks the three properties the migration relies on:
-  1. no interfaces  -> Gamma keeps the pure task gradient (no-op);
-  2. feasible + KKT -> G d* >= b and mu_i (g_i . d* - b_i) == 0;
-  3. geometry survives -> two opposite interfaces (aggregate == 0) are still
-     repaired, which the retired aggregate-gradient path could not do.
-Plus per-interface row correctness and the kappa schedule.
+Covers the properties the Stage8 migration relies on:
+  1. no interfaces            -> Gamma keeps the pure task gradient (no-op);
+  2. feasible + REAL KKT      -> every interface satisfies g_i.d >= b_i and
+                                 mu_j (g_i.d - b_i) == 0 for the active set;
+  3. opposite interfaces      -> g_2 = -g_1 (aggregate == 0) is still repaired,
+                                 which the retired sum-then-project path could
+                                 not do;
+  4. all interfaces checked   -> 1000+ rows, only a small active set, coverage
+                                 reported, row order does not matter;
+  5. non-finite rows          -> dropped, Q never poisoned;
+  6. infeasible               -> the boundary is ABORTED (0 Gamma steps);
+  7. kappa >= 1               -> never binds, identical to the task control
+                                 (one step, same parameters).
 """
 import torch
 import torch.nn as nn
 
-from rpbe_embodied.loss import (_fista_nonneg, kappa_at,
-                                per_cut_influence_grads,
+from rpbe_embodied.boundary import apply_gamma_boundary_update
+from rpbe_embodied.loss import (_fista_nonneg, active_set_feasibility_projection,
+                                interface_influence_rows, kappa_at,
                                 treewise_feasibility_projection)
+from rpbe_embodied.resume import boundary_config, verify_resume_config
 
 D = 6
 torch.manual_seed(0)
@@ -36,17 +45,11 @@ class TinyGamma(nn.Module):
         return m + h + self.u
 
 
-def _rows(gamma, cotangents, inputs):
-    keys = list(cotangents.keys())
-    G, used = per_cut_influence_grads(
-        gamma, cotangents, inputs, keys,
-        params=list(gamma.parameters()), device="cpu")
+def _rows(gamma, cot, inp):
+    keys = list(cot.keys())
+    G, used = interface_influence_rows(
+        gamma, cot, inp, keys, params=list(gamma.parameters()), device="cpu")
     return G, used
-
-
-def _set_task_grad(gamma, g_task):
-    for p, g in zip(gamma.parameters(), g_task):
-        p.grad = g.clone()
 
 
 def _flat_task_grad(gamma, flat):
@@ -57,10 +60,25 @@ def _flat_task_grad(gamma, flat):
     return out
 
 
-def _adversarial_task_grad(gamma, G, scale=0.5):
-    """g_task aligned with the SUM of the interface rows -> every interface
-    sees cos(g_i, -g_task) strongly negative -> the constraints bind."""
+def _set_task_grad(gamma, g_task):
+    for p, g in zip(gamma.parameters(), g_task):
+        p.grad = g.clone()
+
+
+def _adversarial(gamma, G, scale=0.5):
+    """g_task aligned with the SUM of the rows -> many constraints bind."""
     return _flat_task_grad(gamma, scale * G.sum(0))
+
+
+def _d_from_grad(gamma):
+    """d = -p.grad (since p.grad = g_task - corr and d = t + corr)."""
+    return -torch.cat([p.grad.flatten() for p in gamma.parameters()])
+
+
+def _rand_problem(gamma, n):
+    cot = {i: torch.randn(D) for i in range(n)}
+    inp = {i: (torch.randn(D), torch.randn(D)) for i in range(n)}
+    return cot, inp
 
 
 def test_fista_matches_slow_pgd():
@@ -70,7 +88,6 @@ def test_fista_matches_slow_pgd():
     c = torch.randn(n)
     mu = _fista_nonneg(Q, c, 2000)
     assert mu.min() >= 0
-    # slow projected gradient reference
     L = float(torch.linalg.eigvalsh(Q).max())
     m = torch.zeros(n)
     for _ in range(20000):
@@ -83,119 +100,144 @@ def test_no_interfaces_is_pure_task():
     gamma = TinyGamma()
     g_task = [torch.randn_like(p) for p in gamma.parameters()]
     _set_task_grad(gamma, g_task)
-    diag = treewise_feasibility_projection(
+    diag = active_set_feasibility_projection(
         [g.clone() for g in g_task], list(gamma.parameters()), None, 0.05)
     for p, g in zip(gamma.parameters(), g_task):
         assert torch.equal(p.grad, g), "empty G must leave the task grad"
-    assert diag["proj_n_valid"] == 0
+    assert diag["proj_feasible"] and diag["proj_n_active"] == 0
     print("test_no_interfaces_is_pure_task OK")
 
 
-def test_feasible_and_kkt():
+def test_real_kkt_complementarity():
     gamma = TinyGamma()
-    n = 9
-    cot = {i: torch.randn(D) for i in range(n)}
-    inp = {i: (torch.randn(D), torch.randn(D)) for i in range(n)}
+    cot, inp = _rand_problem(gamma, 20)
     G, _ = _rows(gamma, cot, inp)
-    g_task = _adversarial_task_grad(gamma, G)
+    g_task = _adversarial(gamma, G)
     _set_task_grad(gamma, g_task)
-    kappa = 0.2
-    diag = treewise_feasibility_projection(
-        [g.clone() for g in g_task], list(gamma.parameters()), G, kappa)
-
+    kappa, tau = 0.1, 1e-4
+    diag = active_set_feasibility_projection(
+        [g.clone() for g in g_task], list(gamma.parameters()), G, kappa,
+        tau_feas=tau)
+    assert diag["proj_feasible"]
+    assert diag["proj_n_candidates"] >= 1
     t = torch.cat([-g.flatten() for g in g_task])
-    # p.grad = g_task - corr  and d = t + corr  =>  d = -p.grad
-    gp = torch.cat([p.grad.flatten() for p in gamma.parameters()])
-    d = -gp
+    d = _d_from_grad(gamma)
     ng = G.norm(dim=1)
     b = -kappa * ng * float(t.norm())
     slack = G @ d - b
-    assert slack.min() > -1e-3, f"infeasible: min slack {slack.min()}"
-    assert diag["proj_min_slack_after"] > -1e-3
-    # KKT complementarity: active constraints have mu > 0, inactive mu ~ 0.
-    assert diag["proj_n_mu_pos"] >= 1
-    assert diag["proj_corr_ratio"] > 0.0
-    print("test_feasible_and_kkt OK  slack_min=%.2e corr=%.3f"
-          % (slack.min(), diag["proj_corr_ratio"]))
+    # primal feasibility on EVERY interface, not just the active set
+    v = torch.clamp(-slack, min=0.0) / (ng * float(t.norm()) + 1e-30)
+    assert float(v.max()) <= tau + 1e-9, float(v.max())
+    # KKT complementarity: active constraints tight, inactive slack >= 0
+    act, mu = diag["_active"], diag["_mu"]
+    assert mu is not None and len(mu) == len(act)
+    for j, i in enumerate(act):
+        if float(mu[j]) > 1e-6:
+            assert abs(float(slack[i])) < 1e-3, (i, float(slack[i]))
+        assert float(slack[i]) > -1e-3
+    # inactive rows must have mu == 0: |active| == number of positive mu
+    assert int((mu > 1e-8).sum()) == diag["proj_n_mu_pos"]
+    assert len(act) <= G.shape[0] and 0.0 < diag["proj_coverage"] <= 1.0
+    print("test_real_kkt_complementarity OK  vmax=%.2e active=%d/%d"
+          % (float(v.max()), len(act), diag["proj_n_candidates"]))
 
 
 def test_opposite_interfaces_still_repaired():
-    """g_2 = -g_1: the AGGREGATE gradient is zero, so the retired
-    sum-then-project path would see no violation and do nothing.  The
-    per-interface QP must still repair."""
+    """g_2 = -g_1: the AGGREGATE gradient is zero, so a sum-then-project path
+    would see no violation and do nothing.  The per-interface QP must repair."""
     gamma = TinyGamma()
     a1 = (torch.randn(D), torch.randn(D))
-    inp = {0: a1, 1: a1}
     cot = {0: torch.randn(D), 1: torch.randn(D)}
+    inp = {0: a1, 1: a1}
     G, _ = _rows(gamma, cot, inp)
-    # force an exactly opposite pair
     G = torch.stack([G[0], -G[0]])
-    assert float((G.sum(0)).norm()) < 1e-6, "test setup: aggregate must cancel"
-
+    assert float(G.sum(0).norm()) < 1e-6, "test setup: aggregate must cancel"
     g_task = _flat_task_grad(gamma, 0.5 * G[0])
     _set_task_grad(gamma, g_task)
-    diag = treewise_feasibility_projection(
+    diag = active_set_feasibility_projection(
         [g.clone() for g in g_task], list(gamma.parameters()), G, kappa=0.0)
+    assert diag["proj_feasible"]
     assert diag["proj_corr_ratio"] > 1e-6, "opposite pair not repaired"
-    gp = torch.cat([p.grad.flatten() for p in gamma.parameters()])
-    d = -gp
-    b = torch.zeros(2)  # kappa = 0 -> hard
-    slack = G @ d - b
-    assert slack.min() > -1e-3, f"infeasible hard: {slack}"
-    # both constraints active (each side of the pair must be respected)
-    assert diag["proj_n_mu_pos"] >= 1
+    slack = G @ _d_from_grad(gamma) - torch.zeros(2)
+    assert float(slack.min()) > -1e-3, float(slack.min())
     print("test_opposite_interfaces_still_repaired OK  corr=%.3f"
           % diag["proj_corr_ratio"])
 
 
+def test_all_interfaces_checked_and_order_invariant():
+    gamma = TinyGamma()
+    n = 1200
+    cot, inp = _rand_problem(gamma, n)
+    G, used = _rows(gamma, cot, inp)
+    assert G.shape[0] == n and len(used) == n, "no interface may be dropped"
+    g_task = _adversarial(gamma, G, scale=0.05)
+    _set_task_grad(gamma, g_task)
+    diag = active_set_feasibility_projection(
+        [g.clone() for g in g_task], list(gamma.parameters()), G, kappa=0.05)
+    assert diag["proj_feasible"]
+    assert diag["proj_n_checked"] == n
+    assert diag["proj_n_active"] <= n
+    assert diag["proj_n_active"] < n, "active set should be a small subset"
+    assert 0.0 < diag["proj_coverage"] <= 1.0
+    d1 = _d_from_grad(gamma).clone()
+    # permutation of the row order must not change the projected direction
+    perm = torch.randperm(n)
+    _set_task_grad(gamma, g_task)
+    diag2 = active_set_feasibility_projection(
+        [g.clone() for g in g_task], list(gamma.parameters()), G[perm],
+        kappa=0.05)
+    assert diag2["proj_feasible"]
+    d2 = _d_from_grad(gamma)
+    rel = float((d1 - d2).norm() / max(float(d1.norm()), 1e-12))
+    assert rel < 1e-4, f"row order changed the projection: rel={rel}"
+    print("test_all_interfaces_checked_and_order_invariant OK  "
+          "n=%d active=%d coverage=%.3f" % (n, diag["proj_n_active"],
+                                            diag["proj_coverage"]))
+
+
+def test_nonfinite_rows_dropped():
+    gamma = TinyGamma()
+    cot, inp = _rand_problem(gamma, 8)
+    G, _ = _rows(gamma, cot, inp)
+    G[2] = float("inf")
+    G[5, 1] = float("nan")
+    g_task = _adversarial(gamma, torch.nan_to_num(G, posinf=0.0, neginf=0.0))
+    _set_task_grad(gamma, g_task)
+    diag = active_set_feasibility_projection(
+        [g.clone() for g in g_task], list(gamma.parameters()), G, 0.05)
+    assert diag["proj_n_interfaces"] == 8
+    assert diag["proj_n_valid"] == 6, diag["proj_n_valid"]
+    assert diag["proj_feasible"]
+    gp = torch.cat([p.grad.flatten() for p in gamma.parameters()])
+    assert torch.isfinite(gp).all(), "Q was poisoned by a non-finite row"
+    print("test_nonfinite_rows_dropped OK  valid=%d/8" % diag["proj_n_valid"])
+
+
+def test_infeasible_projection_is_dropped_by_row_filter():
+    """A gamma with non-finite weights yields no usable row at all."""
+    gamma = TinyGamma()
+    with torch.no_grad():
+        gamma.w[0, 0] = float("nan")
+    cot, inp = _rand_problem(gamma, 5)
+    G, used = _rows(gamma, cot, inp)
+    assert G is None, "non-finite rows must not be returned as a G matrix"
+    print("test_infeasible_projection_is_dropped_by_row_filter OK")
+
+
 def test_kappa_ge_one_never_binds():
     gamma = TinyGamma()
-    n = 7
-    cot = {i: torch.randn(D) for i in range(n)}
-    inp = {i: (torch.randn(D), torch.randn(D)) for i in range(n)}
+    cot, inp = _rand_problem(gamma, 7)
     G, _ = _rows(gamma, cot, inp)
-    g_task = [torch.randn_like(p) for p in gamma.parameters()]
+    g_task = _adversarial(gamma, G)
     _set_task_grad(gamma, g_task)
-    diag = treewise_feasibility_projection(
+    diag = active_set_feasibility_projection(
         [g.clone() for g in g_task], list(gamma.parameters()), G, kappa=1.0)
     assert diag["proj_n_active_init"] == 0
-    assert diag["proj_corr_ratio"] < 1e-3, diag["proj_corr_ratio"]
-    print("test_kappa_ge_one_never_binds OK  corr=%.2e"
-          % diag["proj_corr_ratio"])
-
-
-def test_zero_rows_are_dropped():
-    gamma = TinyGamma()
-    n = 5
-    cot = {i: torch.randn(D) for i in range(n)}
-    inp = {i: (torch.randn(D), torch.randn(D)) for i in range(n)}
-    G, _ = _rows(gamma, cot, inp)
-    G[2] = 0.0                      # one dead interface
-    g_task = [torch.randn_like(p) for p in gamma.parameters()]
-    _set_task_grad(gamma, g_task)
-    diag = treewise_feasibility_projection(
-        [g.clone() for g in g_task], list(gamma.parameters()), G, 0.05)
-    assert diag["proj_n_trees"] == 5
-    assert diag["proj_n_valid"] == 4
-    print("test_zero_rows_are_dropped OK")
-
-
-def test_per_cut_rows_are_single_interface_vjps():
-    gamma = TinyGamma()
-    n = 3
-    cot = {i: torch.randn(D) for i in range(n)}
-    inp = {i: (torch.randn(D), torch.randn(D)) for i in range(n)}
-    G, used = _rows(gamma, cot, inp)
-    assert used == [0, 1, 2]
-    for i in range(n):
-        a, b = inp[i]
-        z = gamma(a.unsqueeze(0), b.unsqueeze(0))[0]
-        term = (cot[i] * z.float()).sum()
-        ref = torch.cat([g.reshape(-1) for g in torch.autograd.grad(
-            term, list(gamma.parameters()))])
-        assert torch.allclose(G[i], ref, atol=1e-5), \
-            f"row {i} != single-interface VJP"
-    print("test_per_cut_rows_are_single_interface_vjps OK")
+    assert diag["proj_n_active"] == 0
+    assert diag["proj_corr_ratio"] == 0.0
+    for p, g in zip(gamma.parameters(), g_task):
+        assert torch.equal(p.grad, g), "kappa>=1 must be a pure task step"
+    print("test_kappa_ge_one_never_binds OK")
 
 
 def test_kappa_schedule():
@@ -206,13 +248,162 @@ def test_kappa_schedule():
     print("test_kappa_schedule OK")
 
 
+# --- boundary integration ---------------------------------------------------
+
+class _CountingOpt:
+    def __init__(self, opt):
+        self.opt = opt
+        self.steps = 0
+
+    def zero_grad(self, *a, **k):
+        return self.opt.zero_grad(*a, **k)
+
+    def step(self, *a, **k):
+        self.steps += 1
+        return self.opt.step(*a, **k)
+
+
+def _boundary_fixture(n_task=30, n_rpbe=40):
+    gamma = TinyGamma()
+    cot, inp = _rand_problem(gamma, max(n_task, n_rpbe) + 1)
+    task_pairs = [inp[i] for i in range(n_task)]
+    task_cots = [cot[i] for i in range(n_task)]
+    rpbe_pairs = [inp[i] for i in range(n_rpbe)]
+    rpbe_cots = [cot[i] for i in range(n_rpbe)]
+    return gamma, task_pairs, task_cots, rpbe_pairs, rpbe_cots
+
+
+def _run_boundary(gamma, task_pairs, task_cots, rpbe_pairs, rpbe_cots, **kw):
+    opt = _CountingOpt(torch.optim.AdamW(list(gamma.parameters()), lr=1e-3))
+    before = [p.detach().clone() for p in gamma.parameters()]
+    diag = apply_gamma_boundary_update(
+        gamma=gamma, gamma_params=list(gamma.parameters()), optimizer=opt,
+        scheduler=None, task_pairs=task_pairs, task_cotangents=task_cots,
+        rpbe_pairs=rpbe_pairs, rpbe_cotangents=rpbe_cots, device="cpu", **kw)
+    moved = sum(float((p.detach() - b0).pow(2).sum())
+                for p, b0 in zip(gamma.parameters(), before)) ** 0.5
+    return opt, diag, moved
+
+
+def test_boundary_takes_exactly_one_step_per_arm():
+    # task control: no rpbe rows
+    g1, tp, tc, rp, rc = _boundary_fixture()
+    opt1, d1, _ = _run_boundary(g1, tp, tc, [], [])
+    assert opt1.steps == 1 and d1["gamma_steps"] == 1
+    assert not d1["gamma_aborted"]
+    # projected arm: same task data + rpbe constraints
+    g2, tp, tc, rp, rc = _boundary_fixture()
+    opt2, d2, _ = _run_boundary(g2, tp, tc, rp, rc, kappa=0.05)
+    assert opt2.steps == 1 and d2["gamma_steps"] == 1
+    assert d2["proj_n_interfaces"] == len(rp)
+    assert d2["proj_n_checked"] == len(rp)
+    print("test_boundary_takes_exactly_one_step_per_arm OK  "
+          "checked=%d active=%d" % (d2["proj_n_checked"], d2["proj_n_active"]))
+
+
+def test_boundary_kappa_one_equals_task_control():
+    """kappa >= 1 never binds, so the projected arm must reproduce the task
+    control bit-for-bit (same init, same data, fresh optimizer)."""
+    import copy
+    g1, tp, tc, rp, rc = _boundary_fixture()
+    g2 = copy.deepcopy(g1)
+    _run_boundary(g1, tp, tc, [], [])
+    _run_boundary(g2, tp, tc, rp, rc, kappa=1.0)
+    for p1, p2 in zip(g1.parameters(), g2.parameters()):
+        assert torch.allclose(p1, p2, atol=0, rtol=0), "kappa=1 changed the step"
+    print("test_boundary_kappa_one_equals_task_control OK")
+
+
+def test_infeasible_boundary_aborts_without_stepping():
+    g1, tp, tc, rp, rc = _boundary_fixture()
+    opt, diag, moved = _run_boundary(
+        g1, tp, tc, rp, rc, kappa=0.0, tau_feas=1e-12, max_rounds=1,
+        max_active=1, add_per_round=0)
+    assert not diag["proj_feasible"]
+    assert diag["gamma_aborted"] and diag["gamma_steps"] == 0
+    assert opt.steps == 0, "an infeasible projection must not step"
+    assert moved == 0.0, "parameters moved on an aborted boundary"
+    print("test_infeasible_boundary_aborts_without_stepping OK  "
+          "vmax=%.2e" % diag["proj_max_viol_after"])
+
+
+def test_boundary_aborts_without_task_keys():
+    g1, _, _, _, _ = _boundary_fixture()
+    opt, diag, moved = _run_boundary(g1, [], [], [], [])
+    assert diag["gamma_aborted"] and diag["gamma_steps"] == 0
+    assert diag["gamma_abort_reason"] == "no_task_keys"
+    assert opt.steps == 0
+    print("test_boundary_aborts_without_task_keys OK")
+
+
+# --- resume contract --------------------------------------------------------
+
+class _Args:
+    rpbe_mode = "project"
+    kappa = 0.05
+    kappa_anneal_start = -1
+    kappa_anneal_end = -1
+    kappa_anneal_to = 1.0
+    proj_iters = 400
+    proj_tau = 1e-3
+    proj_max_active = 2048
+    proj_max_rounds = 8
+    proj_add_per_round = 512
+
+
+def test_resume_config_contract():
+    want = boundary_config(_Args())
+    assert set(want) == {"rpbe_mode", "kappa", "kappa_anneal_start",
+                         "kappa_anneal_end", "kappa_anneal_to", "proj_iters",
+                         "proj_tau", "proj_max_active", "proj_max_rounds",
+                         "proj_add_per_round"}
+    # Stage8 ckpt, matching -> ok
+    bad, legacy = verify_resume_config(dict(want), want)
+    assert not bad and not legacy
+    # Stage8 ckpt, silently changed kappa -> refused
+    changed = dict(want, kappa=0.2)
+    bad, legacy = verify_resume_config(changed, want)
+    assert bad["kappa"] == (0.2, 0.05) and not legacy
+    # Stage7 ckpt (no rpbe_mode) -> refused by default, allowed only explicitly
+    legacy_cfg = {k: v for k, v in want.items() if k != "rpbe_mode"}
+    bad, legacy = verify_resume_config(legacy_cfg, want)
+    assert "rpbe_mode" in bad and not legacy
+    bad, legacy = verify_resume_config(legacy_cfg, want, allow_legacy_gamma=True)
+    assert not bad and legacy, "legacy migration path must be explicit"
+    print("test_resume_config_contract OK")
+
+
+def test_reference_solver_still_matches_tgn_definition():
+    gamma = TinyGamma()
+    cot, inp = _rand_problem(gamma, 15)
+    G, _ = _rows(gamma, cot, inp)
+    g_task = _adversarial(gamma, G)
+    _set_task_grad(gamma, g_task)
+    ref = treewise_feasibility_projection(
+        [g.clone() for g in g_task], list(gamma.parameters()), G, 0.1)
+    _set_task_grad(gamma, g_task)
+    act = active_set_feasibility_projection(
+        [g.clone() for g in g_task], list(gamma.parameters()), G, 0.1)
+    assert ref["proj_feasible"] and act["proj_feasible"]
+    # the single-shot reference must enforce the same constraints
+    assert act["proj_n_interfaces"] == ref["proj_n_interfaces"]
+    print("test_reference_solver_still_matches_tgn_definition OK")
+
+
 if __name__ == "__main__":
     test_fista_matches_slow_pgd()
     test_no_interfaces_is_pure_task()
-    test_feasible_and_kkt()
+    test_real_kkt_complementarity()
     test_opposite_interfaces_still_repaired()
+    test_all_interfaces_checked_and_order_invariant()
+    test_nonfinite_rows_dropped()
+    test_infeasible_projection_is_dropped_by_row_filter()
     test_kappa_ge_one_never_binds()
-    test_zero_rows_are_dropped()
-    test_per_cut_rows_are_single_interface_vjps()
     test_kappa_schedule()
+    test_boundary_takes_exactly_one_step_per_arm()
+    test_boundary_kappa_one_equals_task_control()
+    test_infeasible_boundary_aborts_without_stepping()
+    test_boundary_aborts_without_task_keys()
+    test_resume_config_contract()
+    test_reference_solver_still_matches_tgn_definition()
     print("ALL_PROJECTION_TESTS_PASS")

@@ -626,6 +626,13 @@ def active_set_feasibility_projection(
     cos = torch.where(valid, Gt / (scale + 1e-30), torch.ones_like(Gt))
     viol = torch.clamp(-cos - kappa, min=0.0)
     diag["proj_cos_min"] = float(cos[valid].min())
+    # cos quantiles over the valid interfaces: the EVIDENCE for choosing kappa
+    # (an interface binds iff cos(g_i, t) < -kappa).  A kappa inherited from
+    # another host can leave the projection permanently inactive.
+    qv = torch.quantile(cos[valid], torch.tensor(
+        [0.01, 0.05, 0.10, 0.25, 0.50]))
+    for nm, v in zip(("q01", "q05", "q10", "q25", "q50"), qv.tolist()):
+        diag[f"proj_cos_{nm}"] = float(v)
     diag["proj_max_viol_before"] = float(viol.max())
     # Only interfaces that BREACH the feasibility tolerance need a constraint.
     # Anything with 0 < v_i <= tau_feas already satisfies the formal criterion,

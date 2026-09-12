@@ -30,7 +30,7 @@ import torch
 import torch.nn as nn
 
 from rpbe_embodied.boundary import apply_gamma_boundary_update
-from rpbe_embodied.loss import (_fista_nonneg, _stack_to,
+from rpbe_embodied.loss import (_fista_nonneg, _iters_ladder, _stack_to,
                                 active_set_feasibility_projection,
                                 interface_influence_rows,
                                 reset_rows_backend_stats, rows_backend_stats)
@@ -280,6 +280,98 @@ def test_stack_to_handles_mixed_inputs():
     print("test_stack_to_handles_mixed_inputs OK")
 
 
+def test_iters_ladder():
+    assert _iters_ladder(400, 1600) == [400, 800, 1600]
+    assert _iters_ladder(400, 400) == [400]
+    assert _iters_ladder(400, 0) == [400]
+    assert _iters_ladder(300, 1000) == [300, 600, 1000]
+    print("test_iters_ladder OK")
+
+
+def _ill_conditioned_problem(gamma, n=60, spread=4.0):
+    """Rows whose norms span `spread` orders of magnitude -- exactly what real
+    bf16 Gamma gradients do, and what made the RAW dual Gram (cond ~1e12)
+    un-solvable by FISTA."""
+    P = sum(p.numel() for p in gamma.parameters())
+    G = (torch.randn(n, P)
+         * torch.logspace(-spread / 2, spread / 2, n)[:, None])
+    t = torch.randn(P) * 1e-2
+    return G, t
+
+
+def test_ill_conditioned_rows_certify_at_the_base_budget():
+    """The row-normalised QP must certify an ill-conditioned problem at the
+    FIRST ladder rung; before the fix this aborted (FISTA stalled)."""
+    gamma = TinyGamma()
+    G, t = _ill_conditioned_problem(gamma)
+    g_task = _flat_task_grad(gamma, t)
+    _set_task_grad(gamma, g_task)
+    kappa = 0.02
+    diag = active_set_feasibility_projection(
+        [g.clone() for g in g_task], list(gamma.parameters()), G, kappa,
+        iters=400, iters_max=1600, tau_feas=1e-3)
+    assert diag["proj_feasible"], diag
+    assert diag["proj_iters_used"] == 400, diag["proj_iters_used"]
+    assert diag["proj_max_viol_after"] <= 1e-3
+    # and the returned d must satisfy the ORIGINAL (un-normalised) half-spaces
+    d = _d_from_grad(gamma)
+    ng = G.norm(dim=1)
+    b = -kappa * ng * float(t.norm())
+    v = torch.clamp(-(G @ d - b), min=0.0) / (ng * float(t.norm()) + 1e-30)
+    assert float(v.max()) <= 1e-3, float(v.max())
+    print("test_ill_conditioned_rows_certify_at_the_base_budget OK  "
+          "vmax=%.2e iters=%d" % (diag["proj_max_viol_after"],
+                                  diag["proj_iters_used"]))
+
+
+def test_row_normalisation_preserves_the_optimum():
+    """Dividing a constraint by the positive ||g_i|| does not change the
+    feasible set, so d* is unchanged.  Checked on a WELL-conditioned problem,
+    where the raw formulation also converges -- so the comparison is
+    meaningful (on an ill-conditioned one the raw dual never converges at
+    all, which is the defect the normalisation fixes)."""
+    gamma = TinyGamma()
+    P = sum(p.numel() for p in gamma.parameters())
+    G = torch.randn(10, P)                      # norms O(1): well conditioned
+    t = torch.randn(P) * 1e-2
+    # the driver's task direction is t_driver = -g_task, so pass -t
+    g_task = _flat_task_grad(gamma, -t)
+    _set_task_grad(gamma, g_task)
+    kappa = 0.02
+    ng = G.norm(dim=1)
+    nt = float(t.norm())
+    b = -kappa * ng * nt
+    # reference: RAW formulation, huge budget (converges here)
+    mu = _fista_nonneg(G @ G.t(), b - G @ t, 40000)
+    d_raw = t + G.t() @ mu
+    assert float((torch.clamp(-(G @ d_raw - b), min=0)
+                  / (ng * nt)).max()) < 1e-6, "raw reference did not converge"
+    # production: normalised QP, driven to the solver's practical floor
+    # (fp32 FISTA bottoms out around 1e-8, so tau must stay above that)
+    active_set_feasibility_projection(
+        [g.clone() for g in g_task], list(gamma.parameters()), G, kappa,
+        iters=40000, iters_max=40000, tau_feas=1e-7)
+    d_prod = _d_from_grad(gamma)
+    rel = float((d_prod - d_raw).norm() / d_raw.norm())
+    assert rel < 1e-3, f"normalisation changed d*: rel={rel}"
+    print("test_row_normalisation_preserves_the_optimum OK  rel=%.2e" % rel)
+
+
+def test_solver_budget_escalates_instead_of_aborting():
+    """A boundary that cannot be certified at the base rung must escalate."""
+    gamma = TinyGamma()
+    G, t = _ill_conditioned_problem(gamma, n=50)
+    g_task = _flat_task_grad(gamma, t)
+    _set_task_grad(gamma, g_task)
+    diag = active_set_feasibility_projection(
+        [g.clone() for g in g_task], list(gamma.parameters()), G, 0.02,
+        iters=5, iters_max=4000, tau_feas=1e-4)
+    assert diag["proj_feasible"], diag
+    assert diag["proj_iters_used"] > 5, diag["proj_iters_used"]
+    print("test_solver_budget_escalates_instead_of_aborting OK  "
+          "iters_used=%d" % diag["proj_iters_used"])
+
+
 def test_nonfinite_rows_dropped():
     gamma = TinyGamma()
     cot, inp = _rand_problem(gamma, 8)
@@ -468,7 +560,7 @@ def test_infeasible_boundary_aborts_without_stepping():
     g1, tp, tc, rp, rc = _boundary_fixture()
     opt, diag, moved = _run_boundary(
         g1, tp, tc, rp, rc, kappa=0.0, tau_feas=1e-12, max_rounds=1,
-        max_active=1, add_per_round=0)
+        max_active=1, add_per_round=0, proj_iters_max=400)
     assert not diag["proj_feasible"]
     assert diag["gamma_aborted"] and diag["gamma_steps"] == 0
     assert diag["gamma_abort_reason"] in ("active_budget_exhausted",
@@ -529,6 +621,7 @@ class _Args:
     rpbe_mode = "project"
     kappa = 0.05
     proj_iters = 400
+    proj_iters_max = 1600
     proj_tau = 1e-3
     proj_max_active = 2048
     proj_max_rounds = 8
@@ -537,8 +630,8 @@ class _Args:
 
 def test_resume_config_contract():
     want = boundary_config(_Args())
-    assert set(want) == {"rpbe_mode", "kappa", "proj_iters", "proj_tau",
-                         "proj_max_active", "proj_max_rounds",
+    assert set(want) == {"rpbe_mode", "kappa", "proj_iters", "proj_iters_max",
+                         "proj_tau", "proj_max_active", "proj_max_rounds",
                          "proj_add_per_round"}
     # kappa is a FIXED constant on the formal method -- no annealing knobs
     assert not any("anneal" in k for k in COMMON_CONFIG_KEYS
@@ -635,6 +728,10 @@ if __name__ == "__main__":
     test_batched_rows_match_per_interface_vjp()
     test_rows_are_detached_constants()
     test_stack_to_handles_mixed_inputs()
+    test_iters_ladder()
+    test_ill_conditioned_rows_certify_at_the_base_budget()
+    test_row_normalisation_preserves_the_optimum()
+    test_solver_budget_escalates_instead_of_aborting()
     test_kappa_ge_one_never_binds()
     test_round0_admits_only_tolerance_breaches()
     test_amp_scale_invariance()

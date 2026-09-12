@@ -182,7 +182,13 @@ def parse_args() -> argparse.Namespace:
                         "constraint (STRICTEST); kappa>=1 = never binds "
                         "(== pure task).")
     p.add_argument("--proj-iters", type=int, default=400,
-                   help="project mode: FISTA iterations per cutting-plane round.")
+                   help="project mode: FISTA iterations at the FIRST rung of "
+                        "the solver-budget ladder.")
+    p.add_argument("--proj-iters-max", type=int, default=1600,
+                   help="project mode: top of the FISTA ladder (400 -> 800 -> "
+                        "1600).  A boundary that cannot be certified at a rung "
+                        "escalates instead of aborting; the certificate "
+                        "tolerance --proj-tau is never relaxed.")
     p.add_argument("--proj-tau", type=float, default=1e-3,
                    help="project mode: feasibility tolerance on the "
                         "DIMENSIONLESS violation v_i = max(0, b_i - g_i.d)/"
@@ -940,7 +946,9 @@ def main() -> None:
                 optimizer=opt_gamma, scheduler=sched_gamma,
                 task_pairs=task_pairs, task_cotangents=task_cots,
                 rpbe_pairs=r_pairs, rpbe_cotangents=r_cots,
-                kappa=kap, proj_iters=args.proj_iters, tau_feas=args.proj_tau,
+                kappa=kap, proj_iters=args.proj_iters,
+                proj_iters_max=args.proj_iters_max,
+                tau_feas=args.proj_tau,
                 max_rounds=args.proj_max_rounds,
                 max_active=args.proj_max_active,
                 add_per_round=args.proj_add_per_round,

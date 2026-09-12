@@ -566,11 +566,84 @@ def _row_dot(G_cpu: torch.Tensor, v_cpu: torch.Tensor,
     return gd
 
 
+def _iters_ladder(base: int, cap: int) -> List[int]:
+    """FISTA budget ladder, e.g. (400, 1600) -> [400, 800, 1600].
+
+    The certificate is checked at each rung, so an easy boundary never pays for
+    the larger budget; a hard one escalates instead of aborting."""
+    base = max(1, int(base))
+    if cap is None or int(cap) <= base:
+        return [base]
+    out = [base]
+    while out[-1] < int(cap):
+        out.append(min(out[-1] * 2, int(cap)))
+    return out
+
+
+def _cutting_plane(G_cpu, t, dev, kappa, tau_feas, ng, Gt, valid, scale, nt,
+                   active, iters, max_rounds, max_active, add_per_round):
+    """One cutting-plane sweep at a fixed FISTA budget.
+
+    Returns (corr, active, mu, vmax, rounds, min_slack, n_mu_pos).  The active
+    rows are EXACTLY row-normalised before the QP: with
+    ``g_hat_i = g_i / ||g_i||`` the half-space ``g_i.d >= -kappa||g_i|| ||t||``
+    is the identical constraint ``g_hat_i.d >= -kappa||t||`` (dividing by the
+    positive ``||g_i||`` does not change the feasible set, hence not d*), but
+    the dual Gram becomes a cosine matrix with unit diagonal instead of one
+    whose conditioning is set by the spread of the row norms -- which is what
+    made FISTA stall on real Gamma gradients.  Rows reaching here already
+    passed ``min_norm``, so the division needs no epsilon.
+    """
+    corr = torch.zeros(t.numel(), dtype=torch.float32, device=dev)
+    mu = None
+    rnd = 0
+    vmax = float("inf")
+    min_slack = float("nan")
+    n_mu_pos = 0
+    active_set = set(active)
+    for rnd in range(1, max_rounds + 1):
+        if active:
+            idx = torch.tensor(active, dtype=torch.long)
+            nga = ng[idx].to(dev, dtype=torch.float32)
+            Ha = G_cpu[idx].to(dev, dtype=torch.float32) / nga[:, None]
+            b = torch.full((Ha.shape[0],), -kappa * nt, device=dev)
+            mu = _fista_nonneg(Ha @ Ha.t(), b - Ha @ t, iters)
+            corr = (mu[:, None] * Ha).sum(0)
+            d = t + corr
+        else:
+            corr = torch.zeros_like(corr)
+            d = t
+        # RE-CHECK every interface at the new d (not just the active set)
+        Gd = _row_dot(G_cpu, d.cpu())
+        vv = torch.where(valid, torch.clamp(-kappa * scale - Gd, min=0.0)
+                         / (scale + 1e-30), torch.zeros_like(Gt))
+        vmax = float(vv.max())
+        if vmax <= tau_feas:
+            break
+        added = 0
+        for i in torch.argsort(vv, descending=True).tolist():
+            if len(active) >= max_active or added >= add_per_round:
+                break
+            if vv[i] > tau_feas and i not in active_set:
+                active.append(i); active_set.add(i); added += 1
+        if added == 0:
+            break
+    if active:
+        idx = torch.tensor(active, dtype=torch.long)
+        nga = ng[idx].to(dev, dtype=torch.float32)
+        Ha = G_cpu[idx].to(dev, dtype=torch.float32) / nga[:, None]
+        slack = Ha @ (t + corr) - (-kappa * nt)
+        min_slack = float(slack.min())
+    if mu is not None:
+        n_mu_pos = int((mu > 1e-8).sum())
+    return corr, active, mu, vmax, rnd, min_slack, n_mu_pos
+
+
 def active_set_feasibility_projection(
     g_task_gamma: List[torch.Tensor], gamma_params: List[torch.Tensor],
     G_cpu: Optional[torch.Tensor], kappa: float, iters: int = 400,
-    tau_feas: float = 1e-3, max_rounds: int = 8, max_active: int = 2048,
-    add_per_round: int = 512, min_norm: float = 1e-9,
+    iters_max: int = 1600, tau_feas: float = 1e-3, max_rounds: int = 8,
+    max_active: int = 2048, add_per_round: int = 512, min_norm: float = 1e-9,
 ) -> dict:
     """Cutting-plane feasibility projection over EVERY interface.
 
@@ -642,38 +715,19 @@ def active_set_feasibility_projection(
     diag["proj_n_candidates"] = n_cand
     active = [i for i in torch.argsort(viol, descending=True).tolist()[:max_active]
               if viol[i] > tau_feas]
-    active_set = set(active)
     diag["proj_n_active_init"] = len(active)
+    # FISTA budget ladder: an easy boundary certifies at `iters` and stops; a
+    # hard one escalates (400 -> 800 -> 1600) instead of aborting.  tau is the
+    # certificate tolerance and is NEVER relaxed to buy feasibility -- that
+    # would fold a solver failure into the method's hyper-parameters.
     corr = torch.zeros(t.numel(), dtype=torch.float32, device=dev)
-    mu = None
-    vmax = float(viol.max())
-    rnd = 0
-    for rnd in range(1, max_rounds + 1):
-        if active:
-            idx = torch.tensor(active, dtype=torch.long)
-            Ga = G_cpu[idx].to(dev, dtype=torch.float32)
-            b = -kappa * ng[idx].to(dev) * nt
-            c = b - Gt[idx].to(dev)
-            mu = _fista_nonneg(Ga @ Ga.t(), c, iters)
-            corr = (mu[:, None] * Ga).sum(0)
-            d = t + corr
-        else:
-            corr = torch.zeros_like(corr)
-            d = t
-        # RE-CHECK every interface at the new d (not just the active set)
-        Gd = _row_dot(G_cpu, d.cpu())
-        vv = torch.where(valid, torch.clamp(-kappa * scale - Gd, min=0.0)
-                         / (scale + 1e-30), torch.zeros_like(Gt))
-        vmax = float(vv.max())
+    mu, vmax, min_slack, rnd, n_mu_pos = None, float(viol.max()), float("nan"), 0, 0
+    for budget in _iters_ladder(iters, iters_max):
+        corr, active, mu, vmax, rnd, min_slack, n_mu_pos = _cutting_plane(
+            G_cpu, t, dev, kappa, tau_feas, ng, Gt, valid, scale, nt, active,
+            budget, max_rounds, max_active, add_per_round)
+        diag["proj_iters_used"] = int(budget)
         if vmax <= tau_feas:
-            break
-        added = 0
-        for i in torch.argsort(vv, descending=True).tolist():
-            if len(active) >= max_active or added >= add_per_round:
-                break
-            if vv[i] > tau_feas and i not in active_set:
-                active.append(i); active_set.add(i); added += 1
-        if added == 0:
             break
     diag["proj_rounds"] = int(rnd)
     diag["proj_n_active"] = len(active)
@@ -685,13 +739,8 @@ def active_set_feasibility_projection(
     diag["proj_max_viol_after"] = vmax
     diag["proj_feasible"] = bool(vmax <= tau_feas)
     diag["proj_corr_ratio"] = float(corr.norm() / max(nt, 1e-12))
-    if mu is not None:
-        diag["proj_n_mu_pos"] = int((mu > 1e-8).sum())
-    if active:
-        idx = torch.tensor(active, dtype=torch.long)
-        Ga = G_cpu[idx].to(dev, dtype=torch.float32)
-        slack = Ga @ (t + corr) - (-kappa * ng[idx].to(dev) * nt)
-        diag["proj_min_slack_after"] = float(slack.min())
+    diag["proj_n_mu_pos"] = n_mu_pos
+    diag["proj_min_slack_after"] = min_slack
     # internal (test-only) handles; the trainer never logs keys starting "_"
     diag["_active"] = active
     diag["_mu"] = None if mu is None else mu.detach().cpu()

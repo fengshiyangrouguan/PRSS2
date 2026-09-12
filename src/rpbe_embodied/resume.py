@@ -28,8 +28,8 @@ COMMON_CONFIG_KEYS = (
 
 # Stage8-only boundary/projection recipe; absent from Stage7 checkpoints
 BOUNDARY_CONFIG_KEYS = (
-    "rpbe_mode", "kappa", "proj_iters", "proj_tau", "proj_max_active",
-    "proj_max_rounds", "proj_add_per_round",
+    "rpbe_mode", "kappa", "proj_iters", "proj_iters_max", "proj_tau",
+    "proj_max_active", "proj_max_rounds", "proj_add_per_round",
 )
 
 

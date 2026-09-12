@@ -49,7 +49,8 @@ def apply_gamma_boundary_update(
     task_cotangents: Sequence[torch.Tensor],
     rpbe_pairs: Optional[Sequence[Tuple[torch.Tensor, torch.Tensor]]] = None,
     rpbe_cotangents: Optional[Sequence[torch.Tensor]] = None,
-    kappa: float = 0.05, proj_iters: int = 400, tau_feas: float = 1e-3,
+    kappa: float = 0.05, proj_iters: int = 400, proj_iters_max: int = 1600,
+    tau_feas: float = 1e-3,
     max_rounds: int = 8, max_active: int = 2048, add_per_round: int = 512,
     grad_clip: float = 1.0, minibatch: int = 64, device: str = "cuda",
     row_chunk: int = 128,
@@ -111,7 +112,8 @@ def apply_gamma_boundary_update(
             return diag
         pj = active_set_feasibility_projection(
             g_task, gamma_params, G_cpu, kappa, iters=proj_iters,
-            tau_feas=tau_feas, max_rounds=max_rounds, max_active=max_active,
+            iters_max=proj_iters_max, tau_feas=tau_feas,
+            max_rounds=max_rounds, max_active=max_active,
             add_per_round=add_per_round)
         diag.update(pj)
         if not pj.get("proj_feasible", True):

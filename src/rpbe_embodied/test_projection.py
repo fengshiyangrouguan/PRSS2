@@ -30,7 +30,8 @@ import torch
 import torch.nn as nn
 
 from rpbe_embodied.boundary import apply_gamma_boundary_update
-from rpbe_embodied.loss import (_fista_nonneg, active_set_feasibility_projection,
+from rpbe_embodied.loss import (_fista_nonneg, _stack_to,
+                                active_set_feasibility_projection,
                                 interface_influence_rows,
                                 reset_rows_backend_stats, rows_backend_stats)
 from rpbe_embodied.resume import (BOUNDARY_CONFIG_KEYS, COMMON_CONFIG_KEYS,
@@ -252,6 +253,31 @@ def test_rows_are_detached_constants():
         list(gamma.parameters()), G, 0.05)
     assert diag["proj_feasible"] is not None
     print("test_rows_are_detached_constants OK")
+
+
+def test_stack_to_handles_mixed_inputs():
+    """Replay inputs are NOT uniform: the window's fixed-trace rebuild returns
+    a CUDA merged state for a merged child and the raw CPU leaf for a leaf
+    child, and leaves are stored fp32.  ``torch.stack`` demands a uniform
+    dtype AND device, so every element must be cast first -- this is the bug
+    the first Stage8 smoke run hit."""
+    a = torch.zeros(3, dtype=torch.float32)
+    b = torch.zeros(3, dtype=torch.bfloat16)
+    out = _stack_to([a, b], "cpu", torch.float32)
+    assert out.dtype == torch.float32 and out.shape == (2, 3)
+    if torch.cuda.is_available():
+        mixed = [torch.zeros(3), torch.zeros(3, device="cuda")]
+        out2 = _stack_to(mixed, "cuda", torch.float32)
+        assert out2.device.type == "cuda" and out2.shape == (2, 3)
+    # and the boundary must survive mixed-dtype pairs end to end
+    g, tp, tc, rp, rc = _boundary_fixture()
+    mixed_tp = [(p[0].to(torch.float32), p[1].to(torch.float32))
+                for p in tp]
+    mixed_tp[::2] = [(p[0].to(torch.bfloat16), p[1].to(torch.bfloat16))
+                     for p in mixed_tp[::2]]
+    opt, diag, _ = _run_boundary(g, mixed_tp, tc, rp, rc, kappa=0.05)
+    assert diag["gamma_steps"] == 1 and opt.steps == 1
+    print("test_stack_to_handles_mixed_inputs OK")
 
 
 def test_nonfinite_rows_dropped():
@@ -608,6 +634,7 @@ if __name__ == "__main__":
     test_rows_backend_is_the_batched_vmap_path()
     test_batched_rows_match_per_interface_vjp()
     test_rows_are_detached_constants()
+    test_stack_to_handles_mixed_inputs()
     test_kappa_ge_one_never_binds()
     test_round0_admits_only_tolerance_breaches()
     test_amp_scale_invariance()

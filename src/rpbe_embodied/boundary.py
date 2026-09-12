@@ -22,6 +22,7 @@ import torch
 
 from .loss import (active_set_feasibility_projection, gamma_replay_loss,
                    interface_influence_rows, rows_backend_stats)
+from .loss import _stack_to
 
 
 def _stream_replay(gamma, pairs, cotangents, dtype, device, minibatch):
@@ -29,12 +30,15 @@ def _stream_replay(gamma, pairs, cotangents, dtype, device, minibatch):
 
     Gradients ACCUMULATE (no zero_grad inside the loop), so the boundary gets
     ONE gradient over every interface -- the property that makes the task
-    control and the projected arm differ by exactly the projection."""
+    control and the projected arm differ by exactly the projection.
+
+    Pairs may hold tensors on MIXED devices (a merged child lives on CUDA, a
+    leaf child on CPU), so every element is cast before the stack."""
     n = len(pairs)
     for i in range(0, n, minibatch):
         sl = list(range(i, min(i + minibatch, n)))
-        m_a = torch.stack([pairs[j][0] for j in sl]).to(device, dtype=dtype)
-        m_b = torch.stack([pairs[j][1] for j in sl]).to(device, dtype=dtype)
+        m_a = _stack_to([pairs[j][0] for j in sl], device, dtype)
+        m_b = _stack_to([pairs[j][1] for j in sl], device, dtype)
         gamma_replay_loss(gamma, m_a, m_b, {j: cotangents[j] for j in sl},
                           sl).backward()
 

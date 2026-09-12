@@ -468,6 +468,16 @@ def _rows_chunk(gamma, m_a, m_b, C, params, device):
         return torch.stack(rows)
 
 
+def _stack_to(seq, device: str, dtype) -> torch.Tensor:
+    """Stack tensors that may live on MIXED devices.
+
+    Replay inputs are not uniform: the window's fixed-trace rebuild returns a
+    CUDA merged state for a merged child but the raw CPU leaf for a leaf child,
+    so ``torch.stack([...]).to(...)`` fails.  Cast each element first.
+    """
+    return torch.stack([t.to(device, dtype=dtype) for t in seq])
+
+
 def interface_influence_rows(
     gamma, cotangents: Dict[tuple, torch.Tensor],
     input_map: Dict[tuple, Tuple[torch.Tensor, torch.Tensor]],
@@ -511,10 +521,10 @@ def interface_influence_rows(
             sl = cand[c0:c0 + chunk]
             rows = _rows_chunk(
                 gamma,
-                torch.stack([input_map[k][0] for k in sl]).to(device, dtype=md),
-                torch.stack([input_map[k][1] for k in sl]).to(device, dtype=md),
-                torch.stack([cotangents[k].reshape(-1) for k in sl]).to(
-                    device, dtype=torch.float32),
+                _stack_to([input_map[k][0] for k in sl], device, md),
+                _stack_to([input_map[k][1] for k in sl], device, md),
+                _stack_to([cotangents[k].reshape(-1) for k in sl],
+                          device, torch.float32),
                 params, device)
             fin = torch.isfinite(rows).all(dim=1)
             n_nonfinite += int((~fin).sum())

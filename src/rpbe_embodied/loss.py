@@ -518,11 +518,14 @@ def interface_influence_rows(
                 params, device)
             fin = torch.isfinite(rows).all(dim=1)
             n_nonfinite += int((~fin).sum())
+            # detach: the rows are constants for the QP.  torch.func.grad can
+            # hand back graph-carrying tensors, and keeping that graph alive
+            # across every cutting-plane round would retain it (and leak).
             if bool(fin.all()):
-                out.append(rows.cpu())
+                out.append(rows.detach().cpu())
                 used.extend(sl)
             else:
-                out.append(rows[fin].cpu())
+                out.append(rows[fin].detach().cpu())
                 used.extend([k for k, ok in zip(sl, fin.tolist()) if ok])
     if not out:
         return None, [], n_nonfinite

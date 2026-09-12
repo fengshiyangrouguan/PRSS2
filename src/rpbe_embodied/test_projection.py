@@ -240,6 +240,20 @@ def test_batched_rows_match_per_interface_vjp():
     print("test_batched_rows_match_per_interface_vjp OK")
 
 
+def test_rows_are_detached_constants():
+    """The QP treats rows as constants: carrying a graph would retain it
+    across every cutting-plane round."""
+    gamma = TinyGamma()
+    cot, inp = _rand_problem(gamma, 6)
+    G, used, _ = _rows(gamma, cot, inp)
+    assert not G.requires_grad, "influence rows must be detached"
+    diag = active_set_feasibility_projection(
+        [torch.randn_like(p) for p in gamma.parameters()],
+        list(gamma.parameters()), G, 0.05)
+    assert diag["proj_feasible"] is not None
+    print("test_rows_are_detached_constants OK")
+
+
 def test_nonfinite_rows_dropped():
     gamma = TinyGamma()
     cot, inp = _rand_problem(gamma, 8)
@@ -593,6 +607,7 @@ if __name__ == "__main__":
     test_infeasible_projection_is_dropped_by_row_filter()
     test_rows_backend_is_the_batched_vmap_path()
     test_batched_rows_match_per_interface_vjp()
+    test_rows_are_detached_constants()
     test_kappa_ge_one_never_binds()
     test_round0_admits_only_tolerance_breaches()
     test_amp_scale_invariance()

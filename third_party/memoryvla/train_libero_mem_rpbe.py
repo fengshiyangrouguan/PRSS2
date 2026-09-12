@@ -123,6 +123,18 @@ def parse_args() -> argparse.Namespace:
                    help="verbose optimizer-closure audit (coverage + per-group "
                         "grad/update norms) for the first N DENSE steps, then "
                         "stop training (0 = off)")
+    p.add_argument("--train-scope",
+                   choices=["full", "lora-gamma", "gamma-only"],
+                   default="full",
+                   help="how much of the HOST may move.  full = the legacy "
+                        "recipe (memory banks + per_compr + DiT + LoRA).  "
+                        "lora-gamma = ONLY LoRA (+ reg_head) in the task "
+                        "optimizer, so the diffusion action model and the "
+                        "memory modules stay frozen.  gamma-only = nothing in "
+                        "the task optimizer; only Gamma trains (pure merger "
+                        "adaptation from a host that already rolls out).  "
+                        "Starting from a working checkpoint, 'full' is a "
+                        "second round of training that destroys the host.")
     p.add_argument("--reg-head", type=int, default=0,
                    help="Stage7: 1 = use the shared deterministic regression "
                         "action head (6DoF equal-weight SmoothL1 + gripper "
@@ -156,6 +168,12 @@ def parse_args() -> argparse.Namespace:
                         "that produced it.  Data stream restarts from a fresh "
                         "epoch (deterministic seed) -- not bitwise cursor "
                         "continuation.")
+    p.add_argument("--no-fullstate", type=int, default=0,
+                   help="1 = do NOT write the rolling fullstate.pt (Adam fp32 "
+                        "state makes it ~2x the weights).  For short pilots "
+                        "where resuming is not needed this halves the disk "
+                        "cost per run; latest.pt/checkpoint.pt still hold the "
+                        "weights.")
     p.add_argument("--snapshot-steps", default="30000,35000,40000",
                    help="optimizer steps (of THIS run) at which to also write "
                         "a weights-only snapshot_<step>.pt for offline eval")
@@ -485,22 +503,32 @@ def main() -> None:
     gamma_params = (list(vla.gamma.parameters())
                     if vla.gamma is not None else [])
     gamma_ids = {id(p) for p in gamma_params}
-    task_modules = [vla.cog_mem_bank, vla.per_mem_bank, vla.per_compr,
-                    vla.action_model]
-    task_params = [p for m in task_modules for p in m.parameters()
-                   if p.requires_grad and id(p) not in lora_ids
-                   and id(p) not in gamma_ids]
-    task_params += lora_params
-    if getattr(vla, "reg_head", None) is not None:
-        task_params += [p for p in vla.reg_head.parameters()
-                        if p.requires_grad and id(p) not in gamma_ids]
+    if args.train_scope == "full":
+        task_modules = [vla.cog_mem_bank, vla.per_mem_bank, vla.per_compr,
+                        vla.action_model]
+        task_params = [p for m in task_modules for p in m.parameters()
+                       if p.requires_grad and id(p) not in lora_ids
+                       and id(p) not in gamma_ids]
+        task_params += lora_params
+        if getattr(vla, "reg_head", None) is not None:
+            task_params += [p for p in vla.reg_head.parameters()
+                            if p.requires_grad and id(p) not in gamma_ids]
+    elif args.train_scope == "lora-gamma":
+        # freeze the host: the DiT action model and the memory modules keep the
+        # rollout ability the init checkpoint already has.
+        task_params = list(lora_params)
+        if getattr(vla, "reg_head", None) is not None:
+            task_params += [p for p in vla.reg_head.parameters()
+                            if p.requires_grad and id(p) not in gamma_ids]
+    else:  # gamma-only: nothing but the merger trains
+        task_params = []
     # disjointness guarantee (reviewer): no trainable param in both optimizers
     task_ids = {id(p) for p in task_params}
     overlap = task_ids & gamma_ids
     assert not overlap, f"gamma/task param overlap: {len(overlap)}"
     gamma_lr = args.gamma_lr if args.gamma_lr > 0 else args.lr
-    opt_task = torch.optim.AdamW(task_params, lr=args.lr, weight_decay=0.0,
-                             foreach=False)
+    opt_task = (torch.optim.AdamW(task_params, lr=args.lr, weight_decay=0.0,
+                                  foreach=False) if task_params else None)
     if gamma_params:
         opt_gamma = torch.optim.AdamW(gamma_params, lr=gamma_lr,
                                weight_decay=0.0, foreach=False)
@@ -522,7 +550,8 @@ def main() -> None:
             1, args.max_steps - args.warmup_steps)
         return 0.5 * (1.0 + math.cos(math.pi * min(1.0, progress)))
 
-    sched_task = torch.optim.lr_scheduler.LambdaLR(opt_task, lr_lambda_task)
+    sched_task = (torch.optim.lr_scheduler.LambdaLR(opt_task, lr_lambda_task)
+                  if opt_task is not None else None)
     # gamma scheduler indexed by param_version (gamma step count).
     def lr_lambda_gamma(rs):
         if args.sched == "const":
@@ -537,7 +566,8 @@ def main() -> None:
     if opt_gamma is not None:
         sched_gamma = torch.optim.lr_scheduler.LambdaLR(opt_gamma,
                                                         lr_lambda_gamma)
-    print(f"task params: {sum(p.numel() for p in task_params)/1e6:.2f}M | "
+    print(f"scope={args.train_scope} | "
+          f"task params: {sum(p.numel() for p in task_params)/1e6:.2f}M | "
           f"gamma params: {sum(p.numel() for p in gamma_params)/1e6:.2f}M",
           flush=True)
 
@@ -585,8 +615,10 @@ def main() -> None:
                 dev.add(str(p.device))
             if gname == "gamma" and opt_gamma is not None:
                 lr = opt_gamma.param_groups[-1]["lr"]
-            else:
+            elif opt_task is not None:
                 lr = opt_task.param_groups[-1]["lr"]
+            else:
+                lr = float("nan")
             print(f"[audit {step}] {gname:10s} n={len(pairs)} "
                   f"grad={gnorm:.3e} upd={math.sqrt(upd2):.3e} "
                   f"lr={lr:.2e} dev={sorted(dev)}", flush=True)
@@ -596,7 +628,7 @@ def main() -> None:
         id2name = {id(p): n for n, p in vla.named_parameters()}
         off = []
         devs = set()
-        for g in opt_task.param_groups:
+        for g in (opt_task.param_groups if opt_task is not None else []):
             for p in g["params"]:
                 if p in opt_task.state:
                     for st in opt_task.state[p].values():
@@ -1001,7 +1033,9 @@ def main() -> None:
         if b_norms:
             mean_b = sum(b_norms) / len(b_norms)
             nz = sum(1 for v in b_norms if v > 0.0)
-            lr_now = opt_task.param_groups[-1]["lr"]
+            lr_now = (opt_task.param_groups[-1]["lr"]
+                      if opt_task is not None
+                      else opt_gamma.param_groups[-1]["lr"])
             print(f"[lora] pv={vla.cog_mem_bank.param_version} "
                   f"lr={lr_now:.2e} mean|B|={mean_b:.3e} "
                   f"nzB={nz}/{n_b}", flush=True)
@@ -1052,10 +1086,12 @@ def main() -> None:
         payload = _ckpt_dict()
         payload["weights_snapshot_only"] = False
         payload["full_state"] = True
-        payload["opt_task"] = opt_task.state_dict()
+        payload["opt_task"] = (opt_task.state_dict()
+                               if opt_task is not None else None)
         payload["opt_gamma"] = (opt_gamma.state_dict()
                                 if opt_gamma is not None else None)
-        payload["sched_task"] = sched_task.state_dict()
+        payload["sched_task"] = (sched_task.state_dict()
+                                 if sched_task is not None else None)
         payload["sched_gamma"] = (sched_gamma.state_dict()
                                   if sched_gamma is not None else None)
         payload["rng_cuda"] = torch.cuda.get_rng_state()
@@ -1095,7 +1131,10 @@ def main() -> None:
         for n, t in ck["model"].items():
             if n in named and named[n].requires_grad:
                 named[n].data.copy_(t.to(named[n].dtype))
-        opt_task.load_state_dict(ck["opt_task"])
+        if opt_task is not None:
+            assert ck["opt_task"] is not None, \
+                "checkpoint has no task-optimizer state"
+            opt_task.load_state_dict(ck["opt_task"])
         # verify the run config the checkpoint was produced under BEFORE any
         # optimizer state is restored (reviewer: resume must not silently
         # change the boundary recipe, and Stage7->Stage8 must be explicit)
@@ -1125,7 +1164,8 @@ def main() -> None:
             assert ck["opt_gamma"] is not None, "full ckpt has no gamma state"
             if not reset_gamma_state:
                 opt_gamma.load_state_dict(ck["opt_gamma"])
-        sched_task.load_state_dict(ck["sched_task"])
+        if sched_task is not None and ck["sched_task"] is not None:
+            sched_task.load_state_dict(ck["sched_task"])
         if sched_gamma is not None and not reset_gamma_state:
             sched_gamma.load_state_dict(ck["sched_gamma"])
         optimizer_step = int(ck.get("optimizer_step", ck["step"]))
@@ -1256,10 +1296,15 @@ def main() -> None:
             audit_snap = (_audit_snapshot()
                           if args.opt_audit and optimizer_step < args.opt_audit
                           else None)
-            torch.nn.utils.clip_grad_norm_(task_params, args.grad_clip)
-            opt_task.step()
-            opt_task.zero_grad()
-            sched_task.step()
+            if opt_task is not None:
+                torch.nn.utils.clip_grad_norm_(task_params, args.grad_clip)
+                opt_task.step()
+                opt_task.zero_grad()
+                sched_task.step()
+            else:
+                # gamma-only: the backward still fills host grads with no
+                # optimizer to consume them -- drop them so they cannot grow.
+                vla.zero_grad(set_to_none=True)
             optimizer_step += 1
             if audit_snap is not None:
                 _audit_report(optimizer_step, audit_snap)
@@ -1290,8 +1335,13 @@ def main() -> None:
             if args.checkpoint_every > 0 and \
                     optimizer_step % args.checkpoint_every == 0:
                 torch.save(_ckpt_dict(), run_dir / "latest.pt")
-                torch.save(_full_dict(), run_dir / "fullstate.pt")
-                print(f"latest+fullstate saved @ opt {optimizer_step}", flush=True)
+                if not args.no_fullstate:
+                    torch.save(_full_dict(), run_dir / "fullstate.pt")
+                    print(f"latest+fullstate saved @ opt {optimizer_step}",
+                          flush=True)
+                else:
+                    print(f"latest saved @ opt {optimizer_step} "
+                          f"(fullstate disabled)", flush=True)
 
             if optimizer_step in snapshot_set and \
                     optimizer_step not in snapshot_saved:

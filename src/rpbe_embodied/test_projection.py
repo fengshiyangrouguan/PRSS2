@@ -29,7 +29,8 @@ import math
 import torch
 import torch.nn as nn
 
-from rpbe_embodied.boundary import apply_gamma_boundary_update
+from rpbe_embodied.boundary import (_counterfactual_task_step,
+                                    apply_gamma_boundary_update)
 from rpbe_embodied.loss import (_fista_nonneg, _iters_ladder, _stack_to,
                                 active_set_feasibility_projection,
                                 interface_influence_rows,
@@ -372,6 +373,119 @@ def test_solver_budget_escalates_instead_of_aborting():
           "iters_used=%d" % diag["proj_iters_used"])
 
 
+def _run_boundary_with(gamma, tp, tc, rp, rc, opt_factory, **kw):
+    opt = _CountingOpt(opt_factory(list(gamma.parameters())))
+    diag = apply_gamma_boundary_update(
+        gamma=gamma, gamma_params=list(gamma.parameters()), optimizer=opt,
+        scheduler=None, task_pairs=tp, task_cotangents=tc,
+        rpbe_pairs=rp, rpbe_cotangents=rc, device="cpu", **kw)
+    return opt, diag
+
+
+def test_realized_audit_matches_raw_certificate_under_sgd():
+    """Plain SGD has no momentum or adaptive preconditioning, so
+    d_theta_real = lr * d* exactly and the realized AdamW constraint is the
+    SAME inequality as the raw one.  This makes SGD the exactness control for
+    the realized audit: if the audit is coded right, the two numbers must
+    agree with the raw certificate."""
+    g, tp, tc, rp, rc = _boundary_fixture()
+    _, diag = _run_boundary_with(g, tp, tc, rp, rc,
+                                 lambda ps: torch.optim.SGD(ps, lr=1e-3),
+                                 kappa=0.05, grad_clip=1e9)
+    assert diag["gamma_steps"] == 1
+    for k in ("real_cos_dstar", "real_vmax", "real_dtheta_norm",
+              "real_dtheta_task_norm", "real_dtheta_ratio"):
+        assert k in diag and diag[k] == diag[k], k          # present, not NaN
+    assert abs(diag["real_cos_dstar"] - 1.0) < 1e-4, diag["real_cos_dstar"]
+    assert diag["real_vmax"] <= 1e-3 + 1e-9, diag["real_vmax"]
+    # The realized displacement is recovered by subtracting fp32 parameters
+    # whose magnitude is O(1) while the step is O(1e-7), so it is only known to
+    # a few digits.  The two certificates must therefore agree to well within
+    # tau, not bitwise.
+    assert abs(diag["real_vmax"] - diag["proj_max_viol_after"]) < 1e-5, \
+        (diag["real_vmax"], diag["proj_max_viol_after"])
+    print("test_realized_audit_matches_raw_certificate_under_sgd OK  "
+          "cos(d*,dtheta)=%.6f real_vmax=%.2e"
+          % (diag["real_cos_dstar"], diag["real_vmax"]))
+
+
+def test_realized_audit_records_adamw_twist():
+    """Under AdamW the realized step is NOT lr*d*, so cos(d*, d_theta_real)
+    is the direct measure of how far the optimizer twisted the certified
+    direction.  The audit must report it (no pass/fail -- it is a measurement)."""
+    g, tp, tc, rp, rc = _boundary_fixture()
+    _, diag = _run_boundary_with(g, tp, tc, rp, rc,
+                                 lambda ps: torch.optim.AdamW(ps, lr=1e-3),
+                                 kappa=0.05, grad_clip=1e9)
+    assert diag["gamma_steps"] == 1
+    assert -1.0 <= diag["real_cos_dstar"] <= 1.0
+    assert diag["real_dtheta_ratio"] > 0
+    assert diag["real_dtheta_task_norm"] > 0
+    assert diag["real_n_below_neg_kappa"] >= 0
+    print("test_realized_audit_records_adamw_twist OK  cos(d*,dtheta)=%.4f "
+          "real_vmax=%.2e ratio=%.3f"
+          % (diag["real_cos_dstar"], diag["real_vmax"],
+             diag["real_dtheta_ratio"]))
+
+
+def test_counterfactual_is_non_destructive_and_rng_free():
+    """The counterfactual must not move the real parameters or touch the real
+    optimizer state, and it must not consume RNG (it does no forward pass)."""
+    import copy as _copy
+    g, _, _, _, _ = _boundary_fixture()
+    params = list(g.parameters())
+    opt = torch.optim.AdamW(params, lr=1e-3)
+    g_task = [torch.randn_like(p) for p in params]
+    for p, gt in zip(params, g_task):
+        p.grad = gt.clone()
+    before = [p.detach().clone() for p in params]
+    state_before = _copy.deepcopy(opt.state_dict())
+    rng_before = torch.get_rng_state()
+    d = _counterfactual_task_step(opt, params, g_task, 1e9)
+    assert d is not None and len(d) == len(params)
+    assert torch.equal(torch.get_rng_state(), rng_before), "RNG consumed"
+    for p, b in zip(params, before):
+        assert torch.equal(p.detach(), b), "counterfactual moved real params"
+    after = opt.state_dict()
+    assert len(after["state"]) == len(state_before["state"])
+    assert float(after["param_groups"][0]["lr"]) == \
+        float(state_before["param_groups"][0]["lr"])
+    print("test_counterfactual_is_non_destructive_and_rng_free OK")
+
+
+def test_tiny_task_direction_skips_projection():
+    """A negligible task direction must be flagged, not normalised by."""
+    gamma = TinyGamma()
+    cot, inp = _rand_problem(gamma, 8)
+    G, _, _ = _rows(gamma, cot, inp)
+    g_task = [torch.zeros_like(p) for p in gamma.parameters()]
+    _set_task_grad(gamma, g_task)
+    diag = active_set_feasibility_projection(
+        [g.clone() for g in g_task], list(gamma.parameters()), G, 0.05)
+    assert diag.get("proj_skipped_tiny_task") == 1, diag
+    assert diag["proj_feasible"] is True
+    for p, g in zip(gamma.parameters(), g_task):
+        assert torch.equal(p.grad, g)
+    print("test_tiny_task_direction_skips_projection OK")
+
+
+def test_tiny_rows_excluded_by_row_norm_tol():
+    gamma = TinyGamma()
+    cot, inp = _rand_problem(gamma, 10)
+    G, _, _ = _rows(gamma, cot, inp)
+    G[3] = 0.0
+    G[7] = 1e-30
+    g_task = _adversarial(gamma, torch.nan_to_num(G))
+    _set_task_grad(gamma, g_task)
+    diag = active_set_feasibility_projection(
+        [g.clone() for g in g_task], list(gamma.parameters()), G, 0.05,
+        row_norm_tol=1e-9)
+    assert diag["proj_n_below_row_tol"] >= 2, diag["proj_n_below_row_tol"]
+    assert diag["proj_n_valid"] == 8
+    print("test_tiny_rows_excluded_by_row_norm_tol OK  below_tol=%d"
+          % diag["proj_n_below_row_tol"])
+
+
 def test_nonfinite_rows_dropped():
     gamma = TinyGamma()
     cot, inp = _rand_problem(gamma, 8)
@@ -496,6 +610,9 @@ class _CountingOpt:
     def __init__(self, opt):
         self.opt = opt
         self.steps = 0
+
+    def __getattr__(self, name):          # forward param_groups etc.
+        return getattr(self.opt, name)
 
     def zero_grad(self, *a, **k):
         return self.opt.zero_grad(*a, **k)
@@ -728,6 +845,11 @@ if __name__ == "__main__":
     test_batched_rows_match_per_interface_vjp()
     test_rows_are_detached_constants()
     test_stack_to_handles_mixed_inputs()
+    test_realized_audit_matches_raw_certificate_under_sgd()
+    test_realized_audit_records_adamw_twist()
+    test_counterfactual_is_non_destructive_and_rng_free()
+    test_tiny_task_direction_skips_projection()
+    test_tiny_rows_excluded_by_row_norm_tol()
     test_iters_ladder()
     test_ill_conditioned_rows_certify_at_the_base_budget()
     test_row_normalisation_preserves_the_optimum()

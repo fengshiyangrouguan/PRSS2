@@ -592,7 +592,7 @@ def _cutting_plane(G_cpu, t, dev, kappa, tau_feas, ng, Gt, valid, scale, nt,
     the dual Gram becomes a cosine matrix with unit diagonal instead of one
     whose conditioning is set by the spread of the row norms -- which is what
     made FISTA stall on real Gamma gradients.  Rows reaching here already
-    passed ``min_norm``, so the division needs no epsilon.
+    passed ``row_norm_tol``, so the division needs no epsilon.
     """
     corr = torch.zeros(t.numel(), dtype=torch.float32, device=dev)
     mu = None
@@ -643,7 +643,8 @@ def active_set_feasibility_projection(
     g_task_gamma: List[torch.Tensor], gamma_params: List[torch.Tensor],
     G_cpu: Optional[torch.Tensor], kappa: float, iters: int = 400,
     iters_max: int = 1600, tau_feas: float = 1e-3, max_rounds: int = 8,
-    max_active: int = 2048, add_per_round: int = 512, min_norm: float = 1e-9,
+    max_active: int = 2048, add_per_round: int = 512,
+    row_norm_tol: float = 1e-9, task_norm_tol: float = 1e-12,
 ) -> dict:
     """Cutting-plane feasibility projection over EVERY interface.
 
@@ -682,15 +683,23 @@ def active_set_feasibility_projection(
         "proj_corr_ratio": 0.0, "proj_kappa": float(kappa),
         "proj_feasible": True,
     }
-    if G_cpu is None or G_cpu.numel() == 0 or nt == 0.0:
+    if G_cpu is None or G_cpu.numel() == 0:
         return diag
     if not math.isfinite(nt):
         # a non-finite task direction can never be feasibly projected
         diag["proj_feasible"] = False
         diag["proj_abort"] = "nonfinite_task_direction"
         return diag
+    if nt <= task_norm_tol:
+        # A negligible task direction makes ||t|| a meaningless normaliser and
+        # t itself ~0, so the pure task step IS the answer.  Flagged distinctly
+        # so this can never be mistaken for a certified projection.
+        diag["proj_skipped_tiny_task"] = 1
+        return diag
     ng, Gt = _norm_and_dot(G_cpu, t_cpu)
-    valid = (ng > min_norm) & torch.isfinite(ng) & torch.isfinite(Gt)
+    valid = ((ng > row_norm_tol) & torch.isfinite(ng)
+             & torch.isfinite(Gt))
+    diag["proj_n_below_row_tol"] = int((ng <= row_norm_tol).sum())
     diag["proj_n_valid"] = int(valid.sum())
     diag["proj_n_checked"] = int(G_cpu.shape[0])
     if not bool(valid.any()):
@@ -744,6 +753,12 @@ def active_set_feasibility_projection(
     # internal (test-only) handles; the trainer never logs keys starting "_"
     diag["_active"] = active
     diag["_mu"] = None if mu is None else mu.detach().cpu()
+    # handles the realized-displacement audit needs (pre-step geometry)
+    diag["_G_cpu"] = G_cpu
+    diag["_ng"] = ng
+    diag["_valid"] = valid
+    diag["_corr"] = corr
+    diag["_t"] = t
     if diag["proj_feasible"]:
         with torch.no_grad():
             for p, cp, gt in zip(gamma_params, torch.split(corr, sizes),

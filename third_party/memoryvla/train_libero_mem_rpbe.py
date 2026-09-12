@@ -1299,12 +1299,13 @@ def main() -> None:
             if opt_task is not None:
                 torch.nn.utils.clip_grad_norm_(task_params, args.grad_clip)
                 opt_task.step()
-                opt_task.zero_grad()
                 sched_task.step()
-            else:
-                # gamma-only: the backward still fills host grads with no
-                # optimizer to consume them -- drop them so they cannot grow.
-                vla.zero_grad(set_to_none=True)
+            # Clear EVERY parameter's grad, not just the optimizer's params.
+            # Under lora-gamma the frozen banks/DiT still receive grads from
+            # the backward, and the gamma task cotangents are read straight off
+            # bank-leaf .grad -- letting them accumulate would both grow them
+            # unboundedly and corrupt those cotangents.
+            vla.zero_grad(set_to_none=True)
             optimizer_step += 1
             if audit_snap is not None:
                 _audit_report(optimizer_step, audit_snap)

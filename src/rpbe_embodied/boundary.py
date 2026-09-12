@@ -73,17 +73,30 @@ def apply_gamma_boundary_update(
     # no constraint is written (empty / all-zero rows).
     g_task = [p.grad.detach().clone() if p.grad is not None
               else torch.zeros_like(p) for p in gamma_params]
-    diag["g_gamma_task"] = float(
-        torch.cat([g.flatten().float() for g in g_task]).norm())
+    g_task_flat = torch.cat([g.flatten().float() for g in g_task])
+    diag["g_gamma_task"] = float(g_task_flat.norm())
+    if not bool(torch.isfinite(g_task_flat).all()):
+        optimizer.zero_grad()
+        diag["gamma_aborted"] = True
+        diag["gamma_abort_reason"] = "nonfinite_task_gradient"
+        return diag
 
     if rpbe_pairs:
         n = len(rpbe_pairs)
-        G_cpu, used = interface_influence_rows(
+        G_cpu, used, n_nonfinite = interface_influence_rows(
             gamma,
             {j: rpbe_cotangents[j] for j in range(n)},
             {j: rpbe_pairs[j] for j in range(n)},
             list(range(n)), params=gamma_params, device=device, chunk=row_chunk)
         diag["proj_n_rows_used"] = len(used)
+        diag["proj_n_nonfinite"] = n_nonfinite
+        if n_nonfinite:
+            # FAIL CLOSED: one bad interface gradient must not silently reduce
+            # the constraint set the boundary claims to satisfy.
+            optimizer.zero_grad()
+            diag["gamma_aborted"] = True
+            diag["gamma_abort_reason"] = "nonfinite_constraint_row"
+            return diag
         pj = active_set_feasibility_projection(
             g_task, gamma_params, G_cpu, kappa, iters=proj_iters,
             tau_feas=tau_feas, max_rounds=max_rounds, max_active=max_active,
@@ -92,7 +105,11 @@ def apply_gamma_boundary_update(
         if not pj.get("proj_feasible", True):
             optimizer.zero_grad()
             diag["gamma_aborted"] = True
-            diag["gamma_abort_reason"] = "infeasible_projection"
+            diag["gamma_abort_reason"] = (
+                pj.get("proj_abort")
+                or ("active_budget_exhausted"
+                    if pj.get("proj_n_active", 0) >= max_active
+                    else "projection_not_certified"))
             return diag
 
     diag["g_gamma_clip"] = float(

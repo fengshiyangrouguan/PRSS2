@@ -16,7 +16,8 @@ from .loss import (  # noqa: F401
     gamma_replay_loss,
     interface_influence_rows,
     kappa_at,
-    treewise_feasibility_projection,
+    reset_rows_backend_stats,
+    rows_backend_stats,
 )
 from .maps import EmbodiedFixedMaps  # noqa: F401
 from .records import (  # noqa: F401
@@ -25,4 +26,8 @@ from .records import (  # noqa: F401
     PendingMerge,
     PendingMergeQueue,
 )
-from .resume import boundary_config, verify_resume_config  # noqa: F401
+from .resume import (  # noqa: F401
+    boundary_config,
+    realign_lambda_scheduler,
+    verify_resume_config,
+)

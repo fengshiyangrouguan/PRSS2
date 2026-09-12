@@ -429,19 +429,53 @@ def kappa_at(step: int, kappa_max: float, start: int, end: int,
     return float(kappa_max) + f * (float(kappa_to) - float(kappa_max))
 
 
+_ROWS_BACKEND = {"batched_chunks": 0, "fallback_chunks": 0, "last_error": None}
+
+
+def rows_backend_stats() -> dict:
+    """Counters for the per-interface VJP backend.
+
+    ``fallback_chunks > 0`` means the batched ``torch.func`` path was
+    unavailable and the slow per-interface loop ran; tests assert it stays 0
+    so a silent regression to the slow path cannot hide.
+    """
+    return dict(_ROWS_BACKEND)
+
+
+def reset_rows_backend_stats() -> None:
+    _ROWS_BACKEND.update(batched_chunks=0, fallback_chunks=0, last_error=None)
+
+
 def _rows_chunk(gamma, m_a, m_b, C, params, device):
-    """One vmap'd backward for a chunk of interfaces -> [c, P] fp32 rows."""
+    """Per-interface VJP rows for one chunk -> [c, P] fp32.
+
+    Primary path: ``torch.func.grad`` + ``vmap`` over the interface batch, so
+    a chunk of ``c`` interfaces costs ONE batched backward.  (Note
+    ``torch.autograd.grad(..., is_grads_batched=True)`` does NOT do this: its
+    grad_outputs leading dim must align with the WHOLE output, not the
+    interface axis.)  If the vmap path is unavailable it falls back to a
+    per-interface loop, but the fallback is COUNTED and warned about loudly --
+    never silent, so a slow run can never masquerade as a fast one.
+    """
     n = C.shape[0]
     try:
-        z = gamma(m_a, m_b)
-        grads = torch.autograd.grad(z.float(), params, grad_outputs=C,
-                                    is_grads_batched=True, allow_unused=True)
-        return torch.cat([
-            (g if g is not None else torch.zeros(
-                (n,) + p.shape, device=device, dtype=torch.float32)
-             ).reshape(n, -1).float() for g, p in zip(grads, params)], dim=1)
-    except Exception:
-        # fallback: one independent forward+VJP per interface (robust, slower)
+        from torch.func import functional_call, grad, vmap
+        pdict = {name: p for name, p in gamma.named_parameters()}
+
+        def scalar(pd, a, b, c):
+            z = functional_call(gamma, pd, (a.unsqueeze(0), b.unsqueeze(0)))[0]
+            return (c * z.float()).sum()
+
+        out = vmap(grad(scalar), in_dims=(None, 0, 0, 0))(pdict, m_a, m_b, C)
+        _ROWS_BACKEND["batched_chunks"] += 1
+        return torch.cat([out[name].reshape(n, -1).float()
+                          for name, _ in gamma.named_parameters()], dim=1)
+    except Exception as e:  # noqa: BLE001 -- must be visible, never silent
+        _ROWS_BACKEND["fallback_chunks"] += 1
+        _ROWS_BACKEND["last_error"] = f"{type(e).__name__}: {e}"
+        print(f"[rpbe rows] WARNING: batched vmap VJP unavailable "
+              f"({type(e).__name__}: {e}); using the per-interface loop "
+              f"(SLOW).  Reported via rows_backend_stats().", flush=True)
         rows = []
         for i in range(n):
             zi = gamma(m_a[i:i + 1], m_b[i:i + 1])[0]
@@ -458,7 +492,7 @@ def interface_influence_rows(
     input_map: Dict[tuple, Tuple[torch.Tensor, torch.Tensor]],
     keys: List[tuple], params: Optional[List[torch.Tensor]] = None,
     device: str = "cuda", chunk: int = 128,
-) -> Tuple[Optional[torch.Tensor], List[tuple]]:
+) -> Tuple[Optional[torch.Tensor], List[tuple], int]:
     """Interface-wise RPBE influence gradients, ONE ROW PER INTERFACE, fp32.
 
     g_i = (dz_i/dGamma)^T a_i, where a_i = dJ/dz_i is the window adjoint for
@@ -475,17 +509,22 @@ def interface_influence_rows(
     dropping rows at random has no unbiased-constraint interpretation.
     Memory is bounded instead by (a) batching the VJPs per ``chunk`` and
     (b) keeping rows in CPU fp32 (P ~ 0.574M -> 2.3 MB/row); VRAM never holds
-    more than one chunk.  Non-finite rows are DROPPED here (an Inf row would
-    poison Q and eigvalsh) and reported via ``used_keys``.
+    more than one chunk.  Non-finite rows are DROPPED here -- an Inf row would
+    poison Q and eigvalsh -- but the count is returned so the caller can FAIL
+    CLOSED (abort the boundary) instead of silently enforcing one constraint
+    fewer than the interfaces it claims to protect.
+
+    Returns ``(G_cpu [n_valid, P] fp32 | None, used_keys, n_nonfinite)``.
     """
     if params is None:
         params = list(gamma.parameters())
     cand = [k for k in keys if k in cotangents and k in input_map]
     if not cand or not params:
-        return None, []
+        return None, [], 0
     md = params[0].dtype
     out: List[torch.Tensor] = []
     used: List[tuple] = []
+    n_nonfinite = 0
     with torch.autocast("cuda", enabled=False):
         for c0 in range(0, len(cand), chunk):
             sl = cand[c0:c0 + chunk]
@@ -497,6 +536,7 @@ def interface_influence_rows(
                     device, dtype=torch.float32),
                 params, device)
             fin = torch.isfinite(rows).all(dim=1)
+            n_nonfinite += int((~fin).sum())
             if bool(fin.all()):
                 out.append(rows.cpu())
                 used.extend(sl)
@@ -504,9 +544,9 @@ def interface_influence_rows(
                 out.append(rows[fin].cpu())
                 used.extend([k for k, ok in zip(sl, fin.tolist()) if ok])
     if not out:
-        return None, []
+        return None, [], n_nonfinite
     G = torch.cat(out, dim=0)
-    return (G if G.numel() else None), used
+    return (G if G.numel() else None), used, n_nonfinite
 
 
 def _norm_and_dot(G_cpu: torch.Tensor, v_cpu: torch.Tensor,
@@ -576,6 +616,11 @@ def active_set_feasibility_projection(
         "proj_feasible": True,
     }
     if G_cpu is None or G_cpu.numel() == 0 or nt == 0.0:
+        return diag
+    if not math.isfinite(nt):
+        # a non-finite task direction can never be feasibly projected
+        diag["proj_feasible"] = False
+        diag["proj_abort"] = "nonfinite_task_direction"
         return diag
     ng, Gt = _norm_and_dot(G_cpu, t_cpu)
     valid = (ng > min_norm) & torch.isfinite(ng) & torch.isfinite(Gt)
@@ -650,77 +695,4 @@ def active_set_feasibility_projection(
             for p, cp, gt in zip(gamma_params, torch.split(corr, sizes),
                                  g_task_gamma):
                 p.grad = (gt.reshape(-1).float() - cp).to(p.dtype).view_as(p)
-    return diag
-
-
-def treewise_feasibility_projection(
-    g_task_gamma: List[torch.Tensor], gamma_params: List[torch.Tensor],
-    G: Optional[torch.Tensor], kappa: float, iters: int = 400,
-    min_norm: float = 1e-9, tau_feas: float = 1e-3,
-) -> dict:
-    """Interface-wise RPBE Feasibility Projection (TGN final algorithm).
-
-    REFERENCE / single-shot solver.  The trainer uses
-    ``active_set_feasibility_projection`` (all-interface cutting plane); this
-    one keeps the TGN definition in one place and is the test oracle.
-
-    One global task direction t = -g_task; each valid interface i contributes a
-    half-space g_i.d >= -kappa*||g_i||*||t||.  Solve
-
-        d* = argmin_d 1/2||d - t||^2   s.t.  G d >= b,  b_i=-kappa||g_i||.||t||
-
-    through the N x N dual (mu >= 0): d* = t + sum_i mu_i g_i.  Writes ONLY
-    Gamma: p.grad = -d* = g_task - sum_i mu_i g_i.  If ``G`` carries no valid
-    row, nothing is written -- the accumulated task gradient stays in p.grad.
-
-    This is a PRE-OPTIMIZER constraint on the raw gradient combination; it does
-    NOT claim AdamW's realized displacement lies in the half-space.  All
-    constraints enter the QP (a repair for interface 1 may otherwise push
-    interface 7 into violation); inactive ones simply get mu=0.
-    """
-    sizes = [p.numel() for p in gamma_params]
-    t = torch.cat([-x.flatten().float() for x in g_task_gamma])
-    nt = float(t.norm())
-    diag = {"proj_n_interfaces": int(G.shape[0]) if G is not None else 0,
-            "proj_n_valid": 0, "proj_n_active_init": 0, "proj_n_mu_pos": 0,
-            "proj_norm_t": nt, "proj_corr_ratio": 0.0, "proj_cos_min": 0.0,
-            "proj_min_slack_after": float("nan"),
-            "proj_max_viol_before": 0.0, "proj_max_viol_after": 0.0,
-            "proj_feasible": True}
-    if G is None or G.numel() == 0 or nt == 0.0:
-        return diag
-    Gf = G.flatten(1).float()
-    ng = Gf.norm(dim=1)
-    valid = (ng > min_norm) & torch.isfinite(Gf).all(dim=1) & torch.isfinite(ng)
-    if not bool(valid.any()):
-        return diag
-    Gv = Gf[valid]
-    ngv = ng[valid]
-    Gt = Gv @ t
-    b = -kappa * ngv * nt
-    cos_init = Gt / (ngv * nt)
-    diag["proj_n_valid"] = int(Gv.shape[0])
-    diag["proj_n_active_init"] = int((cos_init < -kappa).sum())
-    diag["proj_cos_min"] = float(cos_init.min())
-    diag["proj_max_viol_before"] = float(
-        torch.clamp(-cos_init - kappa, min=0.0).max())
-    Q = Gv @ Gv.t()
-    c = b - Gt
-    mu = _fista_nonneg(Q, c, iters)
-    corr = Gv.t() @ mu                 # = sum_i mu_i g_i  (= d* - t)
-    d = t + corr
-    with torch.no_grad():
-        for p, cp, gt in zip(gamma_params, torch.split(corr, sizes),
-                             g_task_gamma):
-            # grad = -d* = g_task - sum_i mu_i g_i, in the param's own dtype
-            p.grad = (gt.reshape(-1).float() - cp).to(p.dtype).view_as(p)
-    slack = Gv @ d - b
-    diag["proj_n_mu_pos"] = int((mu > 1e-8).sum())
-    diag["proj_min_slack_after"] = float(slack.min())
-    diag["proj_max_viol_after"] = float(
-        torch.clamp(-slack, min=0.0).div(
-            (ngv * nt + 1e-30)).max())
-    diag["proj_feasible"] = bool(diag["proj_max_viol_after"] <= tau_feas)
-    diag["proj_corr_ratio"] = float((d - t).norm() / max(nt, 1e-12))
-    diag["_mu"] = mu.detach().cpu()
     return diag

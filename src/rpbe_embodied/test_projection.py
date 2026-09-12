@@ -13,19 +13,28 @@ Covers the properties the Stage8 migration relies on:
                                  not do;
   4. all interfaces checked   -> 1000+ rows, only a small active set, coverage
                                  reported, row order does not matter;
-  5. non-finite rows          -> dropped, Q never poisoned;
-  6. infeasible               -> the boundary is ABORTED (0 Gamma steps);
+  5. non-finite rows          -> dropped from Q, but the count is reported so
+                                 the BOUNDARY fails closed (never silently
+                                 enforces one constraint fewer);
+  6. uncertified projection   -> the boundary is ABORTED (0 Gamma steps);
   7. kappa >= 1               -> never binds, identical to the task control
-                                 (one step, same parameters).
+                                 (one step, same parameters);
+  8. production vs oracle     -> the active-set d matches an INDEPENDENT
+                                 full-QP oracle defined in this file;
+  9. migration                -> the Gamma scheduler is realigned to
+                                 param_version, not left at warmup step 0.
 """
+import math
+
 import torch
 import torch.nn as nn
 
 from rpbe_embodied.boundary import apply_gamma_boundary_update
 from rpbe_embodied.loss import (_fista_nonneg, active_set_feasibility_projection,
                                 interface_influence_rows, kappa_at,
-                                treewise_feasibility_projection)
-from rpbe_embodied.resume import boundary_config, verify_resume_config
+                                reset_rows_backend_stats, rows_backend_stats)
+from rpbe_embodied.resume import (boundary_config, realign_lambda_scheduler,
+                                  verify_resume_config)
 
 D = 6
 torch.manual_seed(0)
@@ -47,9 +56,27 @@ class TinyGamma(nn.Module):
 
 def _rows(gamma, cot, inp):
     keys = list(cot.keys())
-    G, used = interface_influence_rows(
+    G, used, n_bad = interface_influence_rows(
         gamma, cot, inp, keys, params=list(gamma.parameters()), device="cpu")
-    return G, used
+    return G, used, n_bad
+
+
+def _full_qp_reference(g_task_gamma, G, kappa, iters=800, tau_feas=1e-6):
+    """Independent small-scale oracle: ALL interfaces enter ONE full QP.
+
+    Pure function -- returns (d, mu, diag) and never touches p.grad, so it
+    cannot mask a bug in the production active-set solver.
+    """
+    t = torch.cat([-x.flatten().float() for x in g_task_gamma])
+    nt = float(t.norm())
+    ng = G.norm(dim=1)
+    Gt = G @ t
+    b = -kappa * ng * nt
+    mu = _fista_nonneg(G @ G.t(), b - Gt, iters)
+    d = t + G.t() @ mu
+    v = torch.clamp(-(G @ d - b), min=0.0) / (ng * nt + 1e-30)
+    return d, mu, {"vmax": float(v.max()), "min_slack": float((G @ d - b).min()),
+                   "feasible": float(v.max()) <= tau_feas}
 
 
 def _flat_task_grad(gamma, flat):
@@ -111,7 +138,7 @@ def test_no_interfaces_is_pure_task():
 def test_real_kkt_complementarity():
     gamma = TinyGamma()
     cot, inp = _rand_problem(gamma, 20)
-    G, _ = _rows(gamma, cot, inp)
+    G, _, _ = _rows(gamma, cot, inp)
     g_task = _adversarial(gamma, G)
     _set_task_grad(gamma, g_task)
     kappa, tau = 0.1, 1e-4
@@ -149,7 +176,7 @@ def test_opposite_interfaces_still_repaired():
     a1 = (torch.randn(D), torch.randn(D))
     cot = {0: torch.randn(D), 1: torch.randn(D)}
     inp = {0: a1, 1: a1}
-    G, _ = _rows(gamma, cot, inp)
+    G, _, _ = _rows(gamma, cot, inp)
     G = torch.stack([G[0], -G[0]])
     assert float(G.sum(0).norm()) < 1e-6, "test setup: aggregate must cancel"
     g_task = _flat_task_grad(gamma, 0.5 * G[0])
@@ -168,7 +195,7 @@ def test_all_interfaces_checked_and_order_invariant():
     gamma = TinyGamma()
     n = 1200
     cot, inp = _rand_problem(gamma, n)
-    G, used = _rows(gamma, cot, inp)
+    G, used, _ = _rows(gamma, cot, inp)
     assert G.shape[0] == n and len(used) == n, "no interface may be dropped"
     g_task = _adversarial(gamma, G, scale=0.05)
     _set_task_grad(gamma, g_task)
@@ -198,7 +225,7 @@ def test_all_interfaces_checked_and_order_invariant():
 def test_nonfinite_rows_dropped():
     gamma = TinyGamma()
     cot, inp = _rand_problem(gamma, 8)
-    G, _ = _rows(gamma, cot, inp)
+    G, _, _ = _rows(gamma, cot, inp)
     G[2] = float("inf")
     G[5, 1] = float("nan")
     g_task = _adversarial(gamma, torch.nan_to_num(G, posinf=0.0, neginf=0.0))
@@ -214,20 +241,36 @@ def test_nonfinite_rows_dropped():
 
 
 def test_infeasible_projection_is_dropped_by_row_filter():
-    """A gamma with non-finite weights yields no usable row at all."""
+    """A gamma with non-finite weights yields no usable row at all, and the
+    count is reported so the caller can FAIL CLOSED."""
     gamma = TinyGamma()
     with torch.no_grad():
         gamma.w[0, 0] = float("nan")
     cot, inp = _rand_problem(gamma, 5)
-    G, used = _rows(gamma, cot, inp)
+    G, used, n_bad = _rows(gamma, cot, inp)
     assert G is None, "non-finite rows must not be returned as a G matrix"
+    assert n_bad == 5 and used == [], (n_bad, used)
     print("test_infeasible_projection_is_dropped_by_row_filter OK")
+
+
+def test_rows_backend_is_the_batched_vmap_path():
+    """The chunked VJP must use the batched torch.func path, not silently
+    degrade to the per-interface loop."""
+    reset_rows_backend_stats()
+    gamma = TinyGamma()
+    cot, inp = _rand_problem(gamma, 40)
+    G, used, n_bad = _rows(gamma, cot, inp)
+    st = rows_backend_stats()
+    assert G.shape[0] == 40 and n_bad == 0
+    assert st["fallback_chunks"] == 0, st
+    assert st["batched_chunks"] >= 1, st
+    print("test_rows_backend_is_the_batched_vmap_path OK  %s" % st)
 
 
 def test_kappa_ge_one_never_binds():
     gamma = TinyGamma()
     cot, inp = _rand_problem(gamma, 7)
-    G, _ = _rows(gamma, cot, inp)
+    G, _, _ = _rows(gamma, cot, inp)
     g_task = _adversarial(gamma, G)
     _set_task_grad(gamma, g_task)
     diag = active_set_feasibility_projection(
@@ -257,7 +300,7 @@ def test_amp_scale_invariance():
     the GradScaler factor and AMP can never change the projected direction."""
     gamma = TinyGamma()
     cot, inp = _rand_problem(gamma, 12)
-    G, _ = _rows(gamma, cot, inp)
+    G, _, _ = _rows(gamma, cot, inp)
     g_task = _adversarial(gamma, G)
     _set_task_grad(gamma, g_task)
     active_set_feasibility_projection(
@@ -347,10 +390,47 @@ def test_infeasible_boundary_aborts_without_stepping():
         max_active=1, add_per_round=0)
     assert not diag["proj_feasible"]
     assert diag["gamma_aborted"] and diag["gamma_steps"] == 0
-    assert opt.steps == 0, "an infeasible projection must not step"
+    assert diag["gamma_abort_reason"] in ("active_budget_exhausted",
+                                          "projection_not_certified")
+    assert opt.steps == 0, "an uncertified projection must not step"
     assert moved == 0.0, "parameters moved on an aborted boundary"
     print("test_infeasible_boundary_aborts_without_stepping OK  "
-          "vmax=%.2e" % diag["proj_max_viol_after"])
+          "reason=%s vmax=%.2e" % (diag["gamma_abort_reason"],
+                                   diag["proj_max_viol_after"]))
+
+
+def test_nonfinite_constraint_row_fails_closed():
+    """A non-finite interface gradient must ABORT the boundary, not silently
+    enforce one constraint fewer.  (Poisoning Gamma makes BOTH the task
+    gradient and the constraint rows non-finite, so either guard may fire
+    first; both are fail-closed and both give 0 steps.)"""
+    g1, tp, tc, rp, rc = _boundary_fixture()
+    g1.w.data[0, 0] = float("nan")       # poisons the task grad AND every g_i
+    opt, diag, moved = _run_boundary(g1, tp, tc, rp, rc, kappa=0.05)
+    assert diag["gamma_aborted"] and diag["gamma_steps"] == 0
+    assert diag["gamma_abort_reason"] in ("nonfinite_constraint_row",
+                                          "nonfinite_task_gradient"), diag
+    assert opt.steps == 0, "a NaN boundary must not step"
+    print("test_nonfinite_constraint_row_fails_closed OK  reason=%s"
+          % diag["gamma_abort_reason"])
+
+
+def test_nonfinite_task_direction_is_refused():
+    """A non-finite task direction can never be feasibly projected: the driver
+    must refuse to write a gradient even when the rows are fine."""
+    gamma = TinyGamma()
+    cot, inp = _rand_problem(gamma, 6)
+    G, _, _ = _rows(gamma, cot, inp)
+    # finite entries whose fp32 norm overflows to inf
+    g_task = [torch.full_like(p, 1e38) for p in gamma.parameters()]
+    _set_task_grad(gamma, g_task)
+    diag = active_set_feasibility_projection(
+        [g.clone() for g in g_task], list(gamma.parameters()), G, 0.05)
+    assert not diag["proj_feasible"]
+    assert diag["proj_abort"] == "nonfinite_task_direction"
+    for p, g in zip(gamma.parameters(), g_task):
+        assert torch.equal(p.grad, g), "driver must not write on abort"
+    print("test_nonfinite_task_direction_is_refused OK")
 
 
 def test_boundary_aborts_without_task_keys():
@@ -399,21 +479,47 @@ def test_resume_config_contract():
     print("test_resume_config_contract OK")
 
 
-def test_reference_solver_still_matches_tgn_definition():
+def test_production_solver_matches_full_qp_oracle():
+    """The active-set solver must agree with an INDEPENDENT full-QP oracle
+    (written here, not in production) on the projected direction."""
     gamma = TinyGamma()
     cot, inp = _rand_problem(gamma, 15)
-    G, _ = _rows(gamma, cot, inp)
+    G, _, _ = _rows(gamma, cot, inp)
     g_task = _adversarial(gamma, G)
-    _set_task_grad(gamma, g_task)
-    ref = treewise_feasibility_projection(
-        [g.clone() for g in g_task], list(gamma.parameters()), G, 0.1)
     _set_task_grad(gamma, g_task)
     act = active_set_feasibility_projection(
         [g.clone() for g in g_task], list(gamma.parameters()), G, 0.1)
-    assert ref["proj_feasible"] and act["proj_feasible"]
-    # the single-shot reference must enforce the same constraints
-    assert act["proj_n_interfaces"] == ref["proj_n_interfaces"]
-    print("test_reference_solver_still_matches_tgn_definition OK")
+    assert act["proj_feasible"]
+    d_prod = _d_from_grad(gamma)
+    d_ref, mu_ref, ref = _full_qp_reference(g_task, G, kappa=0.1)
+    assert ref["feasible"], ref
+    rel = float((d_prod - d_ref).norm() / max(float(d_ref.norm()), 1e-12))
+    assert rel < 1e-3, f"active-set d disagrees with the full-QP oracle: {rel}"
+    print("test_production_solver_matches_full_qp_oracle OK  rel=%.2e" % rel)
+
+
+def test_scheduler_realignment_after_migration():
+    """Legacy migration resets the Gamma optimizer, so the scheduler must be
+    moved to param_version instead of sitting at step 0 (warmup LR)."""
+    p = nn.Parameter(torch.zeros(3))
+    opt = torch.optim.AdamW([p], lr=1e-3)
+    warm, total = 30, 1200
+
+    def lam(rs):
+        if rs < warm:
+            return rs / warm
+        return 0.5 * (1.0 + math.cos(math.pi * min(
+            1.0, (rs - warm) / max(1, total - warm))))
+
+    sched = torch.optim.lr_scheduler.LambdaLR(opt, lam)
+    assert sched.get_last_lr()[0] == 0.0            # fresh scheduler
+    pv = 500
+    lr = realign_lambda_scheduler(sched, pv)
+    assert abs(lr[0] - 1e-3 * lam(pv)) < 1e-12, (lr, lam(pv))
+    assert sched.last_epoch == pv
+    # and a fresh scheduler would have been wrong there
+    assert abs(1e-3 * lam(0) - 1e-3 * lam(pv)) > 1e-9
+    print("test_scheduler_realignment_after_migration OK  lr=%.3e" % lr[0])
 
 
 if __name__ == "__main__":
@@ -424,13 +530,17 @@ if __name__ == "__main__":
     test_all_interfaces_checked_and_order_invariant()
     test_nonfinite_rows_dropped()
     test_infeasible_projection_is_dropped_by_row_filter()
+    test_rows_backend_is_the_batched_vmap_path()
     test_kappa_ge_one_never_binds()
     test_kappa_schedule()
     test_amp_scale_invariance()
     test_boundary_takes_exactly_one_step_per_arm()
     test_boundary_kappa_one_equals_task_control()
     test_infeasible_boundary_aborts_without_stepping()
+    test_nonfinite_constraint_row_fails_closed()
+    test_nonfinite_task_direction_is_refused()
     test_boundary_aborts_without_task_keys()
     test_resume_config_contract()
-    test_reference_solver_still_matches_tgn_definition()
+    test_production_solver_matches_full_qp_oracle()
+    test_scheduler_realignment_after_migration()
     print("ALL_PROJECTION_TESTS_PASS")

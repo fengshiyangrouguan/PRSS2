@@ -10,6 +10,7 @@ projection run.
 """
 from __future__ import annotations
 
+import warnings
 from typing import Dict, Tuple
 
 # the Stage8 boundary/projection recipe written into every checkpoint config
@@ -41,3 +42,21 @@ def verify_resume_config(ck_config: dict, want: dict,
     bad = {k: (ck_config.get(k), v) for k, v in want.items()
            if ck_config.get(k) != v}
     return bad, False
+
+
+def realign_lambda_scheduler(sched, step: int):
+    """Move a LambdaLR to the state it would have after ``step`` step() calls.
+
+    Needed on the legacy migration path: the Gamma scheduler is deliberately
+    NOT loaded from the checkpoint (its optimizer state is reset), so without
+    this it would sit at step 0 and hand out the warmup learning rate however
+    far the run had already progressed.  Returns the resulting LR.
+    """
+    if sched is None:
+        return None
+    sched.last_epoch = int(step) - 1
+    with warnings.catch_warnings():
+        # realignment is deliberately a step() with no preceding optimizer step
+        warnings.simplefilter("ignore", UserWarning)
+        sched.step()
+    return sched.get_last_lr()

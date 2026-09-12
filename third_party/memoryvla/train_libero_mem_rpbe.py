@@ -69,7 +69,7 @@ from rpbe_embodied import (  # noqa: E402
     EmbodiedFixedMaps, EmbodiedRPBConfig, EmbodiedRPBEWindow,
     PendingMergeQueue, gamma_replay_loss, dual_latent_z_adjoint_modes,
     apply_gamma_boundary_update, boundary_config, kappa_at,
-    verify_resume_config,
+    realign_lambda_scheduler, verify_resume_config,
 )
 
 
@@ -181,11 +181,11 @@ def parse_args() -> argparse.Namespace:
                         "constraint (STRICTEST); kappa>=1 = never binds "
                         "(== pure task).")
     p.add_argument("--kappa-anneal-start", type=int, default=-1,
-                   help="project mode: GAMMA-BOUNDARY clock (param_version) at "
+                   help="project mode: GAMMA-BOUNDARY-attempt clock at "
                         "which kappa starts to move (default -1 = never "
                         "anneal).  Before it kappa=--kappa.")
     p.add_argument("--kappa-anneal-end", type=int, default=-1,
-                   help="project mode: boundary clock at which kappa reaches "
+                   help="project mode: boundary-attempt index at which kappa reaches "
                         "--kappa-anneal-to (linear in between).")
     p.add_argument("--kappa-anneal-to", type=float, default=1.0,
                    help="project mode: kappa value at --kappa-anneal-end. "
@@ -646,6 +646,11 @@ def main() -> None:
     window_micro = 0          # micro-backwards since last gamma boundary
     boundary_pending = False  # repr threshold crossed; fire at fresh-episode top
     last_eid = None
+    # TWO clocks (reviewer): every boundary ATTEMPT advances
+    # gamma_boundary_index (kappa annealing), while param_version -- the value
+    # MergeRecord stamps into every merge and the Gamma scheduler steps on --
+    # advances ONLY when Gamma actually changed (gamma_steps == 1).
+    gamma_boundary_index = 0
     t0 = time.time()
     print("== training loop start (arm={}) ==".format(args.arm), flush=True)
 
@@ -704,7 +709,7 @@ def main() -> None:
         weight independent of episode length under the dense protocol."""
         nonlocal window, task_cotangents, rpbe_cotangents, rpbe_pending_loss
         nonlocal rpbe_input_map, rpbe_window_episodes
-        nonlocal comp_audit_done
+        nonlocal comp_audit_done, gamma_boundary_index
         if not IS_GAMMA or vla.gamma is None:
             return
         comp_zpw = None
@@ -944,10 +949,10 @@ def main() -> None:
             task_cots = [task_cotangents[k] for k in task_keys]
             r_pairs = [rpbe_input_map[k] for k in rpbe_keys] if rpbe_keys else []
             r_cots = [rpbe_cotangents[k] for k in rpbe_keys] if rpbe_keys else []
-            # kappa anneals on the GAMMA-BOUNDARY clock (param_version), not on
-            # dense optimizer steps: a TGN-style schedule in optimizer steps
-            # would be over before the first few projections.
-            kap = kappa_at(vla.cog_mem_bank.param_version, args.kappa,
+            # kappa anneals on the BOUNDARY-ATTEMPT clock, not on dense
+            # optimizer steps: a TGN-style schedule in optimizer steps would be
+            # over before the first few projections.
+            kap = kappa_at(gamma_boundary_index, args.kappa,
                            args.kappa_anneal_start, args.kappa_anneal_end,
                            args.kappa_anneal_to)
             pre = [p.detach().clone() for p in gamma_params]
@@ -971,7 +976,17 @@ def main() -> None:
                   f"steps={diag['gamma_steps']} "
                   f"aborted={diag['gamma_aborted']} |dgamma|={upd:.3e} "
                   f"{shown}", flush=True)
-        vla.cog_mem_bank.param_version += 1
+        # boundary-attempt clock advances unconditionally; the PARAMETER version
+        # (stamped into MergeRecord and driving the Gamma scheduler) advances
+        # only when Gamma really changed.  An aborted boundary therefore does
+        # not fabricate a new parameter version for merges it never touched.
+        gamma_boundary_index += 1
+        if n_opt > 0:
+            vla.cog_mem_bank.param_version += 1
+        else:
+            print(f"[gamma proj] aborted boundary {gamma_boundary_index}: "
+                  f"param_version stays "
+                  f"{vla.cog_mem_bank.param_version}", flush=True)
         task_cotangents = {}
         rpbe_cotangents = {}
         rpbe_input_map = {}
@@ -1021,6 +1036,7 @@ def main() -> None:
             "step": optimizer_step,
             "micro_step": micro_step,
             "param_version": vla.cog_mem_bank.param_version,
+            "gamma_boundary_index": gamma_boundary_index,
             "mem_length": args.mem_length,
             "lambda_rpbe": args.lambda_rpbe,
             "seed": args.seed,
@@ -1122,7 +1138,7 @@ def main() -> None:
                 print("[resume-full] LEGACY Stage7 checkpoint (no rpbe_mode): "
                       "allowing migration -- Gamma optimizer state (Adam "
                       "moments from the retired additive -lambda*J objective) "
-                      "is RESET, and the Gamma scheduler restarts at "
+                      "is RESET and the Gamma scheduler is realigned to "
                       "param_version.", flush=True)
             else:
                 print("[resume-full] config verified against checkpoint",
@@ -1140,28 +1156,18 @@ def main() -> None:
         optimizer_step = int(ck.get("optimizer_step", ck["step"]))
         micro_step = int(ck["micro_step"])
         episodes_seen = int(ck.get("episodes_seen", 0))
-        # verify the run config the checkpoint was produced under (reviewer:
-        # resume must not silently change the recipe)
-        if "config" in ck:
-            want = {
-                "sched": args.sched, "batch_size": args.batch_size,
-                "grad_accum": args.grad_accum,
-                "gamma_replay_batch_size": args.gamma_replay_batch_size,
-                "gamma_task_boundary_episodes": args.gamma_task_boundary_episodes,
-                "rpbe_stats_episodes": args.rpbe_stats_episodes,
-                "lambda_rpbe": args.lambda_rpbe, "mem_length": args.mem_length,
-                "kf_min_abs": args.kf_min_abs,
-                "rpbe_mode": args.rpbe_mode, "proj_iters": args.proj_iters,
-            }
-            bad = {k: (ck["config"].get(k), v) for k, v in want.items()
-                   if ck["config"].get(k) != v}
-            if bad:
-                raise SystemExit(f"[resume-full] CONFIG MISMATCH {bad}")
-            print("[resume-full] config verified against checkpoint", flush=True)
-        else:
-            print("[resume-full] WARNING: checkpoint has no config block",
-                  flush=True)
         vla.cog_mem_bank.param_version = int(ck["param_version"])
+        gamma_boundary_index = int(ck.get("gamma_boundary_index",
+                                          ck["param_version"]))
+        if reset_gamma_state and sched_gamma is not None:
+            # migration: opt_gamma got a FRESH Adam and the scheduler was not
+            # loaded, so realign it to the boundary clock -- otherwise it would
+            # sit at step 0 and hand out the warmup LR regardless of how far
+            # the run had already progressed.
+            lr0 = realign_lambda_scheduler(sched_gamma,
+                                           vla.cog_mem_bank.param_version)
+            print(f"[resume-full] sched_gamma realigned to param_version "
+                  f"{vla.cog_mem_bank.param_version} -> lr={lr0}", flush=True)
         torch.set_rng_state(ck["rng_cpu"])
         torch.cuda.set_rng_state(ck["rng_cuda"])
         np.random.set_state(ck["rng_np"])

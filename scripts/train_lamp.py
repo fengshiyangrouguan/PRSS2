@@ -702,8 +702,14 @@ def main():
                     n_rpbe = torch.cat(
                         [(t - g0).flatten().float()
                          for t, g0 in zip(g_total, g_task_all)]).norm()
+                    # Dual-scope r_eff (review 2 follow-up): the lambda
+                    # decision uses the GAMMA scope (the aux gradient
+                    # acts on Gamma only), while the all-params ratio is
+                    # kept for reference.
                     calib = {
                         "r_eff": float(n_rpbe / max(n_task, 1e-12)),
+                        "r_eff_gamma": float(gdiag.get("g_gamma_ratio",
+                                                      float("nan"))),
                         "n_task": float(n_task),
                         "n_rpbe": float(n_rpbe),
                     }

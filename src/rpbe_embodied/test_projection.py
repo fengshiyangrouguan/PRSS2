@@ -245,7 +245,33 @@ def test_kappa_schedule():
     assert kappa_at(50, 0.05, 100, 200, 1.0) == 0.05       # before start
     assert abs(kappa_at(150, 0.05, 100, 200, 1.0) - 0.525) < 1e-9
     assert kappa_at(250, 0.05, 100, 200, 1.0) == 1.0       # after end
+    # degenerate end <= start and annealing DOWN (stricter)
+    assert kappa_at(200, 0.05, 70, 60, 1.0) == 1.0
+    assert kappa_at(95, 0.05, 70, 120, 0.0) < 0.05
     print("test_kappa_schedule OK")
+
+
+def test_amp_scale_invariance():
+    """Scaling every gradient by S scales d by S (mu unchanged), because the
+    half-space is scale-homogeneous.  The projection is therefore invariant to
+    the GradScaler factor and AMP can never change the projected direction."""
+    gamma = TinyGamma()
+    cot, inp = _rand_problem(gamma, 12)
+    G, _ = _rows(gamma, cot, inp)
+    g_task = _adversarial(gamma, G)
+    _set_task_grad(gamma, g_task)
+    active_set_feasibility_projection(
+        [g.clone() for g in g_task], list(gamma.parameters()), G, 0.1)
+    grad0 = torch.cat([p.grad.flatten() for p in gamma.parameters()]).clone()
+    S = 512.0
+    scaled = [g * S for g in g_task]
+    _set_task_grad(gamma, scaled)
+    active_set_feasibility_projection(
+        [g.clone() for g in scaled], list(gamma.parameters()), G * S, 0.1)
+    gradS = torch.cat([p.grad.flatten() for p in gamma.parameters()])
+    assert torch.allclose(gradS, grad0 * S, rtol=1e-3, atol=1e-3), \
+        float((gradS - grad0 * S).abs().max())
+    print("test_amp_scale_invariance OK  S=%.0f" % S)
 
 
 # --- boundary integration ---------------------------------------------------
@@ -400,6 +426,7 @@ if __name__ == "__main__":
     test_infeasible_projection_is_dropped_by_row_filter()
     test_kappa_ge_one_never_binds()
     test_kappa_schedule()
+    test_amp_scale_invariance()
     test_boundary_takes_exactly_one_step_per_arm()
     test_boundary_kappa_one_equals_task_control()
     test_infeasible_boundary_aborts_without_stepping()

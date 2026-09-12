@@ -20,6 +20,7 @@ pass before any LIBERO-Mem training.
 """
 from __future__ import annotations
 
+import math
 from typing import Dict, List, Optional, Tuple
 
 import torch
@@ -368,3 +369,178 @@ def gamma_replay_loss(gamma, m_a: torch.Tensor, m_b: torch.Tensor,
     gs = torch.stack([cotangents[k].to(z_hat.device, dtype=z_hat.dtype)
                       for k in merge_keys])
     return (gs.detach() * z_hat).sum()
+
+
+# ---------------------------------------------------------------------------
+# Interface-wise feasibility projection (VLA port of the TGN final algorithm)
+#
+# TGN's B3 ruling: RPBE is NOT a second optimisation objective.  Additive
+# ``L = L_task - lambda*J`` was retired because ``J`` is first-order
+# orthogonal AND second-order flat to the task loss (compaudit: cos ~ 0,
+# D2 ~ 0), so ``lambda`` has no task meaning.  The migration keeps the task
+# gradient as the ONLY direction and demotes RPBE to a set of local
+# preservation CONSTRAINTS:
+#
+#     d* = argmin_d 1/2 ||d - t||_2^2   s.t.  g_i . d >= -kappa ||g_i|| ||t||
+#
+# with ``t = -g_task`` the task descent direction and one half-space per
+# memory merge/compression INTERFACE i (the VLA analogue of a TGN tree).
+# Only the Gamma/compressor gradient is replaced (p.grad = -d*); every host
+# parameter keeps its untouched task gradient.  One clip, one AdamW step.
+# The three helpers below are verbatim copies of scripts/train_lamp.py
+# (branch ``lamp_rpbe_project``) so the VLA and TGN lines cannot drift.
+# ---------------------------------------------------------------------------
+
+
+def _fista_nonneg(Q: torch.Tensor, c: torch.Tensor, iters: int) -> torch.Tensor:
+    """min_{mu>=0} 1/2 mu^T Q mu - c^T mu  (Q PSD) by accelerated projected GD.
+
+    Tiny (N x N, N ~ #interfaces) dual of the tree-wise feasibility QP."""
+    L = float(torch.linalg.eigvalsh(Q).max().clamp(min=1e-12))
+    mu = torch.zeros_like(c)
+    y = mu.clone()
+    tk = 1.0
+    for _ in range(iters):
+        grad = Q @ y - c
+        mu_new = torch.clamp(y - grad / L, min=0.0)
+        tk_new = 0.5 * (1.0 + math.sqrt(1.0 + 4.0 * tk * tk))
+        y = mu_new + ((tk - 1.0) / tk_new) * (mu_new - mu)
+        mu, tk = mu_new, tk_new
+    return mu
+
+
+def kappa_at(step: int, kappa_max: float, start: int, end: int,
+             kappa_to: float = 1.0) -> float:
+    """kappa schedule for the per-interface guardrail.
+
+    kappa_max (e.g. 0.05) until ``start`` (step), then LINEARLY to ``kappa_to``
+    at ``end``.  NOTE the direction: in ``g_i.d >= -kappa*||g_i||*||t||`` a
+    LARGER kappa is LOOSER; kappa >= 1 never binds (== pure task), kappa = 0 is
+    the strictest.  start < 0 disables annealing (constant kappa_max)."""
+    if start is None or start < 0:
+        return float(kappa_max)
+    if step < start:
+        return float(kappa_max)
+    if end is None or end <= start:
+        return float(kappa_to)
+    if step >= end:
+        return float(kappa_to)
+    f = (float(step) - float(start)) / float(end - start)
+    return float(kappa_max) + f * (float(kappa_to) - float(kappa_max))
+
+
+def per_cut_influence_grads(
+    gamma, cotangents: Dict[tuple, torch.Tensor],
+    input_map: Dict[tuple, Tuple[torch.Tensor, torch.Tensor]],
+    keys: List[tuple], params: Optional[List[torch.Tensor]] = None,
+    device: str = "cuda", max_rows: int = 0, seed: int = 0,
+) -> Tuple[Optional[torch.Tensor], List[tuple]]:
+    """Interface-wise RPBE influence gradients, ONE ROW PER INTERFACE.
+
+    g_i = (dz_i/dGamma)^T a_i, where a_i = dJ/dz_i is the window adjoint for
+    interface i (``cotangents[cut_id]``).  Rows are taken SEPARATELY -- never
+    summed -- so the interface-interface geometry (e.g. g_1 ~ -g_2) survives
+    into the feasibility QP instead of cancelling.  This is the exact VLA
+    analogue of ``tree_wise_influence_grads`` in the TGN trainer.
+
+    The window's J is still estimated JOINTLY (one ``dual_latent_z_adjoint``
+    over the whole window), so each a_i is interface i's effect ON THE JOINT J.
+
+    Returns (G [n, P] fp32 on ``device``, used_keys).  ``max_rows`` > 0
+    deterministically subsamples the interfaces to bound memory: P ~ 0.574M
+    for the 2-token merge operator, so n=256 already costs ~0.6 GB fp32.
+    """
+    if params is None:
+        params = list(gamma.parameters())
+    cand = [k for k in keys if k in cotangents and k in input_map]
+    if max_rows and len(cand) > max_rows:
+        g = torch.Generator().manual_seed(int(seed))
+        order = torch.randperm(len(cand), generator=g).tolist()[:max_rows]
+        cand = [cand[i] for i in order]
+    if not cand or not params:
+        return None, []
+    md = params[0].dtype
+    rows: List[torch.Tensor] = []
+    used: List[tuple] = []
+    with torch.autocast("cuda", enabled=False):
+        m_a = torch.stack([input_map[k][0] for k in cand]).to(device, dtype=md)
+        m_b = torch.stack([input_map[k][1] for k in cand]).to(device, dtype=md)
+        z = gamma(m_a, m_b)                                   # [n, dim]
+        C = torch.stack([cotangents[k].reshape(-1) for k in cand]).to(
+            device, dtype=torch.float32)
+        n = z.shape[0]
+        for i in range(n):
+            # share ONE forward; N separate VJPs keep the rows independent.
+            # upcast z (differentiable) so the fp32 adjoint is not quantised.
+            term = (C[i] * z[i].float()).sum()
+            grads = torch.autograd.grad(term, params,
+                                        retain_graph=(i < n - 1),
+                                        allow_unused=True)
+            rows.append(torch.cat([
+                (gr if gr is not None else torch.zeros_like(p)
+                 ).reshape(-1).float() for gr, p in zip(grads, params)]))
+            used.append(cand[i])
+    return torch.stack(rows), used
+
+
+def treewise_feasibility_projection(
+    g_task_gamma: List[torch.Tensor], gamma_params: List[torch.Tensor],
+    G: Optional[torch.Tensor], kappa: float, iters: int = 400,
+    min_norm: float = 1e-9,
+) -> dict:
+    """Interface-wise RPBE Feasibility Projection (TGN final algorithm).
+
+    One global task direction t = -g_task; each valid interface i contributes a
+    half-space g_i.d >= -kappa*||g_i||*||t||.  Solve
+
+        d* = argmin_d 1/2||d - t||^2   s.t.  G d >= b,  b_i=-kappa||g_i||.||t||
+
+    through the N x N dual (mu >= 0): d* = t + sum_i mu_i g_i.  Writes ONLY
+    Gamma: p.grad = -d* = g_task - sum_i mu_i g_i.  If ``G`` carries no valid
+    row, nothing is written -- the accumulated task gradient stays in p.grad.
+
+    This is a PRE-OPTIMIZER constraint on the raw gradient combination; it does
+    NOT claim AdamW's realized displacement lies in the half-space.  All
+    constraints enter the QP (a repair for interface 1 may otherwise push
+    interface 7 into violation); inactive ones simply get mu=0.
+    """
+    sizes = [p.numel() for p in gamma_params]
+    t = torch.cat([-x.flatten().float() for x in g_task_gamma])
+    nt = float(t.norm())
+    diag = {"proj_n_trees": int(G.shape[0]) if G is not None else 0,
+            "proj_n_valid": 0, "proj_n_active_init": 0, "proj_n_mu_pos": 0,
+            "proj_norm_t": nt, "proj_corr_ratio": 0.0, "proj_cos_min": 0.0,
+            "proj_min_slack_after": float("nan"),
+            "proj_max_viol_before": 0.0}
+    if G is None or G.numel() == 0 or nt == 0.0:
+        return diag
+    Gf = G.flatten(1).float()
+    ng = Gf.norm(dim=1)
+    valid = ng > min_norm
+    if not bool(valid.any()):
+        return diag
+    Gv = Gf[valid]
+    ngv = ng[valid]
+    Gt = Gv @ t
+    b = -kappa * ngv * nt
+    cos_init = Gt / (ngv * nt)
+    diag["proj_n_valid"] = int(Gv.shape[0])
+    diag["proj_n_active_init"] = int((cos_init < -kappa).sum())
+    diag["proj_cos_min"] = float(cos_init.min())
+    diag["proj_max_viol_before"] = float(
+        torch.clamp(-cos_init - kappa, min=0.0).max())
+    Q = Gv @ Gv.t()
+    c = b - Gt
+    mu = _fista_nonneg(Q, c, iters)
+    corr = Gv.t() @ mu                 # = sum_i mu_i g_i  (= d* - t)
+    d = t + corr
+    with torch.no_grad():
+        for p, cp, gt in zip(gamma_params, torch.split(corr, sizes),
+                             g_task_gamma):
+            # grad = -d* = g_task - sum_i mu_i g_i, in the param's own dtype
+            p.grad = (gt.reshape(-1).float() - cp).to(p.dtype).view_as(p)
+    slack = Gv @ d - b
+    diag["proj_n_mu_pos"] = int((mu > 1e-8).sum())
+    diag["proj_min_slack_after"] = float(slack.min())
+    diag["proj_corr_ratio"] = float((d - t).norm() / max(nt, 1e-12))
+    return diag

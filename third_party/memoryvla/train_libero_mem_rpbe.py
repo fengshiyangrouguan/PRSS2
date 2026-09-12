@@ -19,7 +19,20 @@ Protocol (2026-09-08 protocol-fix ruling):
 Arms:
   avg         : official average merge host control (dense LoRA)
   gamma-task  : Gamma merge + task-gradient replay at macro boundaries
-  gamma-rpbe  : Gamma merge + task + RPBE dual-adjoint replay at macro bounds
+  gamma-rpbe  : Gamma merge + task replay + the TGN-isomorphic multi-halfspace
+                feasibility projection (--rpbe-mode project, DEFAULT).  One
+                accumulated task direction t = -g_task and one half-space
+                g_i.d >= -kappa||g_i||||t|| per memory interface i; the QP
+                d* = argmin 1/2||d - t||^2 s.t. G d >= b replaces ONLY the
+                Gamma gradient (p.grad = g_task - sum_i mu_i g_i), then ONE
+                clip + ONE AdamW step.  --rpbe-mode additive is the RETIRED
+                L_task - lambda*J formulation, kept for old runs.
+
+Ruling (2026-09-12, B3): RPBE is a CONSTRAINT, not a second objective.  The
+compaudit showed J's predictive modes are first-order orthogonal AND
+second-order flat to the task loss (cos ~ 0, D2 ~ 0), so lambda has no task
+meaning and no lambda/weight/gate tuning can help.  Task loss stays the only
+direction; feasibility projection supplies the preservation requirement.
 """
 import argparse
 import copy
@@ -52,6 +65,7 @@ from vla.datasets.hdf5_dataset import (  # noqa: E402
 from rpbe_embodied import (  # noqa: E402
     EmbodiedFixedMaps, EmbodiedRPBConfig, EmbodiedRPBEWindow,
     PendingMergeQueue, gamma_replay_loss, dual_latent_z_adjoint_modes,
+    kappa_at, per_cut_influence_grads, treewise_feasibility_projection,
 )
 
 
@@ -147,7 +161,37 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--kf-min-abs", type=int, default=64,
                    help="min unique merges per RPBE window")
     p.add_argument("--lambda-rpbe", type=float, default=0.0,
-                   help="frozen after calibration")
+                   help="LEGACY additive mode only (--rpbe-mode additive): "
+                        "weight on the -lambda*J term.  Unused by the default "
+                        "project mode (RPBE is a constraint, not an objective).")
+    p.add_argument("--rpbe-mode", choices=["additive", "project"],
+                   default="project",
+                   help="Gamma update rule for the gamma-rpbe arm.  project "
+                        "(DEFAULT, TGN-isomorphic): per-interface influence "
+                        "gradients -> multi-halfspace feasibility QP -> replace "
+                        "ONLY the Gamma gradient -> one clip + one AdamW step. "
+                        "additive (RETIRED legacy): L_task - lambda*J.")
+    p.add_argument("--kappa", type=float, default=0.05,
+                   help="project mode: an interface with cos(g_i, -g_task) < "
+                        "-kappa is protected.  kappa=0 = hard per-interface "
+                        "constraint (STRICTEST); kappa>=1 = never binds "
+                        "(== pure task).")
+    p.add_argument("--kappa-anneal-start", type=int, default=-1,
+                   help="project mode: step from which kappa starts to move "
+                        "(default -1 = never anneal).  Before it kappa=--kappa.")
+    p.add_argument("--kappa-anneal-end", type=int, default=-1,
+                   help="project mode: step at which kappa reaches "
+                        "--kappa-anneal-to (linear in between).")
+    p.add_argument("--kappa-anneal-to", type=float, default=1.0,
+                   help="project mode: kappa value at --kappa-anneal-end. "
+                        "Larger kappa = LOOSER (>=1 never binds == pure task).")
+    p.add_argument("--proj-iters", type=int, default=400,
+                   help="project mode: FISTA iterations for the N x N dual of "
+                        "the feasibility QP.")
+    p.add_argument("--proj-max-rows", type=int, default=256,
+                   help="project mode: cap on interfaces entering the QP "
+                        "(deterministic subsample; P~0.574M so n=256 is ~0.6GB "
+                        "fp32).  0 = no cap.")
     # macro boundary: with dense protocol one episode already yields many cuts,
     # so every finished episode is one boundary.
     p.add_argument("--repr-boundary-episodes", type=int, default=1)
@@ -678,8 +722,11 @@ def main() -> None:
         if task_cotangents and scale != 1.0:
             task_cotangents = {k: v * scale for k, v in task_cotangents.items()}
         task_keys = [k for k in task_cotangents if k in merge_registry]
+        # project mode needs the rpbe rows regardless of lambda (RPBE is a
+        # constraint there); additive mode only uses them when lambda > 0.
         rpbe_keys = (list(rpbe_cotangents.keys())
-                     if args.lambda_rpbe > 0 else [])
+                     if (IS_RPBE and (args.rpbe_mode == "project"
+                                      or args.lambda_rpbe > 0)) else [])
         # Deterministic per-episode shuffle -> the TASK replay minibatch
         # partition is identical for gamma-task and gamma-rpbe; the rpbe arm
         # only ADDS rpbe gradients (clean attribution).
@@ -787,70 +834,134 @@ def main() -> None:
                   flush=True)
 
         n_mb = max(1, (len(task_keys) + B - 1) // B)
-        rpbe_buckets = [[] for _ in range(n_mb)]
-        for i, k in enumerate(rpbe_keys):
-            rpbe_buckets[i % n_mb].append(k)
         n_opt = 0
 
         def _gm():
             return [p.grad.detach().clone() if p.grad is not None else None
                     for p in gamma_params]
 
-        for i in range(n_mb):
-            t_sl = task_keys[i * B:(i + 1) * B]
-            r_sl = rpbe_buckets[i]
-            if opt_gamma is not None:
-                opt_gamma.zero_grad()
-            if t_sl:
+        if args.rpbe_mode == "additive":
+            # ---- LEGACY additive protocol (L_task - lambda*J).  Retired: J is
+            # first-order orthogonal and second-order flat to the task loss, so
+            # lambda carries no task signal.  Kept only to reproduce old runs.
+            rpbe_buckets = [[] for _ in range(n_mb)]
+            for i, k in enumerate(rpbe_keys):
+                rpbe_buckets[i % n_mb].append(k)
+            for i in range(n_mb):
+                t_sl = task_keys[i * B:(i + 1) * B]
+                r_sl = rpbe_buckets[i]
+                if opt_gamma is not None:
+                    opt_gamma.zero_grad()
+                if t_sl:
+                    m_a = torch.stack([merge_registry[k].left_state
+                                       for k in t_sl]).to("cuda", dtype=torch.bfloat16)
+                    m_b = torch.stack([merge_registry[k].right_state
+                                       for k in t_sl]).to("cuda", dtype=torch.bfloat16)
+                    l_task = gamma_replay_loss(vla.gamma, m_a, m_b,
+                                               task_cotangents, t_sl)
+                    l_task.backward()
+                g_t = _gm() if opt_gamma is not None else []
+                if opt_gamma is not None:
+                    opt_gamma.zero_grad()
+                if r_sl:
+                    m_ar = torch.stack([rpbe_input_map[k][0].to("cuda", dtype=torch.bfloat16)
+                                        for k in r_sl])
+                    m_br = torch.stack([rpbe_input_map[k][1].to("cuda", dtype=torch.bfloat16)
+                                        for k in r_sl])
+                    l_rpbe = gamma_replay_loss(vla.gamma, m_ar, m_br,
+                                               rpbe_cotangents, r_sl)
+                    # RPBE maximizes J -> negative sign (gradient ascent on J).
+                    (-args.lambda_rpbe * l_rpbe).backward()
+                g_r = _gm() if opt_gamma is not None else []
+                if opt_gamma is not None:
+                    pre = [p.detach().clone() for p in gamma_params]
+                    nt2 = nr2 = dot = 0.0
+                    for p, a, b in zip(gamma_params, g_t, g_r):
+                        av = a if a is not None else torch.zeros_like(p)
+                        bv = b if b is not None else torch.zeros_like(p)
+                        p.grad = av + bv
+                        fa = av.float(); fb = bv.float()
+                        nt2 += float(fa.pow(2).sum()); nr2 += float(fb.pow(2).sum())
+                        dot += float((fa * fb).sum())
+                    nt = nt2 ** 0.5; nr = nr2 ** 0.5
+                    cos = dot / (nt * nr + 1e-12)
+                    clip = torch.nn.utils.clip_grad_norm_(gamma_params,
+                                                          args.grad_clip)
+                    opt_gamma.step()
+                    sched_gamma.step()
+                    upd = sum(float((p.detach() - p0).float().pow(2).sum())
+                              for p, p0 in zip(gamma_params, pre)) ** 0.5
+                    print(f"[gamma audit] pv={vla.cog_mem_bank.param_version} "
+                          f"mb={i} ntask={len(t_sl)} nrpbe={len(r_sl)} "
+                          f"|g_task|={nt:.3e} |g_rpbe|={nr:.3e} cos={cos:.3f} "
+                          f"r_eff={nr/(nt+1e-12):.3f} clip={float(clip):.3f} "
+                          f"|dgamma|={upd:.3e}", flush=True)
+                    n_opt += 1
+            assert n_opt == n_mb, (
+                f"gamma step count {n_opt} != expected task-replay steps {n_mb}")
+            print(f"[gamma] episode replay: {len(task_keys)} task / "
+                  f"{len(rpbe_keys)} rpbe keys -> {n_opt} opt_gamma steps "
+                  f"(mb<= {B})", flush=True)
+        else:
+            # ---- TGN-isomorphic single update (default) ----
+            # RPBE is a CONSTRAINT, not an objective.  Build ONE global task
+            # direction (the accumulated task-replay gradient) and one
+            # half-space per memory interface, solve the feasibility QP, and
+            # write back ONLY the Gamma gradient.  gamma-task runs the SAME
+            # single-accumulated-step protocol with no rpbe rows, so the two
+            # arms differ ONLY by the projection.
+            opt_gamma.zero_grad()
+            for i in range(n_mb):
+                t_sl = task_keys[i * B:(i + 1) * B]
+                if not t_sl:
+                    continue
                 m_a = torch.stack([merge_registry[k].left_state
                                    for k in t_sl]).to("cuda", dtype=torch.bfloat16)
                 m_b = torch.stack([merge_registry[k].right_state
                                    for k in t_sl]).to("cuda", dtype=torch.bfloat16)
-                l_task = gamma_replay_loss(vla.gamma, m_a, m_b,
-                                           task_cotangents, t_sl)
-                l_task.backward()
-            g_t = _gm() if opt_gamma is not None else []
-            if opt_gamma is not None:
-                opt_gamma.zero_grad()
-            if r_sl:
-                m_ar = torch.stack([rpbe_input_map[k][0].to("cuda", dtype=torch.bfloat16)
-                                    for k in r_sl])
-                m_br = torch.stack([rpbe_input_map[k][1].to("cuda", dtype=torch.bfloat16)
-                                    for k in r_sl])
-                l_rpbe = gamma_replay_loss(vla.gamma, m_ar, m_br,
-                                           rpbe_cotangents, r_sl)
-                # RPBE maximizes J -> negative sign (gradient ascent on J).
-                (-args.lambda_rpbe * l_rpbe).backward()
-            g_r = _gm() if opt_gamma is not None else []
-            if opt_gamma is not None:
-                pre = [p.detach().clone() for p in gamma_params]
-                nt2 = nr2 = dot = 0.0
-                for p, a, b in zip(gamma_params, g_t, g_r):
-                    av = a if a is not None else torch.zeros_like(p)
-                    bv = b if b is not None else torch.zeros_like(p)
-                    p.grad = av + bv
-                    fa = av.float(); fb = bv.float()
-                    nt2 += float(fa.pow(2).sum()); nr2 += float(fb.pow(2).sum())
-                    dot += float((fa * fb).sum())
-                nt = nt2 ** 0.5; nr = nr2 ** 0.5
-                cos = dot / (nt * nr + 1e-12)
-                clip = torch.nn.utils.clip_grad_norm_(gamma_params,
-                                                      args.grad_clip)
-                opt_gamma.step()
-                sched_gamma.step()
-                upd = sum(float((p.detach() - p0).float().pow(2).sum())
-                          for p, p0 in zip(gamma_params, pre)) ** 0.5
-                print(f"[gamma audit] pv={vla.cog_mem_bank.param_version} "
-                      f"mb={i} ntask={len(t_sl)} nrpbe={len(r_sl)} "
-                      f"|g_task|={nt:.3e} |g_rpbe|={nr:.3e} cos={cos:.3f} "
-                      f"r_eff={nr/(nt+1e-12):.3f} clip={float(clip):.3f} "
-                      f"|dgamma|={upd:.3e}", flush=True)
-                n_opt += 1
-        assert n_opt == n_mb, (
-            f"gamma step count {n_opt} != expected task-replay steps {n_mb}")
-        print(f"[gamma] episode replay: {len(task_keys)} task / "
-              f"{len(rpbe_keys)} rpbe keys -> {n_opt} opt_gamma steps "
-              f"(mb<= {B})", flush=True)
+                gamma_replay_loss(vla.gamma, m_a, m_b,
+                                  task_cotangents, t_sl).backward()
+            # p.grad now holds g_task -- also the fallback when no constraint
+            # is written (empty G / all-zero rows).
+            g_task_gamma = [p.grad.detach().clone() if p.grad is not None
+                            else torch.zeros_like(p) for p in gamma_params]
+            n_task_g = float(torch.cat([g.flatten().float()
+                                        for g in g_task_gamma]).norm())
+            proj = {}
+            used = []
+            if IS_RPBE and rpbe_keys:
+                G, used = per_cut_influence_grads(
+                    vla.gamma, rpbe_cotangents, rpbe_input_map, rpbe_keys,
+                    params=gamma_params, device="cuda",
+                    max_rows=args.proj_max_rows, seed=args.seed)
+                kap = kappa_at(optimizer_step, args.kappa,
+                               args.kappa_anneal_start, args.kappa_anneal_end,
+                               args.kappa_anneal_to)
+                proj = treewise_feasibility_projection(
+                    g_task_gamma, gamma_params, G, kap, iters=args.proj_iters)
+                proj["proj_kappa"] = float(kap)
+            pre = [p.detach().clone() for p in gamma_params]
+            clip = torch.nn.utils.clip_grad_norm_(gamma_params, args.grad_clip)
+            opt_gamma.step()
+            sched_gamma.step()
+            n_opt += 1
+            upd = sum(float((p.detach() - p0).float().pow(2).sum())
+                      for p, p0 in zip(gamma_params, pre)) ** 0.5
+            corr_ratio = proj.get("proj_corr_ratio", 0.0)
+            print(f"[gamma proj] pv={vla.cog_mem_bank.param_version} "
+                  f"ntask={len(task_keys)} nproj={len(used)} "
+                  f"|g_task|={n_task_g:.3e} "
+                  f"kappa={proj.get('proj_kappa', float('nan')):.4f} "
+                  f"nvalid={proj.get('proj_n_valid', 0)} "
+                  f"nmu={proj.get('proj_n_mu_pos', 0)} "
+                  f"cos_min={proj.get('proj_cos_min', 0.0):+.3f} "
+                  f"corr={corr_ratio:.3f} "
+                  f"slack={proj.get('proj_min_slack_after', float('nan')):.3e} "
+                  f"clip={float(clip):.3f} |dgamma|={upd:.3e}", flush=True)
+            if proj:
+                print("[gamma proj] diag "
+                      + " ".join(f"{k}={v}" for k, v in proj.items()),
+                      flush=True)
         vla.cog_mem_bank.param_version += 1
         task_cotangents = {}
         rpbe_cotangents = {}
@@ -917,6 +1028,8 @@ def main() -> None:
                 "rpbe_stats_episodes": args.rpbe_stats_episodes,
                 "mem_length": args.mem_length, "kf_min_abs": args.kf_min_abs,
                 "lambda_rpbe": args.lambda_rpbe,
+                "rpbe_mode": args.rpbe_mode, "kappa": args.kappa,
+                "proj_iters": args.proj_iters,
                 "image_aug": args.image_aug, "dim_weight": args.dim_weight,
                 "reg_head": args.reg_head,
             },
@@ -995,6 +1108,7 @@ def main() -> None:
                 "rpbe_stats_episodes": args.rpbe_stats_episodes,
                 "lambda_rpbe": args.lambda_rpbe, "mem_length": args.mem_length,
                 "kf_min_abs": args.kf_min_abs,
+                "rpbe_mode": args.rpbe_mode, "proj_iters": args.proj_iters,
             }
             bad = {k: (ck["config"].get(k), v) for k, v in want.items()
                    if ck["config"].get(k) != v}

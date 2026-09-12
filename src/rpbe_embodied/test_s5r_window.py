@@ -5,8 +5,10 @@ CPU-only.  Run:  PYTHONPATH=src python -m pytest src/rpbe_embodied/test_s5r_wind
 
   1. E=4: cuts from ALL four episodes produce replay inputs (no episode is
      silently dropped by a per-boundary registry clear).
-  2. gamma-task and gamma-rpbe take the SAME number of opt_gamma steps per
-     episode (n_mb = ceil(task_keys / B), rpbe keys bucketed into n_mb).
+  2. ADDITIVE mode only: gamma-task and gamma-rpbe take the SAME number of
+     opt_gamma steps per episode (n_mb = ceil(task_keys / B), rpbe keys
+     bucketed into n_mb).  Under the default PROJECT mode both arms instead
+     take exactly ONE accumulated update per boundary (see test_projection.py).
   3. window rebuild == direct recursive fixed-trace execution, bitwise.
 """
 import math

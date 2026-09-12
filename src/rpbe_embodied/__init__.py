@@ -12,6 +12,9 @@ from .loss import (  # noqa: F401
     dual_latent_z_adjoint,
     dual_latent_z_adjoint_modes,
     gamma_replay_loss,
+    kappa_at,
+    per_cut_influence_grads,
+    treewise_feasibility_projection,
 )
 from .maps import EmbodiedFixedMaps  # noqa: F401
 from .records import (  # noqa: F401

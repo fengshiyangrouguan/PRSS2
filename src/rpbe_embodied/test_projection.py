@@ -31,9 +31,10 @@ import torch.nn as nn
 
 from rpbe_embodied.boundary import apply_gamma_boundary_update
 from rpbe_embodied.loss import (_fista_nonneg, active_set_feasibility_projection,
-                                interface_influence_rows, kappa_at,
+                                interface_influence_rows,
                                 reset_rows_backend_stats, rows_backend_stats)
-from rpbe_embodied.resume import (boundary_config, realign_lambda_scheduler,
+from rpbe_embodied.resume import (BOUNDARY_CONFIG_KEYS, COMMON_CONFIG_KEYS,
+                                  boundary_config, realign_lambda_scheduler,
                                   verify_resume_config)
 
 D = 6
@@ -283,15 +284,38 @@ def test_kappa_ge_one_never_binds():
     print("test_kappa_ge_one_never_binds OK")
 
 
-def test_kappa_schedule():
-    assert kappa_at(0, 0.05, -1, -1, 1.0) == 0.05          # disabled
-    assert kappa_at(50, 0.05, 100, 200, 1.0) == 0.05       # before start
-    assert abs(kappa_at(150, 0.05, 100, 200, 1.0) - 0.525) < 1e-9
-    assert kappa_at(250, 0.05, 100, 200, 1.0) == 1.0       # after end
-    # degenerate end <= start and annealing DOWN (stricter)
-    assert kappa_at(200, 0.05, 70, 60, 1.0) == 1.0
-    assert kappa_at(95, 0.05, 70, 120, 0.0) < 0.05
-    print("test_kappa_schedule OK")
+def test_round0_admits_only_tolerance_breaches():
+    """Round 0 must admit interfaces with v_i > tau_feas, not v_i > 0:
+    interfaces already inside the tolerance would otherwise burn active-set
+    slots and could push a later real violator out of the budget."""
+    gamma = TinyGamma()
+    cot, inp = _rand_problem(gamma, 15)
+    G, _, _ = _rows(gamma, cot, inp)
+    g_task = _adversarial(gamma, G)
+    kappa = 0.1
+    t = torch.cat([-g.flatten() for g in g_task])
+    ng = G.norm(dim=1)
+    v = torch.clamp(-(G @ t) / (ng * float(t.norm())) - kappa, min=0.0)
+    vmax = float(v.max())
+    # tau just above every violation -> nothing breaches -> pure task step
+    _set_task_grad(gamma, g_task)
+    diag = active_set_feasibility_projection(
+        [g.clone() for g in g_task], list(gamma.parameters()), G, kappa,
+        tau_feas=vmax + 1e-6)
+    assert diag["proj_feasible"]
+    assert diag["proj_n_candidates"] == 0, diag["proj_n_candidates"]
+    assert diag["proj_n_active"] == 0
+    assert diag["proj_corr_ratio"] == 0.0
+    for p, g in zip(gamma.parameters(), g_task):
+        assert torch.equal(p.grad, g), "no breach must mean a pure task step"
+    # tau just below the worst violation -> that interface IS admitted
+    _set_task_grad(gamma, g_task)
+    diag2 = active_set_feasibility_projection(
+        [g.clone() for g in g_task], list(gamma.parameters()), G, kappa,
+        tau_feas=max(vmax - 1e-3, 1e-9))
+    assert diag2["proj_n_candidates"] >= 1
+    assert diag2["proj_n_active"] >= 1
+    print("test_round0_admits_only_tolerance_breaches OK  vmax=%.3e" % vmax)
 
 
 def test_amp_scale_invariance():
@@ -447,9 +471,6 @@ def test_boundary_aborts_without_task_keys():
 class _Args:
     rpbe_mode = "project"
     kappa = 0.05
-    kappa_anneal_start = -1
-    kappa_anneal_end = -1
-    kappa_anneal_to = 1.0
     proj_iters = 400
     proj_tau = 1e-3
     proj_max_active = 2048
@@ -459,24 +480,47 @@ class _Args:
 
 def test_resume_config_contract():
     want = boundary_config(_Args())
-    assert set(want) == {"rpbe_mode", "kappa", "kappa_anneal_start",
-                         "kappa_anneal_end", "kappa_anneal_to", "proj_iters",
-                         "proj_tau", "proj_max_active", "proj_max_rounds",
+    assert set(want) == {"rpbe_mode", "kappa", "proj_iters", "proj_tau",
+                         "proj_max_active", "proj_max_rounds",
                          "proj_add_per_round"}
+    # kappa is a FIXED constant on the formal method -- no annealing knobs
+    assert not any("anneal" in k for k in COMMON_CONFIG_KEYS
+                   + BOUNDARY_CONFIG_KEYS)
     # Stage8 ckpt, matching -> ok
     bad, legacy = verify_resume_config(dict(want), want)
     assert not bad and not legacy
     # Stage8 ckpt, silently changed kappa -> refused
-    changed = dict(want, kappa=0.2)
-    bad, legacy = verify_resume_config(changed, want)
+    bad, legacy = verify_resume_config(dict(want, kappa=0.2), want)
     assert bad["kappa"] == (0.2, 0.05) and not legacy
-    # Stage7 ckpt (no rpbe_mode) -> refused by default, allowed only explicitly
+    # Stage7 ckpt (no rpbe_mode) -> refused by default
     legacy_cfg = {k: v for k, v in want.items() if k != "rpbe_mode"}
     bad, legacy = verify_resume_config(legacy_cfg, want)
     assert "rpbe_mode" in bad and not legacy
+    # ... allowed explicitly, exempting ONLY the Stage8-only keys
     bad, legacy = verify_resume_config(legacy_cfg, want, allow_legacy_gamma=True)
     assert not bad and legacy, "legacy migration path must be explicit"
     print("test_resume_config_contract OK")
+
+
+def test_legacy_migration_still_checks_the_common_recipe():
+    """Migration exempts the Stage8-only keys, NOT the shared training recipe:
+    a Stage7 checkpoint with a different batch_size/grad_accum/mem_length must
+    still be refused."""
+    want = dict(boundary_config(_Args()), batch_size=4, grad_accum=2,
+                mem_length=16, gamma_replay_batch_size=64,
+                gamma_task_boundary_episodes=1, rpbe_stats_episodes=1,
+                lambda_rpbe=0.0, kf_min_abs=64, sched="const")
+    legacy_cfg = {k: v for k, v in want.items() if k != "rpbe_mode"}
+    bad, legacy = verify_resume_config(legacy_cfg, want, allow_legacy_gamma=True)
+    assert not bad and legacy
+    for key, wrong in (("batch_size", 8), ("grad_accum", 4),
+                       ("mem_length", 32), ("kf_min_abs", 128)):
+        drifted = dict(legacy_cfg, **{key: wrong})
+        bad, legacy = verify_resume_config(drifted, want,
+                                           allow_legacy_gamma=True)
+        assert legacy and key in bad, (key, bad)
+        assert bad[key] == (wrong, want[key])
+    print("test_legacy_migration_still_checks_the_common_recipe OK")
 
 
 def test_production_solver_matches_full_qp_oracle():
@@ -532,7 +576,7 @@ if __name__ == "__main__":
     test_infeasible_projection_is_dropped_by_row_filter()
     test_rows_backend_is_the_batched_vmap_path()
     test_kappa_ge_one_never_binds()
-    test_kappa_schedule()
+    test_round0_admits_only_tolerance_breaches()
     test_amp_scale_invariance()
     test_boundary_takes_exactly_one_step_per_arm()
     test_boundary_kappa_one_equals_task_control()
@@ -541,6 +585,7 @@ if __name__ == "__main__":
     test_nonfinite_task_direction_is_refused()
     test_boundary_aborts_without_task_keys()
     test_resume_config_contract()
+    test_legacy_migration_still_checks_the_common_recipe()
     test_production_solver_matches_full_qp_oracle()
     test_scheduler_realignment_after_migration()
     print("ALL_PROJECTION_TESTS_PASS")

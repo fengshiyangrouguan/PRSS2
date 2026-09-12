@@ -387,8 +387,9 @@ def gamma_replay_loss(gamma, m_a: torch.Tensor, m_b: torch.Tensor,
 # memory merge/compression INTERFACE i (the VLA analogue of a TGN tree).
 # Only the Gamma/compressor gradient is replaced (p.grad = -d*); every host
 # parameter keeps its untouched task gradient.  One clip, one AdamW step.
-# The three helpers below are verbatim copies of scripts/train_lamp.py
-# (branch ``lamp_rpbe_project``) so the VLA and TGN lines cannot drift.
+# kappa is a FIXED constant on the formal method (no annealing); the solver
+# core is a verbatim port of scripts/train_lamp.py (branch
+# ``lamp_rpbe_project``) so the VLA and TGN lines cannot drift.
 # ---------------------------------------------------------------------------
 
 
@@ -407,26 +408,6 @@ def _fista_nonneg(Q: torch.Tensor, c: torch.Tensor, iters: int) -> torch.Tensor:
         y = mu_new + ((tk - 1.0) / tk_new) * (mu_new - mu)
         mu, tk = mu_new, tk_new
     return mu
-
-
-def kappa_at(step: int, kappa_max: float, start: int, end: int,
-             kappa_to: float = 1.0) -> float:
-    """kappa schedule for the per-interface guardrail.
-
-    kappa_max (e.g. 0.05) until ``start`` (step), then LINEARLY to ``kappa_to``
-    at ``end``.  NOTE the direction: in ``g_i.d >= -kappa*||g_i||*||t||`` a
-    LARGER kappa is LOOSER; kappa >= 1 never binds (== pure task), kappa = 0 is
-    the strictest.  start < 0 disables annealing (constant kappa_max)."""
-    if start is None or start < 0:
-        return float(kappa_max)
-    if step < start:
-        return float(kappa_max)
-    if end is None or end <= start:
-        return float(kappa_to)
-    if step >= end:
-        return float(kappa_to)
-    f = (float(step) - float(start)) / float(end - start)
-    return float(kappa_max) + f * (float(kappa_to) - float(kappa_max))
 
 
 _ROWS_BACKEND = {"batched_chunks": 0, "fallback_chunks": 0, "last_error": None}
@@ -633,10 +614,14 @@ def active_set_feasibility_projection(
     viol = torch.clamp(-cos - kappa, min=0.0)
     diag["proj_cos_min"] = float(cos[valid].min())
     diag["proj_max_viol_before"] = float(viol.max())
-    n_cand = int((viol > 0).sum())
+    # Only interfaces that BREACH the feasibility tolerance need a constraint.
+    # Anything with 0 < v_i <= tau_feas already satisfies the formal criterion,
+    # so admitting it would burn active-set slots (and could push a later, real
+    # violator out of the budget) for no reason.
+    n_cand = int((viol > tau_feas).sum())
     diag["proj_n_candidates"] = n_cand
     active = [i for i in torch.argsort(viol, descending=True).tolist()[:max_active]
-              if viol[i] > 0]
+              if viol[i] > tau_feas]
     active_set = set(active)
     diag["proj_n_active_init"] = len(active)
     corr = torch.zeros(t.numel(), dtype=torch.float32, device=dev)

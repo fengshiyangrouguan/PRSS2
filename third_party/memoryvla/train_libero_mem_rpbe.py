@@ -68,7 +68,7 @@ from vla.datasets.hdf5_dataset import (  # noqa: E402
 from rpbe_embodied import (  # noqa: E402
     EmbodiedFixedMaps, EmbodiedRPBConfig, EmbodiedRPBEWindow,
     PendingMergeQueue, gamma_replay_loss, dual_latent_z_adjoint_modes,
-    apply_gamma_boundary_update, boundary_config, kappa_at,
+    apply_gamma_boundary_update, boundary_config, common_config,
     realign_lambda_scheduler, verify_resume_config,
 )
 
@@ -177,19 +177,10 @@ def parse_args() -> argparse.Namespace:
                         "additive (RETIRED legacy): L_task - lambda*J.")
     p.add_argument("--kappa", type=float, default=0.05,
                    help="project mode: an interface with cos(g_i, -g_task) < "
-                        "-kappa is protected.  kappa=0 = hard per-interface "
+                        "-kappa is protected.  FIXED constant on the formal "
+                        "method (no annealing).  kappa=0 = hard per-interface "
                         "constraint (STRICTEST); kappa>=1 = never binds "
                         "(== pure task).")
-    p.add_argument("--kappa-anneal-start", type=int, default=-1,
-                   help="project mode: GAMMA-BOUNDARY-attempt clock at "
-                        "which kappa starts to move (default -1 = never "
-                        "anneal).  Before it kappa=--kappa.")
-    p.add_argument("--kappa-anneal-end", type=int, default=-1,
-                   help="project mode: boundary-attempt index at which kappa reaches "
-                        "--kappa-anneal-to (linear in between).")
-    p.add_argument("--kappa-anneal-to", type=float, default=1.0,
-                   help="project mode: kappa value at --kappa-anneal-end. "
-                        "Larger kappa = LOOSER (>=1 never binds == pure task).")
     p.add_argument("--proj-iters", type=int, default=400,
                    help="project mode: FISTA iterations per cutting-plane round.")
     p.add_argument("--proj-tau", type=float, default=1e-3,
@@ -300,9 +291,6 @@ def main() -> None:
     # negative kappa would flip the sense of g_i.d >= -kappa||g_i||||t||.
     if not math.isfinite(args.kappa) or args.kappa < 0:
         raise SystemExit(f"--kappa must be finite and >= 0, got {args.kappa}")
-    if not math.isfinite(args.kappa_anneal_to) or args.kappa_anneal_to < 0:
-        raise SystemExit("--kappa-anneal-to must be finite and >= 0, got "
-                         f"{args.kappa_anneal_to}")
     if args.proj_tau <= 0 or not math.isfinite(args.proj_tau):
         raise SystemExit(f"--proj-tau must be finite and > 0, got "
                          f"{args.proj_tau}")
@@ -646,11 +634,6 @@ def main() -> None:
     window_micro = 0          # micro-backwards since last gamma boundary
     boundary_pending = False  # repr threshold crossed; fire at fresh-episode top
     last_eid = None
-    # TWO clocks (reviewer): every boundary ATTEMPT advances
-    # gamma_boundary_index (kappa annealing), while param_version -- the value
-    # MergeRecord stamps into every merge and the Gamma scheduler steps on --
-    # advances ONLY when Gamma actually changed (gamma_steps == 1).
-    gamma_boundary_index = 0
     t0 = time.time()
     print("== training loop start (arm={}) ==".format(args.arm), flush=True)
 
@@ -709,7 +692,7 @@ def main() -> None:
         weight independent of episode length under the dense protocol."""
         nonlocal window, task_cotangents, rpbe_cotangents, rpbe_pending_loss
         nonlocal rpbe_input_map, rpbe_window_episodes
-        nonlocal comp_audit_done, gamma_boundary_index
+        nonlocal comp_audit_done
         if not IS_GAMMA or vla.gamma is None:
             return
         comp_zpw = None
@@ -949,12 +932,8 @@ def main() -> None:
             task_cots = [task_cotangents[k] for k in task_keys]
             r_pairs = [rpbe_input_map[k] for k in rpbe_keys] if rpbe_keys else []
             r_cots = [rpbe_cotangents[k] for k in rpbe_keys] if rpbe_keys else []
-            # kappa anneals on the BOUNDARY-ATTEMPT clock, not on dense
-            # optimizer steps: a TGN-style schedule in optimizer steps would be
-            # over before the first few projections.
-            kap = kappa_at(gamma_boundary_index, args.kappa,
-                           args.kappa_anneal_start, args.kappa_anneal_end,
-                           args.kappa_anneal_to)
+            # kappa is a FIXED constant on the formal method (no annealing)
+            kap = float(args.kappa)
             pre = [p.detach().clone() for p in gamma_params]
             diag = apply_gamma_boundary_update(
                 gamma=vla.gamma, gamma_params=gamma_params,
@@ -976,16 +955,14 @@ def main() -> None:
                   f"steps={diag['gamma_steps']} "
                   f"aborted={diag['gamma_aborted']} |dgamma|={upd:.3e} "
                   f"{shown}", flush=True)
-        # boundary-attempt clock advances unconditionally; the PARAMETER version
-        # (stamped into MergeRecord and driving the Gamma scheduler) advances
-        # only when Gamma really changed.  An aborted boundary therefore does
-        # not fabricate a new parameter version for merges it never touched.
-        gamma_boundary_index += 1
+        # param_version is the Gamma PARAMETER version: it advances only when
+        # Gamma really changed (gamma_steps == 1).  It is what MergeRecord
+        # stamps onto every merge and what the Gamma scheduler steps on, so an
+        # aborted boundary never fabricates a version for untouched merges.
         if n_opt > 0:
             vla.cog_mem_bank.param_version += 1
         else:
-            print(f"[gamma proj] aborted boundary {gamma_boundary_index}: "
-                  f"param_version stays "
+            print("[gamma proj] aborted boundary: param_version stays "
                   f"{vla.cog_mem_bank.param_version}", flush=True)
         task_cotangents = {}
         rpbe_cotangents = {}
@@ -1036,7 +1013,6 @@ def main() -> None:
             "step": optimizer_step,
             "micro_step": micro_step,
             "param_version": vla.cog_mem_bank.param_version,
-            "gamma_boundary_index": gamma_boundary_index,
             "mem_length": args.mem_length,
             "lambda_rpbe": args.lambda_rpbe,
             "seed": args.seed,
@@ -1118,16 +1094,7 @@ def main() -> None:
         reset_gamma_state = False
         legacy_gamma_ckpt = False
         if "config" in ck:
-            want = {
-                "sched": args.sched, "batch_size": args.batch_size,
-                "grad_accum": args.grad_accum,
-                "gamma_replay_batch_size": args.gamma_replay_batch_size,
-                "gamma_task_boundary_episodes": args.gamma_task_boundary_episodes,
-                "rpbe_stats_episodes": args.rpbe_stats_episodes,
-                "lambda_rpbe": args.lambda_rpbe, "mem_length": args.mem_length,
-                "kf_min_abs": args.kf_min_abs,
-                **boundary_config(args),
-            }
+            want = {**common_config(args), **boundary_config(args)}
             bad, legacy_gamma_ckpt = verify_resume_config(
                 ck["config"], want,
                 allow_legacy_gamma=bool(args.migrate_legacy_gamma_state))
@@ -1157,8 +1124,6 @@ def main() -> None:
         micro_step = int(ck["micro_step"])
         episodes_seen = int(ck.get("episodes_seen", 0))
         vla.cog_mem_bank.param_version = int(ck["param_version"])
-        gamma_boundary_index = int(ck.get("gamma_boundary_index",
-                                          ck["param_version"]))
         if reset_gamma_state and sched_gamma is not None:
             # migration: opt_gamma got a FRESH Adam and the scheduler was not
             # loaded, so realign it to the boundary clock -- otherwise it would

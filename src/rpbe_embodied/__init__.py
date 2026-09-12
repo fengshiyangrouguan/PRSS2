@@ -15,7 +15,6 @@ from .loss import (  # noqa: F401
     dual_latent_z_adjoint_modes,
     gamma_replay_loss,
     interface_influence_rows,
-    kappa_at,
     reset_rows_backend_stats,
     rows_backend_stats,
 )
@@ -27,7 +26,10 @@ from .records import (  # noqa: F401
     PendingMergeQueue,
 )
 from .resume import (  # noqa: F401
+    BOUNDARY_CONFIG_KEYS,
+    COMMON_CONFIG_KEYS,
     boundary_config,
+    common_config,
     realign_lambda_scheduler,
     verify_resume_config,
 )

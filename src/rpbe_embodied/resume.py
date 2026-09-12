@@ -1,29 +1,46 @@
 """rpbe_embodied.resume — checkpoint config contract for --resume-full.
 
-The Stage8 boundary recipe (rpbe_mode + the projection knobs) must not change
-silently across a resume, so it is written into the checkpoint config and
-verified on load.  Stage7 checkpoints predate ``rpbe_mode``; they are only
-loadable with an explicit migration flag, and the caller is then required to
-RESET the Gamma optimizer state -- Adam's first/second moments from the
-retired additive ``-lambda*J`` objective must never seed a feasibility-
-projection run.
+Two layers, checked differently:
+
+  * ``COMMON_CONFIG_KEYS`` -- the training recipe that Stage7 and Stage8 both
+    already carry.  ALWAYS compared strictly; a migration must never silently
+    skip ``batch_size`` / ``grad_accum`` / ``mem_length`` / ...
+  * ``BOUNDARY_CONFIG_KEYS`` -- the Stage8-only boundary/projection recipe.
+    Compared strictly on a Stage8 checkpoint; on a Stage7 migration these keys
+    simply do not exist, so they are the ONLY thing the migration flag exempts.
+
+A Stage7 checkpoint has no ``rpbe_mode``; loading one requires
+``--migrate-legacy-gamma-state``, and the caller must then RESET the Gamma
+optimizer state -- Adam's first/second moments from the retired additive
+``-lambda*J`` objective must never seed a feasibility-projection run.
 """
 from __future__ import annotations
 
 import warnings
 from typing import Dict, Tuple
 
-# the Stage8 boundary/projection recipe written into every checkpoint config
+# training recipe shared by Stage7 and Stage8 -- always strictly enforced
+COMMON_CONFIG_KEYS = (
+    "sched", "batch_size", "grad_accum", "gamma_replay_batch_size",
+    "gamma_task_boundary_episodes", "rpbe_stats_episodes", "lambda_rpbe",
+    "mem_length", "kf_min_abs",
+)
+
+# Stage8-only boundary/projection recipe; absent from Stage7 checkpoints
 BOUNDARY_CONFIG_KEYS = (
-    "rpbe_mode", "kappa", "kappa_anneal_start", "kappa_anneal_end",
-    "kappa_anneal_to", "proj_iters", "proj_tau", "proj_max_active",
+    "rpbe_mode", "kappa", "proj_iters", "proj_tau", "proj_max_active",
     "proj_max_rounds", "proj_add_per_round",
 )
 
 
 def boundary_config(args) -> Dict[str, object]:
-    """The subset of run args the boundary protocol depends on."""
+    """The subset of run args the Stage8 boundary protocol depends on."""
     return {k: getattr(args, k) for k in BOUNDARY_CONFIG_KEYS}
+
+
+def common_config(args) -> Dict[str, object]:
+    """The shared training recipe that every resume must reproduce exactly."""
+    return {k: getattr(args, k) for k in COMMON_CONFIG_KEYS}
 
 
 def verify_resume_config(ck_config: dict, want: dict,
@@ -32,13 +49,16 @@ def verify_resume_config(ck_config: dict, want: dict,
     """Compare a checkpoint's config block against the requested run.
 
     Returns ``(bad, legacy)``.  ``bad`` maps key -> (checkpoint, requested) for
-    every mismatch (including a key absent from a Stage8-format checkpoint).
-    A Stage7 checkpoint has no ``rpbe_mode`` at all: that is tolerated only
-    with ``allow_legacy_gamma``, which returns ``legacy=True`` and an empty
-    ``bad`` so the caller can proceed with a Gamma-optimizer reset.
+    every mismatch.  A Stage7 checkpoint (no ``rpbe_mode``) is tolerated only
+    with ``allow_legacy_gamma``; that exempts ONLY the Stage8-only boundary
+    keys -- every COMMON key present in ``want`` is still compared, so a
+    migration cannot silently change the shared training recipe.
     """
-    if "rpbe_mode" not in ck_config and allow_legacy_gamma:
-        return {}, True
+    legacy = "rpbe_mode" not in ck_config
+    if legacy and allow_legacy_gamma:
+        bad = {k: (ck_config.get(k), v) for k, v in want.items()
+               if k not in BOUNDARY_CONFIG_KEYS and ck_config.get(k) != v}
+        return bad, True
     bad = {k: (ck_config.get(k), v) for k, v in want.items()
            if ck_config.get(k) != v}
     return bad, False

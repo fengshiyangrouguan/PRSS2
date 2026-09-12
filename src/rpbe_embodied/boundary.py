@@ -21,7 +21,7 @@ from typing import Optional, Sequence, Tuple
 import torch
 
 from .loss import (active_set_feasibility_projection, gamma_replay_loss,
-                   interface_influence_rows)
+                   interface_influence_rows, rows_backend_stats)
 
 
 def _stream_replay(gamma, pairs, cotangents, dtype, device, minibatch):
@@ -83,11 +83,19 @@ def apply_gamma_boundary_update(
 
     if rpbe_pairs:
         n = len(rpbe_pairs)
+        be0 = rows_backend_stats()
         G_cpu, used, n_nonfinite = interface_influence_rows(
             gamma,
             {j: rpbe_cotangents[j] for j in range(n)},
             {j: rpbe_pairs[j] for j in range(n)},
             list(range(n)), params=gamma_params, device=device, chunk=row_chunk)
+        be1 = rows_backend_stats()
+        diag["rows_batched_chunks"] = be1["batched_chunks"] - be0["batched_chunks"]
+        diag["rows_fallback_chunks"] = (be1["fallback_chunks"]
+                                        - be0["fallback_chunks"])
+        if diag["rows_fallback_chunks"]:
+            # visible in the training log: the slow path is never silent
+            diag["rows_backend_error"] = be1["last_error"]
         diag["proj_n_rows_used"] = len(used)
         diag["proj_n_nonfinite"] = n_nonfinite
         if n_nonfinite:

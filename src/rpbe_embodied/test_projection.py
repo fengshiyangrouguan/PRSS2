@@ -223,6 +223,23 @@ def test_all_interfaces_checked_and_order_invariant():
                                             diag["proj_coverage"]))
 
 
+def test_batched_rows_match_per_interface_vjp():
+    """Correctness of the backend switch: the batched torch.func rows must
+    equal an INDEPENDENT per-interface VJP, row by row."""
+    gamma = TinyGamma()
+    cot, inp = _rand_problem(gamma, 7)
+    G, used, n_bad = _rows(gamma, cot, inp)
+    assert n_bad == 0 and len(used) == 7
+    for i in range(7):
+        a, b = inp[i]
+        z = gamma(a.unsqueeze(0), b.unsqueeze(0))[0]
+        ref = torch.cat([g.reshape(-1) for g in torch.autograd.grad(
+            (cot[i] * z.float()).sum(), list(gamma.parameters()))])
+        assert torch.allclose(G[i], ref, atol=1e-5), \
+            (i, float((G[i] - ref).abs().max()))
+    print("test_batched_rows_match_per_interface_vjp OK")
+
+
 def test_nonfinite_rows_dropped():
     gamma = TinyGamma()
     cot, inp = _rand_problem(gamma, 8)
@@ -575,6 +592,7 @@ if __name__ == "__main__":
     test_nonfinite_rows_dropped()
     test_infeasible_projection_is_dropped_by_row_filter()
     test_rows_backend_is_the_batched_vmap_path()
+    test_batched_rows_match_per_interface_vjp()
     test_kappa_ge_one_never_binds()
     test_round0_admits_only_tolerance_breaches()
     test_amp_scale_invariance()

@@ -57,7 +57,8 @@ def replay_split(tgn, stream, *, n_neighbors=10, bs=200):
 
 
 def evaluate_split(tgn, ds, split="val", *, n_neighbors=10, bs=200,
-                   seed=None, full_finder=None, reset=False):
+                   seed=None, full_finder=None, reset=False,
+                   agg="global"):
     """Score one split; returns {ap, auc, n_pos}.
 
     Memory is NOT reset here: it continues from the caller's current state
@@ -67,6 +68,16 @@ def evaluate_split(tgn, ds, split="val", *, n_neighbors=10, bs=200,
     Official protocol: evaluation neighbor sampling uses the FULL graph
     finder (train+val+test edges), so the finder is swapped in for the
     scoring pass and swapped back afterwards.
+
+    ``agg`` selects the metric aggregation (fairness audit 2026-09-13):
+      * "global"     — concatenate every batch's scores, compute ONE
+                       sklearn AP/AUC over the whole stream (our historic
+                       default);
+      * "batch_mean" — compute AP/AUC INSIDE each batch and average the
+                       per-batch values (the official ``eval_edge_prediction``
+                       convention).  The two differ whenever scores drift
+                       across batches (e.g. temporal drift in the model's
+                       score scale).
     """
     stream = ds.val if split == "val" else ds.test
     n = len(stream.sources)
@@ -92,15 +103,28 @@ def evaluate_split(tgn, ds, split="val", *, n_neighbors=10, bs=200,
             stream.edge_idxs[start:end], n_neighbors, bs)
         pos_probs.append(pp)
         neg_probs.append(np_)
-    pos = np.concatenate(pos_probs)
-    neg = np.concatenate(neg_probs)
-    labels = np.concatenate([np.ones_like(pos), np.zeros_like(neg)])
-    scores = np.concatenate([pos, neg])
     if train_finder is not None:
         tgn.embedding_module.neighbor_finder = train_finder
-    return {"ap": float(average_precision_score(labels, scores)),
-            "auc": float(roc_auc_score(labels, scores)),
-            "n_pos": int(n)}
+    if agg == "global":
+        pos = np.concatenate(pos_probs)
+        neg = np.concatenate(neg_probs)
+        labels = np.concatenate([np.ones_like(pos), np.zeros_like(neg)])
+        scores = np.concatenate([pos, neg])
+        return {"ap": float(average_precision_score(labels, scores)),
+                "auc": float(roc_auc_score(labels, scores)),
+                "n_pos": int(n)}
+    if agg == "batch_mean":
+        aps, aucs = [], []
+        for pp, np_ in zip(pos_probs, neg_probs):
+            labels = np.concatenate(
+                [np.ones_like(pp), np.zeros_like(np_)])
+            scores = np.concatenate([pp, np_])
+            aps.append(float(average_precision_score(labels, scores)))
+            aucs.append(float(roc_auc_score(labels, scores)))
+        return {"ap": float(np.mean(aps)),
+                "auc": float(np.mean(aucs)),
+                "n_pos": int(n)}
+    raise ValueError("unknown agg: {}".format(agg))
 
 
 def evaluate_val(tgn, ds, *, n_neighbors=10, bs=200, full_finder=None):
@@ -122,16 +146,18 @@ def evaluate_val(tgn, ds, *, n_neighbors=10, bs=200, full_finder=None):
     }
 
 
-def evaluate_test(tgn, ds, *, n_neighbors=10, bs=200, full_finder=None):
+def evaluate_test(tgn, ds, *, n_neighbors=10, bs=200, full_finder=None,
+                  agg="global"):
     """Final test: reset memory, replay train then val, score test.
 
     Mirrors ``main``'s ``reset_memory() -> replay_split(train) ->
     replay_split(val) -> evaluate_split(test, reset=False)``.  Read exactly
     once after checkpoint selection (never used for early stopping).
+    ``agg`` selects the metric aggregation (see ``evaluate_split``).
     """
     if tgn.use_memory:
         tgn.memory.__init_memory__()
         replay_split(tgn, ds.train, n_neighbors=n_neighbors, bs=bs)
         replay_split(tgn, ds.val, n_neighbors=n_neighbors, bs=bs)
     return evaluate_split(tgn, ds, "test", n_neighbors=n_neighbors, bs=bs,
-                          full_finder=full_finder)
+                          full_finder=full_finder, agg=agg)

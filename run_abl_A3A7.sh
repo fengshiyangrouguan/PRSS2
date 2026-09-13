@@ -9,7 +9,7 @@ export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 PY=/root/miniconda3/bin/python
 ROOT=/root/autodl-tmp/PRSS2_uci_v2/outputs/uci_formal_v2
 DATA_DIR=/root/autodl-tmp/benchtemp/data_uci
-LAM=LAM_PLACEHOLDER
+LAM=0.00668
 EP=80
 PAT=80
 mkdir -p "$ROOT/logs"

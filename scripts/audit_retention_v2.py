@@ -1,79 +1,30 @@
 #!/usr/bin/env python3
-"""Introduction-mechanism retention audit v2 — corrected protocol.
+"""Retention audit v3 - conditional future-predictive information.
 
-This version supersedes the audit committed at 6bcaa81 whose JSON/figure were
-rejected by review: values were not retention fractions (ratios of unlike
-quantities, a zero denominator padded with eps -> 129k, chained products such
-as 0.503*1.035*1.691 = 0.88, CIs excluding their own point estimate), the CC
-context leaked the *future* event's edge feature (the same edge that builds
-the prediction target), and TGN memory never advanced (each batch restored a
-backup, and the "train tail" started from a zeroed memory without replaying
-the prefix).
+For one fixed leaf-to-root branch per root (a_3 -> a_2 -> a_1 -> a_0) and each
+source line s in {3-hop: leaf state, 2-hop: Z_a2, 1-hop: Z_a1}:
 
-Corrected protocol
-------------------
-Path (one fixed leaf-to-root branch per root, slot chosen by a fixed hash):
-a_3 (leaf) -> a_2 -> a_1 -> a_0 (root); states
-    U0 = leaf layer-0 state
-    Z1 = h_{a_2} = Gamma_1(U0, N1)
-    Z2 = h_{a_1} = Gamma_2(Z1, N2)
-    Z3 = h_{a_0} = Gamma_3(Z2, N3)
+    I_{s,k} = ( NLL(Y | C, Z^-_{s->k}) - NLL(Y | C, Z^+_{s->k}) ) / ln 2
+    R_{s,k} = I_{s,k} / I_{s,0}
 
-History flow: memory is advanced exactly like a real single-pass stream.  A
-pass first replays the prefix with normal keep-only forwards, then processes
-its window batch by batch: snapshot pre-memory -> run the KEEP forward (this
-IS the advance) -> snapshot post-memory -> run each remove variant from the
-same pre-memory and restore after each -> restore post-memory.  A
---memory-parity-batches pre-check asserts the window scheme leaves memory
-bit-identical to a pristine keep-only single pass.
+Z^- is the keep forward; Z^+ = Z^- + Delta (Delta = keep - remove of the
+selected source interface at position k); Y = 2*Y_s + Y_pa(s) with Y=1 iff the
+presented candidate is the node real next out-edge destination (its negative is
+an official-sampler candidate).  The NLL probe is multinomial logistic on a psi
+with a candidate x state INTERACTION term; base and full share the SAME
+dimension and architecture.  Information uses only held-out (audit-block) NLL;
+calibration is the contiguous same-tail block.
 
-Context C is leak-free: it contains ONLY historical path structure (the three
-historical edges' edge_feat/edge_time and node times, path-outside
-other-neighbor means, root/leaf ids).  The future event appears ONLY in the
-prediction target P (fixed witness phi_S).
-
-Retention (fixed same-source signal, bounded <= 1, no chaining).  The figure's
-question is how much of a source node's useful signal survives one/two/three
-recursive aggregations toward the root.  For source depth s let X_s be its
-representation (3: U0, 2: Z1, 1: Z2) and fix the source signal ONCE as
-
-    Q_s = ridge(X_s -> P)          (fit on calib; P = root future witness)
-
-Q_s is never re-estimated per layer and never regressed against the context C.
-C is NOT subtracted from the source signal: the paired keep/remove happens on
-the SAME tree, so the environment (context, siblings, edges, times) is fixed by
-construction.  At each downstream position k the paired-removal delta
-Delta_{s->k} (ancestor state keep minus remove of this source) is measured, and
-retention is how much of the SAME Q_s the audit-set Delta recovers:
-
-    R_{s->k} = 1 - ||Q_s - Qhat_s||_F^2 / (||Q_s - mean Q_s||_F^2 + eps)
-
-with Qhat_s a ridge prediction of Q_s from Delta_{s->k} alone.  Every point is
-an independent direct regression against the same source component -- never a
-chain of local factors, never a ratio of per-layer J, never a per-layer
-re-prediction of the future.  SSE >= 0 makes R <= 1 by construction; negative
-values are reported honestly.
-
-Gates run before plotting: source signal (explained variance of audit P by
-Q_s) must exceed a within-strata shuffle null (95th pct) or the source is
-marked NOT IDENTIFIABLE and its line is not drawn; identity at the source ~1;
-remove-source (Delta = 0) ~0; a mismatched (permuted) delta must not recover
-Q_s; memory parity is stored.  The figure only draws lines whose gates
-all pass.  Calibration for the MAIN result is the contiguous same-tail block
-(just before the audit block, silent gap between); a head-calibration ->
-tail-audit fit is kept only as a cross-temporal TRANSFER stress test.
-
-Gates run before plotting: source predictive signal above a matched-context
-shuffle null (95th pct), identity at the source ~1, delete-source (Delta = 0,
-C-only) floor ~0, and a mismatched-delta control (Delta permuted within
-strata) must not recover Q.  A memory-parity flag is stored.  The figure only
-draws lines whose gates all pass.
+The reported R is a normalized source-specific predictive gain, NOT a strict
+information-retention fraction in [0,1] (each position conditions on a
+different Z^-); R>1 is flagged, never clipped.  This v3 estimator supersedes
+the older corr^2 / Q_s protocol described in prior docstrings.
 
 Usage:
-    python scripts/audit_retention_v2.py \
-        --ckpt <best.pt> --data-dir <processed_tgn_data> --data-name wikipedia \
+    python scripts/audit_retention_v2.py --model-kind tgn \
+        --ckpt <best.pt> --data-dir <dir> --data-name uci --n-neighbors 10 \
         --gpu 0 --bs 64 --audit-batches 200 --calib-batches 60 \
-        --n-bootstrap 200 --memory-parity-batches 5
+        --manifest-out candidate_manifest.pkl
 """
 import argparse
 import hashlib
@@ -276,7 +227,9 @@ def model_meta(ckpt_path):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--ckpt", required=True)
+    ap.add_argument("--ckpt", default="")
+    ap.add_argument("--manifest-out", default="")
+    ap.add_argument("--manifest-in", default="")
     ap.add_argument("--data-dir", required=True)
     ap.add_argument("--data-name", default="wikipedia")
     ap.add_argument("--gpu", type=int, default=0)
@@ -314,6 +267,8 @@ def main():
     ap.add_argument("--n-neighbors", type=int, default=5)
     ap.add_argument("--n-layers", type=int, default=3)
     args = ap.parse_args()
+    if not args.ckpt and not args.recompute_from:
+        raise SystemExit('--ckpt required unless --recompute-from')
     assert int(args.n_layers) == 3, (
         'retention path bookkeeping currently assumes n_layers == 3')
     if args.recompute_from:
@@ -324,7 +279,9 @@ def main():
                   _m.get("memory_parity",
                          {"ok": False,
                           "detail": "memory parity not stored in pkl"}),
-                  layout=_m.get("layout"), model_meta_override=_m)
+                  layout=_m.get("layout"), model_meta_override=_m,
+                  model_kind_override=_m.get("model_kind"),
+                  out_dir=Path(args.recompute_from).parent)
         return
 
     eps = 1e-6
@@ -356,21 +313,32 @@ def main():
         own_dims={"tjo:layer{}".format(l): 172 for l in range(n_layers + 1)},
         width_D=128, m=64, lambda_kf=0.0, ridge_eps=1e-3,
         kf_group_batches=8, kf_min_abs=64)
-    comp = (RecursiveCompressor(cfg).to(device)
-            if args.model_kind == "ours" else None)
-    adapter = JodieTGNAdapter(tgn.embedding_module, compressor=comp,
-                              n_neighbors=n_neighbors)
-    tgn.embedding_module = adapter
     ck = torch.load(args.ckpt, map_location="cpu", weights_only=False)
-    if "model" not in ck:
-        ck = {"model": {"tgn": ck}}          # raw official TGN state_dict
-    tgn.load_state_dict(ck["model"]["tgn"])
-    if args.model_kind == "ours":
-        if "compressor" not in ck["model"]:
+    if not (isinstance(ck, dict) and "model" in ck):
+        # RAW official TGN state_dict: keys are ``embedding_module.*`` and there
+        # is no compressor.  It must be loaded into ``tgn`` BEFORE the adapter
+        # wrapper is installed (afterwards the keys become embedding_module.host.*).
+        if args.model_kind != "tgn":
             raise RuntimeError(
-                "model-kind=ours but checkpoint has no 'compressor' block; "
-                "use --model-kind tgn for a native TGN checkpoint")
-        comp.load_state_dict(ck["model"]["compressor"])
+                "raw TGN state_dict requires --model-kind tgn (no compressor)")
+        tgn.load_state_dict(ck, strict=True)
+        comp = None
+        adapter = JodieTGNAdapter(tgn.embedding_module, compressor=None,
+                                  n_neighbors=n_neighbors)
+        tgn.embedding_module = adapter
+    else:
+        comp = (RecursiveCompressor(cfg).to(device)
+                if args.model_kind == "ours" else None)
+        adapter = JodieTGNAdapter(tgn.embedding_module, compressor=comp,
+                                  n_neighbors=n_neighbors)
+        tgn.embedding_module = adapter
+        tgn.load_state_dict(ck["model"]["tgn"])
+        if args.model_kind == "ours":
+            if "compressor" not in ck["model"]:
+                raise RuntimeError(
+                    "model-kind=ours but checkpoint has no 'compressor' "
+                    "block; use --model-kind tgn for a native TGN checkpoint")
+            comp.load_state_dict(ck["model"]["compressor"])
     tgn.eval()
     print("[model] kind={} n_layers={} n_neighbors={} loaded checkpoint "
           "epoch={} score={}".format(args.model_kind, n_layers, n_neighbors,
@@ -534,6 +502,8 @@ def main():
             if is_top:
                 for r, rec in path_state["recs"].items():
                     rec["z3"] = z[r].detach().cpu().numpy()
+                    if "e" in cur and r < len(cur["e"]):
+                        rec["root_event_id"] = int(cur["e"][r])
                     rec["other_neighbors"] = _other_neighbor_vec(
                         neighbor_lower, r, rec["slot3"], n_neighbors_)
             for (root_r, lv), ch in self_path_choices.items():
@@ -558,12 +528,11 @@ def main():
                     # node_info are kept separately and never conflated.
                     base["u0"] = neighbor_lower[flat_row, ch["slot"]]                         .detach().cpu().numpy()
                     if adapter.use_memory:
-                        base["h0"] = memory[int(ch["node"])] \
-                            .detach().cpu().numpy()
+                        base["h0"] = memory[child].detach().cpu().numpy()
                     else:
                         base["h0"] = np.zeros_like(base["u0"])
                     base["node_info"] = adapter.host.node_features[
-                        int(ch["node"])].detach().cpu().numpy()
+                        child].detach().cpu().numpy()
                     base["leaf"] = child
                     path_state["stash"][(root_r, 1)] = base
         return z
@@ -578,6 +547,8 @@ def main():
     def _forward_batch(bb, rm, record=True):
         cur["d"] = rm
         cur["record"] = record
+        _s0 = bb * bs
+        cur["e"] = train.edge_idxs[_s0:_s0 + bs]
         _reset_path_state()
         s0 = bb * bs
         s1 = s0 + bs
@@ -622,6 +593,12 @@ def main():
         _forward_batch(bb, None, record=False)
 
     manifest_rows = []
+    manifest_in = None
+    if args.manifest_in:
+        with open(args.manifest_in, 'rb') as _mf:
+            _md = pickle.load(_mf)
+        manifest_in = (_md.get('entries') if isinstance(_md, dict)
+                       and 'entries' in _md else _md)
 
     def _rows_from(keep, rm_snaps):
         recs = keep["recs"]
@@ -664,8 +641,11 @@ def main():
                 continue
             leaf_node = int(st1["leaf"]); a2_node = int(st1["node"])
             a1_node = int(st2["node"]); root_t = float(rec["t_root"])
+            root_event_id = int(rec.get("root_event_id", -1))
+            pair_id = (root_event_id, int(root), leaf_node, a2_node, a1_node)
             nodes = {"leaf": leaf_node, "a2": a2_node, "a1": a1_node,
                      "root": root}
+            pair_id = (root_event_id, int(root), leaf_node, a2_node, a1_node)
             F = {}
             okf = True
             for k, v in nodes.items():
@@ -674,25 +654,49 @@ def main():
                     okf = False
                     break
                 jq, _dt, dpos = q
-                rs_ = np.random.RandomState(((int(v) * 1000003) +
-                                             int(root_t)) % (2 ** 31))
-                dneg = int(pool[rs_.randint(len(pool))])
-                bit = int(rs_.randint(2))
-                presented = dpos if bit == 0 else dneg
-                F[k] = {"eid": int(fut.eidx[jq]), "dpos": int(dpos),
-                        "dneg": dneg, "presented": int(presented),
-                        "Y": 1 if int(presented) == int(dpos) else 0,
-                        "bit": bit}
+                dpos = int(dpos)
+                cseed = ((int(v) * 1000003) + int(root_t)) % (2 ** 31)
+                if manifest_in is not None:
+                    e = manifest_in.get(pair_id)
+                    if e is None or k not in e.get("pos_cand", {}):
+                        okf = False
+                        break
+                    dneg = int(e["neg_cand"][k])
+                    presented = int(e["presented"][k])
+                    Y = int(e["Y"][k])
+                    coll = bool(e.get("collision", {}).get(k, False))
+                    eid = int(e.get("pos_future_event_id", {}).get(k,
+                                                                  fut.eidx[jq]))
+                else:
+                    rs_ = np.random.RandomState(cseed)
+                    dneg = int(pool[rs_.randint(len(pool))])
+                    coll = (dneg == dpos)
+                    tries = 0
+                    while dneg == dpos and tries < 64:
+                        dneg = int(pool[rs_.randint(len(pool))])
+                        tries += 1
+                    presented = dpos if int(rs_.randint(2)) == 0 else dneg
+                    Y = 1 if presented == dpos else 0
+                    eid = int(fut.eidx[jq])
+                F[k] = {"eid": int(eid), "dpos": dpos, "dneg": dneg,
+                        "presented": int(presented), "Y": int(Y),
+                        "candidate_seed": int(cseed), "collision": bool(coll)}
             if not okf:
                 continue
             manifest_rows.append({
-                "pair_id": int(r), "root_node": int(root), "t_root": root_t,
+                "pair_id": pair_id, "root_event_id": root_event_id,
+                "root_node": int(root), "t_root": root_t,
                 "nodes": nodes,
                 "pos_cand": {k: F[k]["dpos"] for k in F},
                 "neg_cand": {k: F[k]["dneg"] for k in F},
                 "order_bits": {k: F[k]["bit"] for k in F},
                 "pos_future_event_id": {k: F[k]["eid"] for k in F},
-                "sampler_seed": int(FIXED_SEED)})
+                "candidate_seed": {k: F[k]["candidate_seed"] for k in F},
+                "presented": {k: F[k]["presented"] for k in F},
+                "Y": {k: F[k]["Y"] for k in F},
+                "collision": {k: F[k]["collision"] for k in F},
+                "sampler_formula_version": "v1_ressample_noncollision",
+                "sampler_base_seed": int(FIXED_SEED)})
             zk = {1: z1, 2: z2, 3: z3}
             lines_local = [
                 ("Y_leaf", "Y_a2", st1["u0"], 0,
@@ -710,12 +714,12 @@ def main():
                 rows.append({"line": sk, "phys": origin, "ctx": ctx,
                              "rem": np.zeros_like(src_state),
                              "keep": src_state, "y_s": Ys, "y_p": Yp,
-                             "cand_s": hs, "cand_p": hp, "pair_id": int(r)})
+                             "cand_s": hs, "cand_p": hp, "pair_id": pair_id})
                 for phys, dk, zkey in pts:
                     rows.append({"line": sk, "phys": phys, "ctx": ctx,
                                  "rem": zk[zkey] - dk, "keep": zk[zkey],
                                  "y_s": Ys, "y_p": Yp,
-                                 "cand_s": hs, "cand_p": hp, "pair_id": int(r)})
+                                 "cand_s": hs, "cand_p": hp, "pair_id": pair_id})
         return rows
 
     def _silent_batches(a, b, label):
@@ -848,6 +852,15 @@ def main():
         pickle.dump({"audit": audit_rows, "calib": calib_rows,
                      "head": calib_h_rows, "meta": meta,
                      "manifest": manifest_rows}, f)
+    if args.manifest_out:
+        entries = {e["pair_id"]: e for e in manifest_rows}
+        with open(args.manifest_out, "wb") as _mf:
+            pickle.dump({"entries": entries,
+                         "sampler_formula_version":
+                             "v1_ressample_noncollision",
+                         "dataset_hash": meta["dataset_hash"]}, _mf)
+        print("[manifest] wrote", args.manifest_out, len(entries),
+              "entries", flush=True)
     print("[dump] rows saved to", dump_path, flush=True)
 
     run_stats(calib_rows, audit_rows, calib_h_rows, args, mem_parity,
@@ -860,7 +873,8 @@ def main():
     return
 
 def run_stats(calib_rows, audit_rows, calib_h_rows, args, mem_parity,
-              layout=None, model_meta_override=None):
+              layout=None, model_meta_override=None,
+              model_kind_override=None, out_dir=None):
     """Conditional future-predictive information via held-out joint-future NLL
     with a candidate x state INTERACTION scorer and SAME-dim base/full
     (base = Z^-; full = Z^+ = Z^- + Delta).  Target = 2*Y_s + Y_pa(s) in
@@ -937,12 +951,13 @@ def run_stats(calib_rows, audit_rows, calib_h_rows, args, mem_parity,
                     "flagged).  Naming: normalized source-specific predictive "
                     "gain (not a strict information-retention fraction).",
         "model": model_meta_override or model_meta(args.ckpt),
-        "model_kind": args.model_kind,
+        "model_kind": model_kind_override or args.model_kind,
         "n_audit_rows": len(audit_rows), "n_calib_rows": len(calib_rows),
         "lam_ret": lam, "memory_parity": mem_parity, "layout": layout,
         "sources": results,
     }
-    out = Path(args.ckpt).parent / "retention_audit_v3.json"
+    _outdir = Path(out_dir) if out_dir else Path(args.ckpt).parent
+    out = _outdir / "retention_audit_v3.json"
     with open(out, "w") as f:
         json.dump(report, f, indent=2, default=str)
     print(json.dumps(report, indent=2, default=str), flush=True)

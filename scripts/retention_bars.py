@@ -6,6 +6,11 @@ transformations and reports the fraction retained after each compression,
 NORMALIZED by the signal available at the source (R_0 = 1).  Ours is compared
 with the corresponding host under the SAME measurement protocol.
 
+Rendered in the audit_v2_fig layout: one 1x3 panel figure, x-axis = physical
+position along the path (leaf / a2 / a1 / root), y-axis = normalized retained
+fraction, two trajectories per panel (host dashed, ours solid) with
+bootstrap CI bands.
+
 Computed directly from cached retention_rows.pkl files (no model rerun).
 All groups share ONE root prediction target
 
@@ -15,22 +20,23 @@ and each group tracks ONLY its own source's paired-removal delta chain -- never
 the full ancestor state (which would mix in the parent's own / sibling / new
 neighbor information):
 
-    3-hop source U0 :  U0  -> d32 -> d31 -> d3r      (depth 0..3 trajectory)
-    2-hop source Z1 :  Z1  -> d21 -> d2r             (depth 0..2 trajectory)
-    1-hop source Z2 :  Z2  -> d1r                    (depth 0..1 trajectory)
-
-Rendered as LINE charts: retained fraction (normalized, R_0 = 1) vs recursive
-depth, one subplot per source, host vs ours trajectories in the same axes.
+    3-hop source U0 :  U0  -> d32 -> d31 -> d3r      (leaf..root, 4 points)
+    2-hop source Z1 :  Z1  -> d21 -> d2r             (a2..root,    3 points)
+    1-hop source Z2 :  Z2  -> d1r                    (a1..root,    2 points)
 
 Protocol (all directions/maps fixed on CALIB; nothing refit on audit):
   1. canonical directions between the source state X_s and S_root are fixed on
      calib -> source component Q_s = X_s_std @ W and the common root-target
      directions T = S_root_std @ B (weights = canonical strengths squared);
   2. the source bar is the weighted corr^2 between Q_s and T on audit -- the
-     signal AVAILABLE at the source; every bar is divided by it, so the
-     source reads exactly 1 and downstream bars are retained FRACTIONS;
-  3. each ancestor bar fits the map d_{s->k} -> Q_s on calib, applies it on
-     audit, and scores the RECOVERED component against the SAME root target T.
+     signal AVAILABLE at the source; every point is divided by it, so the
+     source reads exactly 1 and downstream points are retained FRACTIONS;
+  3. each downstream point fits the map d_{s->k} -> Q_s on calib, applies it
+     on audit, and scores the RECOVERED component against the SAME root
+     target T.
+  4. CI bands: paired cluster-bootstrap over audit rows (same resample index
+     for source and every downstream point), so the normalized ratio's
+     distribution is estimated jointly -- percentile 2.5/97.5.
 
 Both arms share the SAME protocol: same frozen phi (FIXED_SEED), same
 GROUPS, same n_dir / ridge lambdas, same normalization.  Each arm fits its
@@ -90,37 +96,60 @@ def _col(rows, key):
     return np.stack([r[key] for r in rows])
 
 
+# title, source-state key, downstream delta chain, x position of the source
 GROUPS = [
-    ("3-hop source (U0)", "u0", ["d32", "d31", "d3r"]),
-    ("2-hop source (Z1)", "z1", ["d21", "d2r"]),
-    ("1-hop source (Z2)", "z2", ["d1r"]),
+    ("3-hop source (U0)", "u0", ["d32", "d31", "d3r"], 0),
+    ("2-hop source (Z1)", "z1", ["d21", "d2r"], 1),
+    ("1-hop source (Z2)", "z2", ["d1r"], 2),
 ]
 
+# physical position on the shared leaf->root axis (audit_v2_fig layout)
+POS_LABELS = {0: "leaf\n(U0)", 1: "a2\n(Z1)", 2: "a1\n(Z2)", 3: "root\n(Z3)"}
 
-def arm_bars(calib, audit, n_dir, lam, lam_ret):
-    """Absolute weighted corr^2 per bar, one arm, same protocol.
 
-    Returns {title: [(bar_name, abs_corr2), ...]} with source first; the
-    caller normalizes each group by its source value (R_0 = 1).
+def arm_bars(calib, audit, n_dir, lam, lam_ret, n_boot, seed):
+    """Normalized retention trajectory per group, with paired-bootstrap CIs.
+
+    Returns {title: [(name, frac, ci_lo, ci_hi), ...]} with source first
+    (frac == 1); CI bands from a paired cluster-bootstrap over audit rows.
     """
     S_c = np.concatenate([_y_phi(calib, "Y_a1"), _y_phi(calib, "Y_root")],
                          axis=1)
     S_a = np.concatenate([_y_phi(audit, "Y_a1"), _y_phi(audit, "Y_root")],
                          axis=1)
     out = {}
-    for title, src_key, deltas in GROUPS:
-        # 1. fix source->root directions on calib (common root-target dirs)
+    for title, src_key, deltas, _x0 in GROUPS:
         mpd = rs.canonical_dirs(_col(calib, src_key), S_c, n_dir, lam=lam)
         wts = np.asarray(mpd["sv"], dtype=np.float64) ** 2
-        T_a = rs.project_future(mpd, S_a)          # root target directions
+        T_a = rs.project_future(mpd, S_a)
         Qc = rs.predict_source_component(mpd, _col(calib, src_key))
         Qa = rs.predict_source_component(mpd, _col(audit, src_key))
-        bars = [("source", rs.weighted_dir_sqcorr(Qa, T_a, wts))]
-        # 2. each delta recovers the SAME source component; score vs root
-        for dk in deltas:
-            mp = rs.fit_ridge_map(_col(calib, dk), Qc, lam=lam_ret)
-            qhat = rs.apply_ridge_map(mp, _col(audit, dk))
-            bars.append((dk, rs.weighted_dir_sqcorr(qhat, T_a, wts)))
+        maps = {dk: rs.fit_ridge_map(_col(calib, dk), Qc, lam=lam_ret)
+                for dk in deltas}
+        d_audit = {dk: _col(audit, dk) for dk in deltas}
+
+        def eval_at(idx):
+            ta = T_a[idx]
+            s0 = rs.weighted_dir_sqcorr(Qa[idx], ta, wts)
+            vs = [rs.weighted_dir_sqcorr(
+                rs.apply_ridge_map(maps[dk], d_audit[dk][idx]), ta, wts)
+                for dk in deltas]
+            return s0, vs
+
+        s0_full, vs_full = eval_at(np.arange(len(audit)))
+        r_full = np.asarray(vs_full, dtype=np.float64) / max(s0_full, 1e-8)
+        rng = np.random.RandomState(seed)
+        n = len(audit)
+        boot = np.zeros((n_boot, len(deltas)))
+        for b in range(n_boot):
+            idx = rng.choice(n, size=n, replace=True)
+            s0b, vsb = eval_at(idx)
+            boot[b] = np.asarray(vsb) / max(s0b, 1e-8)
+        lo = np.percentile(boot, 2.5, axis=0)
+        hi = np.percentile(boot, 97.5, axis=0)
+        bars = [("source", 1.0, 1.0, 1.0)]
+        for i, dk in enumerate(deltas):
+            bars.append((dk, float(r_full[i]), float(lo[i]), float(hi[i])))
         out[title] = bars
     return out
 
@@ -141,6 +170,7 @@ def main():
     ap.add_argument("--n-dir", type=int, default=5)
     ap.add_argument("--lam", type=float, default=1e-2)
     ap.add_argument("--lam-ret", type=float, default=1e-2)
+    ap.add_argument("--n-boot", type=int, default=200)
     args = ap.parse_args()
 
     arms = [("host", load_rows(args.rows))]
@@ -149,59 +179,48 @@ def main():
 
     norm = {}
     for name, (calib, audit) in arms:
-        abs_bars = arm_bars(calib, audit, args.n_dir, args.lam, args.lam_ret)
-        norm[name] = {}
-        for title, bars in abs_bars.items():
-            s0 = bars[0][1]
-            guard = s0 if abs(s0) > 1e-8 else float("nan")
-            norm[name][title] = [(nm, v / guard) for nm, v in bars]
+        norm[name] = arm_bars(calib, audit, args.n_dir, args.lam,
+                              args.lam_ret, args.n_boot,
+                              seed=20260909 + (1 if name == "ours" else 0))
+        for title, bars in norm[name].items():
             print("[{}] {}  ".format(name, title)
-                  + "  ".join("{}={:.3f}".format(nm, rv)
-                              for nm, rv in norm[name][title]),
+                  + "  ".join("{}={:.3f}[{:.3f},{:.3f}]".format(
+                      nm, rv, lo, hi) for nm, rv, lo, hi in bars),
                   flush=True)
 
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
-    fig, axes = plt.subplots(1, 3, figsize=(13.5, 4.3))
-    c_host = "#9aa5b1"
-    c_ours = "#2a78d6"
-    two = len(arms) == 2
-    for ax, (title, _sk, deltas) in zip(axes, GROUPS):
-        # line chart: retained fraction vs recursive depth (source = depth 0)
-        xpos = np.arange(len(deltas) + 1)
+    fig, axes = plt.subplots(1, 3, figsize=(14.0, 4.2), sharey=True)
+    for ax, (title, _sk, deltas, x0) in zip(axes, GROUPS):
+        xpos = np.arange(x0, 4)             # physical leaf->root positions
+        ax.axhline(0.0, color="#b7bcc2", lw=0.8, ls=":", zorder=1)
         for aname, _raw in arms:
-            vals = [v for _nm, v in norm[aname][title]]
-            color = c_ours if aname == "ours" else c_host
+            vals = [max(-0.05, min(1.05, v))
+                    for _nm, v, _l, _h in norm[aname][title]]
+            los = [max(-0.05, min(1.05, l))
+                   for _nm, _v, l, _h in norm[aname][title]]
+            his = [max(-0.05, min(1.05, h))
+                   for _nm, _v, _l, h in norm[aname][title]]
+            color = "#2a78d6" if aname == "ours" else "#eb6834"
             ls = "-" if aname == "ours" else "--"
-            ax.plot(xpos, vals, marker="o", ms=4, lw=1.8, color=color,
-                    ls=ls, zorder=3)
-            for x, v in zip(xpos, vals):
-                if np.isfinite(v):
-                    ax.text(x, v + 0.03, "{:.2f}".format(v),
-                            ha="center", fontsize=8,
-                            color="#333a44" if aname == "ours" else "#7a838e")
-        ax.set_xticks(xpos)
-        ax.set_xticklabels(["source\n(depth 0)"]
-                           + ["depth {}".format(i + 1)
-                              for i in range(len(deltas))], fontsize=8)
+            ax.plot(xpos, vals, lw=1.8, ms=4.5, zorder=3, color=color,
+                    ls=ls, marker="o", label=aname)
+            ax.fill_between(xpos, los, his, color=color, alpha=0.10,
+                            lw=0, zorder=2)
+        ax.set_xticks(list(POS_LABELS.keys()))
+        ax.set_xticklabels([POS_LABELS[k] for k in sorted(POS_LABELS)],
+                           fontsize=8)
         ax.set_title(title, fontsize=10)
-        ax.set_ylim(0.0, 1.15)              # source = 1; noise may push ~1.0x
+        ax.set_ylim(-0.05, 1.05)
         ax.grid(True, axis="y", color="#e5e8ea", lw=0.6, zorder=0)
-    if two:
-        from matplotlib.lines import Line2D
-        axes[0].legend(handles=[
-            Line2D([0], [0], color=c_host, ls="--", marker="o", ms=4,
-                   label="host (task-only)"),
-            Line2D([0], [0], color=c_ours, ls="-", marker="o", ms=4,
-                   label="ours")],
-            fontsize=8, loc="upper right", frameon=False)
+        ax.legend(fontsize=8, frameon=False, loc="lower left")
     axes[0].set_ylabel("fraction of the source predictive signal\n"
                        "retained (normalized to the source, R$_0$ = 1)",
                        fontsize=9)
-    fig.suptitle("Predictive signal retention through recursive compression",
-                 fontsize=11)
+    fig.suptitle("Predictive signal retention through recursive compression "
+                 "-- host vs ours (same measurement protocol)", fontsize=11)
     fig.tight_layout(rect=(0, 0, 1, 0.91))
     fig.savefig(args.out, dpi=150)
     print("wrote", args.out, flush=True)

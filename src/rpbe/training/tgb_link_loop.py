@@ -1125,7 +1125,8 @@ class TGBPairLinkLoop:
                 j_pre = 0.5 * float((d_pre_cpu - t.double()).norm().pow(2))
                 d_p = d
                 n_refine = 0
-                for _ in range(500):
+                ms = []          # viol at 500/1000/1500/2000 milestones
+                for _ in range(2000):
                     cj = H @ d_p
                     bad = cj < -1e-7
                     nv = int(bad.sum().item())
@@ -1135,13 +1136,17 @@ class TGBPairLinkLoop:
                     n_refine += 1
                     d_p = d_p - (0.9 / nv) * ((bad.float() * cj) @ H)
                     viol_max = float((-cj[bad]).max().item()) / (nt + 1e-30)
+                    if n_refine in (500, 1000, 1500, 2000):
+                        ms.append((n_refine, viol_max))
                     if viol_max <= 1e-6:
                         break
                 d_post_cpu = d_p.detach().cpu().double()
                 j_post = 0.5 * float((d_post_cpu - t.double()).norm().pow(2))
                 drift = float((d_post_cpu - d_pre_cpu).norm()) / (nt + 1e-30)
                 print("[rpbe-k0refine] viol=%.3e drift=%.3e dJ=%+.3e iters=%d"
-                      % (viol_max, drift, j_post - j_pre, n_refine),
+                      " ms=%s"
+                      % (viol_max, drift, j_post - j_pre, n_refine,
+                         ",".join("%d:%.2e" % m for m in ms) or "-"),
                       flush=True)
                 d = d_p
                 n_iter += n_refine

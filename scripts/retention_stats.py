@@ -354,3 +354,62 @@ def nll_bootstrap_ci(Fc_base, Fc_full, yc, Fa_base, Fa_full, ya,
     return (float(np.percentile(out, 100 * alpha / 2)),
             float(np.percentile(out, 100 * (1 - alpha / 2))))
 
+
+# --------------------------------------------------- interaction probe (v3)
+def fixed_proj(d_in, d_out, seed):
+    """Frozen Gaussian projection [d_in] -> [d_out] (candidate interaction)."""
+    g = np.random.RandomState(int(seed))
+    return g.normal(0.0, 1.0 / np.sqrt(max(1, d_in)), size=(d_out, d_in))
+
+
+def interaction_feats(ctx, S, cand_s, cand_p, P):
+    """psi = [C, S, e(c_s), e(c_p), S*(P e(c_s)), S*(P e(c_p))].
+
+    The S x candidate interaction terms are the only channel that can express
+    "does this state match this candidate"; S is either Z^- (base) or Z^+ =
+    Z^- + Delta (full) -- SAME dimension and SAME architecture for both, so
+    the full probe gains no extra capacity from the delta.
+    """
+    cs = cand_s @ P.T
+    cp = cand_p @ P.T
+    return np.concatenate([ctx, S, cand_s, cand_p, S * cs, S * cp], axis=1)
+
+
+def info_bits_interaction(ctx_c, S_rem_c, S_keep_c, cs_c, cp_c, yc,
+                          ctx_a, S_rem_a, S_keep_a, cs_a, cp_a, ya,
+                          P, lam=1e-2):
+    """I = (NLL(base) - NLL(full))/ln2 with the interaction scorer; base uses
+    Z^-, full uses Z^+ (same dim)."""
+    base_c = interaction_feats(ctx_c, S_rem_c, cs_c, cp_c, P)
+    full_c = interaction_feats(ctx_c, S_keep_c, cs_c, cp_c, P)
+    base_a = interaction_feats(ctx_a, S_rem_a, cs_a, cp_a, P)
+    full_a = interaction_feats(ctx_a, S_keep_a, cs_a, cp_a, P)
+    return conditional_info_bits(base_c, full_c, yc, base_a, full_a, ya,
+                                 lam=lam)
+
+
+def cluster_bootstrap_ci(ctx_c, S_rem_c, S_keep_c, cs_c, cp_c, yc,
+                         ctx_a, S_rem_a, S_keep_a, cs_a, cp_a, ya, groups_a,
+                         P, n_boot=200, seed=0, lam=1e-2, alpha=0.05):
+    """Paired cluster bootstrap over ``groups_a`` (e.g. pair_id) with BOTH the
+    numerator and denominator computed inside each replicate."""
+    groups = np.asarray(groups_a)
+    uniq = np.unique(groups)
+    by = {g: np.where(groups == g)[0] for g in uniq}
+    rng = np.random.RandomState(seed)
+    out = []
+    for _ in range(n_boot):
+        pick = uniq[rng.randint(0, len(uniq), size=len(uniq))]
+        idx = np.concatenate([by[g] for g in pick])
+        out.append(info_bits_interaction(
+            ctx_c, S_rem_c, S_keep_c, cs_c, cp_c, yc,
+            ctx_a[idx], S_rem_a[idx], S_keep_a[idx], cs_a[idx], cp_a[idx],
+            ya[idx], P, lam=lam))
+    out = np.asarray(out, dtype=np.float64)
+    out = out[np.isfinite(out)]
+    if out.size == 0:
+        return (float("nan"), float("nan"))
+    return (float(np.percentile(out, 100 * alpha / 2)),
+            float(np.percentile(out, 100 * (1 - alpha / 2))))
+
+

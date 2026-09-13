@@ -237,6 +237,21 @@ class FutureIndex:
         cp = int(self.dst[j]) if self.src[j] == node else int(self.src[j])
         return j, float(self.t[j] - time), cp
 
+    def query_src(self, node, time):
+        """First event with ``node`` as SOURCE strictly after ``time`` (UCI
+        link convention: predict the node's next out-edge)."""
+        if not (0 <= node < self.n_nodes):
+            return None
+        rows = self._rows[node]
+        if len(rows) == 0:
+            return None
+        pos = int(np.searchsorted(self.t[rows], time, side="right"))
+        for k in range(pos, len(rows)):
+            j = int(rows[k])
+            if int(self.src[j]) == int(node):
+                return j, float(self.t[j] - time), int(self.dst[j])
+        return None
+
 
 # ------------------------------------------------------------------- main
 def model_meta(ckpt_path):
@@ -299,15 +314,17 @@ def main():
     ap.add_argument("--n-neighbors", type=int, default=5)
     ap.add_argument("--n-layers", type=int, default=3)
     args = ap.parse_args()
+    assert int(args.n_layers) == 3, (
+        'retention path bookkeeping currently assumes n_layers == 3')
     if args.recompute_from:
         with open(args.recompute_from, "rb") as f:
             rd = pickle.load(f)
-        run_stats(rd["calib"], rd["audit"], rd["head"], args,
-                  {"ok": True,
-                   "n_batches": args.memory_parity_batches,
-                   "detail": "recomputed from saved rows (parity was verified "
-                             "at extraction)"},
-                  layout=rd.get("meta", {}).get("layout"))
+        _m = rd.get("meta", {})
+        run_stats(rd["calib"], rd["audit"], rd.get("head", []), args,
+                  _m.get("memory_parity",
+                         {"ok": False,
+                          "detail": "memory parity not stored in pkl"}),
+                  layout=_m.get("layout"), model_meta_override=_m)
         return
 
     eps = 1e-6
@@ -345,8 +362,14 @@ def main():
                               n_neighbors=n_neighbors)
     tgn.embedding_module = adapter
     ck = torch.load(args.ckpt, map_location="cpu", weights_only=False)
+    if "model" not in ck:
+        ck = {"model": {"tgn": ck}}          # raw official TGN state_dict
     tgn.load_state_dict(ck["model"]["tgn"])
-    if comp is not None and "compressor" in ck["model"]:
+    if args.model_kind == "ours":
+        if "compressor" not in ck["model"]:
+            raise RuntimeError(
+                "model-kind=ours but checkpoint has no 'compressor' block; "
+                "use --model-kind tgn for a native TGN checkpoint")
         comp.load_state_dict(ck["model"]["compressor"])
     tgn.eval()
     print("[model] kind={} n_layers={} n_neighbors={} loaded checkpoint "
@@ -598,6 +621,8 @@ def main():
     def silent_batch(bb):
         _forward_batch(bb, None, record=False)
 
+    manifest_rows = []
+
     def _rows_from(keep, rm_snaps):
         recs = keep["recs"]
         stash = keep["stash"]
@@ -623,7 +648,7 @@ def main():
             def _dz(var, key, orig_z):
                 if key == "z3":
                     rr = var["recs"].get(r)
-                    return (orig_z - rr[key]) if rr is not None                         and key in rr else None
+                    return (orig_z - rr[key]) if (rr is not None and key in rr) else None
                 ss = var["stash"].get((r, {"z1": 1, "z2": 2}[key]))
                 return (orig_z - ss["z"]) if ss is not None else None
 
@@ -637,29 +662,38 @@ def main():
             if any(v is None for v in
                    (dz3_2, dz3_1, dz3_r, dz2_1, dz2_r, dz1_r)):
                 continue
-            leaf_node = int(st1["leaf"])
-            a2_node = int(st1["node"])
-            a1_node = int(st2["node"])
-            root_t = float(rec["t_root"])
-            # ---- strict-future link queries for the four path nodes; the real
-            # future edge is y=1 and the official-sampler negative is y=0.
-            # candidates are cached per (node, root_t) and shared by TGN/ours.
-            futq = {}
+            leaf_node = int(st1["leaf"]); a2_node = int(st1["node"])
+            a1_node = int(st2["node"]); root_t = float(rec["t_root"])
+            nodes = {"leaf": leaf_node, "a2": a2_node, "a1": a1_node,
+                     "root": root}
+            F = {}
             okf = True
-            for k, node in [("leaf", leaf_node), ("a2", a2_node),
-                            ("a1", a1_node), ("root", root)]:
-                q = fut.query(node, root_t)
+            for k, v in nodes.items():
+                q = fut.query_src(v, root_t)
                 if q is None:
                     okf = False
                     break
-                jq, dtq, cpq = q
-                futq[k] = {"cp": int(cpq),
-                           "cn": _sample_neg(node, root_t, pool)}
+                jq, _dt, dpos = q
+                rs_ = np.random.RandomState(((int(v) * 1000003) +
+                                             int(root_t)) % (2 ** 31))
+                dneg = int(pool[rs_.randint(len(pool))])
+                bit = int(rs_.randint(2))
+                presented = dpos if bit == 0 else dneg
+                F[k] = {"eid": int(fut.eidx[jq]), "dpos": int(dpos),
+                        "dneg": dneg, "presented": int(presented),
+                        "Y": 1 if int(presented) == int(dpos) else 0,
+                        "bit": bit}
             if not okf:
                 continue
+            manifest_rows.append({
+                "pair_id": int(r), "root_node": int(root), "t_root": root_t,
+                "nodes": nodes,
+                "pos_cand": {k: F[k]["dpos"] for k in F},
+                "neg_cand": {k: F[k]["dneg"] for k in F},
+                "order_bits": {k: F[k]["bit"] for k in F},
+                "pos_future_event_id": {k: F[k]["eid"] for k in F},
+                "sampler_seed": int(FIXED_SEED)})
             zk = {1: z1, 2: z2, 3: z3}
-            # per source line: (src key, parent key, source state, origin phys,
-            # downstream [(phys, delta, keep-key)])
             lines_local = [
                 ("Y_leaf", "Y_a2", st1["u0"], 0,
                  [(1, dz3_2, "z1"), (2, dz3_1, "z2"), (3, dz3_r, "z3")]),
@@ -669,22 +703,19 @@ def main():
                  [(3, dz1_r, "z3")]),
             ]
             for sk, pk, src_state, origin, pts in lines_local:
-                fs = futq[sk.replace("Y_", "")]
-                fp = futq[pk.replace("Y_", "")]
-                combos = [(1, 1, fs["cp"], fp["cp"]), (1, 0, fs["cp"], fp["cn"]),
-                          (0, 1, fs["cn"], fp["cp"]), (0, 0, fs["cn"], fp["cn"])]
-                for y_s, y_p, cand_s, cand_p in combos:
-                    hs = _cand_hash(cand_s, 11)
-                    hp = _cand_hash(cand_p, 22)
-                    rows.append({"line": sk, "phys": origin, "ctx": ctx,
-                                 "rem": np.zeros_like(src_state),
-                                 "delta": src_state, "y_s": y_s, "y_p": y_p,
-                                 "cand_s": hs, "cand_p": hp})
-                    for phys, dk, zkey in pts:
-                        rows.append({"line": sk, "phys": phys, "ctx": ctx,
-                                     "rem": zk[zkey] - dk, "delta": dk,
-                                     "y_s": y_s, "y_p": y_p,
-                                     "cand_s": hs, "cand_p": hp})
+                fsk = sk.replace("Y_", ""); fpk = pk.replace("Y_", "")
+                Ys = int(F[fsk]["Y"]); Yp = int(F[fpk]["Y"])
+                hs = _cand_hash(F[fsk]["presented"], 11)
+                hp = _cand_hash(F[fpk]["presented"], 22)
+                rows.append({"line": sk, "phys": origin, "ctx": ctx,
+                             "rem": np.zeros_like(src_state),
+                             "keep": src_state, "y_s": Ys, "y_p": Yp,
+                             "cand_s": hs, "cand_p": hp, "pair_id": int(r)})
+                for phys, dk, zkey in pts:
+                    rows.append({"line": sk, "phys": phys, "ctx": ctx,
+                                 "rem": zk[zkey] - dk, "keep": zk[zkey],
+                                 "y_s": Ys, "y_p": Yp,
+                                 "cand_s": hs, "cand_p": hp, "pair_id": int(r)})
         return rows
 
     def _silent_batches(a, b, label):
@@ -789,19 +820,34 @@ def main():
     # persist the extracted row matrices so a later statistics-only change can
     # be recomputed without re-running the model (15 min -> seconds)
     dump_path = Path(args.ckpt).parent / "retention_rows.pkl"
+    def _file_sha(paths):
+        h = hashlib.sha256()
+        for pp in paths:
+            try:
+                with open(pp, "rb") as fh:
+                    for chunk in iter(lambda: fh.read(1 << 20), b""):
+                        h.update(chunk)
+            except OSError:
+                pass
+        return h.hexdigest()[:16]
+
+    _dd = Path(args.data_dir)
     meta = model_meta(args.ckpt)
     meta.update({"model_kind": args.model_kind, "n_layers": args.n_layers,
                  "n_neighbors": args.n_neighbors, "bs": args.bs,
                  "data_name": args.data_name,
-                 "dataset_hash": hashlib.sha256(
-                     (str(Path(args.data_dir).resolve()) + args.data_name)
-                     .encode()).hexdigest()[:16],
+                 "dataset_hash": _file_sha([
+                     str(_dd / "ml_{}.csv".format(args.data_name)),
+                     str(_dd / "ml_{}.npy".format(args.data_name)),
+                     str(_dd / "ml_{}_node.npy".format(args.data_name))]),
+                 "memory_parity": mem_parity,
                  "layout": {"audit_block": [audit_lo, audit_hi],
                             "same_tail_calib_block": [calib_lo, calib_hi],
                             "head_calib_block": [0, transfer_hi]}})
     with open(dump_path, "wb") as f:
         pickle.dump({"audit": audit_rows, "calib": calib_rows,
-                     "head": calib_h_rows, "meta": meta}, f)
+                     "head": calib_h_rows, "meta": meta,
+                     "manifest": manifest_rows}, f)
     print("[dump] rows saved to", dump_path, flush=True)
 
     run_stats(calib_rows, audit_rows, calib_h_rows, args, mem_parity,
@@ -814,77 +860,86 @@ def main():
     return
 
 def run_stats(calib_rows, audit_rows, calib_h_rows, args, mem_parity,
-              layout=None):
-    """Conditional future-predictive information via held-out joint-future NLL.
-
-    Per source line s: I_{s,k} = (NLL(C,Z^-_{s->k}) - NLL(C,Z^-_{s->k},Delta))
-    / ln2  [bits/sample]; target = 2*Y_s + Y_pa(s) in {0,1,2,3} (Y=1 for the
-    real strict-future edge, 0 for the official-sampler negative candidate).
-    R_{s,k} = I_{s,k} / I_{s,0}.  NOT clipped: R>1 is flagged as a
-    DPI / finite-sample violation, never silently clamped.
-    """
+              layout=None, model_meta_override=None):
+    """Conditional future-predictive information via held-out joint-future NLL
+    with a candidate x state INTERACTION scorer and SAME-dim base/full
+    (base = Z^-; full = Z^+ = Z^- + Delta).  Target = 2*Y_s + Y_pa(s) in
+    {0,1,2,3} (Y=1 iff the presented candidate is the real future dest).
+    R_{s,k} = I_{s,k} / I_{s,0}; NOT clipped (R>1 flagged)."""
     lam = args.lam_ret
-    LINES = ["Y_leaf", "Y_a2", "Y_a1"]
 
-    def _feat(rows_):
-        ctx = np.stack([r["ctx"] for r in rows_])
-        rem = np.stack([r["rem"] for r in rows_])
-        dl = np.stack([r["delta"] for r in rows_])
-        cs = np.stack([r["cand_s"] for r in rows_])
-        cp = np.stack([r["cand_p"] for r in rows_])
-        base = np.concatenate([ctx, rem, cs, cp], axis=1)
-        full = np.concatenate([base, dl], axis=1)
-        return base, full
+    if not audit_rows or not calib_rows:
+        print("FATAL: no rows to score", flush=True)
+        return
+    d_state = calib_rows[0]["rem"].shape[0]
+    d_cand = calib_rows[0]["cand_s"].shape[0]
+    P = rs.fixed_proj(d_cand, d_state, FIXED_SEED + 77)
 
-    def _tgt(rows_):
+    def _A(rows_, key):
+        return np.stack([r[key] for r in rows_])
+
+    def _Y(rows_):
         return np.asarray([2 * r["y_s"] + r["y_p"] for r in rows_],
                           dtype=np.int64)
 
+    LINES = ["Y_leaf", "Y_a2", "Y_a1"]
     results = {}
     for line in LINES:
         cr = [r for r in calib_rows if r["line"] == line]
         ar = [r for r in audit_rows if r["line"] == line]
         if len(cr) < 40 or len(ar) < 40:
             continue
-        cb, cf = _feat(cr)
-        ab, af = _feat(ar)
-        yc = _tgt(cr)
-        ya = _tgt(ar)
         phs = sorted({r["phys"] for r in cr} & {r["phys"] for r in ar})
-        info = {}
+        info, ci = {}, {}
         for ph in phs:
-            cidx = [i for i, r in enumerate(cr) if r["phys"] == ph]
-            aidx = [i for i, r in enumerate(ar) if r["phys"] == ph]
-            if len(cidx) < 40 or len(aidx) < 40:
+            csel = [r for r in cr if r["phys"] == ph]
+            asel = [r for r in ar if r["phys"] == ph]
+            if len(csel) < 40 or len(asel) < 40:
                 continue
-            yc_ph, ya_ph = yc[cidx], ya[aidx]
-            if len(np.unique(yc_ph)) < 2 or len(np.unique(ya_ph)) < 2:
-                continue
-            ib = rs.conditional_info_bits(
-                cb[cidx], cf[cidx], yc_ph, ab[aidx], af[aidx], ya_ph, lam=lam)
+            yc = _Y(csel)
+            ya = _Y(asel)
+            if len(np.unique(yc)) < 4:
+                raise RuntimeError(
+                    "calibration missing a joint-future class for line {} "
+                    "phys {}: {}".format(line, ph, sorted(np.unique(yc))))
+            args_c = (_A(csel, "ctx"), _A(csel, "rem"), _A(csel, "keep"),
+                      _A(csel, "cand_s"), _A(csel, "cand_p"), yc)
+            args_a = (_A(asel, "ctx"), _A(asel, "rem"), _A(asel, "keep"),
+                      _A(asel, "cand_s"), _A(asel, "cand_p"), ya)
+            ib = rs.info_bits_interaction(*args_c, *args_a, P, lam=lam)
             info[ph] = float(ib)
+            groups_a = np.asarray([r["pair_id"] for r in asel])
+            ci[ph] = rs.cluster_bootstrap_ci(
+                *args_c, *args_a, groups_a, P, n_boot=args.n_bootstrap,
+                lam=lam)
         origin = 0 if line == "Y_leaf" else (1 if line == "Y_a2" else 2)
         i0 = info.get(origin)
+        i0ci = ci.get(origin)
         pts = []
         for ph in sorted(info):
             R = (info[ph] / i0) if (i0 is not None and i0 > 1e-9)                 else float("nan")
             pts.append({"phys": int(ph), "info_bits": float(info[ph]),
+                        "ci95": [float(ci[ph][0]), float(ci[ph][1])]
+                        if ph in ci else [float("nan"), float("nan")],
                         "R": float(R),
                         "R_gt1_flag": bool(R == R and R > 1.0)})
-        results[line] = {"origin_phys": origin, "info_source_bits": i0,
-                         "n_calib": len(cr), "n_audit": len(ar),
-                         "points": pts}
+        results[line] = {
+            "origin_phys": origin, "info_source_bits": i0,
+            "info_source_ci95": [float(i0ci[0]), float(i0ci[1])]
+            if i0ci else None, "n_calib": len(cr), "n_audit": len(ar),
+            "points": pts}
 
     report = {
-        "protocol": "conditional future-predictive information (held-out "
-                    "joint-future NLL drop, bits/sample); R_k = I_k / I_source; "
-                    "no clipping (R>1 flagged)",
-        "model": model_meta(args.ckpt),
+        "protocol": "conditional future-predictive information: held-out "
+                    "joint-future NLL drop (bits/sample) with a candidate x "
+                    "state interaction scorer and same-dim base/full "
+                    "(Z^- vs Z^+).  R_k=I_k/I_source; no clipping (R>1 "
+                    "flagged).  Naming: normalized source-specific predictive "
+                    "gain (not a strict information-retention fraction).",
+        "model": model_meta_override or model_meta(args.ckpt),
         "model_kind": args.model_kind,
         "n_audit_rows": len(audit_rows), "n_calib_rows": len(calib_rows),
-        "lam_ret": lam, "identity_min": args.identity_min,
-        "floor_max": args.floor_max, "memory_parity": mem_parity,
-        "layout": layout,
+        "lam_ret": lam, "memory_parity": mem_parity, "layout": layout,
         "sources": results,
     }
     out = Path(args.ckpt).parent / "retention_audit_v3.json"

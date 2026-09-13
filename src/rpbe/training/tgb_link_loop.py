@@ -93,7 +93,6 @@ class TGBPairLinkLoop:
                  edge_table, arm, rpbe_cfg, repr_optimizer, head_optimizer,
                  trace_roots=32, trace_pairs_per_parent=2,
                  kf_group_batches=56, kf_min_trees=896,
-                 kf_support_frac=1.0,
                  n_observations=2, trace_mode="evenly_spaced",
                  fail_below=False, train_neg_sampler=None,
                  audit_trace=False, aux_prefix_groups=None,
@@ -130,9 +129,6 @@ class TGBPairLinkLoop:
         self.trace_pairs_per_parent = int(trace_pairs_per_parent)
         self.kf_group_batches = int(kf_group_batches)
         self.kf_min_trees = int(kf_min_trees)
-        # Fig 5(c): fraction of window trees kept for the Ky Fan estimate.
-        # 1.0 = full support (identical to the production path).
-        self.kf_support_frac = float(kf_support_frac)
         self.n_observations = int(n_observations)
         self.trace_mode = trace_mode
         # config-resolved axes (9-config registry): parent usage, mispaired
@@ -331,8 +327,7 @@ class TGBPairLinkLoop:
             self.pair_windows[tau] = PairKFWindow(
                 tau=tau, eps=self._window_eps,
                 min_unique_trees=self.kf_min_trees,
-                variant=self.variant,
-                support_frac=self.kf_support_frac)
+                variant=self.variant)
         return self.pair_windows[tau]
 
     def _save_group_state(self):
@@ -601,19 +596,10 @@ class TGBPairLinkLoop:
                                     group_k))
                         continue
                     j, g_pos, diag = win.close_replay(
-                        _MapsAdapter(self, tau),
-                        support_seed=(group_start ^ self.seed))
+                        _MapsAdapter(self, tau))
                     if j is None:
                         below += 1
                         continue
-                    # Fig 5(c) telemetry: estimation sample size under the
-                    # support cut (M_used_trees <= M_unique_trees).
-                    if self.window_diag and diag.get("M_used_trees") \
-                            is not None:
-                        self.window_diag[-1]["M_used_trees"] = \
-                            int(diag["M_used_trees"])
-                        self.window_diag[-1]["support_frac"] = \
-                            float(diag["support_frac"])
                     n_closed += 1
                     closed_tau[tau] = j
                     for pos_in_tau, g in g_pos.items():

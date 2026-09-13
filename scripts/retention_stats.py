@@ -271,3 +271,86 @@ def predict_source_component(mp, Xa):
 def project_future(mp, Pa):
     """Pq = ((Pa-mp)/sp) @ B  -- held-out future along the source directions."""
     return (Pa - mp["mp"]) / mp["sp"] @ mp["B"]
+
+
+# ============================================================ NLL-based MI
+# Conditional future-predictive information estimated by the HELD-OUT drop in
+# NLL of a multinomial (logistic) probe for the joint future label
+# S_s = (Y_s, Y_pa(s)), label = 2*Y_s + Y_pa(s) in {0,1,2,3}.
+#
+#   I_hat_{s,k} = ( NLL_base - NLL_full ) / ln 2      [bits / sample]
+#   NLL_base    = NLL( S_s | C_s, Z^-_{s->k} )
+#   NLL_full    = NLL( S_s | C_s, Z^-_{s->k}, Delta_{s->k} )
+#
+# class_weight=None (so the estimate tracks the natural-distribution MI);
+# the probe family and hyper-parameters are identical for TGN and ours.
+
+
+def joint_target(y_s, y_parent):
+    """2 * Y_s + Y_pa(s) in {0,1,2,3} from two binary future labels."""
+    y_s = np.asarray(y_s, dtype=np.int64)
+    yp = np.asarray(y_parent, dtype=np.int64)
+    return 2 * y_s + yp
+
+
+def _std_fit(Fc):
+    m = Fc.mean(axis=0)
+    s = Fc.std(axis=0) + 1e-9
+    return m, s
+
+
+def multinomial_nll(Fc, yc, Fa, ya, lam=1e-2, n_class=4, max_iter=3000):
+    """Held-out NLL of a multinomial logistic probe (natural log).
+
+    Fit on (Fc,yc) with L2 strength C=1/lam, evaluate NLL on (Fa,ya).
+    Features are standardized on the calibration set only.
+    """
+    from sklearn.linear_model import LogisticRegression
+    Fc = np.asarray(Fc, dtype=np.float64)
+    Fa = np.asarray(Fa, dtype=np.float64)
+    yc = np.asarray(yc, dtype=np.int64)
+    ya = np.asarray(ya, dtype=np.int64)
+    if len(np.unique(yc)) < 2 or len(ya) == 0:
+        return float("nan")
+    m, s = _std_fit(Fc)
+    clf = LogisticRegression(C=1.0 / max(lam, 1e-9), solver="lbfgs",
+                             max_iter=max_iter, class_weight=None)
+    clf.fit((Fc - m) / s, yc)
+    P = clf.predict_proba((Fa - m) / s)
+    cls = clf.classes_.astype(np.int64)
+    # map target labels -> column index (missing classes contribute nothing)
+    col = {int(c): j for j, c in enumerate(cls)}
+    hit = np.array([col.get(int(y), -1) for y in ya])
+    ok = hit >= 0
+    if ok.sum() == 0:
+        return float("nan")
+    p = P[np.arange(len(ya))[ok], hit[ok]]
+    return float(-np.mean(np.log(np.clip(p, 1e-12, 1.0))))
+
+
+def conditional_info_bits(Fc_base, Fc_full, yc, Fa_base, Fa_full, ya,
+                          lam=1e-2):
+    """I_hat = (NLL_base - NLL_full)/ln2  [bits/sample]; can be negative."""
+    nll_b = multinomial_nll(Fc_base, yc, Fa_base, ya, lam=lam)
+    nll_f = multinomial_nll(Fc_full, yc, Fa_full, ya, lam=lam)
+    return (nll_b - nll_f) / np.log(2.0)
+
+
+def nll_bootstrap_ci(Fc_base, Fc_full, yc, Fa_base, Fa_full, ya,
+                     n_boot=200, seed=0, lam=1e-2, alpha=0.05):
+    """Cluster-bootstrap CI for I_hat (rows resampled with replacement)."""
+    rng = np.random.RandomState(seed)
+    n = len(ya)
+    out = []
+    for _ in range(n_boot):
+        idx = rng.choice(n, size=n, replace=True)
+        out.append(conditional_info_bits(
+            Fc_base, Fc_full, yc, Fa_base[idx], Fa_full[idx], ya[idx],
+            lam=lam))
+    out = np.asarray(out, dtype=np.float64)
+    out = out[np.isfinite(out)]
+    if out.size == 0:
+        return (float("nan"), float("nan"))
+    return (float(np.percentile(out, 100 * alpha / 2)),
+            float(np.percentile(out, 100 * (1 - alpha / 2))))
+

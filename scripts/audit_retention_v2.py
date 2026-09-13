@@ -137,6 +137,20 @@ def _hash01(vals, seed):
     return h / float(2 ** 32)
 
 
+def _cand_hash(node, seed):
+    """Fixed 16-d candidate encoding (node-id hash; symmetric pos/neg)."""
+    g = np.random.RandomState((int(node) * 2654435761 + int(seed)) & 0xFFFFFFFF)
+    return g.normal(0.0, 1.0, 16) / 4.0
+
+
+def _sample_neg(node, root_t, pool, salt=0):
+    """Official-sampler negative dst for a strict-future query (cached by the
+    caller; TGN and ours share the SAME candidate)."""
+    g = np.random.RandomState(((int(node) * 1000003 + int(root_t)) + int(salt))
+                              % (2 ** 31))
+    return int(pool[g.randint(len(pool))])
+
+
 def fixed_phi_S(edge_feat, delta_t, counterpart, src_node):
     rng = np.random.RandomState(FIXED_SEED)
     raw = np.stack([np.log1p(delta_t),
@@ -279,6 +293,11 @@ def main():
     ap.add_argument("--lam-ret", type=float, default=1e-2)
     ap.add_argument("--identity-min", type=float, default=0.90)
     ap.add_argument("--floor-max", type=float, default=0.05)
+    ap.add_argument("--model-kind", default="ours", choices=["ours", "tgn"],
+                    help="ours = TGN+Gamma (load tgn+compressor); tgn = native "
+                         "TGN (compressor=None, load tgn only)")
+    ap.add_argument("--n-neighbors", type=int, default=5)
+    ap.add_argument("--n-layers", type=int, default=3)
     args = ap.parse_args()
     if args.recompute_from:
         with open(args.recompute_from, "rb") as f:
@@ -294,45 +313,51 @@ def main():
     eps = 1e-6
     device = torch.device(
         "cuda:{}".format(args.gpu) if torch.cuda.is_available() else "cpu")
-    ds = UCILinkDataset(args.data_dir, data_name=args.data_name,
-                        split_mode="count")
+    ds = UCILinkDataset(args.data_dir, data_name=args.data_name)
+
     train = ds.train
     ts = train.timestamps.astype(np.float64)
     ms, ss = float(ts.mean()), float(ts.std()) + 1e-8
+    n_neighbors = int(args.n_neighbors)
+    n_layers = int(args.n_layers)
     finder = get_neighbor_finder(
         train, uniform=False, max_node_idx=ds.n_nodes - 1)
     tgn = TGN(
         neighbor_finder=finder,
         node_features=ds.node_features.astype(np.float32),
         edge_features=ds.edge_features.astype(np.float32),
-        device=device, n_layers=3, n_heads=2, dropout=0.1, use_memory=True,
+        device=device, n_layers=n_layers, n_heads=2, dropout=0.1,
+        use_memory=True,
         message_dimension=172, memory_dimension=172,
         memory_update_at_start=True,
         embedding_module_type="graph_attention", message_function="identity",
-        aggregator_type="last", n_neighbors=5,
+        aggregator_type="last", n_neighbors=n_neighbors,
         mean_time_shift_src=ms, std_time_shift_src=ss,
         mean_time_shift_dst=ms, std_time_shift_dst=ss).to(device)
     cfg = RPBConfig(
-        state_dims={"tjo:layer{}".format(l): 172 for l in range(4)},
-        own_dims={"tjo:layer{}".format(l): 172 for l in range(4)},
+        state_dims={"tjo:layer{}".format(l): 172 for l in range(n_layers + 1)},
+        own_dims={"tjo:layer{}".format(l): 172 for l in range(n_layers + 1)},
         width_D=128, m=64, lambda_kf=0.0, ridge_eps=1e-3,
         kf_group_batches=8, kf_min_abs=64)
-    comp = RecursiveCompressor(cfg).to(device)
+    comp = (RecursiveCompressor(cfg).to(device)
+            if args.model_kind == "ours" else None)
     adapter = JodieTGNAdapter(tgn.embedding_module, compressor=comp,
-                              n_neighbors=5)
+                              n_neighbors=n_neighbors)
     tgn.embedding_module = adapter
     ck = torch.load(args.ckpt, map_location="cpu", weights_only=False)
     tgn.load_state_dict(ck["model"]["tgn"])
-    comp.load_state_dict(ck["model"]["compressor"])
+    if comp is not None and "compressor" in ck["model"]:
+        comp.load_state_dict(ck["model"]["compressor"])
     tgn.eval()
-    print("[model] loaded checkpoint epoch={} score={}".format(
-        ck.get("epoch"), ck.get("score")), flush=True)
+    print("[model] kind={} n_layers={} n_neighbors={} loaded checkpoint "
+          "epoch={} score={}".format(args.model_kind, n_layers, n_neighbors,
+                                     ck.get("epoch"), ck.get("score")),
+          flush=True)
 
     fut = FutureIndex(ds)
 
     # ---- leaf-to-root path-tracking compute (re-implemented hook) ----
-    n_neighbors = 5
-    n_layers = 3
+    # n_neighbors / n_layers come from args (must match the checkpoint)
     bs = args.bs
     path_state = {
         "by_layer": {1: {}, 2: {}},
@@ -361,7 +386,7 @@ def main():
         if adapter.use_memory:
             raw_source = memory[source_nodes] + raw_source
         if layer == 0:
-            return raw_source
+            return raw_source, raw_source
 
         # ---- bookkeeping only when record=True; the tensor math below is
         # bit-identical to the plain host recursion either way, so silent
@@ -372,7 +397,7 @@ def main():
                 int(row): list(path) + [(0, 0.0)]
                 for row, path in trace_paths.items()}
 
-        source_lower = traced_compute(
+        source_lower, _ = traced_compute(
             memory, source_nodes, timestamps, layer - 1, n_neighbors_,
             source_paths, remove_depth=remove_depth, record=record)
 
@@ -428,16 +453,19 @@ def main():
                         path_state["by_layer"][layer - 1][
                             (flat_row, s2)] = root_r
                 else:
-                    child = int(neighbors[flat_row, s])
+                    # unified path slot: pick the child at THIS node via the
+                    # same hash rule (never reuse the parent's slot index s).
+                    s2 = _slot_hash(node, layer - 1) % n_neighbors_
+                    child = int(neighbors[flat_row, s2])
                     if child != 0:
                         self_path_choices[(root_r, layer)] = {
                             "node": node,
                             "t": float(timestamps[flat_row]),
-                            "slot": s,
+                            "slot": s2,
                             "flat_row": flat_row,
                         }
 
-        neighbor_lower = traced_compute(
+        neighbor_lower, _ = traced_compute(
             memory, flat_neighbors, repeated_times, layer - 1, n_neighbors_,
             {}, remove_depth=remove_depth, record=record)
         neighbor_lower = neighbor_lower.view(
@@ -450,22 +478,28 @@ def main():
         # feature, time diff and mask are left untouched so the removal does
         # not change the surrounding environment -- C is fixed by the paired
         # keep/remove on the same tree.
+        # ---- paired removal of the WHOLE source interface at this layer:
+        # replace that interface's host pre-compression aggregate U0 with a
+        # reference (0) and then run Gamma normally (ours) / pass vanilla (TGN).
+        # This removes the source node's entire U0 -- NOT a single leaf-child
+        # slot -- which is what the retention question asks about.
+        rm_rows = []
         if record and remove_depth is not None and layer == (4 - remove_depth):
             if remove_depth == 1 and is_top:
                 for r, rec in path_state["recs"].items():
-                    neighbor_lower = neighbor_lower.clone()
-                    neighbor_lower[r, rec["slot3"]] = 0.0
+                    rm_rows.append(int(r))
             else:
                 for (pr, s), root_r in list(path_state["by_layer"].get(
                         layer, {}).items()):
                     flat_row = pr * n_neighbors_ + s
-                    if flat_row >= len(source_nodes):
-                        continue
-                    neighbor_lower = neighbor_lower.clone()
-                    neighbor_lower[flat_row, s] = 0.0
+                    if flat_row < len(source_nodes):
+                        rm_rows.append(int(flat_row))
         vanilla = adapter.host.aggregate(
             layer, source_lower, source_time, neighbor_lower, edge_time,
             edge_features, mask)
+        if rm_rows:
+            vanilla = vanilla.clone()
+            vanilla[rm_rows] = 0.0
         if adapter.compressor is not None and 0 < layer < adapter.n_layers:
             tau = TAU_TEMPLATE.format(layer)
             z = adapter.compressor.compress(
@@ -497,11 +531,21 @@ def main():
                     path_state["stash"][(root_r, lv)] = base
                 else:
                     child = int(neighbors[flat_row, ch["slot"]])
-                    base["u0"] = neighbor_lower[flat_row, ch["slot"]] \
-                        .detach().cpu().numpy()
+                    # U0 = host PRE-COMPRESSION aggregate at this interface
+                    # (NOT a selected leaf-child state); h0/node_info are the
+                    # raw memory / node-feature states kept separately so the
+                    # three quantities are never conflated.
+                    base["u0"] = vanilla[flat_row].detach().cpu().numpy()
+                    if adapter.use_memory:
+                        base["h0"] = memory[int(ch["node"])] \
+                            .detach().cpu().numpy()
+                    else:
+                        base["h0"] = np.zeros_like(base["u0"])
+                    base["node_info"] = adapter.host.node_features[
+                        int(ch["node"])].detach().cpu().numpy()
                     base["leaf"] = child
                     path_state["stash"][(root_r, 1)] = base
-        return z
+        return z, z
 
     adapter._compute = traced_compute
 
@@ -560,6 +604,7 @@ def main():
         recs = keep["recs"]
         stash = keep["stash"]
         rm3, rm2, rm1 = rm_snaps[3], rm_snaps[2], rm_snaps[1]
+        pool = ds.full_dst_pool
         rows = []
         for r, rec in recs.items():
             if (r, 1) not in stash or (r, 2) not in stash:
@@ -572,19 +617,18 @@ def main():
                           rec["edge_feat_top"]]
             edge_times = [st1["edge_time"], st2["edge_time"],
                           rec["edge_time_top"]]
-            om = [st1["other_neighbors"],
-                  st2["other_neighbors"],
+            om = [st1["other_neighbors"], st2["other_neighbors"],
                   rec["other_neighbors"]]
             ctx = _ctx_vector(root, st1["leaf"], node_times, edge_feats,
                               edge_times, om)
-            # paired-removal deltas: source component at each position
+
             def _dz(var, key, orig_z):
                 if key == "z3":
                     rr = var["recs"].get(r)
-                    return (orig_z - rr[key]) if rr is not None \
-                        and key in rr else None
+                    return (orig_z - rr[key]) if rr is not None                         and key in rr else None
                 ss = var["stash"].get((r, {"z1": 1, "z2": 2}[key]))
                 return (orig_z - ss["z"]) if ss is not None else None
+
             z1 = st1["z"]; z2 = st2["z"]; z3 = rec["z3"]
             dz3_2 = _dz(rm3, "z1", z1)
             dz3_1 = _dz(rm3, "z2", z2)
@@ -595,41 +639,54 @@ def main():
             if any(v is None for v in
                    (dz3_2, dz3_1, dz3_r, dz2_1, dz2_r, dz1_r)):
                 continue
-            # ---- per-node aligned boundary futures S_s=(Y_s, Y_p(s)).
-            # Every path-node state is computed with the same global memory /
-            # root query horizon, so ALL source futures are queried strictly
-            # after the ROOT query time (never after the leaf's historical edge
-            # time, which could count events already visible inside U0).
             leaf_node = int(st1["leaf"])
             a2_node = int(st1["node"])
             a1_node = int(st2["node"])
             root_t = float(rec["t_root"])
-            Y = {}
+            # ---- strict-future link queries for the four path nodes; the real
+            # future edge is y=1 and the official-sampler negative is y=0.
+            # candidates are cached per (node, root_t) and shared by TGN/ours.
+            futq = {}
+            okf = True
             for k, node in [("leaf", leaf_node), ("a2", a2_node),
                             ("a1", a1_node), ("root", root)]:
                 q = fut.query(node, root_t)
                 if q is None:
+                    okf = False
                     break
-                j, dt, cp = q
-                Y[k] = (np.asarray(ds.edge_features[int(fut.eidx[j])],
-                                   dtype=np.float64),
-                        float(dt), int(cp), node)
-            if len(Y) != 4:
+                jq, dtq, cpq = q
+                futq[k] = {"cp": int(cpq),
+                           "cn": _sample_neg(node, root_t, pool)}
+            if not okf:
                 continue
-            rows.append({
-                "u0": st1["u0"],
-                "z1": z1,
-                "z2": z2,
-                "z3": z3,
-                "d32": dz3_2, "d31": dz3_1, "d3r": dz3_r,
-                "d21": dz2_1, "d2r": dz2_r,
-                "d1r": dz1_r,
-                "ctx": ctx,
-                "Y_leaf": Y["leaf"],
-                "Y_a2": Y["a2"],
-                "Y_a1": Y["a1"],
-                "Y_root": Y["root"],
-            })
+            zk = {1: z1, 2: z2, 3: z3}
+            # per source line: (src key, parent key, source state, origin phys,
+            # downstream [(phys, delta, keep-key)])
+            lines_local = [
+                ("Y_leaf", "Y_a2", st1["u0"], 0,
+                 [(1, dz3_2, "z1"), (2, dz3_1, "z2"), (3, dz3_r, "z3")]),
+                ("Y_a2", "Y_a1", z1, 1,
+                 [(2, dz2_1, "z2"), (3, dz2_r, "z3")]),
+                ("Y_a1", "Y_root", z2, 2,
+                 [(3, dz1_r, "z3")]),
+            ]
+            for sk, pk, src_state, origin, pts in lines_local:
+                fs = futq[sk.replace("Y_", "")]
+                fp = futq[pk.replace("Y_", "")]
+                combos = [(1, 1, fs["cp"], fp["cp"]), (1, 0, fs["cp"], fp["cn"]),
+                          (0, 1, fs["cn"], fp["cp"]), (0, 0, fs["cn"], fp["cn"])]
+                for y_s, y_p, cand_s, cand_p in combos:
+                    hs = _cand_hash(cand_s, 11)
+                    hp = _cand_hash(cand_p, 22)
+                    rows.append({"line": sk, "phys": origin, "ctx": ctx,
+                                 "rem": np.zeros_like(src_state),
+                                 "delta": src_state, "y_s": y_s, "y_p": y_p,
+                                 "cand_s": hs, "cand_p": hp})
+                    for phys, dk, zkey in pts:
+                        rows.append({"line": sk, "phys": phys, "ctx": ctx,
+                                     "rem": zk[zkey] - dk, "delta": dk,
+                                     "y_s": y_s, "y_p": y_p,
+                                     "cand_s": hs, "cand_p": hp})
         return rows
 
     def _silent_batches(a, b, label):
@@ -734,9 +791,19 @@ def main():
     # persist the extracted row matrices so a later statistics-only change can
     # be recomputed without re-running the model (15 min -> seconds)
     dump_path = Path(args.ckpt).parent / "retention_rows.pkl"
+    meta = model_meta(args.ckpt)
+    meta.update({"model_kind": args.model_kind, "n_layers": args.n_layers,
+                 "n_neighbors": args.n_neighbors, "bs": args.bs,
+                 "data_name": args.data_name,
+                 "dataset_hash": hashlib.sha256(
+                     (str(Path(args.data_dir).resolve()) + args.data_name)
+                     .encode()).hexdigest()[:16],
+                 "layout": {"audit_block": [audit_lo, audit_hi],
+                            "same_tail_calib_block": [calib_lo, calib_hi],
+                            "head_calib_block": [0, transfer_hi]}})
     with open(dump_path, "wb") as f:
         pickle.dump({"audit": audit_rows, "calib": calib_rows,
-                     "head": calib_h_rows}, f)
+                     "head": calib_h_rows, "meta": meta}, f)
     print("[dump] rows saved to", dump_path, flush=True)
 
     run_stats(calib_rows, audit_rows, calib_h_rows, args, mem_parity,
@@ -750,234 +817,83 @@ def main():
 
 def run_stats(calib_rows, audit_rows, calib_h_rows, args, mem_parity,
               layout=None):
-    eps = 1e-6
-    # ------------------------------------------------------------ statistics
-    def col(rows_, key):
-        return np.stack([r[key] for r in rows_])
+    """Conditional future-predictive information via held-out joint-future NLL.
 
-    def _y_phi(rows_, key):
-        """fixed 128-d witness phi of one node's aligned future (Y_s)."""
-        ef = np.stack([r[key][0] for r in rows_])
-        dt = np.asarray([r[key][1] for r in rows_], dtype=np.float64)
-        cp = np.asarray([r[key][2] for r in rows_], dtype=np.int64)
-        sn = np.asarray([r[key][3] for r in rows_], dtype=np.int64)
-        return fixed_phi_S(ef, dt, cp, sn)
+    Per source line s: I_{s,k} = (NLL(C,Z^-_{s->k}) - NLL(C,Z^-_{s->k},Delta))
+    / ln2  [bits/sample]; target = 2*Y_s + Y_pa(s) in {0,1,2,3} (Y=1 for the
+    real strict-future edge, 0 for the official-sampler negative candidate).
+    R_{s,k} = I_{s,k} / I_{s,0}.  NOT clipped: R>1 is flagged as a
+    DPI / finite-sample violation, never silently clamped.
+    """
+    lam = args.lam_ret
+    LINES = ["Y_leaf", "Y_a2", "Y_a1"]
 
-    def line_P(rows_, k1, k2):
-        """Two-level boundary target S_s = (Y_s, Y_p(s)) as a 256-d witness."""
-        return np.concatenate([_y_phi(rows_, k1), _y_phi(rows_, k2)], axis=1)
+    def _feat(rows_):
+        ctx = np.stack([r["ctx"] for r in rows_])
+        rem = np.stack([r["rem"] for r in rows_])
+        dl = np.stack([r["delta"] for r in rows_])
+        cs = np.stack([r["cand_s"] for r in rows_])
+        cp = np.stack([r["cand_p"] for r in rows_])
+        base = np.concatenate([ctx, rem, cs, cp], axis=1)
+        full = np.concatenate([base, dl], axis=1)
+        return base, full
 
-    lines = {
-        3: {"name": "U0", "source_key": "u0", "origin_phys": 0,
-            "target": ("Y_leaf", "Y_a2"),
-            "target_label": "(Y_{a3},Y_{a2})",
-            "points": [(1, "d32"), (2, "d31"), (3, "d3r")]},
-        2: {"name": "Z1", "source_key": "z1", "origin_phys": 1,
-            "target": ("Y_a2", "Y_a1"),
-            "target_label": "(Y_{a2},Y_{a1})",
-            "points": [(2, "d21"), (3, "d2r")]},
-        1: {"name": "Z2", "source_key": "z2", "origin_phys": 2,
-            "target": ("Y_a1", "Y_root"),
-            "target_label": "(Y_{a1},Y_{a0})",
-            "points": [(3, "d1r")]},
-    }
-
-    C_aud = col(audit_rows, "ctx")
-    # matched-context key = a historical node-time scalar in C (index 74:
-    # root/leaf hashes and one node time precede the three edge times).
-    strata = rs.strata_ids(C_aud[:, 74])
-
-    def compute_line(s, spec, calib_rows_, audit_rows_, do_ci):
-        """Retention of ONE fixed source signal Q_s along the path.
-
-        Q_s is fixed once at the source as the top --n-dir PREDICTIVE
-        directions of X_s for its own two-level boundary future
-        P_s=(Y_s,Y_p(s)): Q_s = A^T X_s, A estimated once on calib from the
-        whitened X_s<->P_s cross-covariance (only the predictable part of the
-        noisy future is kept).  Q_s is not re-estimated per layer and never
-        regressed against C.
-
-        SOURCE GATE: audit-centered squared-canonical strength
-            J = tr[(Cpp+eps I)^-1 Cpx (Cqq+lam I)^-1 Cxq]
-        between the fixed Q_s and its held-out projected future Pq.  J >= 0
-        and is invariant to mean/scale drift, so cross-block drift cannot
-        produce a negative source signal.  The source is identifiable iff
-        J exceeds the 95th pct of the same-layer shuffle null.
-
-        DOWNSTREAM: each ancestor point is the centered, correlation-type
-        recoverability in [0,1] of the SAME Q_s from the paired-removal delta
-        (mean over directions of squared Pearson corr between Q_s and its
-        ridge recovery from Delta_{s->k}).  The raw cross-block explained
-        variance is kept only as a diagnostic.  No chaining, no per-layer J
-        ratios, no re-predicting the future at any layer."""
-        Xc = col(calib_rows_, spec["source_key"])
-        Xa = col(audit_rows_, spec["source_key"])
-        k1, k2 = spec["target"]
-        Pc = line_P(calib_rows_, k1, k2)
-        Pa = line_P(audit_rows_, k1, k2)
-
-        mpd = rs.canonical_dirs(Xc, Pc, args.n_dir, lam=args.lam, eps=eps)
-        Qc = rs.predict_source_component(mpd, Xc)
-        Qa = rs.predict_source_component(mpd, Xa)
-        Pq_aud = rs.project_future(mpd, Pa)
-        # per-direction canonical strengths squared -> strength-weighted mean
-        wts = np.asarray(mpd["sv"], dtype=np.float64) ** 2
-
-        # ---- source signal: centered squared-canonical strength J ----
-        J = rs.centered_sq_corr_strength(Qa, Pq_aud, lam=args.lam, eps=eps)
-        ev_raw = rs.explained_var(Pq_aud, Qa, eps=eps)  # diagnostic only
-        rng_null = np.random.RandomState(FIXED_SEED + 5000 + s)
-        nulls = []
-        for _ in range(args.n_null):
-            Xp = rs.permute_within_strata(Xa, strata, rng_null)
-            Qp = rs.predict_source_component(mpd, Xp)
-            nulls.append(rs.centered_sq_corr_strength(Qp, Pq_aud,
-                                                      lam=args.lam, eps=eps))
-        null_p95 = float(np.percentile(nulls, 95))
-        sig_ok = bool(J > null_p95)
-        # bootstrap CI on J (root-cluster resampling)
-        n_aud_l = len(audit_rows_)
-        if do_ci:
-            rng_ci = np.random.RandomState(FIXED_SEED + 300 + s)
-            Jb = []
-            for _ in range(args.n_bootstrap):
-                idx = rng_ci.choice(np.arange(n_aud_l), size=n_aud_l,
-                                    replace=True)
-                Jb.append(rs.centered_sq_corr_strength(
-                    Qa[idx], Pq_aud[idx], lam=args.lam, eps=eps))
-            sig_lo, sig_hi = rs.retention_ci(np.asarray(Jb))
-        else:
-            sig_lo = sig_hi = float(J)
-        sig_ci_ok = bool(sig_lo > 0.0)
-
-        # ---- identity at the source: X_s recovers Q_s (corr² ~ 1) ----
-        mp_id = rs.fit_ridge_map(Xc, Qc, lam=args.lam_ret)
-        R_id = rs.corr2_map_metric(mp_id, Qa, Xa)
-        R_id_w = rs.corr2_map_metric(mp_id, Qa, Xa, weights=wts)
-        id_ok = bool(R_id >= args.identity_min)
-
-        # ---- remove-source floor: Delta = 0 recovers ~0 ----
-        mp_floor = rs.fit_ridge_map(np.zeros_like(Xc), Qc,
-                                    lam=args.lam_ret)
-        R_floor = rs.corr2_map_metric(mp_floor, Qa, np.zeros_like(Xa))
-        floor_ok = bool(R_floor <= args.floor_max)
-
-        # ---- per-point retention (correlation-type recoverability) ----
-        points = [{"phys": spec["origin_phys"], "delta": "source",
-                   "R": float(R_id), "Rw": float(R_id_w),
-                   "ci_lo": float(R_id), "ci_hi": float(R_id),
-                   "ciw_lo": float(R_id_w), "ciw_hi": float(R_id_w),
-                   "ev_raw": float(R_id), "ok": True}]
-        first_dc = first_da = None
-        for phys, dk in spec["points"]:
-            Dc = col(calib_rows_, dk)
-            Da = col(audit_rows_, dk)
-            if first_dc is None:
-                first_dc, first_da = Dc, Da
-            mp_k = rs.fit_ridge_map(Dc, Qc, lam=args.lam_ret)
-            R_k = rs.corr2_map_metric(mp_k, Qa, Da)
-            R_kw = rs.corr2_map_metric(mp_k, Qa, Da, weights=wts)
-            ev_k = rs.retention_map_R(mp_k, Qa, Da, eps=eps)  # diagnostic
-            if do_ci:
-                boot = rs.corr2_bootstrap(mp_k, Qa, Da, args.n_bootstrap,
-                                          FIXED_SEED + 9000 + s * 10 + phys)
-                boot_w = rs.corr2_bootstrap(mp_k, Qa, Da, args.n_bootstrap,
-                                            FIXED_SEED + 9500 + s * 10 + phys,
-                                            weights=wts)
-                lo, hi = rs.retention_ci(boot)
-                low, hiw = rs.retention_ci(boot_w)
-            else:
-                lo = hi = float(R_k)
-                low = hiw = float(R_kw)
-            points.append({"phys": int(phys), "delta": dk,
-                           "R": float(R_k), "Rw": float(R_kw),
-                           "ci_lo": lo, "ci_hi": hi,
-                           "ciw_lo": low, "ciw_hi": hiw,
-                           "ev_raw": float(ev_k), "ok": True})
-
-        # ---- mismatched-delta control (permuted Delta recovers ~0) ----
-        if first_dc is not None:
-            perm = rs.permute_within_strata(first_da, strata,
-                                            np.random.RandomState(
-                                                FIXED_SEED + 7000 + s))
-            mp_perm = rs.fit_ridge_map(first_dc, Qc, lam=args.lam_ret)
-            R_perm = rs.corr2_map_metric(mp_perm, Qa, perm)
-            perm_ok = bool(R_perm - R_floor <= 0.02)
-        else:
-            R_perm, perm_ok = float("nan"), True
-
-        line_ok = bool(sig_ok and sig_ci_ok and id_ok and floor_ok and perm_ok
-                       and mem_parity["ok"])
-        return {
-            "target": spec.get("target_label"),
-            "n_dir": int(args.n_dir),
-            "dir_weights": [float(x) for x in wts],
-            "signal": {"J": float(J), "ev_raw": float(ev_raw),
-                       "null_p95": null_p95,
-                       "ci_lo": float(sig_lo), "ci_hi": float(sig_hi),
-                       "ok": sig_ok, "ci_ok": sig_ci_ok},
-            "identity": {"value": float(R_id), "value_w": float(R_id_w),
-                         "ok": id_ok},
-            "delete_floor": {"value": float(R_floor), "ok": floor_ok},
-            "mismatched_delta": {"value": float(R_perm), "ok": perm_ok},
-            "points": points,
-            "line_ok": line_ok,
-        }
+    def _tgt(rows_):
+        return np.asarray([2 * r["y_s"] + r["y_p"] for r in rows_],
+                          dtype=np.int64)
 
     results = {}
-    for s, spec in sorted(lines.items()):
-        same_tail = compute_line(s, spec, calib_rows, audit_rows, do_ci=True)
-        head_tail = compute_line(s, spec, calib_h_rows, audit_rows,
-                                 do_ci=False)
-        results[str(s)] = {
-            "name": spec["name"], "source_key": spec["source_key"],
-            "origin_phys": spec["origin_phys"],
-            "same_tail": same_tail,
-            "head_to_tail": head_tail,
-        }
-        st = same_tail
-        ht = head_tail
-        print("[line {}] same-tail sig {:.4f}(null {:.4f}) id {:.4f} "
-              "floor {:.4f} | head->tail sig {:.4f}(null {:.4f})".format(
-                  s, st["signal"]["J"], st["signal"]["null_p95"],
-                  st["identity"]["value"], st["delete_floor"]["value"],
-                  ht["signal"]["J"], ht["signal"]["null_p95"]),
-              flush=True)
-        for tag, res in (("same-tail", st), ("head->tail", ht)):
-            print("  [{}] line_ok={} points={}".format(
-                tag, res["line_ok"],
-                [(p["phys"], round(p["R"], 3)) for p in res["points"]]),
-                flush=True)
+    for line in LINES:
+        cr = [r for r in calib_rows if r["line"] == line]
+        ar = [r for r in audit_rows if r["line"] == line]
+        if len(cr) < 40 or len(ar) < 40:
+            continue
+        cb, cf = _feat(cr)
+        ab, af = _feat(ar)
+        yc = _tgt(cr)
+        ya = _tgt(ar)
+        phs = sorted({r["phys"] for r in cr} & {r["phys"] for r in ar})
+        info = {}
+        for ph in phs:
+            cidx = [i for i, r in enumerate(cr) if r["phys"] == ph]
+            aidx = [i for i, r in enumerate(ar) if r["phys"] == ph]
+            if len(cidx) < 40 or len(aidx) < 40:
+                continue
+            yc_ph, ya_ph = yc[cidx], ya[aidx]
+            if len(np.unique(yc_ph)) < 2 or len(np.unique(ya_ph)) < 2:
+                continue
+            ib = rs.conditional_info_bits(
+                cb[cidx], cf[cidx], yc_ph, ab[aidx], af[aidx], ya_ph, lam=lam)
+            info[ph] = float(ib)
+        origin = 0 if line == "Y_leaf" else (1 if line == "Y_a2" else 2)
+        i0 = info.get(origin)
+        pts = []
+        for ph in sorted(info):
+            R = (info[ph] / i0) if (i0 is not None and i0 > 1e-9)                 else float("nan")
+            pts.append({"phys": int(ph), "info_bits": float(info[ph]),
+                        "R": float(R),
+                        "R_gt1_flag": bool(R == R and R > 1.0)})
+        results[line] = {"origin_phys": origin, "info_source_bits": i0,
+                         "n_calib": len(cr), "n_audit": len(ar),
+                         "points": pts}
 
     report = {
-        "protocol": "fixed same-source Q_s linear recoverability "
-                    "(corr², equal-mean and canonical-strength-weighted); "
-                    "source gate = audit-centered squared-canonical strength J "
-                    "vs same-layer shuffle-null p95; per-line two-level "
-                    "boundary target S_s=(Y_s,Y_p(s)); leak-free historical C; "
-                    "same-tail causal calibration (main) + head->tail transfer "
-                    "stress; no chaining, no per-layer J ratios.  NOT a "
-                    "retained-information fraction: the plotted value is "
-                    "correlation-type recoverability in [0,1].",
+        "protocol": "conditional future-predictive information (held-out "
+                    "joint-future NLL drop, bits/sample); R_k = I_k / I_source; "
+                    "no clipping (R>1 flagged)",
         "model": model_meta(args.ckpt),
-        "layout": layout if layout is not None else
-            {"note": "recomputed from saved rows (block layout was stored at "
-                     "extraction)"},
-        "n_audit_rows": len(audit_rows),
-        "n_same_tail_calib_rows": len(calib_rows),
-        "n_head_calib_rows": len(calib_h_rows),
-        "lam": args.lam, "lam_ret": args.lam_ret, "eps": eps,
-        "identity_min": args.identity_min, "floor_max": args.floor_max,
-        "fixed_seed": FIXED_SEED,
-        "memory_parity": mem_parity,
+        "model_kind": args.model_kind,
+        "n_audit_rows": len(audit_rows), "n_calib_rows": len(calib_rows),
+        "lam_ret": lam, "identity_min": args.identity_min,
+        "floor_max": args.floor_max, "memory_parity": mem_parity,
+        "layout": layout,
         "sources": results,
     }
-    out = Path(args.ckpt).parent / "retention_audit_v2.json"
+    out = Path(args.ckpt).parent / "retention_audit_v3.json"
     with open(out, "w") as f:
-        json.dump(report, f, indent=2)
-    print(json.dumps(report, indent=2), flush=True)
+        json.dump(report, f, indent=2, default=str)
+    print(json.dumps(report, indent=2, default=str), flush=True)
     print("wrote", out, flush=True)
-
 
 
 if __name__ == "__main__":

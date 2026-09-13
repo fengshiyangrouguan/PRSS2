@@ -110,18 +110,20 @@ POS_LABELS = {0: "leaf\n(U0)", 1: "a2\n(Z1)", 2: "a1\n(Z2)", 3: "root\n(Z3)"}
 def arm_bars(calib, audit, n_dir, lam, lam_ret, n_boot, seed):
     """Normalized retention trajectory per group, with paired-bootstrap CIs.
 
-    Returns {title: [(name, frac, ci_lo, ci_hi), ...]} with source first
-    (frac == 1); CI bands from a paired cluster-bootstrap over audit rows.
+    The retained fraction at each compression is the strength-weighted
+    squared-correlation recoverability of the SAME fixed source component
+    Q_s:  source = corr²(Q_s, Q_s) = 1 by definition; each downstream point
+    scores the ridge-recovered qhat against Q_s itself on audit.  This is the
+    audit_v2 "Rw" metric and matches the Figure-4 caption semantics (fraction
+    of the SAME source predictive signal retained, normalized to the source).
+    CI bands from a cluster-bootstrap over audit rows.
     """
     S_c = np.concatenate([_y_phi(calib, "Y_a1"), _y_phi(calib, "Y_root")],
-                         axis=1)
-    S_a = np.concatenate([_y_phi(audit, "Y_a1"), _y_phi(audit, "Y_root")],
                          axis=1)
     out = {}
     for title, src_key, deltas, _x0 in GROUPS:
         mpd = rs.canonical_dirs(_col(calib, src_key), S_c, n_dir, lam=lam)
         wts = np.asarray(mpd["sv"], dtype=np.float64) ** 2
-        T_a = rs.project_future(mpd, S_a)
         Qc = rs.predict_source_component(mpd, _col(calib, src_key))
         Qa = rs.predict_source_component(mpd, _col(audit, src_key))
         maps = {dk: rs.fit_ridge_map(_col(calib, dk), Qc, lam=lam_ret)
@@ -129,22 +131,20 @@ def arm_bars(calib, audit, n_dir, lam, lam_ret, n_boot, seed):
         d_audit = {dk: _col(audit, dk) for dk in deltas}
 
         def eval_at(idx):
-            ta = T_a[idx]
-            s0 = rs.weighted_dir_sqcorr(Qa[idx], ta, wts)
             vs = [rs.weighted_dir_sqcorr(
-                rs.apply_ridge_map(maps[dk], d_audit[dk][idx]), ta, wts)
+                Qa[idx],
+                rs.apply_ridge_map(maps[dk], d_audit[dk][idx]), wts)
                 for dk in deltas]
-            return s0, vs
+            return vs
 
-        s0_full, vs_full = eval_at(np.arange(len(audit)))
-        r_full = np.asarray(vs_full, dtype=np.float64) / max(s0_full, 1e-8)
+        vs_full = eval_at(np.arange(len(audit)))
+        r_full = np.asarray(vs_full, dtype=np.float64)
         rng = np.random.RandomState(seed)
         n = len(audit)
         boot = np.zeros((n_boot, len(deltas)))
         for b in range(n_boot):
             idx = rng.choice(n, size=n, replace=True)
-            s0b, vsb = eval_at(idx)
-            boot[b] = np.asarray(vsb) / max(s0b, 1e-8)
+            boot[b] = np.asarray(eval_at(idx))
         lo = np.percentile(boot, 2.5, axis=0)
         hi = np.percentile(boot, 97.5, axis=0)
         bars = [("source", 1.0, 1.0, 1.0)]

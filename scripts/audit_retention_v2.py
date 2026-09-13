@@ -817,9 +817,12 @@ def main():
         tgn.memory.__init_memory__()
     calib_h_rows = _collect_rows(0, transfer_hi, "head-calib")
     print("[head] head calib rows:", len(calib_h_rows), flush=True)
-    if not audit_rows or not calib_rows or not calib_h_rows:
+    if not audit_rows or not calib_rows:
         print("FATAL: no leaf-to-root paths extracted", flush=True)
         return
+    if not calib_h_rows:
+        print("[head] WARNING: no head-calibration rows "
+              "(head->tail transfer stress skipped)", flush=True)
     # persist the extracted row matrices so a later statistics-only change can
     # be recomputed without re-running the model (15 min -> seconds)
     dump_path = Path(args.ckpt).parent / "retention_rows.pkl"

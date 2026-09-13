@@ -386,7 +386,7 @@ def main():
         if adapter.use_memory:
             raw_source = memory[source_nodes] + raw_source
         if layer == 0:
-            return raw_source, raw_source
+            return raw_source
 
         # ---- bookkeeping only when record=True; the tensor math below is
         # bit-identical to the plain host recursion either way, so silent
@@ -397,7 +397,7 @@ def main():
                 int(row): list(path) + [(0, 0.0)]
                 for row, path in trace_paths.items()}
 
-        source_lower, _ = traced_compute(
+        source_lower = traced_compute(
             memory, source_nodes, timestamps, layer - 1, n_neighbors_,
             source_paths, remove_depth=remove_depth, record=record)
 
@@ -465,7 +465,7 @@ def main():
                             "flat_row": flat_row,
                         }
 
-        neighbor_lower, _ = traced_compute(
+        neighbor_lower = traced_compute(
             memory, flat_neighbors, repeated_times, layer - 1, n_neighbors_,
             {}, remove_depth=remove_depth, record=record)
         neighbor_lower = neighbor_lower.view(
@@ -478,28 +478,27 @@ def main():
         # feature, time diff and mask are left untouched so the removal does
         # not change the surrounding environment -- C is fixed by the paired
         # keep/remove on the same tree.
-        # ---- paired removal of the WHOLE source interface at this layer:
-        # replace that interface's host pre-compression aggregate U0 with a
-        # reference (0) and then run Gamma normally (ours) / pass vanilla (TGN).
-        # This removes the source node's entire U0 -- NOT a single leaf-child
-        # slot -- which is what the retention question asks about.
-        rm_rows = []
+        # ---- paired removal of the source interface: zero the ENTIRE 172-d
+        # interface vector that this source child hands UP into its parent's
+        # aggregation (neighbor_lower[parent_row, source_slot, :]).  This keeps
+        # the parent's own state, all siblings, edge feature/time and mask
+        # unchanged -- only the selected source's propagated state is removed.
         if record and remove_depth is not None and layer == (4 - remove_depth):
             if remove_depth == 1 and is_top:
                 for r, rec in path_state["recs"].items():
-                    rm_rows.append(int(r))
+                    neighbor_lower = neighbor_lower.clone()
+                    neighbor_lower[r, rec["slot3"], :] = 0.0
             else:
                 for (pr, s), root_r in list(path_state["by_layer"].get(
                         layer, {}).items()):
                     flat_row = pr * n_neighbors_ + s
-                    if flat_row < len(source_nodes):
-                        rm_rows.append(int(flat_row))
+                    if flat_row >= len(source_nodes):
+                        continue
+                    neighbor_lower = neighbor_lower.clone()
+                    neighbor_lower[flat_row, s, :] = 0.0
         vanilla = adapter.host.aggregate(
             layer, source_lower, source_time, neighbor_lower, edge_time,
             edge_features, mask)
-        if rm_rows:
-            vanilla = vanilla.clone()
-            vanilla[rm_rows] = 0.0
         if adapter.compressor is not None and 0 < layer < adapter.n_layers:
             tau = TAU_TEMPLATE.format(layer)
             z = adapter.compressor.compress(
@@ -531,11 +530,10 @@ def main():
                     path_state["stash"][(root_r, lv)] = base
                 else:
                     child = int(neighbors[flat_row, ch["slot"]])
-                    # U0 = host PRE-COMPRESSION aggregate at this interface
-                    # (NOT a selected leaf-child state); h0/node_info are the
-                    # raw memory / node-feature states kept separately so the
-                    # three quantities are never conflated.
-                    base["u0"] = vanilla[flat_row].detach().cpu().numpy()
+                    # 3-hop source = the selected leaf child's full interface
+                    # state handed up into a2 (NOT a2's own aggregate).  h0 /
+                    # node_info are kept separately and never conflated.
+                    base["u0"] = neighbor_lower[flat_row, ch["slot"]]                         .detach().cpu().numpy()
                     if adapter.use_memory:
                         base["h0"] = memory[int(ch["node"])] \
                             .detach().cpu().numpy()
@@ -545,7 +543,7 @@ def main():
                         int(ch["node"])].detach().cpu().numpy()
                     base["leaf"] = child
                     path_state["stash"][(root_r, 1)] = base
-        return z, z
+        return z
 
     adapter._compute = traced_compute
 

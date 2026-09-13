@@ -1062,13 +1062,15 @@ class TGBPairLinkLoop:
         # hundreds of rows per round — a fixed +64 simply never catches up)
         add_batch = 1 << 30 if zero_slack else 1
 
+        t_g = t.float().to(dev)  # single GPU copy, shared across rounds
+
         def _solve_active(active_keys):
             A = torch.stack([_row(k) for k in active_keys]).to(dev)
             gn = A.norm(dim=1)
             H = A / gn[:, None]
+            del A  # halve the peak: only the normalized rows are needed below
             b = -self.rpbe_kappa * nt * torch.ones(
                 int(H.shape[0]), device=dev)
-            t_g = t.float().to(dev)
             K = H @ H.t()
             cvec = b - (H @ t_g)
             lam = torch.zeros(int(H.shape[0]), device=dev)
@@ -1118,8 +1120,9 @@ class TGBPairLinkLoop:
                 # drift ‖d_post−d_pre‖/‖t‖ and the objective degradation
                 # J(d_post)−J(d_pre) — the refinement must be a small
                 # feasibility polish, NOT a move to a distant feasible point.
-                d_pre = d.detach().clone()
-                j_pre = 0.5 * float((d_pre - t_g).double().norm().pow(2))
+                # drift/dJ on CPU fp64: keeps the GPU peak to H + d only
+                d_pre_cpu = d.detach().cpu().double()
+                j_pre = 0.5 * float((d_pre_cpu - t.double()).norm().pow(2))
                 d_p = d
                 n_refine = 0
                 for _ in range(500):
@@ -1134,8 +1137,9 @@ class TGBPairLinkLoop:
                     viol_max = float((-cj[bad]).max().item()) / (nt + 1e-30)
                     if viol_max <= 1e-6:
                         break
-                j_post = 0.5 * float((d_p - t_g).double().norm().pow(2))
-                drift = float((d_p - d_pre).double().norm()) / (nt + 1e-30)
+                d_post_cpu = d_p.detach().cpu().double()
+                j_post = 0.5 * float((d_post_cpu - t.double()).norm().pow(2))
+                drift = float((d_post_cpu - d_pre_cpu).norm()) / (nt + 1e-30)
                 print("[rpbe-k0refine] viol=%.3e drift=%.3e dJ=%+.3e iters=%d"
                       % (viol_max, drift, j_post - j_pre, n_refine),
                       flush=True)

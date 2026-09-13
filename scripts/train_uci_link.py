@@ -311,10 +311,13 @@ def build_model(args, device):
         random.setstate(_rng_saved[2])
         if _rng_saved[3] is not None:
             torch.cuda.set_rng_state(_rng_saved[3], device)
+    _cfg_aux = (CONFIG_MAP.get(args.config, {}) or {}).get(
+        "aux_kind", "kyfan")
     adapter = UciTGNAdapter(
         tgn.embedding_module, compressor=compressor,
         n_neighbors=args.n_neighbors,
-        trace_pairs_per_parent=args.trace_pairs_per_parent)
+        trace_pairs_per_parent=args.trace_pairs_per_parent,
+        retain_child_u=(_cfg_aux == "rec"))
     tgn.embedding_module = adapter
     # --no-memory is a runtime toggle on an IDENTICAL architecture (matched
     # control): memory modules exist and consumed identical init RNG, but the

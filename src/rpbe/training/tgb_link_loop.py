@@ -1512,8 +1512,12 @@ class TGBPairLinkLoop:
             raise RuntimeError(
                 "supervised group {}..{} missing canonical tau(s) {}".format(
                     g0, g1, missing))
-        ntaus = len(by_tau)
-        # readiness + shared window audit (same as the kyfan arm would close)
+        # readiness + shared window audit (same gate as the kyfan arm would
+        # close).  Tree count below threshold is a SKIP, not an error — the
+        # kyfan arm treats it as below-skip (fail_below=False); P1/P2 must
+        # follow the same semantics so a sparse group degrades to fewer
+        # supervised taus instead of killing the run.
+        below_taus = []
         for tau, rl in by_tau.items():
             mt = len({int(r.root_row) for r in rl})
             self.window_diag.append({
@@ -1521,10 +1525,15 @@ class TGBPairLinkLoop:
                 "M_unique_trees": mt, "threshold": self.kf_min_trees,
                 "n_records": len(rl)})
             if mt < self.kf_min_trees:
-                raise RuntimeError(
-                    "supervised group below trees: tau={} {} < {}".format(
-                        tau, mt, self.kf_min_trees))
+                below_taus.append(tau)
+                continue
             self.audit.add_window_close(tau, [r.pair_id for r in rl])
+        for tau in below_taus:
+            for r in by_tau[tau]:
+                meta.pop(r.pair_id, None)
+            w_by_tau.pop(tau, None)
+            by_tau.pop(tau)
+        ntaus = len(by_tau)
         for i in fea:
             self.audit.add_population(recs[i])
         # FROZEN per-tau target stats, PER-TREE-WEIGHTED over the whole window

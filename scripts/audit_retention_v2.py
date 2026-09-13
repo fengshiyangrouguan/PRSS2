@@ -32,42 +32,43 @@ historical edges' edge_feat/edge_time and node times, path-outside
 other-neighbor means, root/leaf ids).  The future event appears ONLY in the
 prediction target P (fixed witness phi_S).
 
-Retention (fixed same-source signal, bounded <= 1, no chaining).  The figure's
-question is how much of a source node's useful signal survives one/two/three
-recursive aggregations toward the root.  For source depth s let X_s be its
-representation (3: U0, 2: Z1, 1: Z2) and fix the source signal ONCE as
+Predictive-information retention (v3, NLL convention).  The figure asks how
+much of a source node's *conditional predictive information* about the joint
+leaf-to-root future survives one/two/three recursive aggregations toward the
+root.  For each fixed leaf->root branch the audit measures, on held-out rows,
+the joint-future NLL of a scorer fit TWO ways at the same dimension and same
+architecture:
 
-    Q_s = ridge(X_s -> P)          (fit on calib; P = root future witness)
+    base : uses Z^- = the ancestor state with this source's contribution
+           removed (paired delete of the leaf interface vector);
+    full : uses Z^+ = Z^- + Delta (the kept state),
+    both scored with a candidate x state interaction feature
+    psi = [C, S, e(c_s), e(c_p), S*(P e(c_s)), S*(P e(c_p))].
 
-Q_s is never re-estimated per layer and never regressed against the context C.
-C is NOT subtracted from the source signal: the paired keep/remove happens on
-the SAME tree, so the environment (context, siblings, edges, times) is fixed by
-construction.  At each downstream position k the paired-removal delta
-Delta_{s->k} (ancestor state keep minus remove of this source) is measured, and
-retention is how much of the SAME Q_s the audit-set Delta recovers:
+    I_k = (NLL_base - NLL_full)/ln2   (bits/sample), and the reported curve is
 
-    R_{s->k} = 1 - ||Q_s - Qhat_s||_F^2 / (||Q_s - mean Q_s||_F^2 + eps)
+    R_k = I_k / I_source              ("normalized source-specific predictive
+                                       gain", NOT a strict [0,1] fraction).
 
-with Qhat_s a ridge prediction of Q_s from Delta_{s->k} alone.  Every point is
-an independent direct regression against the same source component -- never a
-chain of local factors, never a ratio of per-layer J, never a per-layer
-re-prediction of the future.  SSE >= 0 makes R <= 1 by construction; negative
-values are reported honestly.
+No chaining, no ratio of per-layer J, no per-layer future re-prediction.  The
+source signal is fixed once as the joint-future NLL drop at the leaf position;
+C is never subtracted (the keep/remove pair is on the SAME tree, so context,
+siblings, edges and times are held fixed by construction).
 
-Gates run before plotting: source signal (explained variance of audit P by
-Q_s) must exceed a within-strata shuffle null (95th pct) or the source is
-marked NOT IDENTIFIABLE and its line is not drawn; identity at the source ~1;
-remove-source (Delta = 0) ~0; a mismatched (permuted) delta must not recover
-Q_s; memory parity is stored.  The figure only draws lines whose gates
-all pass.  Calibration for the MAIN result is the contiguous same-tail block
-(just before the audit block, silent gap between); a head-calibration ->
-tail-audit fit is kept only as a cross-temporal TRANSFER stress test.
+Candidate protocol: for each branch node the future event is fetched strictly
+after the root time (source->destination direction), paired with ONE sampled
+negative; the label is "balanced sampled candidate existence" (the presented
+candidate is randomly the positive or the negative; the probe must judge
+whether the presented candidate is the true future).  The candidate manifest
+is written once (--manifest-out) and consumed by every arm (--manifest-in),
+with a SHA recorded in the pkl/report; cross-arm comparisons join on
+(pair_id, line, phys) with pair_id = the globally-unique root event + branch
+nodes.  dneg==dpos collisions are handled explicitly (--neg-collision).
 
-Gates run before plotting: source predictive signal above a matched-context
-shuffle null (95th pct), identity at the source ~1, delete-source (Delta = 0,
-C-only) floor ~0, and a mismatched-delta control (Delta permuted within
-strata) must not recover Q.  A memory-parity flag is stored.  The figure only
-draws lines whose gates all pass.
+Gates (run before plotting): source identifiable above a matched shuffle null;
+delete-source (Delta = 0) floor; permutation null on Delta; A/A (same arm vs
+itself); erase/source-dependence control; memory parity stored.  CI/curve
+bootstrap is paired over the shared pair clusters.
 
 Usage:
     python scripts/audit_retention_v2.py \
@@ -276,7 +277,20 @@ def model_meta(ckpt_path):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--ckpt", required=True)
+    ap.add_argument("--ckpt", default=None,
+                    help="checkpoint to audit (required unless --recompute-from)")
+    ap.add_argument("--manifest-out", default=None,
+                    help="write the shared candidate manifest here (one file "
+                         "consumed by every arm)")
+    ap.add_argument("--manifest-in", default=None,
+                    help="read candidates from a shared manifest instead of "
+                         "re-sampling (cross-arm pairing)")
+    ap.add_argument("--neg-collision", default="resample",
+                    choices=["resample", "flip"],
+                    help="when the sampled negative equals the positive "
+                         "(dneg==dpos): resample deterministically until "
+                         "different (default), or 'flip' to reproduce the "
+                         "BenchTemp 1-bit pseudo-negative semantics")
     ap.add_argument("--data-dir", required=True)
     ap.add_argument("--data-name", default="wikipedia")
     ap.add_argument("--gpu", type=int, default=0)
@@ -326,6 +340,8 @@ def main():
                           "detail": "memory parity not stored in pkl"}),
                   layout=_m.get("layout"), model_meta_override=_m)
         return
+    if not args.ckpt:
+        raise SystemExit("--ckpt is required unless --recompute-from is given")
 
     eps = 1e-6
     device = torch.device(
@@ -358,19 +374,34 @@ def main():
         kf_group_batches=8, kf_min_abs=64)
     comp = (RecursiveCompressor(cfg).to(device)
             if args.model_kind == "ours" else None)
-    adapter = JodieTGNAdapter(tgn.embedding_module, compressor=comp,
-                              n_neighbors=n_neighbors)
-    tgn.embedding_module = adapter
     ck = torch.load(args.ckpt, map_location="cpu", weights_only=False)
-    if "model" not in ck:
-        ck = {"model": {"tgn": ck}}          # raw official TGN state_dict
-    tgn.load_state_dict(ck["model"]["tgn"])
     if args.model_kind == "ours":
+        # project checkpoint: keys are embedding_module.host.* -> wrap FIRST.
+        if ("model" not in ck) or ("tgn" not in ck["model"]):
+            raise RuntimeError(
+                "model-kind=ours expects a project checkpoint with "
+                "model['tgn'] (and 'compressor'); got keys {}".format(
+                    sorted(ck.keys())))
         if "compressor" not in ck["model"]:
             raise RuntimeError(
                 "model-kind=ours but checkpoint has no 'compressor' block; "
                 "use --model-kind tgn for a native TGN checkpoint")
-        comp.load_state_dict(ck["model"]["compressor"])
+        adapter = JodieTGNAdapter(tgn.embedding_module, compressor=comp,
+                                  n_neighbors=n_neighbors)
+        tgn.embedding_module = adapter
+        tgn.load_state_dict(ck["model"]["tgn"], strict=True)
+        comp.load_state_dict(ck["model"]["compressor"], strict=True)
+    else:
+        # native official TGN state_dict: keys are embedding_module.* and the
+        # adapter must NOT be installed yet (it renames them to
+        # embedding_module.host.*), otherwise load_state_dict misses/unexpected.
+        raw = ck["model"]["tgn"] if ("model" in ck and
+                                     isinstance(ck.get("model"), dict) and
+                                     "tgn" in ck["model"]) else ck
+        tgn.load_state_dict(raw, strict=True)
+        adapter = JodieTGNAdapter(tgn.embedding_module, compressor=None,
+                                  n_neighbors=n_neighbors)
+        tgn.embedding_module = adapter
     tgn.eval()
     print("[model] kind={} n_layers={} n_neighbors={} loaded checkpoint "
           "epoch={} score={}".format(args.model_kind, n_layers, n_neighbors,
@@ -556,14 +587,17 @@ def main():
                     # 3-hop source = the selected leaf child's full interface
                     # state handed up into a2 (NOT a2's own aggregate).  h0 /
                     # node_info are kept separately and never conflated.
-                    base["u0"] = neighbor_lower[flat_row, ch["slot"]]                         .detach().cpu().numpy()
+                    base["u0"] = neighbor_lower[flat_row, ch["slot"]] \
+                        .detach().cpu().numpy()
+                    # h0/node_info describe the LEAF child (the 3-hop source),
+                    # not the a2 aggregator that consumed it.
                     if adapter.use_memory:
-                        base["h0"] = memory[int(ch["node"])] \
+                        base["h0"] = memory[int(child)] \
                             .detach().cpu().numpy()
                     else:
                         base["h0"] = np.zeros_like(base["u0"])
                     base["node_info"] = adapter.host.node_features[
-                        int(ch["node"])].detach().cpu().numpy()
+                        int(child)].detach().cpu().numpy()
                     base["leaf"] = child
                     path_state["stash"][(root_r, 1)] = base
         return z
@@ -585,6 +619,7 @@ def main():
         dst = train.destinations[s0:s1].astype(np.int64)
         t = train.timestamps[s0:s1]
         e = train.edge_idxs[s0:s1]
+        cur["eidx"] = e   # root event ids for globally-unique pair_id
         adapter.set_trace_source_rows([])
         with torch.no_grad():
             tgn.compute_edge_probabilities(src, dst, dst, t, e, n_neighbors)
@@ -622,8 +657,27 @@ def main():
         _forward_batch(bb, None, record=False)
 
     manifest_rows = []
+    neg_collisions = 0
+    manifest_in = None
+    manifest_in_sha = None
+    if args.manifest_in:
+        with open(args.manifest_in, "rb") as _mf:
+            _mj = json.load(_mf)
+        _rows_in = _mj["rows"] if isinstance(_mj, dict) else _mj
+        # self-consistency: recompute the manifest SHA and compare to stored
+        _sha = hashlib.sha256(json.dumps(
+            _rows_in, sort_keys=True, default=str).encode()).hexdigest()
+        if isinstance(_mj, dict) and _mj.get("manifest_sha") not in (None, _sha):
+            raise RuntimeError(
+                "manifest_in SHA mismatch: stored {} != recomputed {}".format(
+                    _mj.get("manifest_sha"), _sha))
+        manifest_in_sha = _sha
+        manifest_in = {tuple(m["pair_id"]): m for m in _rows_in}
+        print("[manifest] loaded {} pairs from {} (sha {})".format(
+            len(manifest_in), args.manifest_in, _sha[:16]), flush=True)
 
     def _rows_from(keep, rm_snaps):
+        nonlocal neg_collisions
         recs = keep["recs"]
         stash = keep["stash"]
         rm3, rm2, rm1 = rm_snaps[3], rm_snaps[2], rm_snaps[1]
@@ -664,35 +718,85 @@ def main():
                 continue
             leaf_node = int(st1["leaf"]); a2_node = int(st1["node"])
             a1_node = int(st2["node"]); root_t = float(rec["t_root"])
+            # globally-unique pair id: the root EVENT plus the branch nodes
+            root_eid = int(cur["eidx"][r])
+            pair_id = (root_eid, int(root), leaf_node, a2_node, a1_node)
+            pair_key = "{}:{}:{}:{}:{}".format(*pair_id)
             nodes = {"leaf": leaf_node, "a2": a2_node, "a1": a1_node,
                      "root": root}
             F = {}
             okf = True
-            for k, v in nodes.items():
-                q = fut.query_src(v, root_t)
-                if q is None:
+            if manifest_in is not None:
+                mrow = manifest_in.get(pair_id)
+                if mrow is None:
                     okf = False
-                    break
-                jq, _dt, dpos = q
-                rs_ = np.random.RandomState(((int(v) * 1000003) +
-                                             int(root_t)) % (2 ** 31))
-                dneg = int(pool[rs_.randint(len(pool))])
-                bit = int(rs_.randint(2))
-                presented = dpos if bit == 0 else dneg
-                F[k] = {"eid": int(fut.eidx[jq]), "dpos": int(dpos),
-                        "dneg": dneg, "presented": int(presented),
-                        "Y": 1 if int(presented) == int(dpos) else 0,
-                        "bit": bit}
+                else:
+                    for k, v in nodes.items():
+                        if (int(mrow["nodes"][k]) != int(v)
+                                or float(mrow["t_root"]) != root_t):
+                            raise RuntimeError(
+                                "manifest_in mismatch: pair {} node {} "
+                                "stored nodes {} t_root {} vs runtime "
+                                "nodes {} t_root {}".format(
+                                    pair_id, k, mrow["nodes"],
+                                    mrow["t_root"], nodes, root_t))
+                        pres = int(mrow["presented"][k])
+                        dpos = int(mrow["pos_cand"][k])
+                        dneg = int(mrow["neg_cand"][k])
+                        F[k] = {"eid": int(mrow["pos_future_event_id"][k]),
+                                "dpos": dpos, "dneg": dneg,
+                                "presented": pres,
+                                "Y": 1 if pres == dpos else 0,
+                                "cand_seed": int(mrow["candidate_seed"][k])}
+            else:
+                for k, v in nodes.items():
+                    q = fut.query_src(v, root_t)
+                    if q is None:
+                        okf = False
+                        break
+                    jq, _dt, dpos = q
+                    cand_seed = (int(v) * 1000003 + int(root_t)) % (2 ** 31)
+                    g = np.random.RandomState(cand_seed)
+                    dneg = int(pool[g.randint(len(pool))])
+                    collided = int(dneg == int(dpos))
+                    if collided and args.neg_collision == "resample":
+                        for _try in range(64):
+                            d2 = int(pool[g.randint(len(pool))])
+                            if d2 != int(dpos):
+                                dneg = d2
+                                break
+                        else:
+                            raise RuntimeError(
+                                "no non-colliding negative for node {} t {}"
+                                .format(v, root_t))
+                        collided = 0
+                    elif collided:
+                        neg_collisions += 1
+                    bit = int(g.randint(2))
+                    presented = int(dpos) if bit == 0 else int(dneg)
+                    Y = 1 if presented == int(dpos) else 0
+                    if args.neg_collision == "flip" and collided:
+                        # BenchTemp pseudo-negative parity: when dneg==dpos the
+                        # label is the flipped bit instead of a real negative.
+                        Y = 1 - Y
+                    F[k] = {"eid": int(fut.eidx[jq]), "dpos": int(dpos),
+                            "dneg": int(dneg), "presented": int(presented),
+                            "Y": int(Y), "cand_seed": int(cand_seed)}
             if not okf:
                 continue
             manifest_rows.append({
-                "pair_id": int(r), "root_node": int(root), "t_root": root_t,
-                "nodes": nodes,
+                "pair_id": list(pair_id), "root_event_id": int(root_eid),
+                "root_node": int(root), "t_root": root_t, "nodes": nodes,
                 "pos_cand": {k: F[k]["dpos"] for k in F},
                 "neg_cand": {k: F[k]["dneg"] for k in F},
-                "order_bits": {k: F[k]["bit"] for k in F},
+                "presented": {k: F[k]["presented"] for k in F},
+                "presented_bits": {k: (0 if F[k]["presented"] == F[k]["dpos"]
+                                       else 1) for k in F},
                 "pos_future_event_id": {k: F[k]["eid"] for k in F},
-                "sampler_seed": int(FIXED_SEED)})
+                "candidate_seed": {k: F[k]["cand_seed"] for k in F},
+                "sampler_formula_version":
+                    "seed=(v*1000003+root_t)%2**31;dneg=randint;bit=randint",
+                "label_kind": "balanced_sampled_candidate_existence"})
             zk = {1: z1, 2: z2, 3: z3}
             lines_local = [
                 ("Y_leaf", "Y_a2", st1["u0"], 0,
@@ -710,12 +814,16 @@ def main():
                 rows.append({"line": sk, "phys": origin, "ctx": ctx,
                              "rem": np.zeros_like(src_state),
                              "keep": src_state, "y_s": Ys, "y_p": Yp,
-                             "cand_s": hs, "cand_p": hp, "pair_id": int(r)})
+                             "cand_s": hs, "cand_p": hp,
+                             "pair_id": pair_id, "pair_key": pair_key,
+                             "row_id": (pair_key, sk, int(origin))})
                 for phys, dk, zkey in pts:
                     rows.append({"line": sk, "phys": phys, "ctx": ctx,
                                  "rem": zk[zkey] - dk, "keep": zk[zkey],
                                  "y_s": Ys, "y_p": Yp,
-                                 "cand_s": hs, "cand_p": hp, "pair_id": int(r)})
+                                 "cand_s": hs, "cand_p": hp,
+                                 "pair_id": pair_id, "pair_key": pair_key,
+                                 "row_id": (pair_key, sk, int(phys))})
         return rows
 
     def _silent_batches(a, b, label):
@@ -822,24 +930,52 @@ def main():
     dump_path = Path(args.ckpt).parent / "retention_rows.pkl"
     def _file_sha(paths):
         h = hashlib.sha256()
+        per = {}
         for pp in paths:
+            fh_ = hashlib.sha256()
             try:
                 with open(pp, "rb") as fh:
                     for chunk in iter(lambda: fh.read(1 << 20), b""):
-                        h.update(chunk)
-            except OSError:
-                pass
-        return h.hexdigest()[:16]
+                        fh_.update(chunk)
+            except OSError as ex:
+                raise FileNotFoundError(
+                    "dataset file missing/unreadable: {} ({})".format(pp, ex))
+            per[Path(pp).name] = fh_.hexdigest()[:16]
+            h.update(fh_.digest())
+        return h.hexdigest()[:16], per
 
     _dd = Path(args.data_dir)
     meta = model_meta(args.ckpt)
+    _dsha, _dper = _file_sha([
+        str(_dd / "ml_{}.csv".format(args.data_name)),
+        str(_dd / "ml_{}.npy".format(args.data_name)),
+        str(_dd / "ml_{}_node.npy".format(args.data_name))])
+    # shared manifest: write once (from any arm) and record its SHA so every
+    # arm can be proven to have consumed the identical candidate set.
+    _mrows_json = json.dumps(manifest_rows, sort_keys=True, default=str)
+    manifest_sha = hashlib.sha256(_mrows_json.encode()).hexdigest()
+    if args.manifest_out:
+        with open(args.manifest_out, "w") as f:
+            json.dump({"manifest_sha": manifest_sha,
+                       "neg_collisions": int(neg_collisions),
+                       "sampler_formula_version":
+                           "seed=(v*1000003+root_t)%2**31",
+                       "rows": manifest_rows}, f, default=str)
+        print("[manifest] wrote {} pairs (sha {}) to {}".format(
+            len(manifest_rows), manifest_sha[:16], args.manifest_out),
+            flush=True)
+    if args.manifest_in:
+        if manifest_sha != manifest_in_sha:
+            raise RuntimeError(
+                "manifest_in sha {} != regenerated sha {} (arm candidates "
+                "differ)".format(manifest_in_sha, manifest_sha))
     meta.update({"model_kind": args.model_kind, "n_layers": args.n_layers,
                  "n_neighbors": args.n_neighbors, "bs": args.bs,
                  "data_name": args.data_name,
-                 "dataset_hash": _file_sha([
-                     str(_dd / "ml_{}.csv".format(args.data_name)),
-                     str(_dd / "ml_{}.npy".format(args.data_name)),
-                     str(_dd / "ml_{}_node.npy".format(args.data_name))]),
+                 "dataset_hash": _dsha, "dataset_file_hashes": _dper,
+                 "manifest_sha": manifest_sha,
+                 "neg_collisions": int(neg_collisions),
+                 "manifest_in": args.manifest_in,
                  "memory_parity": mem_parity,
                  "layout": {"audit_block": [audit_lo, audit_hi],
                             "same_tail_calib_block": [calib_lo, calib_hi],
@@ -908,7 +1044,7 @@ def run_stats(calib_rows, audit_rows, calib_h_rows, args, mem_parity,
                       _A(asel, "cand_s"), _A(asel, "cand_p"), ya)
             ib = rs.info_bits_interaction(*args_c, *args_a, P, lam=lam)
             info[ph] = float(ib)
-            groups_a = np.asarray([r["pair_id"] for r in asel])
+            groups_a = np.asarray([r["pair_key"] for r in asel], dtype=object)
             ci[ph] = rs.cluster_bootstrap_ci(
                 *args_c, *args_a, groups_a, P, n_boot=args.n_bootstrap,
                 lam=lam)
@@ -937,12 +1073,18 @@ def run_stats(calib_rows, audit_rows, calib_h_rows, args, mem_parity,
                     "flagged).  Naming: normalized source-specific predictive "
                     "gain (not a strict information-retention fraction).",
         "model": model_meta_override or model_meta(args.ckpt),
-        "model_kind": args.model_kind,
+        "model_kind": ((model_meta_override or {}).get("model_kind")
+                       or args.model_kind),
         "n_audit_rows": len(audit_rows), "n_calib_rows": len(calib_rows),
         "lam_ret": lam, "memory_parity": mem_parity, "layout": layout,
         "sources": results,
     }
-    out = Path(args.ckpt).parent / "retention_audit_v3.json"
+    # provenance: in recompute mode the SOURCE of truth is the stored meta and
+    # the pkl's directory -- never a possibly-unrelated --ckpt.
+    if args.recompute_from:
+        out = Path(args.recompute_from).parent / "retention_audit_v3.json"
+    else:
+        out = Path(args.ckpt).parent / "retention_audit_v3.json"
     with open(out, "w") as f:
         json.dump(report, f, indent=2, default=str)
     print(json.dumps(report, indent=2, default=str), flush=True)

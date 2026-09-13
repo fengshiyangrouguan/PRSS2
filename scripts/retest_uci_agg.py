@@ -126,6 +126,10 @@ def build_ours(ds, device, cfg):
 def retest_one(run_dir, ds, device, gpu):
     run_dir = Path(run_dir)
     out_path = run_dir / "retest_agg.json"
+    if out_path.exists():
+        print("[retest] SKIP {} (retest_agg.json exists)".format(
+            run_dir.name), flush=True)
+        return None
     cfg_path = run_dir / "config.json"
     is_vanilla = (run_dir.name == "vanilla")
     if not is_vanilla and not (run_dir / "best.pt").exists():

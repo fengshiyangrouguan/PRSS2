@@ -1055,10 +1055,7 @@ class TGBPairLinkLoop:
         # Objective, constraints and the 1e-6 certificate tolerance are
         # identical in both regimes.
         zero_slack = bool(float(self.rpbe_kappa) == 0.0)
-        # 2048000 tail: full-set FISTA at κ=0 stalls at viol≈1.2e-6 after
-        # 682000 steps (18.6% short of the 1e-6 tolerance) — one more gear
-        # finishes the tail.  Tolerance/objective/constraints unchanged.
-        ladder = ((2000, 8000, 32000, 128000, 512000, 2048000) if zero_slack
+        ladder = ((2000, 8000, 32000, 128000, 512000) if zero_slack
                   else (2000, 8000, 32000))
         max_rounds = 12 if zero_slack else 3
         # κ=0: add EVERY violating row each round (the dense regime re-exposes
@@ -1108,42 +1105,33 @@ class TGBPairLinkLoop:
                 if viol_max <= 1e-6:
                     break
             if zero_slack and viol_max > 1e-6 and viol_max < 1e-3:
-                # fp64 polish (κ=0 only): fp32 λ updates stall at viol≈1.1e-6
-                # (4× budget moved it 7.8% — representation floor, not a
-                # convergence limit).  Continue the SAME FISTA in fp64
-                # arithmetic on the warm-started λ; H rows stay fp32 (their
-                # own precision is fine — the floor is in the λ updates).
-                # The certificate is then re-checked on CPU in fp64, exactly
-                # like the full re-scan below.  Tolerance/objective/
-                # constraints unchanged.
-                K64 = K.double()
-                c64 = cvec.double()
-                lam64 = lam.double().clamp(min=0.0)
-                y = lam64
-                tk = 1.0
-                n_polish = 0
-                for _ in range(100000):
-                    lam_new = torch.clamp(y + eta * (c64 - K64 @ y),
-                                          min=0.0)
-                    tk_new = 0.5 * (1.0 + math.sqrt(1.0 + 4.0 * tk * tk))
-                    y = lam_new + ((tk - 1.0) / tk_new) * (lam_new - lam64)
-                    lam64 = lam_new
-                    tk = tk_new
-                    n_polish += 1
-                n_iter += n_polish
-                d_pol = t_g + H.t() @ lam64.float()
-                d_cpu = d_pol.detach().cpu().double()
-                viol_max = 0.0
-                for cs in range(0, len(active_keys), 200):
-                    ce = min(len(active_keys), cs + 200)
-                    rows = torch.stack([_row(active_keys[j])
-                                        for j in range(cs, ce)]).double()
-                    viol = (-self.rpbe_kappa * nt
-                            - (rows @ d_cpu)
-                            / (rows.norm(dim=1) * nt + 1e-30))
-                    if viol.numel():
-                        viol_max = max(viol_max, float(viol.max()))
-                d = d_pol
+                # κ=0 feasible refinement (Cimmino, primal space): the dual
+                # FISTA stalls at viol≈1.1e-6 no matter the budget (4× = 7.8%
+                # gain) or the λ precision (fp64 100k steps = noise) — at zero
+                # slack there is NO strictly feasible point (any d keeps some
+                # cos ≤ 0), so the dual objective is flat/unbounded along
+                # null(K) and λ drifts without improving d.  Refine in primal
+                # space instead, projecting onto the half-space cone:
+                #     d ← d − (α/N_v)·Σ_{j: h_j·d<0} (h_j·d)·h_j
+                # Same QP (objective / constraints / 1e-6 tolerance
+                # unchanged); from the near-optimal FISTA iterate the drift
+                # is ~1e-4·‖t‖, a second-order effect on the objective.
+                d_p = d
+                n_refine = 0
+                for _ in range(500):
+                    cj = H @ d_p
+                    bad = cj < -1e-7
+                    nv = int(bad.sum().item())
+                    if nv == 0:
+                        viol_max = 0.0
+                        break
+                    n_refine += 1
+                    d_p = d_p - (0.9 / nv) * ((bad.float() * cj) @ H)
+                    viol_max = float((-cj[bad]).max().item()) / (nt + 1e-30)
+                    if viol_max <= 1e-6:
+                        break
+                d = d_p
+                n_iter += n_refine
             return d, viol_max, int((lam > 1e-9).sum().item()), \
                 float((H.t() @ lam).norm()) / (nt + 1e-30), n_iter
 

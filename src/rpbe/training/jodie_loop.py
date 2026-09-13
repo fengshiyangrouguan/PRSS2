@@ -384,8 +384,9 @@ class JodieNodeClassificationLoop:
         for cs in range(0, len(keys), 200):
             ce = min(len(keys), cs + 200)
             rows = torch.stack([_row(keys[j]) for j in range(cs, ce)])
+            rows = rows.double()
             gn = rows.norm(dim=1)
-            cos = (rows @ t_cpu.double()) / (gn.double() * nt + 1e-30)
+            cos = (rows @ t_cpu.double()) / (gn * nt + 1e-30)
             cos_all[cs:ce] = cos
             gn_all[cs:ce] = gn.float()
         c_np = cos_all.numpy()

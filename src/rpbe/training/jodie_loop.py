@@ -290,7 +290,7 @@ class JodieNodeClassificationLoop:
         """
         if self._cstr_scope_task is None:
             self._cstr_scope_task = [
-                torch.zeros_like(p, device=self.device)
+                torch.zeros_like(p, device="cpu", dtype=torch.float32)
                 for p in self._cstr_scope_params]
             self._cstr_scope_snap = [None] * len(self._cstr_scope_params)
         for k, p in enumerate(self._cstr_scope_params):
@@ -299,92 +299,122 @@ class JodieNodeClassificationLoop:
                 self._cstr_scope_snap[k] = None
                 continue
             prev = self._cstr_scope_snap[k]
-            if prev is None:
-                self._cstr_scope_task[k].add_(g)
-            else:
-                self._cstr_scope_task[k].add_(g - prev)
+            delta = g if prev is None else (g - prev)
+            self._cstr_scope_task[k].add_(delta.detach().float().cpu())
             self._cstr_scope_snap[k] = g.detach().clone()
 
     def _cstr_accum_tree_dirs(self, term_keys, term_pieces):
-        """One VJP per (tree, tau): keep the RPBE directions SEPARATE.
+        """Per-(tree, tau) RPBE directions, kept SEPARATE.
 
-        The raw surrogate pieces are 0-valued; each per-tree sub-sum keeps
-        the adjoint direction in its graph, and ``autograd.grad`` extracts
-        the per-tree scope gradient.  The auxiliary coefficient is
-        ``-lambda * group_k`` (negative), so each sub-sum is NEGATED to
-        live in the same sign convention as the aggregate aux gradient —
-        the QP is scale-invariant in ||g_j||, only the sign matters.
+        Aggregates the raw surrogate pieces per (tree, tau) into one scalar
+        per key (negated to match the aggregate aux sign convention), then
+        extracts the parameter-space rows with CHUNKED batched VJPs
+        (``is_grads_batched=True``): each chunk of 8 scalars is one
+        autograd.grad call, the last chunk releases the batch graph
+        (``retain_graph=False``).  Rows are detached, cast to float32 and
+        parked in a CPU row bank — the N x P bank NEVER lives on the GPU;
+        only the small active set is materialized there at group close.
         """
         by_tree: Dict[tuple, list] = {}
         for k, key in enumerate(term_keys):
             by_tree.setdefault(key, []).append(k)
-        for key, idxs in by_tree.items():
+        keys = sorted(by_tree.keys())
+        qs = []
+        for key in keys:
+            idxs = by_tree[key]
             sub = term_pieces[idxs[0]]
             for _j in idxs[1:]:
                 sub = sub + term_pieces[_j]
-            sub = -sub
+            qs.append(-sub)  # sign convention (see UCI counterpart)
+        M = len(qs)
+        chunk = 8
+        for cs in range(0, M, chunk):
+            ce = min(M, cs + chunk)
+            q_t = torch.stack(qs[cs:ce])                    # [C]
+            retain = (ce < M)
             gs = torch.autograd.grad(
-                sub, self._cstr_scope_params,
-                retain_graph=True, allow_unused=True)
-            acc = self._cstr_tree_aux.get(key)
-            if acc is None:
-                acc = [torch.zeros_like(p, device=self.device)
-                       for p in self._cstr_scope_params]
-                self._cstr_tree_aux[key] = acc
-            for _k2, gg in enumerate(gs):
-                if gg is not None:
-                    acc[_k2].add_(gg)
+                q_t, self._cstr_scope_params,
+                retain_graph=retain, allow_unused=True,
+                is_grads_batched=True)
+            for k, p in enumerate(self._cstr_scope_params):
+                gg = gs[k]
+                if gg is None:
+                    continue
+                rows = gg.detach().float().cpu()           # [C, *shape]
+                for j in range(ce - cs):
+                    key = keys[cs + j]
+                    acc = self._cstr_tree_aux.get(key)
+                    if acc is None:
+                        acc = [torch.zeros_like(
+                            p, device="cpu", dtype=torch.float32)
+                            for p in self._cstr_scope_params]
+                        self._cstr_tree_aux[key] = acc
+                    acc[k].add_(rows[j])
 
     def _cstr_group_close(self, group_k, group_start):
-        """Reviewer-formulation group-end projection with ROW-NORMALIZED
-        rows, a FISTA budget ladder, and a hard feasibility certificate.
+        """Reviewer-formulation group-end projection, memory-layered:
 
             min_d 1/2||d - t||^2  s.t.  h_j^T d >= -kappa ||t||,
             h_j = g_j / ||g_j||          (cosine Gram — row normalization)
 
-        t is the aggregate task gradient on the SCOPE (compressor).  When
-        the certificate still fails after the budget ladder the method
-        returns False and the caller SKIPS the representation step.
-        Returns True when the projected d was written back.
+        * rows live in a CPU bank (N x P never sits on the GPU);
+        * cosine scan on the CPU picks the ACTIVE set (violated rows);
+        * only the small active matrix is materialized on the GPU and
+          solved (row-normalized QP, FISTA budget ladder);
+        * a full CPU re-scan certifies EVERY row; newly violated rows join
+          the active set for another solve round (max 3 rounds);
+        * hard gate: certificate failure after the ladder SKIPS the
+          representation step (returns False).
+
+        t is the aggregate task gradient on the SCOPE (compressor).
         """
         dev = self.device
         scope = self._cstr_scope_params
         self._cstr_groups += 1
         if self._cstr_scope_task is None:
-            # degenerate: no task gradients accumulated — fall through to
-            # the ordinary (task-only) step
             self._cstr_reset_group_state()
             return True
-        t = torch.cat([a.reshape(-1).float()
-                       for a in self._cstr_scope_task])
-        nt = float(t.norm())
+        t_cpu = torch.cat([a.reshape(-1)
+                           for a in self._cstr_scope_task])  # [P] CPU
+        nt = float(t_cpu.norm())
         keys = sorted(self._cstr_tree_aux.keys())
         if not keys or nt <= 1e-12:
             self._cstr_reset_group_state()
             return True
-        A = torch.stack([torch.cat([a.reshape(-1).float()
-                                    for a in self._cstr_tree_aux[k]])
-                         for k in keys])                    # [N, P]
-        gn = A.norm(dim=1)
-        keep = gn > 1e-12
-        A = A[keep]
-        gn = gn[keep]
-        if int(A.shape[0]) == 0:
+
+        def _row(k):
+            return torch.cat([a.reshape(-1)
+                              for a in self._cstr_tree_aux[k]])
+
+        # ---- CPU cosine scan (chunked) ----
+        cos_all = torch.zeros(len(keys), dtype=torch.float64)
+        gn_all = torch.zeros(len(keys), dtype=torch.float64)
+        for cs in range(0, len(keys), 200):
+            ce = min(len(keys), cs + 200)
+            rows = torch.stack([_row(keys[j]) for j in range(cs, ce)])
+            gn = rows.norm(dim=1)
+            cos = (rows @ t_cpu.double()) / (gn.double() * nt + 1e-30)
+            cos_all[cs:ce] = cos
+            gn_all[cs:ce] = gn.float()
+        c_np = cos_all.numpy()
+        frac_below = float(np.mean(c_np < -self.rpbe_kappa))
+        active_keys = [keys[j] for j in range(len(keys))
+                       if c_np[j] < -self.rpbe_kappa]
+        if not active_keys:
             self._cstr_reset_group_state()
             return True
-        # row normalization (reviewer item): the QP becomes the cosine
-        # Gram problem and the solver condition number no longer depends
-        # on the per-tree row norms.
-        H = A / gn[:, None]                                  # [N, P]
-        cos = (H @ t) / nt                                   # [N]
-        c_np = cos.detach().cpu().numpy()
-        b = -self.rpbe_kappa * nt * torch.ones_like(gn)      # [N]
-        K = H @ H.t()                                        # cosine Gram
+        # ---- active-set solve on the GPU ----
+        A = torch.stack([_row(k) for k in active_keys]).to(dev)  # [Na, P]
+        gn = A.norm(dim=1)
+        H = A / gn[:, None]
+        b = -self.rpbe_kappa * nt * torch.ones(H.shape[0], device=dev)
+        t = t_cpu.float().to(dev)
+        K = H @ H.t()
         cvec = b - (H @ t)
-        N = int(H.shape[0])
-        lam = torch.zeros(N, device=dev)
+        Na = int(H.shape[0])
+        lam = torch.zeros(Na, device=dev)
         with torch.no_grad():
-            v = torch.randn(N, device=dev)
+            v = torch.randn(Na, device=dev)
             v = v / (v.norm() + 1e-30)
             lam_max = 1.0
             for _ in range(30):
@@ -397,27 +427,70 @@ class JodieNodeClassificationLoop:
         eta = 1.0 / (lam_max + 1e-12)
         d = None
         viol_max = float("inf")
-        # ---- budget ladder: 2000 -> 8000 -> 32000 FISTA iterations ----
-        for budget in (2000, 8000, 32000):
-            y = lam
-            tk = 1.0
-            for _ in range(budget):
-                lam_new = torch.clamp(y + eta * (cvec - K @ y), min=0.0)
-                tk_new = 0.5 * (1.0 + math.sqrt(1.0 + 4.0 * tk * tk))
-                y = lam_new + ((tk - 1.0) / tk_new) * (lam_new - lam)
-                lam = lam_new
-                tk = tk_new
-            corr = H.t() @ lam
-            d = t + corr
-            viol = b - (H @ d)                               # >0 = violated
-            rel = viol / (nt + 1e-30)
-            viol_max = float(rel.max()) if rel.numel() else 0.0
-            if viol_max <= 1e-6:
+        for _round in range(3):
+            # ---- FISTA budget ladder on the active set ----
+            for budget in (2000, 8000, 32000):
+                y = lam
+                tk = 1.0
+                for _ in range(budget):
+                    lam_new = torch.clamp(y + eta * (cvec - K @ y),
+                                          min=0.0)
+                    tk_new = 0.5 * (1.0 + math.sqrt(1.0 + 4.0 * tk * tk))
+                    y = lam_new + ((tk - 1.0) / tk_new) * (lam_new - lam)
+                    lam = lam_new
+                    tk = tk_new
+                d = t + H.t() @ lam
+                viol = b - (H @ d)
+                viol_max = float(
+                    (viol / (nt + 1e-30)).max()) if viol.numel() else 0.0
+                if viol_max <= 1e-6:
+                    break
+            if viol_max > 1e-6:
                 break
+            # ---- full CPU re-scan: certify EVERY row ----
+            d_cpu = d.detach().cpu().double()
+            worst = -1.0
+            worst_j = -1
+            for cs in range(0, len(keys), 200):
+                ce = min(len(keys), cs + 200)
+                rows = torch.stack([_row(keys[j])
+                                    for j in range(cs, ce)]).double()
+                viol = (-self.rpbe_kappa * nt
+                        - (rows @ d_cpu)
+                        / (rows.norm(dim=1) * nt + 1e-30))
+                if viol.numel() and float(viol.max()) > worst:
+                    worst = float(viol.max())
+                    worst_j = int(cs + torch.argmax(viol).item())
+            if worst <= 1e-6:
+                viol_max = 0.0
+                break
+            # newly violated row joins the active set
+            new_key = keys[worst_j]
+            if new_key in active_keys:
+                break
+            active_keys.append(new_key)
+            A = torch.stack([_row(k) for k in active_keys]).to(dev)
+            gn = A.norm(dim=1)
+            H = A / gn[:, None]
+            b = -self.rpbe_kappa * nt * torch.ones(H.shape[0], device=dev)
+            K = H @ H.t()
+            cvec = b - (H @ t)
+            lam = torch.zeros(H.shape[0], device=dev)
+            with torch.no_grad():
+                v = torch.randn(H.shape[0], device=dev)
+                v = v / (v.norm() + 1e-30)
+                lam_max = 1.0
+                for _ in range(30):
+                    v = K @ v
+                    nv = float(v.norm())
+                    if nv <= 1e-30:
+                        break
+                    v = v / nv
+                    lam_max = nv
+            eta = 1.0 / (lam_max + 1e-12)
+            viol_max = 1.0  # force the ladder again next round
         active = int((lam > 1e-9).sum().item())
         if viol_max > 1e-6:
-            # certificate FAILED after the full ladder: skip the
-            # constrained update for this group (reviewer requirement).
             self._cstr_skips += 1
             print("[wiki-rpbe-cstr] group=%d CERT_FAIL max_viol=%.3e "
                   "skipping repr step" % (group_start // group_k,
@@ -437,11 +510,10 @@ class JodieNodeClassificationLoop:
             self._cstr_corr_ratios.append(
                 float((d - t).norm()) / (nt + 1e-30))
         print("[wiki-rpbe-cstr] group=%d N=%d cos_mean=%.3f "
-              "frac_below=%.3f active=%d max_viol=%.2e corr/task=%.3f"
-              % (group_start // group_k, N,
-                 float(np.mean(c_np)),
-                 float(np.mean(c_np < -self.rpbe_kappa)),
-                 active, viol_max,
+              "frac_below=%.3f active=%d/%d max_viol=%.2e corr/task=%.3f"
+              % (group_start // group_k, len(keys),
+                 float(np.mean(c_np)), frac_below,
+                 active, len(active_keys), viol_max,
                  float((d - t).norm()) / (nt + 1e-30)), flush=True)
         self._cstr_reset_group_state()
         return True

@@ -832,9 +832,11 @@ class TGBPairLinkLoop:
                 continue
             prev = self._cstr_scope_snap[k]
             if prev is None:
-                self._cstr_scope_task[k].add_(p.grad)
+                self._cstr_scope_task[k].add_(
+                    p.grad.detach().float().cpu())
             else:
-                self._cstr_scope_task[k].add_(p.grad - prev)
+                self._cstr_scope_task[k].add_(
+                    (p.grad - prev).detach().float().cpu())
             self._cstr_scope_snap[k] = p.grad.detach().clone()
 
     def _cstr_accum_tree_dirs(self, terms, term_keys):
@@ -863,12 +865,15 @@ class TGBPairLinkLoop:
                 retain_graph=True, allow_unused=True)
             acc = self._cstr_tree_aux.get(key)
             if acc is None:
-                acc = [torch.zeros_like(p, device=self.device)
-                       for p in self._cstr_scope_params]
+                # CPU row bank (memory-layered reviewer fix): the N x P
+                # direction bank never lives on the GPU.
+                acc = [torch.zeros_like(
+                    p, device="cpu", dtype=torch.float32)
+                    for p in self._cstr_scope_params]
                 self._cstr_tree_aux[key] = acc
             for _k2, gg in enumerate(gs):
                 if gg is not None:
-                    acc[_k2].add_(gg)
+                    acc[_k2].add_(gg.detach().float().cpu())
 
     def _cstr_accum_tree_dirs_supervised(self, parts, part_keys):
         """Rec/Pred counterpart of ``_cstr_accum_tree_dirs`` (A1 single-axis
@@ -896,7 +901,7 @@ class TGBPairLinkLoop:
                 self._cstr_tree_aux[key] = acc
             for _k2, gg in enumerate(gs):
                 if gg is not None:
-                    acc[_k2].add_(gg)
+                    acc[_k2].add_(gg.detach().float().cpu())
 
     def _cstr_group_close_aggregate(self, group_start):
         """Legacy plan-B group-end projection on the accumulated components
@@ -985,7 +990,7 @@ class TGBPairLinkLoop:
             for a_t, p in zip(self._cstr_scope_task, scope):
                 if p.grad is None:
                     p.grad = torch.zeros_like(p, device=dev)
-                p.grad.copy_(a_t)
+                p.grad.copy_(a_t.to(dev))
 
         if not keys or nt <= 1e-12:
             diag["note"] = "no_dirs_or_zero_task"
@@ -993,22 +998,24 @@ class TGBPairLinkLoop:
             self._cstr_print_diag(group_start, diag)
             _write_task_only()
             return True
-        A = torch.stack([torch.cat([a.reshape(-1).float()
-                                    for a in self._cstr_tree_aux[k]])
-                         for k in keys])                    # [N, P]
-        gn = A.norm(dim=1)                                  # [N]
-        keep = gn > 1e-12
-        A = A[keep]
-        gn = gn[keep]
-        if int(A.shape[0]) == 0:
-            diag["note"] = "all_zero_dirs"
-            self._cstr_last_diag = diag
-            self._cstr_print_diag(group_start, diag)
-            _write_task_only()
-            return True
-        cos = (A @ t) / (gn * nt)                            # [N]
-        c_np = cos.detach().cpu().numpy()
-        diag["n_dirs"] = int(A.shape[0])
+        # ---- CPU cosine scan (chunked): the N x P bank lives on the CPU;
+        # only the small ACTIVE set is materialized on the GPU ----
+        def _row(k):
+            return torch.cat([a.reshape(-1)
+                              for a in self._cstr_tree_aux[k]])
+        cos_all = np.zeros(len(keys), dtype=np.float64)
+        n_valid = 0
+        for cs in range(0, len(keys), 200):
+            ce = min(len(keys), cs + 200)
+            rows = torch.stack([_row(keys[j]) for j in range(cs, ce)])
+            rows = rows.double()
+            gn = rows.norm(dim=1)
+            keepm = gn > 1e-12
+            cos = (rows @ t.double()) / (gn * nt + 1e-30)
+            cos_all[cs:ce] = cos.numpy()
+            n_valid += int(keepm.sum().item())
+        c_np = cos_all
+        diag["n_dirs"] = int(n_valid)
         diag["cos_mean"] = float(np.mean(c_np))
         diag["cos_med"] = float(np.median(c_np))
         diag["cos_p5"] = float(np.percentile(c_np, 5.0))
@@ -1019,68 +1026,101 @@ class TGBPairLinkLoop:
             for kk in (0.0, 0.02, 0.05, 0.1, 0.15, 0.2, 0.3)}
         diag["feasible_d0"] = bool(np.all(c_np >= -self.rpbe_kappa))
         self._cstr_epoch.append(dict(diag))
+        active_keys = [keys[j] for j in range(len(keys))
+                       if c_np[j] < -self.rpbe_kappa]
+        if not active_keys:
+            _write_task_only()
+            self._cstr_last_diag = diag
+            self._cstr_print_diag(group_start, diag)
+            return True
         if self.rpbe_constrain_probe:
             # probe: leave .grad as the ordinary link+aux group sum — the
             # update must stay identical to the unconstrained arm.
             self._cstr_last_diag = diag
             self._cstr_print_diag(group_start, diag)
             return True
-        # ---- multi-half-space QP via the dual -------------------------
-        # max_{lam>=0} -1/2 lam^T K lam + lam^T c.  FISTA (accelerated
-        # projected gradient) with the spectral step 1/lam_max(K) from a
-        # power iteration; a plain projected gradient with a conservative
-        # step under-converges and leaves violated constraints inactive.
-        # Reviewer formulation (2026-09-13): ROW-NORMALIZED rows (cosine
-        # Gram) + budget ladder + hard feasibility certificate.
-        H = A / gn[:, None]                                  # [N, P] unit rows
-        b = -self.rpbe_kappa * nt * torch.ones(
-            int(H.shape[0]), device=dev)                     # [N]
-        K = H @ H.t()                                        # cosine Gram
-        cvec = b - (H @ t)
-        lam = torch.zeros(int(H.shape[0]), device=dev)
-        with torch.no_grad():
-            v = torch.randn(int(H.shape[0]), device=dev)
-            v = v / (v.norm() + 1e-30)
-            lam_max = 1.0
-            for _ in range(30):
-                v = K @ v
-                nv = float(v.norm())
-                if nv <= 1e-30:
+        # ---- active-set QP on the GPU (row-normalized cosine Gram) ----
+        def _solve_active(active_keys):
+            A = torch.stack([_row(k) for k in active_keys]).to(dev)
+            gn = A.norm(dim=1)
+            H = A / gn[:, None]
+            b = -self.rpbe_kappa * nt * torch.ones(
+                int(H.shape[0]), device=dev)
+            t_g = t.float().to(dev)
+            K = H @ H.t()
+            cvec = b - (H @ t_g)
+            lam = torch.zeros(int(H.shape[0]), device=dev)
+            with torch.no_grad():
+                v = torch.randn(int(H.shape[0]), device=dev)
+                v = v / (v.norm() + 1e-30)
+                lam_max = 1.0
+                for _ in range(30):
+                    v = K @ v
+                    nv = float(v.norm())
+                    if nv <= 1e-30:
+                        break
+                    v = v / nv
+                    lam_max = nv
+            eta = 1.0 / (lam_max + 1e-12)
+            d = None
+            viol_max = float("inf")
+            for budget in (2000, 8000, 32000):
+                y = lam
+                tk = 1.0
+                for _ in range(budget):
+                    lam_new = torch.clamp(y + eta * (cvec - K @ y),
+                                          min=0.0)
+                    tk_new = 0.5 * (1.0 + math.sqrt(1.0 + 4.0 * tk * tk))
+                    y = lam_new + ((tk - 1.0) / tk_new) * (lam_new - lam)
+                    lam = lam_new
+                    tk = tk_new
+                d = t_g + H.t() @ lam
+                viol = b - (H @ d)
+                rel = viol / (nt + 1e-30)
+                viol_max = float(rel.max()) if rel.numel() else 0.0
+                if viol_max <= 1e-6:
                     break
-                v = v / nv
-                lam_max = nv
-        eta = 1.0 / (lam_max + 1e-12)
+            return d, viol_max, int((lam > 1e-9).sum().item()), \
+                float((H.t() @ lam).norm()) / (nt + 1e-30)
+
         d = None
         viol_max = float("inf")
-        # ---- budget ladder: 2000 -> 8000 -> 32000 FISTA iterations ----
-        for budget in (2000, 8000, 32000):
-            y = lam
-            tk = 1.0
-            for _ in range(budget):
-                lam_new = torch.clamp(y + eta * (cvec - K @ y), min=0.0)
-                tk_new = 0.5 * (1.0 + math.sqrt(1.0 + 4.0 * tk * tk))
-                y = lam_new + ((tk - 1.0) / tk_new) * (lam_new - lam)
-                lam = lam_new
-                tk = tk_new
-            d = t + H.t() @ lam
-            viol = b - (H @ d)                               # >0 = violated
-            rel = viol / (nt + 1e-30)
-            viol_max = float(rel.max()) if rel.numel() else 0.0
-            if viol_max <= 1e-6:
+        active = 0
+        corr_ratio = 0.0
+        for _round in range(3):
+            d, viol_max, active, corr_ratio = _solve_active(active_keys)
+            if viol_max > 1e-6:
                 break
-        corr = H.t() @ lam                                   # [P]
-        active = int((lam > 1e-9).sum().item())
-        # primal residual: how many constraints are still violated at d
-        viol = b - (H @ d)                                   # [N] (>0 = violated)
-        rel = viol / (nt + 1e-30)
+            # full CPU re-scan: certify EVERY row
+            d_cpu = d.detach().cpu().double()
+            worst = -1.0
+            worst_j = -1
+            for cs in range(0, len(keys), 200):
+                ce = min(len(keys), cs + 200)
+                rows = torch.stack([_row(keys[j])
+                                    for j in range(cs, ce)]).double()
+                viol = (-self.rpbe_kappa * nt
+                        - (rows @ d_cpu)
+                        / (rows.norm(dim=1) * nt + 1e-30))
+                if viol.numel() and float(viol.max()) > worst:
+                    worst = float(viol.max())
+                    worst_j = int(cs + torch.argmax(viol).item())
+            if worst <= 1e-6:
+                viol_max = 0.0
+                break
+            new_key = keys[worst_j]
+            if new_key in active_keys:
+                break
+            active_keys.append(new_key)
+            viol_max = 1.0  # force the ladder again next round
         diag["active"] = active
-        diag["n_viol"] = int((rel > 1e-6).sum().item())
+        diag["n_viol"] = int(viol_max > 1e-6)
         diag["max_viol"] = viol_max
-        diag["corr_ratio"] = float(corr.norm()) / (nt + 1e-30)
+        diag["corr_ratio"] = corr_ratio
         diag["d_norm_ratio"] = float(d.norm()) / (nt + 1e-30)
         if active > 0:
             self._cstr_active += 1
-            self._cstr_corr_ratios.append(float(diag["corr_ratio"]))
+            self._cstr_corr_ratios.append(corr_ratio)
         self._cstr_print_diag(group_start, diag)
         if viol_max > 1e-6:
             # hard certificate FAILED after the full ladder: the caller
@@ -1162,8 +1202,10 @@ class TGBPairLinkLoop:
                               for p in self.repr_params]
         self._cstr_snap = [None] * len(self.repr_params)
         # tree-wise state: scope task accumulation + per-(tree, tau) dirs
-        self._cstr_scope_task = [torch.zeros_like(p, device=dev)
-                                 for p in self._cstr_scope_params]
+        # (CPU row bank: the N x P bank never lives on the GPU)
+        self._cstr_scope_task = [
+            torch.zeros_like(p, device="cpu", dtype=torch.float32)
+            for p in self._cstr_scope_params]
         self._cstr_scope_snap = [None] * len(self._cstr_scope_params)
         self._cstr_tree_aux = {}
 

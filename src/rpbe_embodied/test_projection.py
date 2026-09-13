@@ -374,12 +374,39 @@ def test_solver_budget_escalates_instead_of_aborting():
 
 
 def _run_boundary_with(gamma, tp, tc, rp, rc, opt_factory, **kw):
+    dev = kw.pop("device", "cpu")
     opt = _CountingOpt(opt_factory(list(gamma.parameters())))
     diag = apply_gamma_boundary_update(
         gamma=gamma, gamma_params=list(gamma.parameters()), optimizer=opt,
         scheduler=None, task_pairs=tp, task_cotangents=tc,
-        rpbe_pairs=rp, rpbe_cotangents=rc, device="cpu", **kw)
+        rpbe_pairs=rp, rpbe_cotangents=rc, device=dev, **kw)
     return opt, diag
+
+
+def test_realized_audit_on_cuda_when_available():
+    """Cross-device guard for the whole boundary path, including the realized
+    audit.  CPU-only boxes SKIP this -- which is exactly why the GPU run must
+    execute it: a device mix-up in the audit is invisible on CPU and takes the
+    training job down on GPU."""
+    if not torch.cuda.is_available():
+        print("test_realized_audit_on_cuda_when_available SKIP (no CUDA)")
+        return
+    g, tp, tc, rp, rc = _boundary_fixture()
+    g = g.to("cuda")
+    tp = [(a.to("cuda"), b.to("cuda")) for a, b in tp]
+    rp = [(a.to("cuda"), b.to("cuda")) for a, b in rp]
+    tc = [c.to("cuda") for c in tc]
+    rc = [c.to("cuda") for c in rc]
+    _, diag = _run_boundary_with(
+        g, tp, tc, rp, rc, lambda ps: torch.optim.AdamW(ps, lr=1e-3),
+        kappa=0.05, grad_clip=1e9, device="cuda")
+    assert diag["gamma_steps"] == 1
+    for k in ("real_cos_dstar", "real_vmax", "real_dtheta_norm",
+              "real_dtheta_task_norm"):
+        assert k in diag and diag[k] == diag[k], k
+    assert -1.0 <= diag["real_cos_dstar"] <= 1.0
+    print("test_realized_audit_on_cuda_when_available OK  cos(d*,dtheta)=%.4f"
+          % diag["real_cos_dstar"])
 
 
 def test_realized_audit_matches_raw_certificate_under_sgd():
@@ -484,6 +511,85 @@ def test_tiny_rows_excluded_by_row_norm_tol():
     assert diag["proj_n_valid"] == 8
     print("test_tiny_rows_excluded_by_row_norm_tol OK  below_tol=%d"
           % diag["proj_n_below_row_tol"])
+
+
+def test_proposal_space_gates_on_dstar_not_on_fp32_writeback():
+    """HARD GATE = v_max(Delta*) <= tau (the algorithm object).  The fp32
+    writeback residual is AUDITED, never gated: at lr-scale steps its norm is
+    comparable to ||g_i|| ||Delta_adam||, so gating on v_max(Delta_stored)
+    would reject boundaries on quantisation alone."""
+    tau = 3e-4
+    g1, tp, tc, rp, rc = _boundary_fixture()
+    _, raw = _run_boundary_with(g1, tp, tc, rp, rc,
+                                lambda ps: torch.optim.AdamW(ps, lr=1e-3),
+                                kappa=0.05, grad_clip=1e9,
+                                proposal_space=False, tau_feas=tau)
+    g2, tp, tc, rp, rc = _boundary_fixture()
+    _, new = _run_boundary_with(g2, tp, tc, rp, rc,
+                                lambda ps: torch.optim.AdamW(ps, lr=1e-3),
+                                kappa=0.05, grad_clip=1e9,
+                                proposal_space=True, tau_feas=tau)
+    assert new["gamma_steps"] == 1 and not new["gamma_aborted"]
+    assert new["vmax_proj"] <= tau, new["vmax_proj"]
+    for k in ("dstar_norm", "wb_resid_norm", "wb_resid_ratio",
+              "stored_vmax", "stored_cos_dstar", "stored_delta_norm"):
+        assert k in new and new[k] == new[k], k
+    assert new["wb_resid_ratio"] >= 0.0
+    print("test_proposal_space_gates_on_dstar_not_on_fp32_writeback OK  "
+          "vmax_proj=%.2e (tau=%.0e)  raw realization=%.2e  "
+          "wb_resid_ratio=%.2e stored_vmax=%.2e"
+          % (new["vmax_proj"], tau, raw.get("real_vmax", float("nan")),
+             new["wb_resid_ratio"], new["stored_vmax"]))
+
+
+def test_large_writeback_residual_still_steps():
+    """Regression guard: a big fp32 writeback residual must NOT abort."""
+    g, tp, tc, rp, rc = _boundary_fixture()
+    with torch.no_grad():
+        for p in g.parameters():
+            p.mul_(1e3)          # O(1e3) params -> fp32 rounding ~1e-4 absolute
+    _, diag = _run_boundary_with(g, tp, tc, rp, rc,
+                                 lambda ps: torch.optim.AdamW(ps, lr=1e-2),
+                                 kappa=0.05, grad_clip=1e9,
+                                 proposal_space=True, tau_feas=3e-4)
+    assert diag["gamma_steps"] == 1 and not diag["gamma_aborted"], diag.get(
+        "gamma_abort_reason")
+    assert diag["vmax_proj"] <= 3e-4
+    print("test_large_writeback_residual_still_steps OK  "
+          "stored_vmax=%.3e wb_resid_ratio=%.3e (still stepped)"
+          % (diag["stored_vmax"], diag["wb_resid_ratio"]))
+
+
+def test_proposal_space_abort_leaves_state_untouched():
+    """If the QP itself cannot certify Delta*, BOTH the parameters and the
+    optimizer state go back -- the proposal never partially lands."""
+    import copy as _copy
+    g, tp, tc, rp, rc = _boundary_fixture()
+    params = list(g.parameters())
+    opt = torch.optim.AdamW(params, lr=1e-3)
+    before = [p.detach().clone() for p in params]
+    state_before = _copy.deepcopy(opt.state_dict())
+    diag = apply_gamma_boundary_update(
+        gamma=g, gamma_params=params, optimizer=opt, scheduler=None,
+        task_pairs=tp, task_cotangents=tc, rpbe_pairs=rp,
+        rpbe_cotangents=rc, device="cpu", kappa=0.0, tau_feas=1e-12,
+        max_rounds=1, max_active=1, add_per_round=0, proj_iters_max=400,
+        proposal_space=True)
+    assert diag["gamma_aborted"] and diag["gamma_steps"] == 0
+    assert diag["gamma_abort_reason"] in (
+        "active_budget_exhausted", "projection_not_certified",
+        "proposal_not_certified")
+    for p, b in zip(params, before):
+        assert torch.equal(p.detach(), b), "params not rolled back"
+    after = opt.state_dict()
+    for k, v in state_before["state"].items():
+        assert k in after["state"]
+        for sk, sv in v.items():
+            if torch.is_tensor(sv):
+                assert torch.equal(after["state"][k][sk], sv), \
+                    "optimizer state not rolled back"
+    print("test_proposal_space_abort_leaves_state_untouched OK  "
+          "reason=%s" % diag["gamma_abort_reason"])
 
 
 def test_nonfinite_rows_dropped():
@@ -678,11 +784,13 @@ def test_infeasible_boundary_aborts_without_stepping():
     opt, diag, moved = _run_boundary(
         g1, tp, tc, rp, rc, kappa=0.0, tau_feas=1e-12, max_rounds=1,
         max_active=1, add_per_round=0, proj_iters_max=400)
-    assert not diag["proj_feasible"]
+    assert not diag["proj_feasible"] or not diag["gamma_steps"]
     assert diag["gamma_aborted"] and diag["gamma_steps"] == 0
-    assert diag["gamma_abort_reason"] in ("active_budget_exhausted",
-                                          "projection_not_certified")
-    assert opt.steps == 0, "an uncertified projection must not step"
+    assert diag["gamma_abort_reason"] in (
+        "active_budget_exhausted", "projection_not_certified",
+        "proposal_not_certified", "stored_displacement_not_certified")
+    # In proposal space the optimizer DOES propose -- that call is rolled back,
+    # so the test is that nothing was WRITTEN, not that step() was never called.
     assert moved == 0.0, "parameters moved on an aborted boundary"
     print("test_infeasible_boundary_aborts_without_stepping OK  "
           "reason=%s vmax=%.2e" % (diag["gamma_abort_reason"],
@@ -743,13 +851,14 @@ class _Args:
     proj_max_active = 2048
     proj_max_rounds = 8
     proj_add_per_round = 512
+    rpbe_proposal_space = 1
 
 
 def test_resume_config_contract():
     want = boundary_config(_Args())
     assert set(want) == {"rpbe_mode", "kappa", "proj_iters", "proj_iters_max",
                          "proj_tau", "proj_max_active", "proj_max_rounds",
-                         "proj_add_per_round"}
+                         "proj_add_per_round", "rpbe_proposal_space"}
     # kappa is a FIXED constant on the formal method -- no annealing knobs
     assert not any("anneal" in k for k in COMMON_CONFIG_KEYS
                    + BOUNDARY_CONFIG_KEYS)
@@ -847,6 +956,10 @@ if __name__ == "__main__":
     test_stack_to_handles_mixed_inputs()
     test_realized_audit_matches_raw_certificate_under_sgd()
     test_realized_audit_records_adamw_twist()
+    test_realized_audit_on_cuda_when_available()
+    test_proposal_space_gates_on_dstar_not_on_fp32_writeback()
+    test_large_writeback_residual_still_steps()
+    test_proposal_space_abort_leaves_state_untouched()
     test_counterfactual_is_non_destructive_and_rng_free()
     test_tiny_task_direction_skips_projection()
     test_tiny_rows_excluded_by_row_norm_tol()

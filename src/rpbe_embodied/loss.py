@@ -639,12 +639,29 @@ def _cutting_plane(G_cpu, t, dev, kappa, tau_feas, ng, Gt, valid, scale, nt,
     return corr, active, mu, vmax, rnd, min_slack, n_mu_pos
 
 
+def normalized_violation(G_cpu, ng, valid, delta, ref_norm, kappa):
+    """Dimensionless max violation of every interface for a DISPLACEMENT.
+
+    v_i = max(0, -kappa||g_i||*ref_norm - g_i.delta) / (||g_i||*ref_norm + eps)
+
+    ``ref_norm`` is the scale the half-space was built against (||Delta_adam||
+    in proposal space, ||t|| in raw-gradient space).  Returns (vmax, g_i.delta).
+    """
+    Gd = _row_dot(G_cpu, delta.detach().cpu().flatten().float())
+    scale = ng * max(float(ref_norm), 1e-30)
+    vv = torch.where(valid, torch.clamp(-kappa * scale - Gd, min=0.0)
+                     / (scale + 1e-30), torch.zeros_like(Gd))
+    return float(vv.max()), Gd
+
+
 def active_set_feasibility_projection(
-    g_task_gamma: List[torch.Tensor], gamma_params: List[torch.Tensor],
-    G_cpu: Optional[torch.Tensor], kappa: float, iters: int = 400,
-    iters_max: int = 1600, tau_feas: float = 1e-3, max_rounds: int = 8,
-    max_active: int = 2048, add_per_round: int = 512,
+    g_task_gamma: Optional[List[torch.Tensor]] = None,
+    gamma_params: Optional[List[torch.Tensor]] = None,
+    G_cpu: Optional[torch.Tensor] = None, kappa: float = 0.05,
+    iters: int = 400, iters_max: int = 1600, tau_feas: float = 1e-3,
+    max_rounds: int = 8, max_active: int = 2048, add_per_round: int = 512,
     row_norm_tol: float = 1e-9, task_norm_tol: float = 1e-12,
+    t_override: Optional[torch.Tensor] = None, write_grad: bool = True,
 ) -> dict:
     """Cutting-plane feasibility projection over EVERY interface.
 
@@ -666,10 +683,15 @@ def active_set_feasibility_projection(
 
     VRAM holds only the active rows; ``G_cpu`` stays in host memory.
     """
-    sizes = [p.numel() for p in gamma_params]
-    # t lives on the Gamma params' device; the full-interface scans run on the
-    # CPU-resident G rows, and only the active rows ever reach `dev`.
-    t = torch.cat([-x.detach().flatten().float() for x in g_task_gamma])
+    sizes = [p.numel() for p in gamma_params] if gamma_params else []
+    # t is the direction being constrained.  In raw-gradient space it is the
+    # task descent direction -g_task; in PROPOSAL space the caller passes the
+    # AdamW displacement itself (t_override), so the object we certify is the
+    # object that gets written into the parameters.
+    if t_override is not None:
+        t = t_override.detach().flatten().float()
+    else:
+        t = torch.cat([-x.detach().flatten().float() for x in g_task_gamma])
     dev = t.device
     t_cpu = t.detach().cpu()
     nt = float(t.norm())
@@ -759,9 +781,12 @@ def active_set_feasibility_projection(
     diag["_valid"] = valid
     diag["_corr"] = corr
     diag["_t"] = t
-    if diag["proj_feasible"]:
+    if write_grad and diag["proj_feasible"] and g_task_gamma is not None:
         with torch.no_grad():
             for p, cp, gt in zip(gamma_params, torch.split(corr, sizes),
                                  g_task_gamma):
                 p.grad = (gt.reshape(-1).float() - cp).to(p.dtype).view_as(p)
+    # the projected direction, always available (raw-gradient space: raw cfg;
+    # proposal space: the displacement to write back)
+    diag["_d_star"] = (t + corr).detach()
     return diag

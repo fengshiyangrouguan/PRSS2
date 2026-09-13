@@ -199,6 +199,13 @@ def parse_args() -> argparse.Namespace:
                         "method (no annealing).  kappa=0 = hard per-interface "
                         "constraint (STRICTEST); kappa>=1 = never binds "
                         "(== pure task).")
+    p.add_argument("--rpbe-proposal-space", type=int, default=1,
+                   help="1 (DEFAULT) = project the AdamW PROPOSAL: clip, take "
+                        "one optimizer.step(), then solve the QP on the "
+                        "realized displacement and write Gamma_old + Delta* "
+                        "with a final certificate on the STORED difference.  "
+                        "0 = legacy raw-gradient projection (certifies a "
+                        "direction AdamW is then free to rotate).")
     p.add_argument("--proj-iters", type=int, default=400,
                    help="project mode: FISTA iterations at the FIRST rung of "
                         "the solver-budget ladder.")
@@ -984,7 +991,8 @@ def main() -> None:
                 max_rounds=args.proj_max_rounds,
                 max_active=args.proj_max_active,
                 add_per_round=args.proj_add_per_round,
-                grad_clip=args.grad_clip, minibatch=B, device="cuda")
+                grad_clip=args.grad_clip, minibatch=B, device="cuda",
+                proposal_space=bool(args.rpbe_proposal_space))
             diag["proj_kappa"] = float(kap)
             n_opt += diag["gamma_steps"]
             upd = sum(float((p.detach() - p0).float().pow(2).sum())
@@ -1045,9 +1053,13 @@ def main() -> None:
         # or scheduler state.  Avoids the Adam-state CPU-poisoning hazard and
         # the extra save-time memory peak entirely.
         payload = {
+            # requires_grad params PLUS the adapters: under
+            # --train-scope gamma-only the LoRA tensors are frozen
+            # (requires_grad=False) but the rollout loader still needs their
+            # Stage5 weights, so they must stay in the checkpoint.
             "model": {n: p.detach().cpu()
                       for n, p in vla.named_parameters()
-                      if p.requires_grad},
+                      if p.requires_grad or "lora_" in n},
             "lora_config": {"r": lora_config.r,
                             "lora_alpha": lora_config.lora_alpha,
                             "lora_dropout": lora_config.lora_dropout},
@@ -1190,6 +1202,26 @@ def main() -> None:
               f"fresh epoch (deterministic seed); bank/queue reset.", flush=True)
         assert optimizer_step < args.max_steps, \
             "resume point already at/past --max-steps; raise --max-steps"
+
+    if args.train_scope == "gamma-only":
+        # THOROUGH freeze: LoRA keeps the Stage5 weights but is excluded from
+        # the backward (requires_grad=False) AND from every optimizer param
+        # group (task_params is empty), so neither a residual gradient nor
+        # AdamW weight decay can touch it.  It is still written into the
+        # checkpoint (see _ckpt_dict) because the rollout loader needs it.
+        frozen = 0
+        for n, p in vla.named_parameters():
+            if "lora_" in n and p.requires_grad:
+                p.requires_grad_(False)
+                frozen += 1
+        still = [n for n, p in vla.named_parameters()
+                 if "lora_" in n and p.requires_grad]
+        assert not still, f"LoRA not fully frozen: {still[:3]}"
+        assert not task_params, "gamma-only must have an empty task optimizer"
+        print(f"[train-scope] gamma-only: {frozen} LoRA tensors frozen "
+              f"(requires_grad=False, excluded from all optimizers); "
+              f"the only trainable tensor group is Gamma "
+              f"({len(gamma_params)} tensors)", flush=True)
 
     # ---- fixed independent batch + task-loss evaluator (RPBE mode intervention) ----
     fixed_batch = None

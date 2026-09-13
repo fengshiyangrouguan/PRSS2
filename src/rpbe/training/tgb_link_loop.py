@@ -1046,6 +1046,20 @@ class TGBPairLinkLoop:
             self._cstr_print_diag(group_start, diag)
             return True
         # ---- active-set QP on the GPU (row-normalized cosine Gram) ----
+        # κ=0 lands in the DENSE-violation regime (typicallyhalf of all rows
+        # start out violating), where a 3-round / one-row-at-a-time expansion
+        # over a 2000..32000 FISTA ladder is a SOLVER-CAPACITY limit rather
+        # than a certificate of infeasibility.  κ=0 therefore gets a wider
+        # ladder, batched expansion and more rounds; the κ>0 path is
+        # UNTOUCHED (same ladder / rounds / batch, bit-identical numerics).
+        # Objective, constraints and the 1e-6 certificate tolerance are
+        # identical in both regimes.
+        zero_slack = bool(float(self.rpbe_kappa) == 0.0)
+        ladder = ((2000, 8000, 32000, 128000, 512000) if zero_slack
+                  else (2000, 8000, 32000))
+        max_rounds = 12 if zero_slack else 3
+        add_batch = 64 if zero_slack else 1
+
         def _solve_active(active_keys):
             A = torch.stack([_row(k) for k in active_keys]).to(dev)
             gn = A.norm(dim=1)
@@ -1070,7 +1084,8 @@ class TGBPairLinkLoop:
             eta = 1.0 / (lam_max + 1e-12)
             d = None
             viol_max = float("inf")
-            for budget in (2000, 8000, 32000):
+            n_iter = 0
+            for budget in ladder:
                 y = lam
                 tk = 1.0
                 for _ in range(budget):
@@ -1080,6 +1095,7 @@ class TGBPairLinkLoop:
                     y = lam_new + ((tk - 1.0) / tk_new) * (lam_new - lam)
                     lam = lam_new
                     tk = tk_new
+                    n_iter += 1
                 d = t_g + H.t() @ lam
                 viol = b - (H @ d)
                 rel = viol / (nt + 1e-30)
@@ -1087,20 +1103,27 @@ class TGBPairLinkLoop:
                 if viol_max <= 1e-6:
                     break
             return d, viol_max, int((lam > 1e-9).sum().item()), \
-                float((H.t() @ lam).norm()) / (nt + 1e-30)
+                float((H.t() @ lam).norm()) / (nt + 1e-30), n_iter
 
         d = None
         viol_max = float("inf")
         active = 0
         corr_ratio = 0.0
-        for _round in range(3):
-            d, viol_max, active, corr_ratio = _solve_active(active_keys)
+        n_iter_total = 0
+        rounds_used = 0
+        solve_trace = []
+        for _round in range(max_rounds):
+            rounds_used = _round + 1
+            d, viol_max, active, corr_ratio, _n_it = _solve_active(active_keys)
+            n_iter_total += _n_it
+            solve_trace.append({"round": _round, "viol_max": viol_max,
+                                "active_lam": active, "fista_iter": _n_it,
+                                "active_keys": len(active_keys)})
             if viol_max > 1e-6:
                 break
             # full CPU re-scan: certify EVERY row
             d_cpu = d.detach().cpu().double()
-            worst = -1.0
-            worst_j = -1
+            hits = []
             for cs in range(0, len(keys), 200):
                 ce = min(len(keys), cs + 200)
                 rows = torch.stack([_row(keys[j])
@@ -1108,22 +1131,42 @@ class TGBPairLinkLoop:
                 viol = (-self.rpbe_kappa * nt
                         - (rows @ d_cpu)
                         / (rows.norm(dim=1) * nt + 1e-30))
-                if viol.numel() and float(viol.max()) > worst:
-                    worst = float(viol.max())
-                    worst_j = int(cs + torch.argmax(viol).item())
-            if worst <= 1e-6:
+                if viol.numel():
+                    bad = (viol > 1e-6).nonzero(as_tuple=False).reshape(-1)
+                    for bi in bad.tolist():
+                        hits.append((float(viol[bi]), cs + bi))
+            if not hits:
                 viol_max = 0.0
                 break
-            new_key = keys[worst_j]
-            if new_key in active_keys:
+            # worst first; stable sort keeps the earlier row on ties (same
+            # pick as the legacy argmax scan when add_batch == 1)
+            hits.sort(key=lambda x: -x[0])
+            added = 0
+            for _v, j in hits[:add_batch]:
+                new_key = keys[j]
+                if new_key in active_keys:
+                    continue
+                active_keys.append(new_key)
+                added += 1
+            if added == 0:
+                # the worst violating rows are ALREADY in the active set and
+                # the subsolver still cannot certify on it -> further rounds
+                # cannot help (legacy terminal condition, preserved)
                 break
-            active_keys.append(new_key)
             viol_max = 1.0  # force the ladder again next round
         diag["active"] = active
         diag["n_viol"] = int(viol_max > 1e-6)
         diag["max_viol"] = viol_max
         diag["corr_ratio"] = corr_ratio
         diag["d_norm_ratio"] = float(d.norm()) / (nt + 1e-30)
+        # solver-capacity telemetry (κ=0 capability test): rounds used,
+        # final active-set size, total FISTA iterations, initial violations
+        diag["zero_slack"] = zero_slack
+        diag["rounds"] = rounds_used
+        diag["n_active_keys"] = len(active_keys)
+        diag["fista_iter"] = n_iter_total
+        diag["n_below0"] = int(np.sum(c_np < 0.0))
+        diag["solve_trace"] = solve_trace
         if active > 0:
             self._cstr_active += 1
             self._cstr_corr_ratios.append(corr_ratio)
@@ -1154,8 +1197,13 @@ class TGBPairLinkLoop:
         def _f(v):
             return "nan" if v is None else "%.3f" % float(v)
 
+        _solve = ""
+        if diag.get("rounds"):
+            _solve = " solve=r%d/keys%d/it%d/lam%d" % (
+                int(diag["rounds"]), int(diag.get("n_active_keys", 0)),
+                int(diag.get("fista_iter", 0)), int(diag.get("active", 0)))
         print("[rpbe-treewise] group=%d kappa=%.2f N=%d active=%d "
-              "cos_mean/p5/min=%s/%s/%s below=%s corr/task=%s viol=%s%s"
+              "cos_mean/p5/min=%s/%s/%s below=%s corr/task=%s viol=%s%s%s"
               % (group_start // self.kf_group_batches, self.rpbe_kappa,
                  int(diag.get("n_dirs", 0)), int(diag.get("active", 0)),
                  _f(diag.get("cos_mean")), _f(diag.get("cos_p5")),
@@ -1163,6 +1211,7 @@ class TGBPairLinkLoop:
                  _f(diag.get("corr_ratio")),
                  ("-" if diag.get("n_viol") is None
                   else "%d(%s)" % (diag["n_viol"], _f(diag.get("max_viol")))),
+                 _solve,
                  "  [PROBE: update untouched]"
                  if self.rpbe_constrain_probe
                  else ("  note=%s" % diag["note"] if diag.get("note")

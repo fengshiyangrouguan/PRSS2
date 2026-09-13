@@ -1065,10 +1065,15 @@ class TGBPairLinkLoop:
         t_g = t.float().to(dev)  # single GPU copy, shared across rounds
 
         def _solve_active(active_keys):
-            A = torch.stack([_row(k) for k in active_keys]).to(dev)
-            gn = A.norm(dim=1)
-            H = A / gn[:, None]
-            del A  # halve the peak: only the normalized rows are needed below
+            # dense groups (P1 late epochs / κ=0) push the active set to
+            # thousands of rows; normalize on CPU so only H (never A) lives
+            # on the GPU — halves the QP peak (~7.1GB per 3k rows).  Row
+            # normalization is per-row: CPU vs GPU numerics differ only in
+            # reduction order (~1e-7), far below the 1e-6 certificate.
+            A_cpu = torch.stack([_row(k) for k in active_keys])
+            gn_cpu = A_cpu.norm(dim=1)
+            H = (A_cpu / gn_cpu[:, None]).to(dev)
+            del A_cpu, gn_cpu
             b = -self.rpbe_kappa * nt * torch.ones(
                 int(H.shape[0]), device=dev)
             K = H @ H.t()

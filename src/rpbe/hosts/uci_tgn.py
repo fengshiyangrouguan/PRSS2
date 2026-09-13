@@ -161,8 +161,8 @@ class UciTGNAdapter(nn.Module):
                         continue
                     if int(flat_neighbors[nidx]) == 0:
                         continue
-                    lag = (float(edge_deltas[nidx])
-                           if nidx < len(edge_deltas) else 0.0)
+                    lag = (float(edge_deltas.flatten()[nidx])
+                           if nidx < len(edge_deltas.flatten()) else 0.0)
                     lower_paths[nidx] = list(path) + [(NEIGHBOR_REL, lag)]
         neighbor_lower, neighbor_u = self._compute(
             memory, flat_neighbors, repeated_times, layer - 1, n_neighbors,

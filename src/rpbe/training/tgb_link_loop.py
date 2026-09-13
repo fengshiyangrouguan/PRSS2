@@ -1055,7 +1055,10 @@ class TGBPairLinkLoop:
         # Objective, constraints and the 1e-6 certificate tolerance are
         # identical in both regimes.
         zero_slack = bool(float(self.rpbe_kappa) == 0.0)
-        ladder = ((2000, 8000, 32000, 128000, 512000) if zero_slack
+        # 2048000 tail: full-set FISTA at κ=0 stalls at viol≈1.2e-6 after
+        # 682000 steps (18.6% short of the 1e-6 tolerance) — one more gear
+        # finishes the tail.  Tolerance/objective/constraints unchanged.
+        ladder = ((2000, 8000, 32000, 128000, 512000, 2048000) if zero_slack
                   else (2000, 8000, 32000))
         max_rounds = 12 if zero_slack else 3
         # κ=0: add EVERY violating row each round (the dense regime re-exposes

@@ -870,6 +870,34 @@ class TGBPairLinkLoop:
                 if gg is not None:
                     acc[_k2].add_(gg)
 
+    def _cstr_accum_tree_dirs_supervised(self, parts, part_keys):
+        """Rec/Pred counterpart of ``_cstr_accum_tree_dirs`` (A1 single-axis
+        isolation): the per-record supervised losses are REAL-valued and
+        enter the loss with a POSITIVE coefficient, so their gradients are
+        already in the "minimize" convention — NO negation is needed
+        (unlike the kyfan surrogate whose coefficient is -lambda*K).  The
+        per-tree sub-sums keep the directions SEPARATE and feed the SAME
+        tree-wise QP at group close.
+        """
+        by_tree: Dict[tuple, list] = {}
+        for _k, key in enumerate(part_keys):
+            by_tree.setdefault(key, []).append(_k)
+        for key, idxs in by_tree.items():
+            sub = parts[idxs[0]]
+            for _j in idxs[1:]:
+                sub = sub + parts[_j]
+            gs = torch.autograd.grad(
+                sub, self._cstr_scope_params,
+                retain_graph=True, allow_unused=True)
+            acc = self._cstr_tree_aux.get(key)
+            if acc is None:
+                acc = [torch.zeros_like(p, device=self.device)
+                       for p in self._cstr_scope_params]
+                self._cstr_tree_aux[key] = acc
+            for _k2, gg in enumerate(gs):
+                if gg is not None:
+                    acc[_k2].add_(gg)
+
     def _cstr_group_close_aggregate(self, group_start):
         """Legacy plan-B group-end projection on the accumulated components
         (lambda-invariant; see __init__ note):
@@ -1373,6 +1401,11 @@ class TGBPairLinkLoop:
         closed = len(by_tau)     # accepted (eligible) tau windows this group
         gauge_done = False
         gs = gs0
+        if self.rpbe_constrain and not self._cstr_scope_params:
+            comp = getattr(self.adapter, "compressor", None)
+            if comp is not None:
+                self._cstr_scope_params = [
+                    p for p in comp.parameters() if p.requires_grad]
         self.snapshot_comp_params()
         for b in range(g0, g1):
             self.head_optimizer.zero_grad(set_to_none=True)
@@ -1383,6 +1416,7 @@ class TGBPairLinkLoop:
                 continue
             link_loss, records = out
             contrib = torch.zeros((), device=self.device)
+            part_keys = []
             if self.aux_heads is not None and records and meta:
                 parts = []
                 for r in records:
@@ -1400,6 +1434,7 @@ class TGBPairLinkLoop:
                     # per-batch partial sums, across the group, to
                     # (lambda / n_layers) * per-tree-weighted window mean
                     parts.append((w / Wtau) * (self.aux_lambda / ntaus) * Lr)
+                    part_keys.append((r.pair_id, r.tau))
                     aux_terms += 1
                 if parts:
                     contrib = sum(parts)
@@ -1408,14 +1443,38 @@ class TGBPairLinkLoop:
                     for r in records:
                         if r.pair_id in meta:
                             self.audit.add_replay(r)
-            loss = link_loss + contrib
-            if not gauge_done and self._comp_params \
-                    and float(contrib.detach()) != 0.0:
-                tn, an = self.gauge_comp(link_loss, contrib)
-                self._gauge_group_task.append(tn)
-                self._gauge_group_aux.append(an)
-                gauge_done = True
-            loss.backward()
+            if self.rpbe_constrain and self._cstr_scope_params:
+                # A1 single-axis isolation: Rec/Pred auxiliary gradients
+                # enter the SAME tree-wise safety machinery as the kyfan
+                # arm (per-tree sub-sum VJPs + the shared group-end QP).
+                # task backward first (graph retained for the per-tree
+                # VJPs below), then per-tree directions, then the aux-head
+                # gradients are extracted WITHOUT flowing into the repr
+                # params (non-scope repr keeps the pure task gradient).
+                link_loss.backward(retain_graph=True)
+                self._cstr_accum_scope_task()
+                if parts:
+                    self._cstr_accum_tree_dirs_supervised(parts, part_keys)
+                if self.aux_optimizer is not None and parts:
+                    aps = self.aux_optimizer.param_groups[0]["params"]
+                    gs = torch.autograd.grad(
+                        contrib, aps, retain_graph=False, allow_unused=True)
+                    for p, gg in zip(aps, gs):
+                        if gg is None:
+                            continue
+                        if p.grad is None:
+                            p.grad = gg.detach()
+                        else:
+                            p.grad.add_(gg)
+            else:
+                loss = link_loss + contrib
+                if not gauge_done and self._comp_params \
+                        and float(contrib.detach()) != 0.0:
+                    tn, an = self.gauge_comp(link_loss, contrib)
+                    self._gauge_group_task.append(tn)
+                    self._gauge_group_aux.append(an)
+                    gauge_done = True
+                loss.backward()
             self._probe_memory_grad()
             self._clip(self.head_params)
             if not self.calibrate:
@@ -1424,11 +1483,14 @@ class TGBPairLinkLoop:
                 self.tgn.memory.detach_memory()
             link_sum += float(link_loss.detach())
         # group close: repr and aux heads step once (per macro group)
+        cert_ok = True
+        if self.rpbe_constrain and self._cstr_scope_params \
+                and self._cstr_scope_task is not None:
+            cert_ok = self._cstr_group_close_treewise(g0)
+            self._cstr_reset()
         if not self.calibrate:
-            for opt in (self.repr_optimizer, self.aux_optimizer):
-                if opt is None:
-                    continue
-                ps = opt.param_groups[0]["params"]
+            if cert_ok and self.repr_optimizer is not None:
+                ps = self.repr_optimizer.param_groups[0]["params"]
                 for p in ps:
                     if p.grad is not None:
                         p.grad.div_(float(max(1, group_k)))
@@ -1436,7 +1498,17 @@ class TGBPairLinkLoop:
                 if live:
                     torch.nn.utils.clip_grad_norm_(
                         live, max_norm=self.grad_clip)
-                opt.step()
+                self.repr_optimizer.step()
+            if self.aux_optimizer is not None:
+                ps = self.aux_optimizer.param_groups[0]["params"]
+                for p in ps:
+                    if p.grad is not None:
+                        p.grad.div_(float(max(1, group_k)))
+                live = [p for p in ps if p.grad is not None]
+                if live:
+                    torch.nn.utils.clip_grad_norm_(
+                        live, max_norm=self.grad_clip)
+                self.aux_optimizer.step()
             self.record_param_delta()
         return {"link_sum": link_sum, "aux_sum": aux_sum,
                 "aux_batches": aux_batches, "aux_terms": aux_terms,

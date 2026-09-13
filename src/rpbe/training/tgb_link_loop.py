@@ -1459,9 +1459,9 @@ class TGBPairLinkLoop:
                     self._cstr_accum_tree_dirs_supervised(parts, part_keys)
                 if self.aux_optimizer is not None and parts:
                     aps = self.aux_optimizer.param_groups[0]["params"]
-                    gs = torch.autograd.grad(
+                    _aux_gs = torch.autograd.grad(
                         contrib, aps, retain_graph=False, allow_unused=True)
-                    for p, gg in zip(aps, gs):
+                    for p, gg in zip(aps, _aux_gs):
                         if gg is None:
                             continue
                         if p.grad is None:

@@ -336,7 +336,7 @@ class JodieNodeClassificationLoop:
             # is_grads_batched semantics: every output is a scalar and its
             # grad_output is a [C] batch vector; unit rows select the
             # diagonal, so result row b == VJP of scalar b.
-            eye = torch.eye(C, device=self.device)
+            eye = torch.eye(C, device=self.device, dtype=torch.float64)
             gs = torch.autograd.grad(
                 q_list, self._cstr_scope_params,
                 grad_outputs=[eye[i] for i in range(C)],

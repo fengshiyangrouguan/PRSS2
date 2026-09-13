@@ -696,7 +696,7 @@ def main():
                 "collision": {k: F[k]["collision"] for k in F},
                 "sampler_formula_version": "v1_ressample_noncollision",
                 "sampler_base_seed": int(FIXED_SEED)})
-            zk = {1: z1, 2: z2, 3: z3}
+            zk = {"z1": z1, "z2": z2, "z3": z3}
             lines_local = [
                 ("Y_leaf", "Y_a2", st1["u0"], 0,
                  [(1, dz3_2, "z1"), (2, dz3_1, "z2"), (3, dz3_r, "z3")]),

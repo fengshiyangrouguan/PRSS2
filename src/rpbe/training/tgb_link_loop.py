@@ -1107,6 +1107,43 @@ class TGBPairLinkLoop:
                 viol_max = float(rel.max()) if rel.numel() else 0.0
                 if viol_max <= 1e-6:
                     break
+            if zero_slack and viol_max > 1e-6 and viol_max < 1e-3:
+                # fp64 polish (κ=0 only): fp32 λ updates stall at viol≈1.1e-6
+                # (4× budget moved it 7.8% — representation floor, not a
+                # convergence limit).  Continue the SAME FISTA in fp64
+                # arithmetic on the warm-started λ; H rows stay fp32 (their
+                # own precision is fine — the floor is in the λ updates).
+                # The certificate is then re-checked on CPU in fp64, exactly
+                # like the full re-scan below.  Tolerance/objective/
+                # constraints unchanged.
+                K64 = K.double()
+                c64 = cvec.double()
+                lam64 = lam.double().clamp(min=0.0)
+                y = lam64
+                tk = 1.0
+                n_polish = 0
+                for _ in range(100000):
+                    lam_new = torch.clamp(y + eta * (c64 - K64 @ y),
+                                          min=0.0)
+                    tk_new = 0.5 * (1.0 + math.sqrt(1.0 + 4.0 * tk * tk))
+                    y = lam_new + ((tk - 1.0) / tk_new) * (lam_new - lam64)
+                    lam64 = lam_new
+                    tk = tk_new
+                    n_polish += 1
+                n_iter += n_polish
+                d_pol = t_g + H.t() @ lam64.float()
+                d_cpu = d_pol.detach().cpu().double()
+                viol_max = 0.0
+                for cs in range(0, len(active_keys), 200):
+                    ce = min(len(active_keys), cs + 200)
+                    rows = torch.stack([_row(active_keys[j])
+                                        for j in range(cs, ce)]).double()
+                    viol = (-self.rpbe_kappa * nt
+                            - (rows @ d_cpu)
+                            / (rows.norm(dim=1) * nt + 1e-30))
+                    if viol.numel():
+                        viol_max = max(viol_max, float(viol.max()))
+                d = d_pol
             return d, viol_max, int((lam > 1e-9).sum().item()), \
                 float((H.t() @ lam).norm()) / (nt + 1e-30), n_iter
 

@@ -151,9 +151,12 @@ def parse_args():
                    help="dimensionless margin for --rpbe-constrain "
                         "(0 = hard constraint; 0.05 = default gate).")
     p.add_argument("--rpbe-constrain-mode", default="treewise",
-                   choices=["aggregate", "treewise"],
-                   help="aggregate = legacy single-half-space projection on "
-                        "the flattened group gradient (tree conflicts cancel); "
+                   choices=["treewise", "global", "additive"],
+                   help="A6 optimization-coupling control: "
+                        "additive = NO safety projection (plain "
+                        "g_task + beta*g_LPSE, beta=lambda_kf); "
+                        "global = single-half-space projection on the "
+                        "flattened group gradient (tree conflicts cancel); "
                         "treewise = final spec: keep the per-(tree, interface) "
                         "RPBE directions separate and solve the multi-half-"
                         "space QP  min_d 1/2||d-t||^2 s.t. g_j^T d >= "

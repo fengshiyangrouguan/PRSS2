@@ -756,8 +756,10 @@ class TGBPairLinkLoop:
                 if self.rpbe_constrain and self._cstr_task_acc is not None:
                     if self.rpbe_constrain_mode == "treewise":
                         self._cstr_group_close_treewise(group_start)
-                    else:
+                    elif self.rpbe_constrain_mode == "global":
                         self._cstr_group_close_aggregate(group_start)
+                    else:  # additive (A6 control): plain task + beta*LPSE
+                        self._cstr_group_close_additive(group_start)
                     self._cstr_reset()
                 for p in self.repr_params:
                     if p.grad is not None:
@@ -889,6 +891,20 @@ class TGBPairLinkLoop:
                                self.repr_params):
             if p.grad is not None:
                 p.grad.copy_(a_t + mu * a_a)
+
+    def _cstr_group_close_additive(self, group_start):
+        """A6 control: NO safety projection — the ordinary additive update
+        g_write = g_t + beta*g_a with beta = lambda_kf (the auxiliary
+        gradient already carries the lambda coefficient through the
+        surrogate).  Same separation bookkeeping as the constrained modes,
+        only the coupling rule changes."""
+        for a_t, a_a, p in zip(self._cstr_task_acc,
+                               self._cstr_aux_acc,
+                               self.repr_params):
+            if p.grad is not None:
+                p.grad.copy_(a_t + a_a)
+        print("[rpbe-additive] group=%d (no projection)"
+              % (group_start // self.kf_group_batches), flush=True)
 
     def _cstr_group_close_treewise(self, group_start):
         """Final-spec group close: multi-half-space QP over the per-(tree,

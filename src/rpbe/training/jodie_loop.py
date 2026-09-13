@@ -325,7 +325,10 @@ class JodieNodeClassificationLoop:
             sub = term_pieces[idxs[0]]
             for _j in idxs[1:]:
                 sub = sub + term_pieces[_j]
-            qs.append(-sub)  # sign convention (see UCI counterpart)
+            # sign convention (see UCI counterpart); cast to float32 —
+            # the surrogate VALUE is exactly zero, only its graph matters,
+            # and a float32 graph keeps the batched VJP dtype-clean.
+            qs.append((-sub).float())
         M = len(qs)
         chunk = 8
         for cs in range(0, M, chunk):
@@ -336,7 +339,7 @@ class JodieNodeClassificationLoop:
             # is_grads_batched semantics: every output is a scalar and its
             # grad_output is a [C] batch vector; unit rows select the
             # diagonal, so result row b == VJP of scalar b.
-            eye = torch.eye(C, device=self.device, dtype=torch.float64)
+            eye = torch.eye(C, device=self.device, dtype=torch.float32)
             gs = torch.autograd.grad(
                 q_list, self._cstr_scope_params,
                 grad_outputs=[eye[i] for i in range(C)],

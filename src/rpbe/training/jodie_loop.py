@@ -319,46 +319,29 @@ class JodieNodeClassificationLoop:
         for k, key in enumerate(term_keys):
             by_tree.setdefault(key, []).append(k)
         keys = sorted(by_tree.keys())
-        qs = []
-        for key in keys:
+        n_keys = len(keys)
+        for idx, key in enumerate(keys):
             idxs = by_tree[key]
             sub = term_pieces[idxs[0]]
             for _j in idxs[1:]:
                 sub = sub + term_pieces[_j]
             # sign convention (see UCI counterpart); cast to float32 —
-            # the surrogate VALUE is exactly zero, only its graph matters,
-            # and a float32 graph keeps the batched VJP dtype-clean.
-            qs.append((-sub).float())
-        M = len(qs)
-        chunk = 8
-        for cs in range(0, M, chunk):
-            ce = min(M, cs + chunk)
-            C = ce - cs
-            q_list = qs[cs:ce]                              # C scalar outs
-            retain = (ce < M)
-            # is_grads_batched semantics: every output is a scalar and its
-            # grad_output is a [C] batch vector; unit rows select the
-            # diagonal, so result row b == VJP of scalar b.
-            eye = torch.eye(C, device=self.device, dtype=torch.float32)
+            # the surrogate VALUE is exactly zero, only its graph matters.
+            sub = (-sub).float()
+            # the LAST VJP releases the batch graph
+            retain = (idx < n_keys - 1)
             gs = torch.autograd.grad(
-                q_list, self._cstr_scope_params,
-                grad_outputs=[eye[i] for i in range(C)],
-                retain_graph=retain, allow_unused=True,
-                is_grads_batched=True)
-            for k, p in enumerate(self._cstr_scope_params):
-                gg = gs[k]
-                if gg is None:
-                    continue
-                rows = gg.detach().float().cpu()           # [C, *shape]
-                for j in range(ce - cs):
-                    key = keys[cs + j]
-                    acc = self._cstr_tree_aux.get(key)
-                    if acc is None:
-                        acc = [torch.zeros_like(
-                            p, device="cpu", dtype=torch.float32)
-                            for p in self._cstr_scope_params]
-                        self._cstr_tree_aux[key] = acc
-                    acc[k].add_(rows[j])
+                sub, self._cstr_scope_params,
+                retain_graph=retain, allow_unused=True)
+            acc = self._cstr_tree_aux.get(key)
+            if acc is None:
+                acc = [torch.zeros_like(
+                    p, device="cpu", dtype=torch.float32)
+                    for p in self._cstr_scope_params]
+                self._cstr_tree_aux[key] = acc
+            for _k2, gg in enumerate(gs):
+                if gg is not None:
+                    acc[_k2].add_(gg.detach().float().cpu())
 
     def _cstr_group_close(self, group_k, group_start):
         """Reviewer-formulation group-end projection, memory-layered:

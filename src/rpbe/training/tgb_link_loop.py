@@ -1105,17 +1105,21 @@ class TGBPairLinkLoop:
                 if viol_max <= 1e-6:
                     break
             if zero_slack and viol_max > 1e-6 and viol_max < 1e-3:
-                # κ=0 feasible refinement (Cimmino, primal space): the dual
-                # FISTA stalls at viol≈1.1e-6 no matter the budget (4× = 7.8%
-                # gain) or the λ precision (fp64 100k steps = noise) — at zero
-                # slack there is NO strictly feasible point (any d keeps some
-                # cos ≤ 0), so the dual objective is flat/unbounded along
-                # null(K) and λ drifts without improving d.  Refine in primal
-                # space instead, projecting onto the half-space cone:
+                # κ=0 feasible refinement (Cimmino, primal space).  The dual
+                # FISTA stalls at viol≈1.1e-6 regardless of budget (4× = 7.8%
+                # gain) or λ precision (fp64 100k steps = noise) — this
+                # STRONGLY SUGGESTS dual degeneracy/ill-conditioning near
+                # κ=0, though it does not by itself prove absence of a
+                # strictly feasible point.  Refine in primal space instead,
+                # projecting onto the half-space cone:
                 #     d ← d − (α/N_v)·Σ_{j: h_j·d<0} (h_j·d)·h_j
                 # Same QP (objective / constraints / 1e-6 tolerance
-                # unchanged); from the near-optimal FISTA iterate the drift
-                # is ~1e-4·‖t‖, a second-order effect on the objective.
+                # unchanged).  Acceptance telemetry: viol_max, the primal
+                # drift ‖d_post−d_pre‖/‖t‖ and the objective degradation
+                # J(d_post)−J(d_pre) — the refinement must be a small
+                # feasibility polish, NOT a move to a distant feasible point.
+                d_pre = d.detach().clone()
+                j_pre = 0.5 * float((d_pre - t_g).double().norm().pow(2))
                 d_p = d
                 n_refine = 0
                 for _ in range(500):
@@ -1130,6 +1134,11 @@ class TGBPairLinkLoop:
                     viol_max = float((-cj[bad]).max().item()) / (nt + 1e-30)
                     if viol_max <= 1e-6:
                         break
+                j_post = 0.5 * float((d_p - t_g).double().norm().pow(2))
+                drift = float((d_p - d_pre).double().norm()) / (nt + 1e-30)
+                print("[rpbe-k0refine] viol=%.3e drift=%.3e dJ=%+.3e iters=%d"
+                      % (viol_max, drift, j_post - j_pre, n_refine),
+                      flush=True)
                 d = d_p
                 n_iter += n_refine
             return d, viol_max, int((lam > 1e-9).sum().item()), \

@@ -330,10 +330,10 @@ class JodieNodeClassificationLoop:
         chunk = 8
         for cs in range(0, M, chunk):
             ce = min(M, cs + chunk)
-            q_t = torch.stack(qs[cs:ce])                    # [C]
+            q_list = qs[cs:ce]                              # C scalars
             retain = (ce < M)
             gs = torch.autograd.grad(
-                q_t, self._cstr_scope_params,
+                q_list, self._cstr_scope_params,
                 retain_graph=retain, allow_unused=True,
                 is_grads_batched=True)
             for k, p in enumerate(self._cstr_scope_params):

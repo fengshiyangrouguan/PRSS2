@@ -150,19 +150,28 @@ class UciTGNAdapter(nn.Module):
         # ---- propagate trace paths one level down (recursive closure fix:
         # layer-1 cuts were never produced because the recursion passed an
         # EMPTY path dict; build the per-neighbor path map so every internal
-        # compressible interface yields its cut records) ----
+        # compressible interface yields its cut records).  Per-root SLOT
+        # SAMPLING (same k = trace_pairs_per_parent as the pair tracing)
+        # keeps the layer-1 record count at the same scale as layer-2 — an
+        # all-neighbor map explodes the feasibility derangement. ----
         lower_paths = {}
         if self._trace is not None and 0 < layer - 1 < int(
                 self._trace_n_layers()):
             for prow, path in trace_paths.items():
-                for slot in range(n_neighbors):
+                nonpad = [s for s in range(n_neighbors)
+                          if int(neighbors[prow, s]) != 0]
+                if not nonpad:
+                    continue
+                rng = np.random.RandomState(
+                    ((self._trace_batch * 1000003) ^ (int(prow) * 104729)
+                     ^ (int(layer) * 1543)) & 0xFFFFFFFF)
+                k = min(self.trace_pairs_per_parent, len(nonpad))
+                slots = [nonpad[i] for i in
+                         rng.choice(len(nonpad), size=k, replace=False)]
+                for slot in slots:
                     nidx = int(prow) * n_neighbors + slot
-                    if nidx >= len(flat_neighbors):
-                        continue
-                    if int(flat_neighbors[nidx]) == 0:
-                        continue
-                    lag = (float(edge_deltas.flatten()[nidx])
-                           if nidx < len(edge_deltas.flatten()) else 0.0)
+                    lag = (float(edge_deltas[int(prow), slot])
+                           if int(prow) < edge_deltas.shape[0] else 0.0)
                     lower_paths[nidx] = list(path) + [(NEIGHBOR_REL, lag)]
         neighbor_lower, neighbor_u = self._compute(
             memory, flat_neighbors, repeated_times, layer - 1, n_neighbors,

@@ -32,6 +32,11 @@ run_one() {
   echo "DONE $abl s$seed rc=$? $(date '+%H:%M:%S')" >> "$ROOT/run_abl_G4.log"
 }
 
+# 补跑：修复前（supervised 树数门禁 raise）崩溃的 s0 格；run_one 自带
+# SKIP 幂等保护，已完成的格不会重跑。
+run_one P1 0 --config P1 --rpbe-constrain --rpbe-constrain-mode treewise --rpbe-kappa 0.05
+run_one P2 0 --config P2 --rpbe-constrain --rpbe-constrain-mode treewise --rpbe-kappa 0.05
+
 for s in 0 1 2; do
   run_one P1 "$s" --config P1 --rpbe-constrain --rpbe-constrain-mode treewise --rpbe-kappa 0.05
   run_one P2 "$s" --config P2 --rpbe-constrain --rpbe-constrain-mode treewise --rpbe-kappa 0.05

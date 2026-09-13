@@ -88,7 +88,8 @@ class JodieNodeClassificationLoop:
                  trace_roots=8, trace_mode="evenly_spaced",
                  train_eval_auc=False, grad_diag=None,
                  kf_estimator="exact_replay",
-                 kf_fail_below_threshold=False):
+                 kf_fail_below_threshold=False,
+                 rpbe_constrain=False, rpbe_kappa=0.05):
         self.tgn = tgn
         self.decoder = decoder
         # Representation parameters (host + compressor, everything that can
@@ -108,6 +109,27 @@ class JodieNodeClassificationLoop:
         self.repr_params = (list(repr_optimizer.param_groups[0]["params"])
                             if self.repr_train_on else [])
         self.head_params = list(head_optimizer.param_groups[0]["params"])
+        # Constrained RPBE (reviewer formulation, 2026-09-13): per-tree
+        # RPBE directions stay SEPARATE and the group-end projection solves
+        #   min_d 1/2||d - t||^2  s.t.  h_j^T d >= -kappa ||t||
+        # with ROW-NORMALIZED rows h_j = g_j/||g_j|| (cosine Gram), a
+        # FISTA budget ladder (certificate escalation), and a hard gate:
+        # when the certificate still fails the representation step is
+        # SKIPPED for that group (no constrained update is executed).
+        # This is a PRE-OPTIMIZER gradient-space projection (the paper
+        # wording must say so; Adam still reshapes the actual displacement).
+        # Scope: compressor (Gamma) parameters only — every other repr
+        # param keeps the plain task gradient.
+        self.rpbe_constrain = bool(rpbe_constrain)
+        self.rpbe_kappa = float(rpbe_kappa)
+        self._cstr_scope_params = []   # compressor params (the scope)
+        self._cstr_scope_task = None   # aggregate task grad accumulators
+        self._cstr_scope_snap = None   # per-batch task-grad snapshots
+        self._cstr_tree_aux = {}       # (tree_id, tau) -> [grad per scope p]
+        self._cstr_groups = 0
+        self._cstr_active = 0
+        self._cstr_skips = 0
+        self._cstr_corr_ratios = []
         self.device = device
         self.batch_size = int(batch_size)
         self.n_neighbors = int(n_neighbors)
@@ -259,6 +281,177 @@ class JodieNodeClassificationLoop:
             return 1.0
         return float(d)
 
+    def _cstr_accum_scope_task(self):
+        """Accumulate the per-batch task gradient on the correction scope.
+
+        repr grads are zeroed once per group, so ``p.grad`` is the running
+        total — accumulate the DELTA against the previous snapshot (the
+        running total would triangularly reweight earlier batches).
+        """
+        if self._cstr_scope_task is None:
+            self._cstr_scope_task = [
+                torch.zeros_like(p, device=self.device)
+                for p in self._cstr_scope_params]
+            self._cstr_scope_snap = [None] * len(self._cstr_scope_params)
+        for k, p in enumerate(self._cstr_scope_params):
+            g = p.grad
+            if g is None:
+                self._cstr_scope_snap[k] = None
+                continue
+            prev = self._cstr_scope_snap[k]
+            if prev is None:
+                self._cstr_scope_task[k].add_(g)
+            else:
+                self._cstr_scope_task[k].add_(g - prev)
+            self._cstr_scope_snap[k] = g.detach().clone()
+
+    def _cstr_accum_tree_dirs(self, term_keys, term_pieces):
+        """One VJP per (tree, tau): keep the RPBE directions SEPARATE.
+
+        The raw surrogate pieces are 0-valued; each per-tree sub-sum keeps
+        the adjoint direction in its graph, and ``autograd.grad`` extracts
+        the per-tree scope gradient.  The auxiliary coefficient is
+        ``-lambda * group_k`` (negative), so each sub-sum is NEGATED to
+        live in the same sign convention as the aggregate aux gradient —
+        the QP is scale-invariant in ||g_j||, only the sign matters.
+        """
+        by_tree: Dict[tuple, list] = {}
+        for k, key in enumerate(term_keys):
+            by_tree.setdefault(key, []).append(k)
+        for key, idxs in by_tree.items():
+            sub = term_pieces[idxs[0]]
+            for _j in idxs[1:]:
+                sub = sub + term_pieces[_j]
+            sub = -sub
+            gs = torch.autograd.grad(
+                sub, self._cstr_scope_params,
+                retain_graph=True, allow_unused=True)
+            acc = self._cstr_tree_aux.get(key)
+            if acc is None:
+                acc = [torch.zeros_like(p, device=self.device)
+                       for p in self._cstr_scope_params]
+                self._cstr_tree_aux[key] = acc
+            for _k2, gg in enumerate(gs):
+                if gg is not None:
+                    acc[_k2].add_(gg)
+
+    def _cstr_group_close(self, group_k, group_start):
+        """Reviewer-formulation group-end projection with ROW-NORMALIZED
+        rows, a FISTA budget ladder, and a hard feasibility certificate.
+
+            min_d 1/2||d - t||^2  s.t.  h_j^T d >= -kappa ||t||,
+            h_j = g_j / ||g_j||          (cosine Gram — row normalization)
+
+        t is the aggregate task gradient on the SCOPE (compressor).  When
+        the certificate still fails after the budget ladder the method
+        returns False and the caller SKIPS the representation step.
+        Returns True when the projected d was written back.
+        """
+        dev = self.device
+        scope = self._cstr_scope_params
+        self._cstr_groups += 1
+        if self._cstr_scope_task is None:
+            # degenerate: no task gradients accumulated — fall through to
+            # the ordinary (task-only) step
+            self._cstr_reset_group_state()
+            return True
+        t = torch.cat([a.reshape(-1).float()
+                       for a in self._cstr_scope_task])
+        nt = float(t.norm())
+        keys = sorted(self._cstr_tree_aux.keys())
+        if not keys or nt <= 1e-12:
+            self._cstr_reset_group_state()
+            return True
+        A = torch.stack([torch.cat([a.reshape(-1).float()
+                                    for a in self._cstr_tree_aux[k]])
+                         for k in keys])                    # [N, P]
+        gn = A.norm(dim=1)
+        keep = gn > 1e-12
+        A = A[keep]
+        gn = gn[keep]
+        if int(A.shape[0]) == 0:
+            self._cstr_reset_group_state()
+            return True
+        # row normalization (reviewer item): the QP becomes the cosine
+        # Gram problem and the solver condition number no longer depends
+        # on the per-tree row norms.
+        H = A / gn[:, None]                                  # [N, P]
+        cos = (H @ t) / nt                                   # [N]
+        c_np = cos.detach().cpu().numpy()
+        b = -self.rpbe_kappa * nt * torch.ones_like(gn)      # [N]
+        K = H @ H.t()                                        # cosine Gram
+        cvec = b - (H @ t)
+        N = int(H.shape[0])
+        lam = torch.zeros(N, device=dev)
+        with torch.no_grad():
+            v = torch.randn(N, device=dev)
+            v = v / (v.norm() + 1e-30)
+            lam_max = 1.0
+            for _ in range(30):
+                v = K @ v
+                nv = float(v.norm())
+                if nv <= 1e-30:
+                    break
+                v = v / nv
+                lam_max = nv
+        eta = 1.0 / (lam_max + 1e-12)
+        d = None
+        viol_max = float("inf")
+        # ---- budget ladder: 2000 -> 8000 -> 32000 FISTA iterations ----
+        for budget in (2000, 8000, 32000):
+            y = lam
+            tk = 1.0
+            for _ in range(budget):
+                lam_new = torch.clamp(y + eta * (cvec - K @ y), min=0.0)
+                tk_new = 0.5 * (1.0 + math.sqrt(1.0 + 4.0 * tk * tk))
+                y = lam_new + ((tk - 1.0) / tk_new) * (lam_new - lam)
+                lam = lam_new
+                tk = tk_new
+            corr = H.t() @ lam
+            d = t + corr
+            viol = b - (H @ d)                               # >0 = violated
+            rel = viol / (nt + 1e-30)
+            viol_max = float(rel.max()) if rel.numel() else 0.0
+            if viol_max <= 1e-6:
+                break
+        active = int((lam > 1e-9).sum().item())
+        if viol_max > 1e-6:
+            # certificate FAILED after the full ladder: skip the
+            # constrained update for this group (reviewer requirement).
+            self._cstr_skips += 1
+            print("[wiki-rpbe-cstr] group=%d CERT_FAIL max_viol=%.3e "
+                  "skipping repr step" % (group_start // group_k,
+                                          viol_max), flush=True)
+            self._cstr_reset_group_state()
+            return False
+        # ---- write back: scope gets d, other repr params keep task grad --
+        off = 0
+        for p in scope:
+            n = int(p.numel())
+            if p.grad is None:
+                p.grad = torch.zeros_like(p, device=dev)
+            p.grad.copy_(d[off:off + n].reshape(p.shape).to(p.dtype))
+            off += n
+        if active > 0:
+            self._cstr_active += 1
+            self._cstr_corr_ratios.append(
+                float((d - t).norm()) / (nt + 1e-30))
+        print("[wiki-rpbe-cstr] group=%d N=%d cos_mean=%.3f "
+              "frac_below=%.3f active=%d max_viol=%.2e corr/task=%.3f"
+              % (group_start // group_k, N,
+                 float(np.mean(c_np)),
+                 float(np.mean(c_np < -self.rpbe_kappa)),
+                 active, viol_max,
+                 float((d - t).norm()) / (nt + 1e-30)), flush=True)
+        self._cstr_reset_group_state()
+        return True
+
+    def _cstr_reset_group_state(self):
+        """Clear the per-group accumulators (called at every group close)."""
+        self._cstr_scope_task = None
+        self._cstr_scope_snap = None
+        self._cstr_tree_aux = {}
+
     def _close_repr_group(self, group_batch_count: int, global_step: int,
                           new_ref_j: dict, param_version: int, stats: dict):
         """Close one macro group: build the next KF reference (KF path),
@@ -365,9 +558,13 @@ class JodieNodeClassificationLoop:
         (n_planned, n_matched)).
         """
         z_by_oid = {}
+        tree_by_oid = {}
         for cut in cuts:
-            z_by_oid[(cut.tau, cut.occurrence_id)] = cut.z
+            key = (cut.tau, cut.occurrence_id)
+            z_by_oid[key] = cut.z
+            tree_by_oid[key] = int(cut.tree_id)
         terms = []
+        term_keys = []
         n_terms = 0
         n_planned = 0
         for tau, plan in replay_plan.items():
@@ -382,11 +579,13 @@ class JodieNodeClassificationLoop:
                 gd = g.detach()
                 terms.append(self._tau_coeff[tau] * (
                     (gd * z).sum() - (gd * z.detach()).sum()))
+                term_keys.append((tree_by_oid[(tau, oid)], tau))
                 n_terms += 1
         if not terms:
-            return torch.zeros((), device=self.device), 0, (n_planned, 0)
+            return (torch.zeros((), device=self.device), 0,
+                    (n_planned, 0), [], [])
         auxiliary = -self.lambda_kf * float(group_k) * sum(terms)
-        return auxiliary, n_terms, (n_planned, n_terms)
+        return auxiliary, n_terms, (n_planned, n_terms), term_keys, terms
 
     def _train_epoch_exact_replay(self, epoch: int, global_step: int,
                                   train: object, max_batches: int = None
@@ -499,6 +698,11 @@ class JodieNodeClassificationLoop:
             self._restore_group_state(state)
             # ---------------- pass 2: train, exact surrogate ----------
             self.repr_optimizer.zero_grad(set_to_none=True)
+            if self.rpbe_constrain and not self._cstr_scope_params:
+                comp = getattr(self.adapter, "compressor", None)
+                if comp is not None:
+                    self._cstr_scope_params = [
+                        p for p in comp.parameters() if p.requires_grad]
             for b in range(group_start, group_end):
                 self.head_optimizer.zero_grad(set_to_none=True)
                 prediction, cuts, labels_np = _run_one_pass(
@@ -508,31 +712,49 @@ class JodieNodeClassificationLoop:
                     self.device)
                 task_loss = F.binary_cross_entropy(prediction, labels_t)
                 auxiliary = torch.zeros((), device=self.device)
+                term_keys = []
                 aligned_planned = 0
                 aligned_matched = 0
                 if cuts and closed:
                     (auxiliary, n_terms,
-                     (aligned_planned, aligned_matched)) = \
+                     (aligned_planned, aligned_matched),
+                     term_keys, term_pieces) = \
                         self._batch_surrogate_exact(
                             cuts, replay_plan, group_k, b - group_start)
                     if n_terms:
                         aux_batches += 1
-                # Per-batch gradient diagnostics (the sprint script),
-                # same hook as the single-pass path: r_eff =
-                # |grad(aux)| / |grad(task)| carries lambda and the rank
-                # coefficients already.
-                if self._grad_diag_fn is not None and self.kf_on \
-                        and auxiliary.requires_grad and self.repr_params:
-                    row = self._grad_diag_fn(
-                        self, task_loss, auxiliary, global_step)
-                    self.grad_diag["rows"].append(row)
-                loss = task_loss + auxiliary
-                self.monitor.validate_losses({
-                    "task": float(task_loss.detach()),
-                    "kf_score": total_raw,
-                    "main_total": float(loss.detach()),
-                }, global_step)
-                loss.backward()
+                else:
+                    term_pieces = []
+                if self.rpbe_constrain and self._cstr_scope_params:
+                    # Constrained RPBE: separate the two components.
+                    # task backward first (retain the graph for the
+                    # per-tree VJPs below), accumulate the SCOPE task
+                    # gradient by batch delta, then one VJP per
+                    # (tree, tau) on the raw surrogate pieces (the
+                    # surrogate is 0-valued; only its graph matters).
+                    # The auxiliary's aggregate backward is NOT needed —
+                    # per-tree directions come from autograd.grad.
+                    task_loss.backward(retain_graph=True)
+                    self._cstr_accum_scope_task()
+                    if term_keys:
+                        self._cstr_accum_tree_dirs(term_keys, term_pieces)
+                else:
+                    # Per-batch gradient diagnostics (the sprint script),
+                    # same hook as the single-pass path: r_eff =
+                    # |grad(aux)| / |grad(task)| carries lambda and the
+                    # rank coefficients already.
+                    if self._grad_diag_fn is not None and self.kf_on \
+                            and auxiliary.requires_grad and self.repr_params:
+                        row = self._grad_diag_fn(
+                            self, task_loss, auxiliary, global_step)
+                        self.grad_diag["rows"].append(row)
+                    loss = task_loss + auxiliary
+                    self.monitor.validate_losses({
+                        "task": float(task_loss.detach()),
+                        "kf_score": total_raw,
+                        "main_total": float(loss.detach()),
+                    }, global_step)
+                    loss.backward()
                 self._clip(self.head_params)
                 self.head_optimizer.step()
                 if self.tgn.use_memory and \
@@ -545,6 +767,13 @@ class JodieNodeClassificationLoop:
                 train_labels.append(labels_np)
                 global_step += 1
             # ---------------- group close: one repr step ---------------
+            if self.rpbe_constrain and self._cstr_scope_params:
+                if not self._cstr_group_close(group_k, group_start):
+                    # certificate failed after escalation: SKIP the
+                    # representation step for this group (no constrained
+                    # update is executed; the next group starts fresh).
+                    group_start = group_end
+                    continue
             for p in self.repr_params:
                 if p.grad is not None:
                     p.grad.div_(float(max(1, group_k)))

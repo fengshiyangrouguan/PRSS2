@@ -128,6 +128,18 @@ def parse_args():
                    help="abort the run if any macro group closes a window "
                         "below the KF tree threshold (fail-fast for the "
                         "structural ablations; default off)")
+    p.add_argument("--rpbe-constrain", action="store_true",
+                   help="reviewer-formulation constrained RPBE: per-tree "
+                        "RPBE directions stay separate and the group-end "
+                        "projection solves min 1/2||d-t||^2 s.t. "
+                        "h_j^T d >= -kappa||t|| with ROW-NORMALIZED rows "
+                        "(cosine Gram), a FISTA budget ladder and a hard "
+                        "feasibility certificate; on certificate failure "
+                        "the representation step is SKIPPED.  "
+                        "Pre-optimizer gradient-space projection "
+                        "(scope = compressor/Gamma only).")
+    p.add_argument("--rpbe-kappa", type=float, default=0.05,
+                   help="dimensionless margin for --rpbe-constrain")
     p.add_argument("--ridge-eps", type=float, default=1e-4)
     p.add_argument("--rpbe-seed", type=int, default=0)
     p.add_argument("--trace-roots", type=int, default=32)
@@ -398,7 +410,9 @@ def main():
         trace_mode=args.trace_mode,
         train_eval_auc=args.train_eval_auc,
         kf_estimator=args.kf_estimator,
-        kf_fail_below_threshold=args.kf_fail_below_threshold)
+        kf_fail_below_threshold=args.kf_fail_below_threshold,
+        rpbe_constrain=args.rpbe_constrain,
+        rpbe_kappa=args.rpbe_kappa)
 
     save_json(out / "config.json", {
         "data": args.data,

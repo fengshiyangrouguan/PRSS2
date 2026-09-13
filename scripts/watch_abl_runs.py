@@ -25,7 +25,7 @@ except Exception:
 
 POLL = int(os.environ.get("POLL_SEC", "300"))
 HOST = "connect.weste.seetacloud.com"
-GROUPS = [("A1", 35360), ("A2A6", 17127), ("A3A7", 26389)]
+GROUPS = [("G1", 26389), ("G2", 17127), ("G3", 21954), ("G4", 35360)]
 SSH = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10",
        "-o", "StrictHostKeyChecking=no", "-o", "LogLevel=ERROR"]
 

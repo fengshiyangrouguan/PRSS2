@@ -330,11 +330,16 @@ class JodieNodeClassificationLoop:
         chunk = 8
         for cs in range(0, M, chunk):
             ce = min(M, cs + chunk)
-            q_t = torch.stack(qs[cs:ce])                    # [C]
+            C = ce - cs
+            q_list = qs[cs:ce]                              # C scalar outs
             retain = (ce < M)
+            # is_grads_batched semantics: every output is a scalar and its
+            # grad_output is a [C] batch vector; unit rows select the
+            # diagonal, so result row b == VJP of scalar b.
+            eye = torch.eye(C, device=self.device)
             gs = torch.autograd.grad(
-                q_t, self._cstr_scope_params,
-                grad_outputs=[torch.ones_like(q_t)],
+                q_list, self._cstr_scope_params,
+                grad_outputs=[eye[i] for i in range(C)],
                 retain_graph=retain, allow_unused=True,
                 is_grads_batched=True)
             for k, p in enumerate(self._cstr_scope_params):

@@ -105,21 +105,32 @@ def feasible_positions(records: List[BoundaryRecord], *,
                        n_tbins: int = 16):
     """Positions of records that survive the mispaired feasibility drop.
 
-    Used by ALL arms so the surviving candidate set is identical.
+    Used by ALL arms so the surviving candidate set is identical.  Bucketing
+    is done PER TAU (recursive-closure fix): mixing layer1 and layer2 records
+    in the same time buckets lets one interface's records shift the
+    derangement feasibility of the other (layer1 joins -> layer2 unique-tree
+    counts dropped below the KF threshold).
     """
-    buckets = _bucket_records(records, n_tbins)
+    by_tau: Dict[str, List[int]] = {}
+    for i, r in enumerate(records):
+        by_tau.setdefault(r.tau, []).append(i)
     ok = set()
-    for bkey, idxs in buckets.items():
-        if len(idxs) < 2:
-            continue
-        times_from = [records[i].parent_time for i in idxs]
-        times_to = [records[i].parent_future.time for i in idxs]
-        bucket_seed = 0
-        for i in idxs:
-            bucket_seed = (bucket_seed * 31 + i) % (2 ** 31)
-        perm = _fixed_bipartite_derangement(
-            times_from, times_to,
-            ((seed * 104729) ^ int(batch_seed) ^ bucket_seed) & 0xFFFFFFFF)
-        if perm is not None:
-            ok.update(idxs)
+    for tau, tau_idxs in by_tau.items():
+        tau_recs = [records[i] for i in tau_idxs]
+        buckets = _bucket_records(tau_recs, n_tbins)
+        for bkey, bidxs in buckets.items():
+            if len(bidxs) < 2:
+                continue
+            orig_idxs = [tau_idxs[j] for j in bidxs]
+            times_from = [tau_recs[j].parent_time for j in bidxs]
+            times_to = [tau_recs[j].parent_future.time for j in bidxs]
+            bucket_seed = 0
+            for i in orig_idxs:
+                bucket_seed = (bucket_seed * 31 + i) % (2 ** 31)
+            perm = _fixed_bipartite_derangement(
+                times_from, times_to,
+                ((seed * 104729) ^ int(batch_seed) ^ bucket_seed)
+                & 0xFFFFFFFF)
+            if perm is not None:
+                ok.update(orig_idxs)
     return sorted(ok)

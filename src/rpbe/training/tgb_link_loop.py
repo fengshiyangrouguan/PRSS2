@@ -606,6 +606,14 @@ class TGBPairLinkLoop:
                     if j is None:
                         below += 1
                         continue
+                    # Fig 5(c) telemetry: estimation sample size under the
+                    # support cut (M_used_trees <= M_unique_trees).
+                    if self.window_diag and diag.get("M_used_trees") \
+                            is not None:
+                        self.window_diag[-1]["M_used_trees"] = \
+                            int(diag["M_used_trees"])
+                        self.window_diag[-1]["support_frac"] = \
+                            float(diag["support_frac"])
                     n_closed += 1
                     closed_tau[tau] = j
                     for pos_in_tau, g in g_pos.items():

@@ -147,9 +147,26 @@ class UciTGNAdapter(nn.Module):
         flat_neighbors = neighbors.reshape(-1)
         repeated_times = np.repeat(timestamps, n_neighbors)
 
+        # ---- propagate trace paths one level down (recursive closure fix:
+        # layer-1 cuts were never produced because the recursion passed an
+        # EMPTY path dict; build the per-neighbor path map so every internal
+        # compressible interface yields its cut records) ----
+        lower_paths = {}
+        if self._trace is not None and 0 < layer - 1 < int(
+                self._trace_n_layers()):
+            for prow, path in trace_paths.items():
+                for slot in range(n_neighbors):
+                    nidx = int(prow) * n_neighbors + slot
+                    if nidx >= len(flat_neighbors):
+                        continue
+                    if int(flat_neighbors[nidx]) == 0:
+                        continue
+                    lag = (float(edge_deltas[nidx])
+                           if nidx < len(edge_deltas) else 0.0)
+                    lower_paths[nidx] = list(path) + [(NEIGHBOR_REL, lag)]
         neighbor_lower, neighbor_u = self._compute(
             memory, flat_neighbors, repeated_times, layer - 1, n_neighbors,
-            {})
+            lower_paths)
         neighbor_lower = neighbor_lower.view(
             len(source_nodes), n_neighbors, -1)
         neighbor_u = (neighbor_u.view(len(source_nodes), n_neighbors, -1)

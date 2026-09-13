@@ -725,8 +725,12 @@ def main():
         skips_now = int(row.get("cstr_skips", cstr_skips_cum))
         skips_epoch = skips_now - cstr_skips_cum
         cstr_skips_cum = skips_now
-        assert raw_repr + skips_epoch == expected_repr, (
-            "cadence broken: repr_step {} + cert_skips {} != expected {} "
+        # kyfan arm: a CERT_FAIL skips the repr step, so raw_repr is short
+        # by one per skip; supervised arm (P1/P2): the repr still steps and
+        # only the projection is skipped, so raw_repr stays full.  Both
+        # satisfy |raw_repr - expected| <= cert_skips.
+        assert abs(raw_repr - expected_repr) <= skips_epoch, (
+            "cadence broken: repr_step {} + cert_skips {} vs expected {} "
             "(n_batches {}, group_batches {})".format(
                 raw_repr, skips_epoch, expected_repr, raw_nbatches,
                 args.kf_group_batches))

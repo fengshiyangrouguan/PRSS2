@@ -40,12 +40,18 @@ class PairKFWindow:
 
     def __init__(self, *, tau: str, eps: float = 1e-4,
                  min_unique_trees: int = 64, strict: bool = False,
-                 variant: str = "full_balancing"):
+                 variant: str = "full_balancing",
+                 support_frac: float = 1.0):
         self.tau = str(tau)
         self.eps = float(eps)
         self.min_unique_trees = int(min_unique_trees)
         self.strict = bool(strict)
         self.variant = str(variant)   # full_balancing / diagonal / unbalanced
+        # Fig 5(c): statistical-support cut.  The readiness gate still uses
+        # the FULL window (repr cadence unchanged); only the estimation
+        # sample shrinks.  Sampling is per TREE so every kept tree's
+        # per-tree weight (sum = 1) stays intact.
+        self.support_frac = float(support_frac)
         self.reset()
 
     def reset(self):
@@ -106,14 +112,45 @@ class PairKFWindow:
         return j
 
     # --------------------------------------------------------------- replay
-    def close_replay(self, maps):
+    def _subsample_trees(self, records: List, seed: int):
+        """Fig 5(c): keep a fixed-seed random subset of TREES.
+
+        Returns ``(subset, orig_pos)`` where ``orig_pos[i]`` is the subset
+        record's index in ``records`` (needed because the loop indexes
+        adjoints by position in its own full record list).  ``seed`` must
+        vary per window (the loop passes group_start-derived values) so
+        different windows draw different subsets; the readiness gate above
+        used the full window, so this only shrinks the estimation sample
+        (statistical support), never the cadence.
+        """
+        n = len(records)
+        if self.support_frac >= 1.0 - 1e-9:
+            return records, list(range(n))
+        order: List[int] = []
+        seen = set()
+        for i, r in enumerate(records):
+            t = int(r.root_row)
+            if t not in seen:
+                seen.add(t)
+                order.append(t)
+        rng = np.random.RandomState((int(seed) * 1000003) & 0xFFFFFFFF)
+        n_keep = max(1, int(round(len(order) * self.support_frac)))
+        keep = set(rng.choice(order, size=n_keep, replace=False).tolist())
+        out, pos = [], []
+        for i, r in enumerate(records):
+            if int(r.root_row) in keep:
+                out.append(r)
+                pos.append(i)
+        return out, pos
+
+    def close_replay(self, maps, *, support_seed: int = 0):
         """Contract onto per-record z adjoints for the exact-replay pass 2.
 
         Returns ``(closed_score, g_by_position, diag)`` where
         ``g_by_position`` maps a record's position in ``_records`` to its
         merged z gradient tensor.
         """
-        records = self._records
+        records, orig_pos = self._subsample_trees(self._records, support_seed)
         if len(records) == 0:
             return None, {}, {"below_threshold": False, "M": 0}
         if not self.ready():
@@ -149,9 +186,11 @@ class PairKFWindow:
         for i, r in enumerate(records):
             g = g_by_cut.get(r.boundary_key)
             if g is not None:
-                g_by_position[i] = g
+                g_by_position[orig_pos[i]] = g
         return float(j), g_by_position, {
             "M_unique_trees": len(self._tree_seen),
+            "M_used_trees": len({int(r.root_row) for r in records}),
+            "support_frac": self.support_frac,
             "below_threshold": False}
 
     def surrogate(self, position_grads: Dict[int, torch.Tensor],

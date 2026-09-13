@@ -185,6 +185,15 @@ def parse_args():
     p.add_argument("--trace-pairs-per-parent", type=int, default=2)
     p.add_argument("--kf-group-batches", type=int, default=56)
     p.add_argument("--kf-min-trees", type=int, default=896)
+    p.add_argument("--kf-support-frac", type=float, default=1.0,
+                   help="Fig 5(c): fraction of window TREES kept for the "
+                        "Ky Fan estimate (1.0 = full support, production "
+                        "path unchanged).")
+    p.add_argument("--node-dim", type=int, default=None,
+                   help="Fig 5(b): host state dimension (compression "
+                        "budget). Node features are fixed-PCA projected "
+                        "from the raw 172 dims; None = raw features "
+                        "(production path).")
     p.add_argument("--lambda-kf", type=float, default=0.088)
     p.add_argument("--ridge-eps", type=float, default=1e-3)
     p.add_argument("--sketch-dim", type=int, default=64)
@@ -248,6 +257,34 @@ def build_model(args, device):
     ts = train.timestamps.astype(np.float64)
     ms, ss = float(ts.mean()), float(ts.std()) + 1e-8
 
+    # ---- Fig 5(b) compression budget: fixed deterministic PCA of the raw
+    # node features.  The raw dim (172 on UCI) is the uncompressed width
+    # d_u; the projected dim is the host state width d_z, so the panel's
+    # x-axis reads d_z / d_u.  d == raw dim is the identity point and passes
+    # the raw features bit-exact (production path unchanged).
+    raw_feats = ds.node_features.astype(np.float32)
+    pca_info = None
+    if args.node_dim is not None:
+        d = int(args.node_dim)
+        raw_dim = int(raw_feats.shape[1])
+        if d != raw_dim:
+            if not (1 <= d < raw_dim):
+                raise ValueError(
+                    "node-dim {} must be in [1, {})".format(d, raw_dim))
+            mu = raw_feats.mean(axis=0, keepdims=True)
+            _, _, vt = np.linalg.svd(raw_feats - mu, full_matrices=False)
+            w = np.ascontiguousarray(vt[:d].T)      # [raw_dim, d]
+            raw_feats = np.ascontiguousarray(
+                (raw_feats - mu) @ w, dtype=np.float32)
+            pca_info = {"raw_dim": raw_dim, "node_dim": d,
+                        "mean_norm": float(np.linalg.norm(mu)),
+                        "w_norm": float(np.linalg.norm(w)),
+                        "kept_energy": float(
+                            (vt[:d] ** 2).sum() / max((vt ** 2).sum(), 1e-30))}
+        else:
+            pca_info = {"raw_dim": raw_dim, "node_dim": d, "identity": True}
+    node_dim = int(raw_feats.shape[1])
+
     # BenchTemp official TGN.  memory_update_at_start=True is the official /
     # main-lineage protocol: the memory GRU update is in the loss path (so the
     # cross-batch memory is actually learnable), versus end-mode where the
@@ -262,7 +299,7 @@ def build_model(args, device):
     assert args.n_layers >= 2, "host needs n_layers >= 2 for Gamma"
     tgn = TGN(
         neighbor_finder=finder,
-        node_features=ds.node_features.astype(np.float32),
+        node_features=raw_feats,
         edge_features=ds.edge_features.astype(np.float32),
         device=device,
         n_layers=args.n_layers,
@@ -270,7 +307,7 @@ def build_model(args, device):
         dropout=0.1,
         use_memory=True,
         message_dimension=100,
-        memory_dimension=172,
+        memory_dimension=node_dim,
         memory_update_at_start=True,
         embedding_module_type="graph_attention",
         message_function="identity",
@@ -369,6 +406,7 @@ def build_model(args, device):
                 link_future_index=link_future_index,
                 edge_table=ds.edge_features,
                 full_finder=full_finder,
+                node_dim=node_dim, pca_info=pca_info,
                 opt_split={"n_head": len(head_params),
                            "n_repr": len(repr_params),
                            "head_lr": args.lr, "repr_lr": repr_lr,
@@ -513,6 +551,7 @@ def main():
         trace_pairs_per_parent=args.trace_pairs_per_parent,
         kf_group_batches=args.kf_group_batches,
         kf_min_trees=args.kf_min_trees,
+        kf_support_frac=args.kf_support_frac,
         fail_below=args.kf_fail_below,
         audit_trace=True,
         aux_prefix_groups=aux_prefix, group_plan_sha=plan_sha,
@@ -542,6 +581,9 @@ def main():
         "lambda_kf": args.lambda_kf, "aux_lambda": aux_lambda,
         "kf_group_batches": args.kf_group_batches,
         "kf_min_trees": args.kf_min_trees,
+        "kf_support_frac": args.kf_support_frac,
+        "node_dim": c.get("node_dim"),
+        "pca": c.get("pca_info"),
         "group_plan_sha": plan_sha,
         "maps_sha": c["boundary_maps"].isolation_fingerprint()["sha256"],
         "opt_split": c["opt_split"], "cli": vars(args)})

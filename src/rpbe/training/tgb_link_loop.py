@@ -1058,7 +1058,9 @@ class TGBPairLinkLoop:
         ladder = ((2000, 8000, 32000, 128000, 512000) if zero_slack
                   else (2000, 8000, 32000))
         max_rounds = 12 if zero_slack else 3
-        add_batch = 64 if zero_slack else 1
+        # κ=0: add EVERY violating row each round (the dense regime re-exposes
+        # hundreds of rows per round — a fixed +64 simply never catches up)
+        add_batch = 1 << 30 if zero_slack else 1
 
         def _solve_active(active_keys):
             A = torch.stack([_row(k) for k in active_keys]).to(dev)
@@ -1137,6 +1139,8 @@ class TGBPairLinkLoop:
                         hits.append((float(viol[bi]), cs + bi))
             if not hits:
                 viol_max = 0.0
+                solve_trace[-1]["n_hits"] = 0
+                solve_trace[-1]["n_added"] = 0
                 break
             # worst first; stable sort keeps the earlier row on ties (same
             # pick as the legacy argmax scan when add_batch == 1)
@@ -1148,6 +1152,9 @@ class TGBPairLinkLoop:
                     continue
                 active_keys.append(new_key)
                 added += 1
+            solve_trace[-1]["n_hits"] = len(hits)
+            solve_trace[-1]["n_added"] = added
+            solve_trace[-1]["worst_viol"] = hits[0][0]
             if added == 0:
                 # the worst violating rows are ALREADY in the active set and
                 # the subsolver still cannot certify on it -> further rounds

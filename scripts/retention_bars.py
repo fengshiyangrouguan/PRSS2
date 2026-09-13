@@ -197,11 +197,12 @@ def main():
             Line2D([0], [0], color=c_ours, ls="-", marker="o", ms=4,
                    label="ours")],
             fontsize=8, loc="upper right", frameon=False)
-    axes[0].set_ylabel("fraction of the source predictive signal retained\n"
-                       "(normalized to the source, R$_0$ = 1)", fontsize=9)
+    axes[0].set_ylabel("fraction of the source predictive signal\n"
+                       "retained (normalized to the source, R$_0$ = 1)",
+                       fontsize=9)
     fig.suptitle("Predictive signal retention through recursive compression",
                  fontsize=11)
-    fig.tight_layout(rect=(0, 0, 1, 0.93))
+    fig.tight_layout(rect=(0, 0, 1, 0.91))
     fig.savefig(args.out, dpi=150)
     print("wrote", args.out, flush=True)
 

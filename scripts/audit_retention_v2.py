@@ -689,7 +689,6 @@ def main():
                 "nodes": nodes,
                 "pos_cand": {k: F[k]["dpos"] for k in F},
                 "neg_cand": {k: F[k]["dneg"] for k in F},
-                "order_bits": {k: F[k]["bit"] for k in F},
                 "pos_future_event_id": {k: F[k]["eid"] for k in F},
                 "candidate_seed": {k: F[k]["candidate_seed"] for k in F},
                 "presented": {k: F[k]["presented"] for k in F},

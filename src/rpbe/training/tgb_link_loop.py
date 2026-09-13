@@ -793,6 +793,10 @@ class TGBPairLinkLoop:
             "global_step": global_step,
             "task_step": global_step,
             "repr_step": repr_step,
+            # cumulative hard-certificate failures (repr step skipped BY
+            # DESIGN); the cadence invariant in the trainer is
+            #     repr_step + cert_skips == n_batches // group_batches
+            "cstr_skips": self._cstr_skips,
             "closed_window_step": n_closed,   # real closed windows (>= kf arms)
             "aux_terms": aux_terms_total,
             "aux_comp_grad_norm": gsum["aux_comp_grad_norm"],

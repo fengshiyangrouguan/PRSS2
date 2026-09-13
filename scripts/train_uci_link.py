@@ -654,6 +654,7 @@ def main():
     budget = args.epochs if args.epochs > 0 else args.budget_cap
     extended = False
     stop_reason = "budget"
+    cstr_skips_cum = 0   # cumulative CERT_FAIL count (loop-side, monotone)
 
     epoch = start_epoch
     while epoch < budget:
@@ -675,10 +676,17 @@ def main():
         assert raw_task == raw_nbatches, (
             "cadence broken: task_step delta {} != n_batches {}".format(
                 raw_task, raw_nbatches))
-        assert raw_repr == expected_repr, (
-            "cadence broken: repr_step {} != expected {} (n_batches {}, "
-            "group_batches {})".format(
-                raw_repr, expected_repr, raw_nbatches,
+        # A CERT_FAIL is a LEGITIMATE algorithm path (reviewer requirement:
+        # no constrained update runs when the hard certificate fails), and it
+        # skips the repr step BY DESIGN.  The invariant is therefore
+        #     repr_step + cert_skips == expected_repr
+        skips_now = int(row.get("cstr_skips", cstr_skips_cum))
+        skips_epoch = skips_now - cstr_skips_cum
+        cstr_skips_cum = skips_now
+        assert raw_repr + skips_epoch == expected_repr, (
+            "cadence broken: repr_step {} + cert_skips {} != expected {} "
+            "(n_batches {}, group_batches {})".format(
+                raw_repr, skips_epoch, expected_repr, raw_nbatches,
                 args.kf_group_batches))
         if epoch == 0 and not args.no_memory:
             assert mem_grad > 0.0, (

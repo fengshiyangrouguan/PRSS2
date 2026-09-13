@@ -896,8 +896,10 @@ class TGBPairLinkLoop:
                 retain_graph=True, allow_unused=True)
             acc = self._cstr_tree_aux.get(key)
             if acc is None:
-                acc = [torch.zeros_like(p, device=self.device)
-                       for p in self._cstr_scope_params]
+                # CPU row bank (memory-layered): never on the GPU
+                acc = [torch.zeros_like(
+                    p, device="cpu", dtype=torch.float32)
+                    for p in self._cstr_scope_params]
                 self._cstr_tree_aux[key] = acc
             for _k2, gg in enumerate(gs):
                 if gg is not None:

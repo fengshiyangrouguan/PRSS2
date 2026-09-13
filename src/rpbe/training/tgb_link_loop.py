@@ -193,6 +193,7 @@ class TGBPairLinkLoop:
         self._cstr_active = 0
         self._cstr_groups = 0
         self._cstr_corr_ratios = []
+        self._cstr_skips = 0      # hard-certificate failures (repr skipped)
         # --- tree-wise constrained RPBE (final spec) -----------------------
         # The aggregate projection flattens every tree/interface into ONE
         # half-space, so tree-level conflicts cancel (g_1 + g_2 ~ 0) and the
@@ -754,13 +755,21 @@ class TGBPairLinkLoop:
                          len(g_by_pos_all), _grp_recs, _grp_hits), flush=True)
             if self.repr_optimizer is not None and self.repr_params:
                 if self.rpbe_constrain and self._cstr_task_acc is not None:
+                    cert_ok = True
                     if self.rpbe_constrain_mode == "treewise":
-                        self._cstr_group_close_treewise(group_start)
+                        cert_ok = self._cstr_group_close_treewise(
+                            group_start)
                     elif self.rpbe_constrain_mode == "global":
                         self._cstr_group_close_aggregate(group_start)
                     else:  # additive (A6 control): plain task + beta*LPSE
                         self._cstr_group_close_additive(group_start)
                     self._cstr_reset()
+                    if not cert_ok:
+                        # hard certificate failed: SKIP the representation
+                        # step for this group (no constrained update runs).
+                        group_start = group_end
+                        gi += 1
+                        continue
                 for p in self.repr_params:
                     if p.grad is not None:
                         p.grad.div_(float(max(1, group_k)))
@@ -955,7 +964,7 @@ class TGBPairLinkLoop:
             self._cstr_last_diag = diag
             self._cstr_print_diag(group_start, diag)
             _write_task_only()
-            return
+            return True
         A = torch.stack([torch.cat([a.reshape(-1).float()
                                     for a in self._cstr_tree_aux[k]])
                          for k in keys])                    # [N, P]
@@ -968,7 +977,7 @@ class TGBPairLinkLoop:
             self._cstr_last_diag = diag
             self._cstr_print_diag(group_start, diag)
             _write_task_only()
-            return
+            return True
         cos = (A @ t) / (gn * nt)                            # [N]
         c_np = cos.detach().cpu().numpy()
         diag["n_dirs"] = int(A.shape[0])
@@ -987,18 +996,22 @@ class TGBPairLinkLoop:
             # update must stay identical to the unconstrained arm.
             self._cstr_last_diag = diag
             self._cstr_print_diag(group_start, diag)
-            return
+            return True
         # ---- multi-half-space QP via the dual -------------------------
         # max_{lam>=0} -1/2 lam^T K lam + lam^T c.  FISTA (accelerated
         # projected gradient) with the spectral step 1/lam_max(K) from a
         # power iteration; a plain projected gradient with a conservative
         # step under-converges and leaves violated constraints inactive.
-        b = -self.rpbe_kappa * gn * nt                       # [N]
-        K = A @ A.t()                                        # [N, N]
-        cvec = b - (A @ t)
-        lam = torch.zeros(int(A.shape[0]), device=dev)
+        # Reviewer formulation (2026-09-13): ROW-NORMALIZED rows (cosine
+        # Gram) + budget ladder + hard feasibility certificate.
+        H = A / gn[:, None]                                  # [N, P] unit rows
+        b = -self.rpbe_kappa * nt * torch.ones(
+            int(H.shape[0]), device=dev)                     # [N]
+        K = H @ H.t()                                        # cosine Gram
+        cvec = b - (H @ t)
+        lam = torch.zeros(int(H.shape[0]), device=dev)
         with torch.no_grad():
-            v = torch.randn(int(A.shape[0]), device=dev)
+            v = torch.randn(int(H.shape[0]), device=dev)
             v = v / (v.norm() + 1e-30)
             lam_max = 1.0
             for _ in range(30):
@@ -1009,29 +1022,49 @@ class TGBPairLinkLoop:
                 v = v / nv
                 lam_max = nv
         eta = 1.0 / (lam_max + 1e-12)
-        y = lam
-        tk = 1.0
-        for _ in range(2000):
-            lam_new = torch.clamp(y + eta * (cvec - K @ y), min=0.0)
-            tk_new = 0.5 * (1.0 + math.sqrt(1.0 + 4.0 * tk * tk))
-            y = lam_new + ((tk - 1.0) / tk_new) * (lam_new - lam)
-            lam = lam_new
-            tk = tk_new
-        corr = A.t() @ lam                                   # [P]
-        d = t + corr
+        d = None
+        viol_max = float("inf")
+        # ---- budget ladder: 2000 -> 8000 -> 32000 FISTA iterations ----
+        for budget in (2000, 8000, 32000):
+            y = lam
+            tk = 1.0
+            for _ in range(budget):
+                lam_new = torch.clamp(y + eta * (cvec - K @ y), min=0.0)
+                tk_new = 0.5 * (1.0 + math.sqrt(1.0 + 4.0 * tk * tk))
+                y = lam_new + ((tk - 1.0) / tk_new) * (lam_new - lam)
+                lam = lam_new
+                tk = tk_new
+            d = t + H.t() @ lam
+            viol = b - (H @ d)                               # >0 = violated
+            rel = viol / (nt + 1e-30)
+            viol_max = float(rel.max()) if rel.numel() else 0.0
+            if viol_max <= 1e-6:
+                break
+        corr = H.t() @ lam                                   # [P]
         active = int((lam > 1e-9).sum().item())
         # primal residual: how many constraints are still violated at d
-        viol = b - (A @ d)                                   # [N] (>0 = violated)
-        rel = viol / (gn * nt + 1e-30)
+        viol = b - (H @ d)                                   # [N] (>0 = violated)
+        rel = viol / (nt + 1e-30)
         diag["active"] = active
         diag["n_viol"] = int((rel > 1e-6).sum().item())
-        diag["max_viol"] = float(rel.max()) if rel.numel() else 0.0
+        diag["max_viol"] = viol_max
         diag["corr_ratio"] = float(corr.norm()) / (nt + 1e-30)
         diag["d_norm_ratio"] = float(d.norm()) / (nt + 1e-30)
         if active > 0:
             self._cstr_active += 1
             self._cstr_corr_ratios.append(float(diag["corr_ratio"]))
         self._cstr_print_diag(group_start, diag)
+        if viol_max > 1e-6:
+            # hard certificate FAILED after the full ladder: the caller
+            # SKIPS the representation step for this group (reviewer
+            # requirement — no constrained update is executed).
+            self._cstr_skips += 1
+            print("[rpbe-cstr] group=%d CERT_FAIL max_viol=%.3e "
+                  "skipping repr step"
+                  % (group_start // self.kf_group_batches, viol_max),
+                  flush=True)
+            self._cstr_last_diag = diag
+            return False
         off = 0
         for p in scope:
             n = int(p.numel())
@@ -1040,6 +1073,7 @@ class TGBPairLinkLoop:
             p.grad.copy_(d[off:off + n].reshape(p.shape).to(p.dtype))
             off += n
         self._cstr_last_diag = diag
+        return True
 
     def _cstr_print_diag(self, group_start, diag):
         """One compact per-group line (probe and solve paths alike)."""

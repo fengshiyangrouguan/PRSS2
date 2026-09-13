@@ -1573,8 +1573,9 @@ class TGBPairLinkLoop:
             link_loss, records = out
             contrib = torch.zeros((), device=self.device)
             part_keys = []
+            parts = []          # outside the gate: meta may be empty after
+                                # below-skip removed every tau this group
             if self.aux_heads is not None and records and meta:
-                parts = []
                 for r in records:
                     w = meta.get(r.pair_id)
                     if w is None:

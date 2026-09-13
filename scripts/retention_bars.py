@@ -15,9 +15,12 @@ and each group tracks ONLY its own source's paired-removal delta chain -- never
 the full ancestor state (which would mix in the parent's own / sibling / new
 neighbor information):
 
-    3-hop source U0 :  U0  -> d32 -> d31 -> d3r      (source + 3 bars)
-    2-hop source Z1 :  Z1  -> d21 -> d2r             (source + 2 bars)
-    1-hop source Z2 :  Z2  -> d1r                    (source + 1 bar)
+    3-hop source U0 :  U0  -> d32 -> d31 -> d3r      (depth 0..3 trajectory)
+    2-hop source Z1 :  Z1  -> d21 -> d2r             (depth 0..2 trajectory)
+    1-hop source Z2 :  Z2  -> d1r                    (depth 0..1 trajectory)
+
+Rendered as LINE charts: retained fraction (normalized, R_0 = 1) vs recursive
+depth, one subplot per source, host vs ours trajectories in the same axes.
 
 Protocol (all directions/maps fixed on CALIB; nothing refit on audit):
   1. canonical directions between the source state X_s and S_root are fixed on
@@ -164,33 +167,36 @@ def main():
     fig, axes = plt.subplots(1, 3, figsize=(13.5, 4.3))
     c_host = "#9aa5b1"
     c_ours = "#2a78d6"
-    w = 0.38
     two = len(arms) == 2
     for ax, (title, _sk, deltas) in zip(axes, GROUPS):
-        names = ["source"] + deltas
-        xpos = np.arange(len(names))
-        for ai, (aname, _raw) in enumerate(arms):
+        # line chart: retained fraction vs recursive depth (source = depth 0)
+        xpos = np.arange(len(deltas) + 1)
+        for aname, _raw in arms:
             vals = [v for _nm, v in norm[aname][title]]
-            off = (ai - 0.5) * w if two else 0.0
-            ax.bar(xpos + off, vals, width=w if two else 0.5,
-                   color=c_ours if aname == "ours" else c_host, zorder=3)
+            color = c_ours if aname == "ours" else c_host
+            ls = "-" if aname == "ours" else "--"
+            ax.plot(xpos, vals, marker="o", ms=4, lw=1.8, color=color,
+                    ls=ls, zorder=3)
             for x, v in zip(xpos, vals):
                 if np.isfinite(v):
-                    ax.text(x + off, v + 0.02, "{:.2f}".format(v),
+                    ax.text(x, v + 0.03, "{:.2f}".format(v),
                             ha="center", fontsize=8,
                             color="#333a44" if aname == "ours" else "#7a838e")
         ax.set_xticks(xpos)
-        ax.set_xticklabels(["source\n({})".format(_sk)]
-                           + ["+{} agg".format(i + 1)
+        ax.set_xticklabels(["source\n(depth 0)"]
+                           + ["depth {}".format(i + 1)
                               for i in range(len(deltas))], fontsize=8)
         ax.set_title(title, fontsize=10)
-        ax.set_ylim(0.0, 1.12)              # source = 1; noise may push ~1.0x
+        ax.set_ylim(0.0, 1.15)              # source = 1; noise may push ~1.0x
         ax.grid(True, axis="y", color="#e5e8ea", lw=0.6, zorder=0)
     if two:
-        from matplotlib.patches import Patch
-        axes[0].legend(handles=[Patch(color=c_host, label="host (task-only)"),
-                                Patch(color=c_ours, label="ours")],
-                       fontsize=8, loc="upper right", frameon=False)
+        from matplotlib.lines import Line2D
+        axes[0].legend(handles=[
+            Line2D([0], [0], color=c_host, ls="--", marker="o", ms=4,
+                   label="host (task-only)"),
+            Line2D([0], [0], color=c_ours, ls="-", marker="o", ms=4,
+                   label="ours")],
+            fontsize=8, loc="upper right", frameon=False)
     axes[0].set_ylabel("fraction of the source predictive signal retained\n"
                        "(normalized to the source, R$_0$ = 1)", fontsize=9)
     fig.suptitle("Predictive signal retention through recursive compression",

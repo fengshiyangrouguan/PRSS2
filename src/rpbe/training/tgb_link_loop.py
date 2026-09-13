@@ -1406,6 +1406,8 @@ class TGBPairLinkLoop:
             if comp is not None:
                 self._cstr_scope_params = [
                     p for p in comp.parameters() if p.requires_grad]
+        if self.rpbe_constrain and self._cstr_scope_task is None:
+            self._cstr_reset()
         self.snapshot_comp_params()
         for b in range(g0, g1):
             self.head_optimizer.zero_grad(set_to_none=True)

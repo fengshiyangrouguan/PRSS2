@@ -446,7 +446,8 @@ def main():
                    "audit_block_ids": [int(b) for b in blocks],
                    "base_probe": {"cv_oof_nll": float(cv_base),
                                   "lam": float(base_params["lam"]),
-                                  "n_invalid_lambda": int(base_diag["n_invalid"])},
+                                  "n_invalid_lambda": int(base_diag["n_invalid"]),
+                                  "lambda_trials": base_diag["trials"]},
                    "positions": {}}
             for p in phys_set:
                 lo, hi = np.percentile(jrep[p], [2.5, 97.5])
@@ -471,13 +472,23 @@ def main():
             if 3 in phys_set:
                 root[(lab, line)] = {"reps": jrep[3],
                                      "point": rj.gain_bits(nll0_a, nll1[3]),
-                                     "nll1": nll1[3]}
+                                     "nll1": nll1[3],
+                                     # per-line, so a comparison can never
+                                     # silently reuse another line's blocks
+                                     "blocks": np.asarray(blocks).copy(),
+                                     "pair_keys": tuple(aud_keys)}
 
     # ---- pre-registered, same-seed, ONE-DIRECTION comparisons --------------
     info = {lab: _role_seed(arms[i]) for i, lab in enumerate(labels)}
     by_seed = {}
     for lab, (role, seed) in info.items():
-        by_seed.setdefault(seed, {})[role] = lab
+        slot = by_seed.setdefault(seed, {})
+        if role in slot:
+            raise RunnerError(
+                "two checkpoints share (role={!r}, seed={!r}): {} and {} -- a "
+                "silent overwrite would drop a model from the comparison".format(
+                    role, seed, slot[role], lab))
+        slot[role] = lab
     comparisons, skipped = [], []
     for seed in sorted(by_seed, key=lambda s: (s is None, s)):
         roles = by_seed[seed]
@@ -495,19 +506,31 @@ def main():
                 ka, kb = (ours, line), (base, line)
                 if ka not in root or kb not in root:
                     continue
+                ra, rb = root[ka], root[kb]
+                if ra["pair_keys"] != rb["pair_keys"]:
+                    raise RunnerError(
+                        "hop {} paired comparison has different audit rows: "
+                        "{} vs {}".format(h, len(ra["pair_keys"]),
+                                          len(rb["pair_keys"])))
+                if not np.array_equal(ra["blocks"], rb["blocks"]):
+                    raise RunnerError(
+                        "hop {} paired comparison has different time "
+                        "blocks".format(h))
                 dpt, lo, hi, p_tail = rj.paired_diff_ci(
-                    root[ka]["reps"], root[kb]["reps"],
-                    root[ka]["point"], root[kb]["point"])
-                # formal test: sign-flip the RAW paired audit rows, not the
-                # bootstrap replicates.  d_i = (NLL1_other,i - NLL1_ours,i)/ln2
-                # is exactly the per-row contribution to
-                # RootGain_ours - RootGain_other.
-                d_rows = (root[kb]["nll1"] - root[ka]["nll1"]) / np.log(2.0)
+                    ra["reps"], rb["reps"], ra["point"], rb["point"])
+                # formal test: sign-flip the RAW paired audit rows of THIS hop,
+                # using THIS line's own time blocks.  d_i is exactly the per-row
+                # contribution to RootGain_ours - RootGain_other.
+                d_rows = (rb["nll1"] - ra["nll1"]) / np.log(2.0)
                 p_sf = rj.block_signflip_p(
-                    d_rows, blocks, n_perm=args.n_perm, seed=args.seed + h,
-                    alternative="greater")
-                hops[str(h)] = {"line": line, "diff_point": dpt,
-                                "diff_ci95": [lo, hi],
+                    d_rows, ra["blocks"], n_perm=args.n_perm,
+                    seed=args.seed + h, alternative="greater")
+                hops[str(h)] = {"line": line,
+                                "diff_bits": dpt,
+                                "diff_ci95_bits": [lo, hi],
+                                "diff_millibits": 1000.0 * dpt,
+                                "diff_ci95_millibits": [1000.0 * lo,
+                                                        1000.0 * hi],
                                 "p_tail_boot": p_tail, "p_signflip": p_sf}
                 pvals.append(p_sf)
                 keys.append(str(h))
@@ -531,13 +554,14 @@ def main():
         key = "{} - {}".format(cmp_["ours_role"], cmp_["base_role"])
         for h, e in cmp_["hops"].items():
             across.setdefault(key, {}).setdefault(h, []).append(
-                {"seed": cmp_["seed"], "diff_point": e["diff_point"]})
+                {"seed": cmp_["seed"], "diff_bits": e["diff_bits"]})
     report["comparisons"] = {c["name"]: c["hops"] for c in comparisons}
     report["comparisons_skipped"] = skipped
     report["comparisons_across_seed"] = {
         k: {h: {"n_seeds": len(v),
-                "mean_diff_point": float(np.mean([x["diff_point"]
-                                                  for x in v])),
+                "mean_diff_bits": float(np.mean([x["diff_bits"] for x in v])),
+                "mean_diff_millibits": float(
+                    1000.0 * np.mean([x["diff_bits"] for x in v])),
                 "per_seed": sorted(v, key=lambda x: (x["seed"] is None,
                                                      x["seed"])),
                 "ci_claimed": False}

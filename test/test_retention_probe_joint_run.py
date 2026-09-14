@@ -70,6 +70,13 @@ def _build_arm(noise_seed, informative, arm, sha, seed=0, n_cal=90, n_aud=90):
                         "pair_id": list(pid), "line": line, "phys": phys,
                         "ctx": ctx, "keep": Z, "rem": np.zeros(172),
                         "y_s": leg_s, "y_p": leg_p})
+    # give the Y_leaf line a DIFFERENT audit pair set, so its time blocks differ
+    # from the other lines'.  Any code that silently reuses another line's
+    # blocks then produces a wrong p-value instead of hiding behind identical
+    # fixtures.
+    rows["audit"] = [r for r in rows["audit"]
+                     if not (r["line"] == "Y_leaf"
+                             and (int(r["pair_id"][0]) % 100000) % 3 == 0)]
     d = {"audit": rows["audit"], "calib": rows["calib"], "head": [],
          "manifest": manifest,
          "meta": {"n_layers": 3, "n_neighbors": 5, "bs": 64,
@@ -137,7 +144,9 @@ def test_runner_end_to_end(tmp_path, capsys):
         "ours|seed0|aaaa - taskonly|seed0|bbbb (seed 0)"]
     hops = rep["comparisons"]["ours|seed0|aaaa - taskonly|seed0|bbbb (seed 0)"]
     assert set(hops) == {"1", "2", "3"}
-    assert hops["3"]["diff_point"] > 0.1
+    assert hops["3"]["diff_bits"] > 0.1
+    assert abs(hops["3"]["diff_millibits"] - 1000.0 * hops["3"]["diff_bits"]) \
+        < 1e-9
     assert hops["3"]["p_signflip"] < 0.05 and hops["3"]["significant_05"]
     across = rep["comparisons_across_seed"]["ours - taskonly"]
     assert across["3"]["n_seeds"] == 1
@@ -146,19 +155,33 @@ def test_runner_end_to_end(tmp_path, capsys):
     assert (out / "joint_probe_rows.pkl").exists()
     with open(out / "joint_probe_rows.pkl", "rb") as f:
         tab = pickle.load(f)
-    # the sign-flip p-value is computed from the RAW paired audit rows
-    lo_ours = tab["row_losses"][("ours|seed0|aaaa", "Y_leaf", 3)]
-    lo_oth = tab["row_losses"][("taskonly|seed0|bbbb", "Y_leaf", 3)]
-    d_rows = (lo_oth["nll_full"] - lo_ours["nll_full"]) / np.log(2.0)
-    blocks = np.asarray(ours["audit_block_ids"])
-    assert len(blocks) == len(d_rows)
-    p_check = rj.block_signflip_p(d_rows, blocks, n_perm=2000, seed=0 + 3,
-                                  alternative="greater")
-    assert abs(p_check - hops["3"]["p_signflip"]) < 1e-12, \
-        (p_check, hops["3"]["p_signflip"])
+    # each hop's sign-flip must use ITS OWN line's time blocks.  Y_leaf has a
+    # reduced audit set here, so reusing another line's blocks would mismatch.
+    assert ours["audit_block_ids"] != \
+        rep["arms"]["Y_a1"]["ours|seed0|aaaa"]["audit_block_ids"]
+    for hop, line in ((3, "Y_leaf"), (2, "Y_a2"), (1, "Y_a1")):
+        p_check = _recompute_p(rep, tab, line, hop, "ours|seed0|aaaa",
+                               "taskonly|seed0|bbbb")
+        got = rep["comparisons"][
+            "ours|seed0|aaaa - taskonly|seed0|bbbb (seed 0)"][str(hop)]
+        assert abs(p_check - got["p_signflip"]) < 1e-12, (hop, p_check, got)
     loss = tab["row_losses"][("ours|seed0|aaaa", "Y_leaf", 0)]
     j = (loss["nll_base"].mean() - loss["nll_full"].mean()) / np.log(2.0)
     assert abs(j - ours["positions"][0]["J_point"]) < 1e-9
+    # the base probe records its full lambda trial list, not just a count
+    assert isinstance(ours["base_probe"]["lambda_trials"], list)
+    assert len(ours["base_probe"]["lambda_trials"]) == 7
+
+
+def _recompute_p(rep, tab, line, hop, ours_lab, base_lab, n_perm=2000,
+                 seed=0):
+    """Independent recomputation of the sign-flip p for one hop/line."""
+    blocks = np.asarray(rep["arms"][line][ours_lab]["audit_block_ids"])
+    a = tab["row_losses"][(ours_lab, line, 3)]["nll_full"]
+    b = tab["row_losses"][(base_lab, line, 3)]["nll_full"]
+    assert len(blocks) == len(a)
+    return rj.block_signflip_p((b - a) / np.log(2.0), blocks, n_perm=n_perm,
+                               seed=seed + hop, alternative="greater")
 
 
 def test_comparisons_are_same_seed_and_one_direction(tmp_path):
@@ -181,15 +204,32 @@ def test_comparisons_are_same_seed_and_one_direction(tmp_path):
     across = rep["comparisons_across_seed"]["ours - taskonly"]
     assert across["3"]["n_seeds"] == 2
     assert across["3"]["ci_claimed"] is False
-    per_seed = {x["seed"]: x["diff_point"] for x in across["3"]["per_seed"]}
+    per_seed = {x["seed"]: x["diff_bits"] for x in across["3"]["per_seed"]}
     assert set(per_seed) == {0, 1}
     # the per-seed deltas are exactly the same-seed comparison point diffs --
     # no rows were pooled across seeds
     for k, hops in rep["comparisons"].items():
         seed = 0 if "(seed 0)" in k else 1
-        assert abs(per_seed[seed] - hops["3"]["diff_point"]) < 1e-12
-    assert abs(across["3"]["mean_diff_point"]
+        assert abs(per_seed[seed] - hops["3"]["diff_bits"]) < 1e-12
+    assert abs(across["3"]["mean_diff_bits"]
                - np.mean(list(per_seed.values()))) < 1e-12
+    assert abs(across["3"]["mean_diff_millibits"]
+               - 1000.0 * across["3"]["mean_diff_bits"]) < 1e-9
+
+
+def test_duplicate_role_seed_is_rejected(tmp_path):
+    """Two checkpoints sharing (role, seed) must not silently overwrite."""
+    rng = np.random.RandomState(6)
+    E = rng.randn(400, 16)
+    arms = [_build_arm(1, True, "ours", "aaa1", seed=0),
+            _build_arm(2, False, "taskonly", "bbb1", seed=0),
+            _build_arm(3, False, "taskonly", "bbb2", seed=0)]   # role+seed clash
+    paths, pe = _write(tmp_path, E, arms)
+    try:
+        _run(paths, pe, tmp_path / "o")
+        raise AssertionError("expected RunnerError on duplicate (role, seed)")
+    except run.RunnerError as e:
+        assert "share (role=" in str(e)
 
 
 class _Stub:

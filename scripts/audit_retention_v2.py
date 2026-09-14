@@ -193,6 +193,29 @@ def _ctx_vector(root_id, leaf_id, node_times, edge_feats, edge_times,
     return out[:CTX_DIM]
 
 
+# The three model-dependent blocks of C are the fixed projections of the
+# path-outside OTHER-NEIGHBOR hidden states (a checkpoint quantity).  They are
+# NOT shared across arms, so a fair cross-arm context must drop them; only the
+# historical edge features/times, node/edge ids, selected slot and other-
+# neighbour RAW structure may remain.
+CTX_MODEL_DEP_BLOCKS = ((0, 16), (24, 40), (48, 64))
+
+
+def ctx_shared_only(ctx):
+    """Zero the three model-dependent other-neighbor blocks of a stored C."""
+    out = np.array(ctx, dtype=np.float64, copy=True)
+    for a, b in CTX_MODEL_DEP_BLOCKS:
+        out[a:b] = 0.0
+    return out
+
+
+def _mask_rows_ctx(rows):
+    for r in rows:
+        if "ctx" in r and r["ctx"] is not None:
+            r["ctx"] = ctx_shared_only(r["ctx"])
+    return rows
+
+
 # -------------------------------------------------------------- future index
 class FutureIndex:
     def __init__(self, ds):
@@ -291,6 +314,12 @@ def main():
                          "(dneg==dpos): resample deterministically until "
                          "different (default), or 'flip' to reproduce the "
                          "BenchTemp 1-bit pseudo-negative semantics")
+    ap.add_argument("--ctx-shared-only", action="store_true",
+                    help="drop the three model-dependent other-neighbor "
+                         "blocks of C so the context is identical across arms")
+    ap.add_argument("--ctx-candidate-pairs", action="store_true",
+                    help="(v3) feed BOTH the positive and the negative "
+                         "candidate of each node with a random swap label")
     ap.add_argument("--data-dir", required=True)
     ap.add_argument("--data-name", default="wikipedia")
     ap.add_argument("--gpu", type=int, default=0)
@@ -1007,6 +1036,11 @@ def run_stats(calib_rows, audit_rows, calib_h_rows, args, mem_parity,
     if not audit_rows or not calib_rows:
         print("FATAL: no rows to score", flush=True)
         return
+    if getattr(args, "ctx_shared_only", False):
+        for _rows in (calib_rows, audit_rows, calib_h_rows):
+            _mask_rows_ctx(_rows)
+        print("[ctx] model-dependent other-neighbor blocks zeroed "
+              "(shared-only context)", flush=True)
     d_state = calib_rows[0]["rem"].shape[0]
     d_cand = calib_rows[0]["cand_s"].shape[0]
     P = rs.fixed_proj(d_cand, d_state, FIXED_SEED + 77)

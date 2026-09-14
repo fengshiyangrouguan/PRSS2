@@ -413,3 +413,195 @@ def cluster_bootstrap_ci(ctx_c, S_rem_c, S_keep_c, cs_c, cp_c, yc,
             float(np.percentile(out, 100 * (1 - alpha / 2))))
 
 
+
+
+# ==========================================================================
+# v3 nested source-contribution probe (fair, arm-agnostic).
+#
+# Two problems are measured SEPARATELY:
+#   (a) mechanism retention -- how much of the SOURCE's predictive
+#       contribution about the joint local future (Y_s, Y_p) survives to
+#       each downstream position k;
+#   (b) root-task gain -- see audit_retention_v2 (native frozen task head).
+#
+# Fairness contract for (a):
+#   * identical C (context) and identical candidate pairs Q across arms;
+#   * both the POSITIVE and the NEGATIVE candidate of a node are fed in, and
+#     the label says WHICH one is the true future destination (a random swap);
+#   * one COMMON base b_theta(C, Q) is fit once; each position k only adds a
+#     rank-limited increment g_phi_k(Delta_{s->k}, Q) on top of the FROZEN
+#     base, so full always contains the g=0 base (never two unrelated probes);
+#   * E(candidate) and the Delta projections are frozen (arm-shared) maps.
+#
+#   J_{s->k} = (NLL_base - NLL_full,k) / ln2   [bits/tree]
+#   R_{s->k} = J_{s->k} / J_{s->s}
+# The source position's own delta is Delta_{s->s} = U_s (the leaf interface
+# state); report J_{s->s}, J_{s->k} and R_{s->k} together.
+# ==========================================================================
+
+def _std_cols(F):
+    F = np.asarray(F, dtype=np.float64)
+    return F.mean(axis=0), F.std(axis=0) + 1e-9
+
+
+def _logit_fit(F, y, lam):
+    from sklearn.linear_model import LogisticRegression
+    m, s = _std_cols(F)
+    clf = LogisticRegression(C=1.0 / max(float(lam), 1e-9), solver="lbfgs",
+                             max_iter=2000)
+    clf.fit((np.asarray(F, dtype=np.float64) - m) / s,
+            np.asarray(y, dtype=np.int64))
+    return m, s, clf
+
+
+def _logit_score(m, s, clf, F):
+    return clf.decision_function(
+        (np.asarray(F, dtype=np.float64) - m) / s).astype(np.float64)
+
+
+def _nll_logit(z, y):
+    y = np.asarray(y, dtype=np.float64)
+    z = np.asarray(z, dtype=np.float64)
+    return float(np.mean(np.logaddexp(0.0, z) - y * z))
+
+
+def _offset_fit(base_c, Zc, yc, lam):
+    """Fit increment weights w with the base logit FROZEN as an offset."""
+    from scipy.optimize import minimize
+    base_c = np.asarray(base_c, dtype=np.float64)
+    Zc = np.asarray(Zc, dtype=np.float64)
+    yc = np.asarray(yc, dtype=np.float64)
+    l2 = float(lam)
+
+    def obj(w):
+        z = base_c + Zc @ w
+        return float(np.mean(np.logaddexp(0.0, z) - yc * z) + l2 * float(w @ w))
+
+    r = minimize(obj, np.zeros(Zc.shape[1]), method="L-BFGS-B")
+    return r.x
+
+
+def _offset_nll(base, Z, y, w):
+    z = np.asarray(base, dtype=np.float64) + np.asarray(Z, np.float64) @ w
+    return _nll_logit(z, np.asarray(y, dtype=np.float64))
+
+
+def _proj(d_in, d_out, seed):
+    g = np.random.RandomState(int(seed))
+    return g.normal(0.0, 1.0 / np.sqrt(max(1, int(d_in))),
+                    size=(int(d_out), int(d_in)))
+
+
+def increment_feats(delta, q, Gd, Gq):
+    """Rank-limited bilinear candidate match: (Gd @ delta) * (Gq @ q).
+
+    With a linear head this realizes g = <A delta, q> for a rank<=r matrix A.
+    """
+    return (np.asarray(delta, np.float64) @ Gd.T) * (
+        np.asarray(q, np.float64) @ Gq.T)
+
+
+def _base_two(C, qs, qp, ys, yp, lam):
+    F = np.concatenate([np.asarray(C, np.float64),
+                        np.asarray(qs, np.float64),
+                        np.asarray(qp, np.float64)], axis=1)
+    ms, ss, clf_s = _logit_fit(F, ys, lam)
+    mp, sp, clf_p = _logit_fit(F, yp, lam)
+    return (F, (ms, ss, clf_s), (mp, sp, clf_p))
+
+
+def _base_nll_and_logit(F, model_s, model_p, ys, yp):
+    zs = _logit_score(*model_s, F)
+    zp = _logit_score(*model_p, F)
+    return _nll_logit(zs, ys) + _nll_logit(zp, yp), zs, zp
+
+
+def nested_info_bits(Cc, qsc, qpc, Dc, ysc, ypc,
+                     Ca, qsa, qpa, Da, ysa, ypa,
+                     ranks=(4, 8, 16), lam=1e-2, seed=0):
+    """Audit-set conditional info J of the source contribution at ONE position.
+
+    ``Dc``/``Da`` are the source contribution Delta_{s->k} on calib/audit
+    (for the source position itself pass U_s).  Returns J (bits/tree), the
+    calib-selected rank, and the base/full audit NLLs.
+    """
+    Fc, model_s, model_p = _base_two(Cc, qsc, qpc, ysc, ypc, lam)
+    Fa, _, _ = _base_two(Ca, qsa, qpa, ysa, ypa, lam)   # same shapes only
+    nll_base_a, bas, bap = _base_nll_and_logit(Fa, model_s, model_p, ysa, ypa)
+    nll_base_c, bcs, bcp = _base_nll_and_logit(Fc, model_s, model_p, ysc, ypc)
+    best = None
+    for r in ranks:
+        Gd = _proj(np.asarray(Dc).shape[1], int(r), seed + 101)
+        Gq = _proj(np.asarray(qsc).shape[1], int(r), seed + 202)
+        Zc_s = increment_feats(Dc, qsc, Gd, Gq)
+        Zc_p = increment_feats(Dc, qpc, Gd, Gq)
+        Za_s = increment_feats(Da, qsa, Gd, Gq)
+        Za_p = increment_feats(Da, qpa, Gd, Gq)
+        ws = _offset_fit(bcs, Zc_s, ysc, lam)
+        wp = _offset_fit(bcp, Zc_p, ypc, lam)
+        calib = _offset_nll(bcs, Zc_s, ysc, ws) + _offset_nll(bcp, Zc_p, ypc, wp)
+        if best is None or calib < best[0]:
+            best = (calib, int(r), ws, wp, Za_s, Za_p)
+    _, rank, ws, wp, Za_s, Za_p = best
+    nll_full_a = _offset_nll(bas, Za_s, ysa, ws) + _offset_nll(bap, Za_p, ypa, wp)
+    return {"J": float((nll_base_a - nll_full_a) / np.log(2.0)),
+            "rank": rank, "nll_base": float(nll_base_a),
+            "nll_full": float(nll_full_a)}
+
+
+def nested_curve(Cc, qsc, qpc, ysc, ypc, Ca, qsa, qpa, ysa, ypa,
+                 Dc_bypos, Da_bypos, origin_pos, ranks=(4, 8, 16),
+                 lam=1e-2, seed=0):
+    """J at every position + R relative to ``origin_pos`` (the source)."""
+    out = {}
+    j0 = None
+    for pos in sorted(Da_bypos):
+        res = nested_info_bits(
+            Cc, qsc, qpc, Dc_bypos[pos], ysc, ypc,
+            Ca, qsa, qpa, Da_bypos[pos], ysa, ypa,
+            ranks=ranks, lam=lam, seed=seed)
+        out[int(pos)] = res
+        if int(pos) == int(origin_pos):
+            j0 = res["J"]
+    for pos, res in out.items():
+        res["R"] = (float(res["J"]) / j0) if (j0 and abs(j0) > 1e-12) \
+            else float("nan")
+    return {"origin_pos": int(origin_pos), "J_source": j0, "points": out}
+
+
+def nested_null_source(Cc, qsc, qpc, ysc, ypc, Ca, qsa, qpa, ysa, ypa,
+                       Dc_s, Da_s, strata_a, ranks=(4, 8, 16), lam=1e-2,
+                       seed=0, n_null=200):
+    """Permutation null for J_{s->s}: shuffle the audit delta within strata."""
+    rng = np.random.RandomState(int(seed))
+    strata_a = np.asarray(strata_a)
+    uniq = np.unique(strata_a)
+    by = {g: np.where(strata_a == g)[0] for g in uniq}
+    null = []
+    for t in range(int(n_null)):
+        idx = np.arange(len(strata_a))
+        for g in uniq:
+            rows = by[g].copy()
+            rng.shuffle(rows)
+            idx[by[g]] = rows
+        per = nested_info_bits(
+            Cc, qsc, qpc, Dc_s, ysc, ypc,
+            Ca, qsa, qpa, np.asarray(Da_s)[idx],
+            ysa, ypa, ranks=ranks, lam=lam, seed=seed + 7 * (t + 1))
+        null.append(per["J"])
+    return np.asarray(null, dtype=np.float64)
+
+
+def cluster_join_ids(*key_arrays):
+    """Intersection helper: rows share a key iff every array's element equals.
+
+    Returns (keep_masks, common_keys) for the FIRST array against the rest,
+    so cross-arm statistics can be computed on the shared (pair_id,line,phys)
+    set only.
+    """
+    keys = [tuple(str(k) for k in a) for a in key_arrays]
+    common = set(keys[0])
+    for k in keys[1:]:
+        common &= set(k)
+    masks = [np.asarray([kk in common for kk in k], dtype=bool) for k in keys]
+    return masks, sorted(common)

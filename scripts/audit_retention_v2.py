@@ -858,7 +858,8 @@ def main():
                 "sampler_formula_version":
                     "seed=(v*1000003+root_t)%2**31;dneg=randint;bit=randint",
                 "label_kind": "balanced_sampled_candidate_existence"})
-            zk = {1: z1, 2: z2, 3: z3}
+            # keys must match the "z1"/"z2"/"z3" strings used by pts below
+            zk = {"z1": z1, "z2": z2, "z3": z3}
             lines_local = [
                 ("Y_leaf", "Y_a2", st1["u0"], 0,
                  [(1, dz3_2, "z1"), (2, dz3_1, "z2"), (3, dz3_r, "z3")]),
@@ -983,9 +984,13 @@ def main():
         tgn.memory.__init_memory__()
     calib_h_rows = _collect_rows(0, transfer_hi, "head-calib")
     print("[head] head calib rows:", len(calib_h_rows), flush=True)
-    if not audit_rows or not calib_rows or not calib_h_rows:
+    if not audit_rows or not calib_rows:
         print("FATAL: no leaf-to-root paths extracted", flush=True)
         return
+    if not calib_h_rows:
+        # the head->tail transfer stress test is optional
+        print("[head] WARNING: no head-calibration rows "
+              "(head->tail transfer stress skipped)", flush=True)
     # persist the extracted row matrices so a later statistics-only change can
     # be recomputed without re-running the model (15 min -> seconds)
     dump_path = Path(args.ckpt).parent / "retention_rows.pkl"

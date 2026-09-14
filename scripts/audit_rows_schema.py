@@ -66,7 +66,8 @@ LABEL_KIND_ALIASES = {"canonical": rj.CANONICAL_LABEL_KIND,
 LABEL_KIND_CHOICES = list(rj.LABEL_KINDS) + list(LABEL_KIND_ALIASES)
 COMPARE_FIELDS = ("pair_id", "t_root", "nodes", "joint_label", "ordered_s",
                   "ordered_p", "pos_cand", "neg_cand", "presented",
-                  "future_event_id", "candidate_seed", "c_shared")
+                  "future_event_id", "future_event_time", "candidate_seed",
+                  "c_shared")
 
 
 def ctx_shared(ctx):
@@ -102,8 +103,7 @@ def resolve_label_kind(d, declared=None):
         d.get("meta", {}).get("label_kind")
     if meta_kind in rj.LABEL_KINDS:
         return meta_kind, []
-    man = {tuple(int(x) for x in m["pair_id"]): m
-           for m in d.get("manifest", [])}
+    man, _dups = _manifest_index(d)
     n_can = n_leg = 0
     for split in SPLITS:
         for r in d.get(split, []):
@@ -126,13 +126,29 @@ def resolve_label_kind(d, declared=None):
     return (rj.CANONICAL_LABEL_KIND if n_can else rj.LEGACY_LABEL_KIND), []
 
 
+def _manifest_index(d, problems=None):
+    """pair_id -> manifest row, refusing silently-overwritten duplicates."""
+    man, dups = {}, []
+    for m in d.get("manifest", []):
+        pid = tuple(int(x) for x in m["pair_id"])
+        if pid in man:
+            dups.append(pid)
+        man[pid] = m
+    return man, dups
+
+
 def arm_records(d, label_kind):
     """Per-row shared-field records keyed by (split, pair_key, line, phys)."""
-    man = {tuple(int(x) for x in m["pair_id"]): m for m in d.get("manifest", [])}
+    problems = []
+    man, dups = _manifest_index(d)
+    if dups:
+        problems.append("manifest has {} duplicate pair_id(s), e.g. {}".format(
+            len(dups), list(dups[:3])))
     recs = {}
     intra = {"label_kind": label_kind, "n_rows": 0,
              "rows_missing_manifest": 0, "label_conflict": 0,
-             "duplicate_row_keys": 0, "split_overlap": 0}
+             "duplicate_row_keys": 0, "split_overlap": 0,
+             "manifest_duplicate_pair_ids": len(dups)}
     seen = {}
     for split in SPLITS:
         for r in d.get(split, []):
@@ -168,6 +184,9 @@ def arm_records(d, label_kind):
                 "presented": {k: int(m["presented"][k]) for k in NODE_KEYS},
                 "future_event_id": {k: int(m["pos_future_event_id"][k])
                                     for k in NODE_KEYS},
+                "future_event_time": (
+                    {k: float(m["future_event_time"][k]) for k in NODE_KEYS}
+                    if m.get("future_event_time") is not None else None),
                 "candidate_seed": {k: int(m["candidate_seed"][k])
                                    for k in NODE_KEYS},
                 "c_shared": ctx_shared(r["ctx"]),
@@ -242,7 +261,8 @@ def full_audit(arms, declared_label_kind=None):
         problems.append("meta/layout mismatch: {}".format(sorted(meta_mism)))
     for i, intra in enumerate(per_arm):
         for k in ("label_conflict", "rows_missing_manifest",
-                  "duplicate_row_keys", "split_overlap"):
+                  "duplicate_row_keys", "split_overlap",
+                  "manifest_duplicate_pair_ids"):
             if intra[k]:
                 problems.append("arm {} {}={}".format(i, k, intra[k]))
 

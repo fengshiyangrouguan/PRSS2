@@ -216,10 +216,10 @@ def test_audit_labels_do_not_change_the_fit():
     assert rj.params_hash(p1) == rj.params_hash(p2)
     # a lambda selected on an internal split of the fit block is unchanged too
     folds = [(np.arange(0, 250), np.arange(250, 400))]
-    s1, _ = rj.select_joint(Phi[fit], C[fit], Z[fit], y[fit], folds,
-                            use_state=True)
-    s2, _ = rj.select_joint(Phi[fit], C[fit], Z[fit], y2[fit], folds,
-                            use_state=True)
+    s1, _, _ = rj.select_joint(Phi[fit], C[fit], Z[fit], y[fit], folds,
+                               use_state=True)
+    s2, _, _ = rj.select_joint(Phi[fit], C[fit], Z[fit], y2[fit], folds,
+                               use_state=True)
     assert abs(s1["lam"] - s2["lam"]) < 1e-15
 
 
@@ -242,15 +242,16 @@ def test_selection_uses_out_of_fold_not_a_refit_on_all():
     folds = [(np.arange(50), np.arange(50, 100)),
              (np.arange(100), np.arange(100, 150))]
     lams = (1e-4,)
-    params, oof = rj.select_joint(Phi, C, Z, y, folds, lams=lams,
-                                  use_state=False)
+    params, oof, diag = rj.select_joint(Phi, C, Z, y, folds, lams=lams,
+                                        use_state=False)
     leaky = float(np.mean([
         rj.joint_row_nll(params, Phi[t], C[t], Z[t], y[t]).mean()
         for _, t in folds]))
     assert oof > leaky + 0.05, (oof, leaky)
     # the returned value is exactly the fold-based estimate
-    manual = rj.oof_nll(Phi, C, Z, y, folds, lams[0], use_state=False)
+    manual, _ = rj.oof_nll(Phi, C, Z, y, folds, lams[0], use_state=False)
     assert abs(oof - manual) < 1e-12, (oof, manual)
+    assert diag["chosen_lam"] == lams[0] and diag["n_invalid"] == 0
 
 
 def test_fit_failure_is_loud():
@@ -259,6 +260,78 @@ def test_fit_failure_is_loud():
     import pytest
     with pytest.raises(rj.ProbeFitError):
         rj.fit_joint(Phi, C, Z, y, 1e-2, use_state=False)
+
+
+# ------------------------------------------- 7c. lambda failure is not fatal
+def _sel_data(n=200, seed=21):
+    rng = np.random.RandomState(seed)
+    E = rng.randn(6, 4)
+    s_pair, p_pair = _pairs(n)
+    Phi = rj.phi_tensor(E, s_pair, p_pair)
+    C = rng.randn(n, 5)
+    Z = rng.randn(n, 6)
+    y = rng.randint(0, 4, size=n)
+    folds = [(np.arange(0, 100), np.arange(100, 150)),
+             (np.arange(0, 150), np.arange(150, 200))]
+    return Phi, C, Z, y, folds
+
+
+def test_invalid_lambda_is_skipped_not_fatal(monkeypatch):
+    import pytest
+    Phi, C, Z, y, folds = _sel_data()
+    real = rj.fit_joint
+
+    def failing(Phi_, C_, Z_, y_, lam, **kw):
+        if abs(float(lam) - 1.0) < 1e-12:
+            raise rj.ProbeFitError("deliberate failure at lam=1.0")
+        return real(Phi_, C_, Z_, y_, lam, **kw)
+
+    monkeypatch.setattr(rj, "fit_joint", failing)
+    params, oof, diag = rj.select_joint(
+        Phi, C, Z, y, folds, lams=(1e-1, 1.0, 1e-2), use_state=False)
+    assert diag["n_invalid"] == 1
+    trials = {t["lam"]: t for t in diag["trials"]}
+    assert trials[1.0]["valid"] is False
+    assert any(f["ok"] is False and "deliberate" in f["error"]
+               for f in trials[1.0]["folds"])
+    assert any(t["valid"] for t in diag["trials"])
+    assert params["lam"] != 1.0
+    assert np.isfinite(oof)
+
+
+def test_all_invalid_lambdas_raise(monkeypatch):
+    import pytest
+    Phi, C, Z, y, folds = _sel_data()
+
+    def always_fail(*a, **k):
+        raise rj.ProbeFitError("boom")
+
+    monkeypatch.setattr(rj, "fit_joint", always_fail)
+    with pytest.raises(rj.ProbeFitError) as ei:
+        rj.select_joint(Phi, C, Z, y, folds, lams=(1e-1, 1e-2),
+                        use_state=False)
+    assert "every candidate lambda failed" in str(ei.value)
+
+
+def test_require_all_classes():
+    import pytest
+    assert rj.require_all_classes([0, 1, 2, 3, 0]) == [2, 1, 1, 1]
+    with pytest.raises(rj.ProbeFitError) as ei:
+        rj.require_all_classes([0, 3, 3, 0], where="line X")
+    assert "line X" in str(ei.value)
+    assert rj.class_counts([0, 0, 1]) == [2, 1, 0, 0]
+
+
+# ------------------------------------------- 7d. block sign-flip p-value
+def test_block_signflip_p_detects_and_spares():
+    rng = np.random.RandomState(9)
+    blocks = np.repeat(np.arange(20), 30)
+    d_alt = 0.30 + 0.4 * rng.randn(600)
+    d_null = 0.4 * rng.randn(600)
+    assert rj.block_signflip_p(d_alt, blocks, n_perm=600, seed=1) < 0.01
+    assert rj.block_signflip_p(d_null, blocks, n_perm=600, seed=1) > 0.05
+    assert rj.block_signflip_p(d_alt, blocks, n_perm=600, seed=1,
+                               alternative="two-sided") < 0.01
 
 
 # ------------------------------------------------ 8. scale / rotation invariance

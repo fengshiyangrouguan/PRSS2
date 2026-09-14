@@ -15,22 +15,29 @@ Fixed design:
   * the base probe is fit ONCE per source line and shared across arms and
     positions; the full probe is fit per arm/line/position;
   * lambda and the base-vs-full family choice are made on OUT-OF-FOLD
-    predictions from an expanding-window time split whose fit side is purged by
-    ``t_end = max(t_future_s, t_future_p)`` -- no row whose target future lands
-    after a validation block starts may sit in that block's fit side;
+    predictions whose fit side is purged by
+    ``t_end = max(t_future_s, t_future_p)``; a candidate lambda that fails in
+    any fold is marked invalid and skipped, and only an all-invalid set aborts;
+  * every calibration block, every usable fold and the audit block must contain
+    all four joint classes -- a missing class makes the family nearly separable
+    and the optimiser unreliable, so it is an error, never a silent prune;
   * after selection everything is refit once on the full calibration block and
     the audit block is scored exactly once;
   * ONE block-bootstrap index set (root-event time blocks) is shared by every
-    arm, position and metric; R and the ours-vs-other RootGain differences are
-    computed inside each replicate, with Holm over the three hops.
+    arm, position and metric.
+
+Comparisons are restricted to PRE-REGISTERED same-seed, one-direction pairs
+(``--ours-role`` minus each baseline role at the same seed); cross-seed
+aggregation is reported separately.  The formal p-value is a paired time-block
+sign-flip randomization test; the percentile bootstrap supplies the CIs.
 
 Fail-closed: the runner aborts unless the full rows/schema audit passes, the
-encoder verifies against its recorded hash/rank/cutoff/dataset hash, and every
-convex fit converges cleanly.
+encoder verifies against its recorded hash/rank/cutoff/dataset hash, the
+future-event-id table is validated, and the chosen fits converge.
 
 Usage:
     python scripts/retention_probe_joint_run.py \
-        --rows armA.pkl armB.pkl --data-dir /path/to/processed \
+        --rows ours_s0.pkl taskonly_s0.pkl --data-dir /path/to/processed \
         --data-name uci --out-dir ./joint_out
 """
 
@@ -38,6 +45,7 @@ import argparse
 import hashlib
 import json
 import pickle
+import re
 import sys
 from pathlib import Path
 
@@ -58,26 +66,32 @@ LINE_NODES = {"Y_leaf": ("leaf", "a2"), "Y_a2": ("a2", "a1"),
 ORIGIN_PHYS = {"Y_leaf": 0, "Y_a2": 1, "Y_a1": 2}
 PRI_PHYS = {"Y_leaf": (1, 2, 3), "Y_a2": (2, 3), "Y_a1": (3,)}
 HOP_LINE = {3: "Y_leaf", 2: "Y_a2", 1: "Y_a1"}
+# positions the extractor emits for each line; a pair missing one is an error
+EXPECTED_PHYS = {"Y_leaf": (0, 1, 2, 3), "Y_a2": (1, 2, 3), "Y_a1": (2, 3)}
 
 
 # ------------------------------------------------------------------ helpers
+class RunnerError(RuntimeError):
+    """A fail-closed condition in the runner (never a silently pruned sample)."""
+
+
 def expanding_folds(t_root, t_end, n_folds=3, min_rows=20):
     """Purged expanding-window folds over contiguous, non-overlapping slices.
 
-    Rows are cut into ``n_folds + 1`` contiguous time slices by ``t_root`` (so
-    the validation blocks never overlap and none is empty).  Slice 0 is always
-    available as fit data; for fold ``k`` in 1..n_folds the validation block is
-    slice ``k`` and the fit set is every row whose TARGET FUTURE has already
-    finished before that block starts: ``t_end_i < min(t_root over the block)``.
-    That purges label leakage across the boundary; ties on ``t_root`` cannot
-    enter the fit set because ``t_end >= t_root``.
+    Rows are cut into ``n_folds + 1`` contiguous time slices by ``t_root``.
+    Slice 0 is always available as fit data; for fold ``k`` in 1..n_folds the
+    validation block is slice ``k`` and the fit set is every row whose TARGET
+    FUTURE has already finished before that block starts:
+    ``t_end_i < min(t_root over the block)``.  That purges label leakage across
+    the boundary; ties on ``t_root`` cannot enter the fit set because
+    ``t_end >= t_root``.
     """
     t_root = np.asarray(t_root, np.float64)
     t_end = np.asarray(t_end, np.float64)
     order = np.argsort(t_root, kind="stable")
     n = len(order)
     if n < 2 * int(min_rows):
-        raise RuntimeError(
+        raise RunnerError(
             "not enough rows for purged folds: n={} min_rows={}".format(
                 n, min_rows))
     edges = np.quantile(t_root[order],
@@ -94,17 +108,98 @@ def expanding_folds(t_root, t_end, n_folds=3, min_rows=20):
         if len(fit) < int(min_rows):
             continue
         folds.append((fit, tune))
-    if not folds:
-        raise RuntimeError(
-            "no fold survived the future-event-time purge; the calibration "
-            "block is too short or its futures span the whole window")
     return folds
 
 
-def select_probe(Phi, C, Z, y, folds, use_state, lams, fallback=None):
-    """Thin wrapper so the runner names the concept it uses."""
-    return rj.select_joint(Phi, C, Z, y, folds, lams=lams,
-                           use_state=use_state, fallback=fallback)
+def build_folds(t_root, t_end, y, line, n_folds, min_rows):
+    """Folds that additionally carry all four joint classes on BOTH sides.
+
+    Fewer/larger slices are tried in turn; if no configuration yields a usable
+    fold the line is an error rather than an under-powered silent fallback.
+    """
+    attempts = []
+    for nf in range(int(n_folds), 0, -1):
+        try:
+            folds = expanding_folds(t_root, t_end, n_folds=nf,
+                                    min_rows=min_rows)
+        except RunnerError as e:
+            attempts.append({"n_folds": nf, "error": str(e)})
+            continue
+        good, rejected = [], []
+        for fi, (fit, tune) in enumerate(folds):
+            try:
+                rj.require_all_classes(y[fit],
+                                       where="{} fold{} fit".format(line, fi))
+                rj.require_all_classes(y[tune],
+                                       where="{} fold{} tune".format(line, fi))
+                good.append((fit, tune))
+            except rj.ProbeFitError as e:
+                rejected.append({"fold": fi, "reason": str(e)})
+        attempts.append({"n_folds": nf, "built": len(folds),
+                         "usable": len(good), "rejected": rejected})
+        if good:
+            return good, attempts
+    raise RunnerError(
+        "line {}: no usable validation fold (all four joint classes required "
+        "on both sides of every fold).  attempts={}".format(line, attempts))
+
+
+def _role_seed(d):
+    """(role, seed) from checkpoint meta; role is the arm name minus the seed."""
+    m = d.get("meta", {})
+    arm = str(m.get("arm") or "")
+    seed = m.get("seed")
+    role = re.sub(r"^seed\d+[_-]?", "", arm) or arm
+    if seed is None:
+        mm = re.search(r"seed(\d+)", arm)
+        seed = int(mm.group(1)) if mm else None
+    return role, seed
+
+
+def build_eid_time_map(ds):
+    """edge_id -> timestamp, validated (unique ids, full coverage)."""
+    eid = np.asarray(ds.full.edge_idxs, np.int64)
+    if eid.size == 0:
+        raise RunnerError("edge_idxs is empty; cannot map future event ids")
+    if eid.min() < 0:
+        raise RunnerError("edge_idxs contains negative ids")
+    n_uniq = int(np.unique(eid).size)
+    if n_uniq != int(eid.size):
+        raise RunnerError(
+            "edge_idxs is not a bijection ({} distinct of {} rows); an "
+            "edge_id -> time map would silently overwrite entries".format(
+                n_uniq, eid.size))
+    out = np.zeros(int(eid.max()) + 1, dtype=np.float64)
+    out[eid] = np.asarray(ds.full.timestamps, np.float64)
+    if not np.all(np.isfinite(out[eid])):
+        raise RunnerError("some edge_id -> time assignments are not finite")
+    return out
+
+
+def _future_end(man, sk, pk, fut_map):
+    """``max(t_future_s, t_future_p)`` for one pair.
+
+    Prefers ``manifest['future_event_time']`` (new schema); otherwise maps the
+    stored future EVENT ID through the validated edge-id -> time table,
+    checking that every referenced id exists.
+    """
+    ft = man.get("future_event_time")
+    if ft is not None:
+        return max(float(ft[sk]), float(ft[pk]))
+    if fut_map is None:
+        raise RunnerError(
+            "manifest lacks future_event_time and no dataset was supplied, so "
+            "the future-event-time purge cannot be done")
+    eid = man["pos_future_event_id"]
+    vals = []
+    for k in (sk, pk):
+        j = int(eid[k])
+        if not (0 <= j < fut_map.size):
+            raise RunnerError(
+                "future_event_id {} (node {}) is outside the edge-id table "
+                "(size {})".format(j, k, fut_map.size))
+        vals.append(float(fut_map[j]))
+    return max(vals)
 
 
 def _file_sha16(paths):
@@ -119,23 +214,6 @@ def _file_sha16(paths):
     return h.hexdigest()[:16]
 
 
-def _future_end(man, sk, pk, fut_map):
-    """``max(t_future_s, t_future_p)`` for one pair.
-
-    Prefers ``manifest['future_event_time']`` (the new schema); otherwise maps
-    the stored future EVENT ID through the dataset's edge-id -> time table.
-    """
-    ft = man.get("future_event_time")
-    if ft is not None:
-        return max(float(ft[sk]), float(ft[pk]))
-    if fut_map is None:
-        raise RuntimeError(
-            "manifest lacks future_event_time and no dataset was supplied, so "
-            "the future-event-time purge cannot be done")
-    eid = man["pos_future_event_id"]
-    return max(float(fut_map[int(eid[sk])]), float(fut_map[int(eid[pk])]))
-
-
 def _index_by_pair(d, split, line):
     """{pair_key: {'pair_id':..., 'rows': {phys: row}}} for one line/split."""
     out = {}
@@ -146,6 +224,19 @@ def _index_by_pair(d, split, line):
         e = out.setdefault(rj.pair_key(pid), {"pair_id": pid, "rows": {}})
         e["rows"][int(r["phys"])] = r
     return out
+
+
+def _require_positions(idx, line, split):
+    """Every pair must carry exactly the expected positions for its line."""
+    want = set(EXPECTED_PHYS[line])
+    bad = {k: sorted(v["rows"]) for k, v in idx.items()
+           if set(v["rows"]) != want}
+    if bad:
+        ex = list(bad.items())[:3]
+        raise RunnerError(
+            "{} {}: {} pair(s) do not have the expected positions {} "
+            "(examples: {}).  Re-extract rather than pruning rows.".format(
+                line, split, len(bad), sorted(want), ex))
 
 
 def main():
@@ -159,10 +250,13 @@ def main():
     ap.add_argument("--row-label-kind", default=None,
                     choices=ars.LABEL_KIND_CHOICES,
                     help="override the stored-row label convention")
+    ap.add_argument("--ours-role", default="ours",
+                    help="role compared as the primary arm (pre-registered)")
     ap.add_argument("--n-folds", type=int, default=3)
     ap.add_argument("--min-fold-rows", type=int, default=20)
     ap.add_argument("--n-blocks", type=int, default=20)
     ap.add_argument("--n-boot", type=int, default=2000)
+    ap.add_argument("--n-perm", type=int, default=2000)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--lams", default="1e-4,1e-3,1e-2,1e-1,1,10,100")
     ap.add_argument("--out-dir", default=None)
@@ -216,14 +310,13 @@ def main():
             int(ds.n_nodes), rank=args.svd_rank, random_state=0)
         emb_meta.update({"encoder": "svd_train_prefix", "cutoff_time": cutoff,
                          "prefix_edges": int(keep.sum())})
-        if args.data_dir:
-            try:
-                emb_meta["dataset_hash"] = _file_sha16([
-                    str(Path(args.data_dir) / "ml_{}.csv".format(args.data_name)),
-                    str(Path(args.data_dir) / "ml_{}.npy".format(args.data_name)),
-                    str(Path(args.data_dir) / "ml_{}_node.npy".format(args.data_name))])
-            except OSError:
-                pass
+        try:
+            emb_meta["dataset_hash"] = _file_sha16([
+                str(Path(args.data_dir) / "ml_{}.csv".format(args.data_name)),
+                str(Path(args.data_dir) / "ml_{}.npy".format(args.data_name)),
+                str(Path(args.data_dir) / "ml_{}_node.npy".format(args.data_name))])
+        except OSError as e:
+            raise SystemExit("cannot hash the dataset files: {}".format(e))
     problems = rj.verify_encoder(E, emb_meta, expect_rank=args.svd_rank,
                                  cutoff_max=cutoff, dataset_hash=ds_hash)
     if problems:
@@ -232,36 +325,28 @@ def main():
                         ("svd_rank", "embedding_hash", "cutoff_time")},
           flush=True)
 
-    # ---- future-event times (purge) ---------------------------------------
-    fut_map = None
-    if ds is not None:
-        n_e = int(np.asarray(ds.full.edge_idxs).max()) + 1
-        fut_map = np.zeros(n_e, dtype=np.float64)
-        fut_map[np.asarray(ds.full.edge_idxs, np.int64)] = np.asarray(
-            ds.full.timestamps, np.float64)
+    fut_map = build_eid_time_map(ds) if ds is not None else None
 
     report = {"encoder": emb_meta, "labels": labels, "rows": args.rows,
               "schema": {"ok": audit["ok"], "problems": audit["problems"],
-                         "label_kinds": [a["label_kind"] for a in audit["per_arm"]]},
+                         "label_kinds": [a["label_kind"]
+                                         for a in audit["per_arm"]]},
               "n_boot": int(args.n_boot), "n_blocks": int(args.n_blocks),
-              "lams": list(lams), "arms": {}}
+              "ours_role": args.ours_role, "lams": list(lams), "arms": {}}
     row_losses = {}
-    root_reps = {}     # (label, line) -> replicate vector at phys 3
-    root_point = {}
+    root = {}          # (label, line) -> {'reps','point','nll1','blocks'}
 
     for line in LINES:
         sk, pk = LINE_NODES[line]
         origin = ORIGIN_PHYS[line]
         idx = {s: _index_by_pair(arms[0], s, line) for s in ("calib", "audit")}
-        pos_cal = {k: sorted(v["rows"]) for k, v in idx["calib"].items()}
-        pos_aud = {k: sorted(v["rows"]) for k, v in idx["audit"].items()}
-        phys_set = sorted({p for v in pos_cal.values() for p in v}
-                          & {p for v in pos_aud.values() for p in v})
-        cal_keys = sorted(k for k, v in pos_cal.items() if set(v) == set(phys_set))
-        aud_keys = sorted(k for k, v in pos_aud.items() if set(v) == set(phys_set))
+        for s in ("calib", "audit"):
+            _require_positions(idx[s], line, s)
+        phys_set = list(EXPECTED_PHYS[line])
+        cal_keys = sorted(idx["calib"])
+        aud_keys = sorted(idx["audit"])
         if not cal_keys or not aud_keys:
-            report["arms"][line] = {"error": "no aligned pairs"}
-            continue
+            raise RunnerError("line {}: empty calib or audit block".format(line))
 
         def _pair_arrays(keys, side):
             fields = [rj.ordered_pair_ids(man0[idx[side][k]["pair_id"]], sk, pk)
@@ -279,12 +364,14 @@ def main():
 
         Phi_c, C_c, y_c, t_c, te_c = _pair_arrays(cal_keys, "calib")
         Phi_a, C_a, y_a, t_a, _ = _pair_arrays(aud_keys, "audit")
-        folds = expanding_folds(t_c, te_c, n_folds=args.n_folds,
-                                min_rows=args.min_fold_rows)
+        count_c = rj.require_all_classes(y_c, where="{} calib".format(line))
+        count_a = rj.require_all_classes(y_a, where="{} audit".format(line))
+        folds, fold_attempts = build_folds(t_c, te_c, y_c, line,
+                                           args.n_folds, args.min_fold_rows)
 
-        base_params, cv_base = select_probe(
+        base_params, cv_base, base_diag = rj.select_joint(
             Phi_c, C_c, np.zeros((len(cal_keys), 1)), y_c, folds,
-            use_state=False, lams=lams)
+            lams=lams, use_state=False)
         nll0_a = rj.joint_row_nll(base_params, Phi_a, C_a,
                                   np.zeros((len(aud_keys), 1)), y_a)
 
@@ -302,13 +389,15 @@ def main():
                 Za = np.stack([np.asarray(d_aud[k]["rows"][p]["keep"], np.float64)
                                for k in aud_keys])
                 fb = (rj.base_as_full(base_params, d_z=Zc.shape[1]), cv_base)
-                full, cv_full = select_probe(
-                    Phi_c, C_c, Zc, y_c, folds, use_state=True, lams=lams,
+                full, cv_full, diag = rj.select_joint(
+                    Phi_c, C_c, Zc, y_c, folds, lams=lams, use_state=True,
                     fallback=fb)
                 nll1[p] = rj.joint_row_nll(full, Phi_a, C_a, Za, y_a)
                 chosen[p] = {"lam": float(full["lam"]),
-                             "used_base_fallback": bool(full is fb[0]),
-                             "cv_oof_nll": float(cv_full)}
+                             "used_base_fallback": bool(diag["used_fallback"]),
+                             "cv_oof_nll": float(cv_full),
+                             "n_invalid_lambda": int(diag["n_invalid"]),
+                             "lambda_trials": diag["trials"]}
                 row_losses[(lab, line, p)] = {
                     "pair_keys": aud_keys, "nll_base": nll0_a,
                     "nll_full": nll1[p]}
@@ -318,7 +407,12 @@ def main():
             j_src_pt = (rj.gain_bits(nll0_a, nll1[origin])
                         if origin in phys_set else None)
             out = {"n_calib_pairs": len(cal_keys), "n_audit_pairs": len(aud_keys),
-                   "n_folds": len(folds), "positions": {}}
+                   "n_folds": len(folds), "fold_attempts": fold_attempts,
+                   "class_counts_calib": count_c, "class_counts_audit": count_a,
+                   "base_probe": {"cv_oof_nll": float(cv_base),
+                                  "lam": float(base_params["lam"]),
+                                  "n_invalid_lambda": int(base_diag["n_invalid"])},
+                   "positions": {}}
             for p in phys_set:
                 lo, hi = np.percentile(jrep[p], [2.5, 97.5])
                 pt = rj.gain_bits(nll0_a, nll1[p])
@@ -339,32 +433,66 @@ def main():
             out["PRI_bits"] = float(np.mean(pri)) if pri else None
             report["arms"].setdefault(line, {})[lab] = out
             if 3 in phys_set:
-                root_reps[(lab, line)] = jrep[3]
-                root_point[(lab, line)] = rj.gain_bits(nll0_a, nll1[3])
+                root[(lab, line)] = {"reps": jrep[3],
+                                     "point": rj.gain_bits(nll0_a, nll1[3]),
+                                     "nll1": nll1[3]}
 
-    # ---- paired ours-vs-other RootGain differences, Holm over the 3 hops --
-    report["rootgain_paired"] = {}
-    for a in labels:
-        for b in labels:
-            if a == b:
+    # ---- pre-registered, same-seed, ONE-DIRECTION comparisons --------------
+    info = {lab: _role_seed(arms[i]) for i, lab in enumerate(labels)}
+    by_seed = {}
+    for lab, (role, seed) in info.items():
+        by_seed.setdefault(seed, {})[role] = lab
+    comparisons, skipped = {}, []
+    for seed in sorted(by_seed, key=lambda s: (s is None, s)):
+        roles = by_seed[seed]
+        ours = roles.get(args.ours_role)
+        if ours is None:
+            skipped.append({"seed": seed, "roles": sorted(roles),
+                            "reason": "no '{}' arm".format(args.ours_role)})
+            continue
+        for role in sorted(roles):
+            if role == args.ours_role:
                 continue
-            hops, pvals = {}, []
+            base = roles[role]
+            hops, pvals, keys = {}, [], []
             for h, line in HOP_LINE.items():
-                ka, kb = (a, line), (b, line)
-                if ka not in root_reps or kb not in root_reps:
+                ka, kb = (ours, line), (base, line)
+                if ka not in root or kb not in root:
                     continue
-                dpt, lo, hi, p = rj.paired_diff_ci(
-                    root_reps[ka], root_reps[kb],
-                    root_point[ka], root_point[kb])
+                dpt, lo, hi, p_tail = rj.paired_diff_ci(
+                    root[ka]["reps"], root[kb]["reps"],
+                    root[ka]["point"], root[kb]["point"])
+                # per-row paired contribution to the RootGain difference
+                d_rows = (root[kb]["nll1"] - root[ka]["nll1"]) / np.log(2.0)
+                p_sf = rj.block_signflip_p(
+                    d_rows, blocks, n_perm=args.n_perm, seed=args.seed + h,
+                    alternative="greater")
                 hops[str(h)] = {"line": line, "diff_point": dpt,
-                                "diff_ci95": [lo, hi], "p_boot": p}
-                pvals.append(p)
-            if pvals:
-                adj = rj.holm_adjust(pvals)
-                for h, p in zip(list(hops), adj):
-                    hops[h]["p_holm"] = float(p)
-                    hops[h]["significant_05"] = bool(p < 0.05)
-                report["rootgain_paired"]["{} - {}".format(a, b)] = hops
+                                "diff_ci95": [lo, hi],
+                                "p_tail_boot": p_tail, "p_signflip": p_sf}
+                pvals.append(p_sf)
+                keys.append(str(h))
+            if not pvals:
+                continue
+            adj = rj.holm_adjust(pvals)
+            for k, p in zip(keys, adj):
+                hops[k]["p_holm"] = float(p)
+                hops[k]["significant_05"] = bool(p < 0.05)
+            comparisons["{} - {} (seed {})".format(ours, base, seed)] = hops
+
+    # ---- cross-seed summary, reported separately ---------------------------
+    across = {}
+    for cmp_name, hops in comparisons.items():
+        base_role = info[re.search(r" - (\S+) \(seed", cmp_name).group(1)][0]
+        for h, e in hops.items():
+            key = "{} - {}".format(args.ours_role, base_role)
+            across.setdefault(key, {}).setdefault(h, []).append(e["diff_point"])
+    report["comparisons"] = comparisons
+    report["comparisons_skipped"] = skipped
+    report["comparisons_across_seed"] = {
+        k: {h: {"n_seeds": len(v), "mean_diff_point": float(np.mean(v)),
+                "diffs": [float(x) for x in v]} for h, v in hs.items()}
+        for k, hs in across.items()}
 
     with open(out_dir / "joint_probe_rows.pkl", "wb") as f:
         pickle.dump({"row_losses": row_losses,

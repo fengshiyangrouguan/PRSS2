@@ -281,13 +281,50 @@ def oof_nll(Phi, C, Z, y, folds, lam, use_state=True, max_iter=500):
     Nothing from ``tune`` ever enters the parameters used to score it, so this
     is a genuine held-out estimate of the family's generalisation.
     """
-    per = []
-    for fit, tune in folds:
-        p = fit_joint(Phi[fit], C[fit], Z[fit], y[fit], lam,
-                      use_state=use_state, max_iter=max_iter)
-        per.append(float(joint_row_nll(
-            p, Phi[tune], C[tune], Z[tune], y[tune]).mean()))
-    return float(np.mean(per))
+def class_counts(y, n_class=4):
+    """Joint-class histogram (classes 0..n_class-1)."""
+    return np.bincount(np.asarray(y, np.int64),
+                       minlength=int(n_class))[:int(n_class)].tolist()
+
+
+def require_all_classes(y, n_class=4, where="", exc=ProbeFitError):
+    """Raise unless the four joint classes are all present.  Returns counts.
+
+    A probe family is only identified when every joint class is represented;
+    with a missing class the fit can be nearly separable and the optimiser is
+    unreliable, so this fails loudly instead of pruning rows.
+    """
+    c = class_counts(y, n_class)
+    missing = [i for i, k in enumerate(c) if k == 0]
+    if missing:
+        raise exc("{}: joint classes {} missing (counts {})".format(
+            where or "probe rows", missing, c))
+    return c
+
+
+def oof_nll(Phi, C, Z, y, folds, lam, use_state=True, max_iter=500):
+    """Out-of-fold NLL for one lambda.
+
+    Returns ``(value, statuses)``; ``value`` is ``None`` when ANY fold failed to
+    fit (the failure is recorded per fold in ``statuses`` and that lambda is
+    simply skipped, rather than aborting the whole selection).
+    """
+    per, statuses = [], []
+    for fi, (fit, tune) in enumerate(folds):
+        try:
+            p = fit_joint(Phi[fit], C[fit], Z[fit], y[fit], lam,
+                          use_state=use_state, max_iter=max_iter)
+            v = float(joint_row_nll(
+                p, Phi[tune], C[tune], Z[tune], y[tune]).mean())
+            if not np.isfinite(v):
+                raise ProbeFitError("non-finite OOF NLL")
+            per.append(v)
+            statuses.append({"fold": fi, "ok": True, "oof_nll": v})
+        except ProbeFitError as e:
+            statuses.append({"fold": fi, "ok": False, "error": str(e)})
+    if len(per) != len(folds):
+        return None, statuses
+    return float(np.mean(per)), statuses
 
 
 def select_joint(Phi, C, Z, y, folds,
@@ -300,24 +337,40 @@ def select_joint(Phi, C, Z, y, folds,
     single refit on the full row set with the chosen lambda, and the audit set
     is never touched.  Ties go to the LARGER lambda (the simpler model).
 
+    A lambda that fails to fit in any fold is marked invalid and skipped; only
+    when EVERY candidate lambda is invalid does the selection raise.  The refit
+    at the chosen lambda is not tolerated -- it must converge.
+
     ``fallback``: optional ``(params, oof_nll)`` for a simpler family that must
     not be beaten before the richer family is used (e.g. the base reproduced
     with ``W_Z = 0``).  Its ``oof_nll`` must have been computed on the same
     folds.  On a tie the fallback wins.
 
-    Returns ``(params, oof_nll)``.
+    Returns ``(params, oof_nll, diagnostics)``.
     """
-    best_lam, best_oof = None, None
+    trials, best_lam, best_oof = [], None, None
     for lam in sorted([float(x) for x in lams], reverse=True):
-        v = oof_nll(Phi, C, Z, y, folds, lam, use_state=use_state,
-                    max_iter=max_iter)
+        v, st = oof_nll(Phi, C, Z, y, folds, lam, use_state=use_state,
+                        max_iter=max_iter)
+        trials.append({"lam": lam, "valid": v is not None, "oof_nll": v,
+                       "folds": st})
+        if v is None:
+            continue
         if best_oof is None or v < best_oof - tol:   # ties -> larger lambda
             best_lam, best_oof = lam, v
+    if best_lam is None:
+        raise ProbeFitError(
+            "every candidate lambda failed in at least one fold (use_state={}, "
+            "n_folds={}); reasons: {}".format(
+                use_state, len(folds),
+                [[f.get("error") for f in t["folds"]] for t in trials]))
+    diag = {"trials": trials, "chosen_lam": best_lam,
+            "n_invalid": int(sum(1 for t in trials if not t["valid"]))}
     if use_state and fallback is not None and fallback[1] <= best_oof + 1e-12:
-        return fallback[0], float(fallback[1])
+        return fallback[0], float(fallback[1]), dict(diag, used_fallback=True)
     params = fit_joint(Phi, C, Z, y, best_lam, use_state=use_state,
                        max_iter=max_iter)
-    return params, float(best_oof)
+    return params, float(best_oof), dict(diag, used_fallback=False)
 
 
 def base_as_full(base_params, d_z):
@@ -416,9 +469,12 @@ def ratio_ci(j_src_reps, j_pos_reps, j_src_point, j_pos_point, alpha=0.05):
 def paired_diff_ci(a_reps, b_reps, a_point, b_point, alpha=0.05):
     """Paired difference ``a - b`` across shared replicates.
 
-    Returns ``(diff_point, lo, hi, p_boot)``.  The p-value is the two-sided
-    bootstrap sign test over the paired replicates; the point estimate uses the
-    two point estimates, not the replicate means.
+    Returns ``(diff_point, lo, hi, p_tail_boot)``.  ``p_tail_boot`` is a
+    MONTE-CARLO BOOTSTRAP TAIL PROBABILITY (twice the smaller tail share of the
+    replicate distribution) -- it is not an exact sign test and is reported as a
+    descriptive tail share only.  The formal p-value is
+    :func:`block_signflip_p`.  The point estimate uses the two point estimates,
+    not the replicate means.
     """
     d = np.asarray(a_reps, dtype=np.float64) - np.asarray(b_reps, dtype=np.float64)
     if d.size == 0:
@@ -428,6 +484,38 @@ def paired_diff_ci(a_reps, b_reps, a_point, b_point, alpha=0.05):
     return (float(a_point) - float(b_point),
             float(np.percentile(d, 100 * alpha / 2)),
             float(np.percentile(d, 100 * (1 - alpha / 2))), float(p))
+
+
+def block_signflip_p(d_rows, block_ids, n_perm=2000, seed=0,
+                     alternative="greater"):
+    """Paired time-block sign-flip (randomization) p-value.
+
+    ``d_rows`` are the per-row paired contributions to the statistic (for a
+    RootGain difference, ``(nll_other - nll_ours)/ln2`` per row).  Rows are
+    grouped into time blocks; under the null each block's contribution is
+    equally likely to have either sign, so the reference distribution is
+    ``(1/n) * sum_b eps_b * s_b`` with ``eps_b`` i.i.d. +/-1.  The direction is
+    PRE-REGISTERED, so the default is a one-sided test.
+    """
+    d = np.asarray(d_rows, dtype=np.float64)
+    blocks = np.asarray(block_ids)
+    uniq = np.unique(blocks)
+    sums = np.array([float(d[blocks == b].sum()) for b in uniq],
+                    dtype=np.float64)
+    n = d.size
+    if n == 0 or uniq.size == 0:
+        return float("nan")
+    obs = float(d.mean())
+    rng = np.random.RandomState(int(seed))
+    cnt = 0
+    for _ in range(int(n_perm)):
+        eps = rng.choice([-1.0, 1.0], size=uniq.size)
+        star = float(eps @ sums) / n
+        extreme = (star >= obs - 1e-15) if alternative == "greater" \
+            else (abs(star) >= abs(obs) - 1e-15)
+        if extreme:
+            cnt += 1
+    return (cnt + 1.0) / (int(n_perm) + 1.0)
 
 
 def holm_adjust(pvals):
@@ -476,8 +564,12 @@ def verify_encoder(E, meta, expect_rank=None, cutoff_max=None,
             problems.append(
                 "encoder cutoff {} is after the earliest calib time {}"
                 .format(meta["cutoff_time"], cutoff_max))
-    if dataset_hash is not None and meta.get("dataset_hash") not in (
-            None, dataset_hash):
-        problems.append("dataset_hash mismatch: {} != {}".format(
-            meta.get("dataset_hash"), dataset_hash))
+    if dataset_hash is not None:
+        if "dataset_hash" not in meta:
+            problems.append(
+                "encoder meta has no dataset_hash but one is required "
+                "(expected {})".format(dataset_hash))
+        elif str(meta["dataset_hash"]) != str(dataset_hash):
+            problems.append("dataset_hash mismatch: {} != {}".format(
+                meta.get("dataset_hash"), dataset_hash))
     return problems

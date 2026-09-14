@@ -133,6 +133,23 @@ def test_future_event_id_mismatch_flagged():
     assert rep["compare"]["mismatch_counts"]["future_event_id"] > 0
 
 
+def test_future_event_time_mismatch_flagged():
+    a, b = _mk_arms()
+    b["manifest"][1]["future_event_time"]["a2"] = 123456.5
+    rep = ars.full_audit([a, b])
+    assert not rep["ok"]
+    assert rep["compare"]["mismatch_counts"]["future_event_time"] > 0
+
+
+def test_duplicate_manifest_pair_id_fails():
+    a, b = _mk_arms()
+    a["manifest"] = a["manifest"] + [dict(a["manifest"][0])]
+    rep = ars.full_audit([a, b])
+    assert not rep["ok"]
+    assert any("manifest_duplicate_pair_ids" in p for p in rep["problems"]), \
+        rep["problems"]
+
+
 def test_label_conflict_detected_against_manifest():
     a, b = _mk_arms()
     a["audit"] = [dict(r) for r in a["audit"]]

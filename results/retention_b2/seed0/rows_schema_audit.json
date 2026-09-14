@@ -1,0 +1,67 @@
+{
+  "ok": true,
+  "labels": [
+    "ours|seed0|188689d7cf0c20e9",
+    "taskonly|seed0|aec7005f44873c0d"
+  ],
+  "arm_identity": [
+    "ours|seed0|188689d7cf0c20e9",
+    "taskonly|seed0|aec7005f44873c0d"
+  ],
+  "per_arm": [
+    {
+      "label_kind": "presented_is_positive",
+      "n_rows": 232677,
+      "rows_missing_manifest": 0,
+      "label_conflict": 0,
+      "duplicate_row_keys": 0,
+      "split_overlap": 0,
+      "manifest_duplicate_pair_ids": 0
+    },
+    {
+      "label_kind": "presented_is_positive",
+      "n_rows": 232677,
+      "rows_missing_manifest": 0,
+      "label_conflict": 0,
+      "duplicate_row_keys": 0,
+      "split_overlap": 0,
+      "manifest_duplicate_pair_ids": 0
+    }
+  ],
+  "problems": [],
+  "meta_mismatch": {},
+  "compare": {
+    "n_common_rows": 232677,
+    "n_keys_not_in_all_arms": 0,
+    "n_rows_per_arm": [
+      232677,
+      232677
+    ],
+    "mismatch_counts": {
+      "pair_id": 0,
+      "t_root": 0,
+      "nodes": 0,
+      "joint_label": 0,
+      "ordered_s": 0,
+      "ordered_p": 0,
+      "pos_cand": 0,
+      "neg_cand": 0,
+      "presented": 0,
+      "future_event_id": 0,
+      "future_event_time": 0,
+      "candidate_seed": 0,
+      "c_shared": 0
+    },
+    "examples": [],
+    "ok": true,
+    "labels": [
+      "ours|seed0|188689d7cf0c20e9",
+      "taskonly|seed0|aec7005f44873c0d"
+    ]
+  },
+  "ctx_shared_dim": 32,
+  "rows": [
+    "/root/autodl-tmp/PRSS2_uci_v2/outputs/uci_formal_v2/seed0_TGN_3hop/ours/retention_rows.pkl",
+    "/root/autodl-tmp/PRSS2_uci_v2/outputs/uci_formal_v2/seed0_TGN_3hop/taskonly/retention_rows.pkl"
+  ]
+}

@@ -32,6 +32,10 @@ run_one() {
   echo "DONE $abl s$seed rc=$? $(date '+%H:%M:%S')" >> "$ROOT/run_abl_G4.log"
 }
 
+# 用户指定：additive s1 优先（G4 先出结果，P1 dense 修复验证推后）；
+# G3 编排器届时由 run_one 的 SKIP 幂等保护自动跳过。
+run_one additive 1 --arm 2obs_aligned --lambda-kf "$LAM" --rpbe-constrain --rpbe-constrain-mode additive
+
 # 补跑：修复前（supervised 树数门禁 raise）崩溃的 s0 格；run_one 自带
 # SKIP 幂等保护，已完成的格不会重跑。
 run_one P1 0 --config P1 --rpbe-constrain --rpbe-constrain-mode treewise --rpbe-kappa 0.05

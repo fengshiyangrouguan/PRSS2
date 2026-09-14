@@ -1,5 +1,8 @@
 #!/bin/bash
-# G1 (26389): k0 / C1 / B1  × 3 seeds
+# G1 (26389): Per-tree Est. 消融 × 3 seeds（审阅定义的新格）
+# 正式方法 = window-level pooled estimation；本格 = 每棵树只用自己的
+# 行独立估计中心化/白化/协方差/伴随。其余全部与 R0 相同（同样的树数、
+# targets、interface-wise 约束、κ=0.05、一个 window 一次更新）。
 ROOT=/root/autodl-tmp/PRSS2_uci_v2/outputs/uci_formal_v2
 DATA_DIR=/root/autodl-tmp/benchtemp/data_uci
 LAM=0.00668
@@ -22,7 +25,7 @@ run_one() {
   fi
   mkdir -p "$out"
   echo "START $abl seed=$seed $(date '+%H:%M:%S')" >> "$ROOT/run_abl_G1.log"
-  $PY -m scripts.train_uci_link \
+  PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True $PY -m scripts.train_uci_link \
     --data-dir "$DATA_DIR" --gpu 0 \
     --epochs "$EP" --budget-cap "$EP" --patience "$PAT" \
     --kf-group-batches 40 --n-neighbors 10 --n-layers 3 \
@@ -33,8 +36,6 @@ run_one() {
 }
 
 for s in 0 1 2; do
-  run_one k0 "$s" --arm 2obs_aligned --lambda-kf "$LAM" --rpbe-constrain --rpbe-constrain-mode treewise --rpbe-kappa 0
-  run_one C1 "$s" --config C1 --rpbe-constrain --rpbe-constrain-mode treewise --rpbe-kappa 0.05
-  run_one B1 "$s" --config B1 --rpbe-constrain --rpbe-constrain-mode treewise --rpbe-kappa 0.05
+  run_one PerTree "$s" --arm 2obs_aligned --lambda-kf "$LAM" --rpbe-constrain --rpbe-constrain-mode treewise --rpbe-kappa 0.05 --est-mode per_tree
 done
 echo "ALL_DONE_ABL_G1 $(date '+%H:%M:%S')" >> "$ROOT/run_abl_G1.log"

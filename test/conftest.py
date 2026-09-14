@@ -19,6 +19,13 @@ SRC_DIR = Path(__file__).resolve().parents[1] / "src"
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
+# The offline audits/statistics live in scripts/ as flat modules (e.g.
+# ``import retention_stats``); put them on the path too so those tests run
+# without an external PYTHONPATH.
+SCRIPTS_DIR = Path(__file__).resolve().parents[1] / "scripts"
+if str(SCRIPTS_DIR) not in sys.path:
+    sys.path.insert(0, str(SCRIPTS_DIR))
+
 
 import os
 

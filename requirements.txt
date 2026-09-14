@@ -1,8 +1,12 @@
 # RPBE -- dual-environment install notes (Windows CPU / AutoDL GPU)
 #
-# torch is deliberately NOT pinned here: install the wheel matching your environment FIRST.
-#   Windows CPU: pip install torch --index-url https://download.pytorch.org/whl/cpu
-#   AutoDL GPU : pip install torch==2.8.0 --index-url https://download.pytorch.org/whl/cu128
+# torch is deliberately NOT listed below: install the wheel matching your
+# environment FIRST.  MINIMUM VERSION IS 2.1 -- the test suite calls
+# torch.nn.init.xavier_normal_(..., generator=...), which does not exist before
+# 2.1, so a torch 2.0 environment shows one spurious test failure.
+#   Windows CPU: pip install "torch>=2.1,<3" --index-url https://download.pytorch.org/whl/cpu
+#   AutoDL GPU : pip install "torch>=2.1,<3" --index-url https://download.pytorch.org/whl/cu128
+# The GPU/UCI line is validated on torch 2.8.0+cu128 and torch 2.7.1+cu128.
 
 # ---------- core (required on both environments) ----------
 numpy>=1.21

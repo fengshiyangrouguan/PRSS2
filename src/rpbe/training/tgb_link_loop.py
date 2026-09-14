@@ -105,7 +105,8 @@ class TGBPairLinkLoop:
                  rpbe_constrain=False, rpbe_kappa=0.05,
                  rpbe_constrain_mode="treewise",
                  rpbe_constrain_scope="gamma",
-                 rpbe_constrain_probe=False):
+                 rpbe_constrain_probe=False,
+                 est_mode="pooled"):
         self.tgn = tgn
         self.device = device
         self.batch_size = int(batch_size)
@@ -140,6 +141,7 @@ class TGBPairLinkLoop:
         self.context_mode = str(context_mode)
         self.variant = str(variant)
         self.aux_kind = str(aux_kind)   # kyfan / rec / pred / none
+        self.est_mode = str(est_mode)   # pooled (canonical) / per_tree
         self.aux_heads = aux_heads
         self.aux_optimizer = aux_optimizer
         self.aux_lambda = (float(aux_lambda) if aux_lambda is not None
@@ -327,7 +329,8 @@ class TGBPairLinkLoop:
             self.pair_windows[tau] = PairKFWindow(
                 tau=tau, eps=self._window_eps,
                 min_unique_trees=self.kf_min_trees,
-                variant=self.variant)
+                variant=self.variant,
+                est_mode=self.est_mode)
         return self.pair_windows[tau]
 
     def _save_group_state(self):

@@ -41,12 +41,21 @@ class PairKFWindow:
     def __init__(self, *, tau: str, eps: float = 1e-4,
                  min_unique_trees: int = 64, strict: bool = False,
                  variant: str = "full_balancing",
-                 support_frac: float = 1.0):
+                 support_frac: float = 1.0,
+                 est_mode: str = "pooled"):
         self.tau = str(tau)
         self.eps = float(eps)
         self.min_unique_trees = int(min_unique_trees)
         self.strict = bool(strict)
         self.variant = str(variant)   # full_balancing / diagonal / unbalanced
+        # Per-tree Est. ablation: "pooled" = window-level pooled estimation
+        # (canonical); "per_tree" = each tree estimates its own statistics
+        # (whitening / covariance / adjoints) from ITS OWN rows only.  Same
+        # trees, same targets, same interface-wise constraints, same kappa,
+        # same one-update-per-window cadence — only the estimation grain
+        # changes.  Single-tree samples are tiny (1–3 pairs), so per-tree
+        # estimates are expected to be unstable.
+        self.est_mode = str(est_mode)
         # Fig 5(c): statistical-support cut.  The readiness gate still uses
         # the FULL window (repr cadence unchanged); only the estimation
         # sample shrinks.  Sampling is per TREE so every kept tree's
@@ -158,6 +167,8 @@ class PairKFWindow:
                 "below_threshold": True,
                 "M_unique_trees": len(self._tree_seen),
                 "threshold": self.min_unique_trees}
+        if self.est_mode == "per_tree":
+            return self._close_per_tree(records, orig_pos, maps)
         z = torch.stack([r.z for r in records]).double()
         p = torch.stack([maps.pv_row(r) for r in records]).double()
         w = torch.tensor([float(r.weight) for r in records],
@@ -190,6 +201,60 @@ class PairKFWindow:
         return float(j), g_by_position, {
             "M_unique_trees": len(self._tree_seen),
             "M_used_trees": len({int(r.root_row) for r in records}),
+            "support_frac": self.support_frac,
+            "below_threshold": False}
+
+    def _close_per_tree(self, records, orig_pos, maps):
+        """Per-tree Est.: each tree contracts its OWN adjoints from its own
+        rows (per-tree centering / whitening / covariance).  Adjoints from
+        all trees are then merged into the usual g_by_position; the window
+        score is the size-weighted mean of the per-tree scores.  Trees whose
+        tiny-sample estimate fails (cholesky / nonpositive D) contribute
+        nothing — the expected instability cost of the ablation."""
+        by_tree: Dict[int, List] = {}
+        for i, r in enumerate(records):
+            by_tree.setdefault(int(r.root_row), []).append((i, r))
+        g_by_position = {}
+        js: List[float] = []
+        wts: List[float] = []
+        n_failed = 0
+        for _t, items in by_tree.items():
+            z = torch.stack([r.z for _i, r in items]).double()
+            p = torch.stack([maps.pv_row(r) for _i, r in items]).double()
+            w = torch.tensor([float(r.weight) for _i, r in items],
+                             dtype=torch.float64, device=z.device)
+            W = float(w.sum())
+            W2 = float((w * w).sum())
+            D = W - W2 / W if W > 0 else 0.0
+            if not (D > 0.0):
+                n_failed += 1
+                continue
+            mu_z = (z * w[:, None]).sum(0, keepdim=True) / W
+            mu_p = (p * w[:, None]).sum(0, keepdim=True) / W
+            j_t, g_by_cut_t, diag_t = latent_z_adjoint(
+                z.detach().float(), p.float(), w,
+                [r.boundary_key for _i, r in items],
+                mu_z.float(), mu_p.float(), D, self.eps, self.strict,
+                variant=self.variant, scale_bounds=True)
+            if diag_t["failed"] is not None:
+                n_failed += 1
+                continue
+            js.append(float(j_t))
+            wts.append(float(len(items)))
+            for i, r in items:
+                g = g_by_cut_t.get(r.boundary_key)
+                if g is not None:
+                    g_by_position[orig_pos[i]] = g
+        if not js:
+            return None, {}, {"failed": "all_per_tree_estimates_failed",
+                              "n_trees": len(by_tree)}
+        j = float(np.average(js, weights=wts))
+        return j, g_by_position, {
+            "M_unique_trees": len(self._tree_seen),
+            "M_used_trees": len(by_tree),
+            "M_estimated_trees": len(js),
+            "n_tree_failed": n_failed,
+            "est_mode": "per_tree",
             "support_frac": self.support_frac,
             "below_threshold": False}
 

@@ -161,6 +161,11 @@ def parse_args():
                         "RPBE directions separate and solve the multi-half-"
                         "space QP  min_d 1/2||d-t||^2 s.t. g_j^T d >= "
                         "-kappa||g_j||||t||.")
+    p.add_argument("--est-mode", default="pooled",
+                   choices=["pooled", "per_tree"],
+                   help="Per-tree Est. ablation: pooled = window-level "
+                        "pooled estimation (canonical); per_tree = each tree "
+                        "estimates its own statistics from its own rows only")
     p.add_argument("--rpbe-constrain-scope", default="gamma",
                    choices=["gamma", "repr"],
                    help="params the projection may correct: gamma = "
@@ -525,6 +530,7 @@ def main():
         rpbe_constrain=args.rpbe_constrain,
         rpbe_kappa=args.rpbe_kappa,
         rpbe_constrain_mode=args.rpbe_constrain_mode,
+        est_mode=args.est_mode,
         rpbe_constrain_scope=args.rpbe_constrain_scope,
         rpbe_constrain_probe=args.rpbe_constrain_probe)
 

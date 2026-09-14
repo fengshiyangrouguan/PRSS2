@@ -22,7 +22,7 @@ run_one() {
   fi
   mkdir -p "$out"
   echo "START $abl seed=$seed $(date '+%H:%M:%S')" >> "$ROOT/run_abl_G1.log"
-  $PY -m scripts.train_uci_link \
+  PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True $PY -m scripts.train_uci_link \
     --data-dir "$DATA_DIR" --gpu 0 \
     --epochs "$EP" --budget-cap "$EP" --patience "$PAT" \
     --kf-group-batches 40 --n-neighbors 10 --n-layers 3 \

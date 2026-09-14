@@ -32,9 +32,11 @@ run_one() {
   echo "DONE $abl s$seed rc=$? $(date '+%H:%M:%S')" >> "$ROOT/run_abl_G3.log"
 }
 
+# additive s1 由 G4（35360）优先跑；本组顺序 global -> P0 -> additive，
+# 跑到 additive 时 G4 若已完成则 SKIP（run_one 幂等保护），不重复。
 for s in 0 1 2; do
-  run_one additive "$s" --arm 2obs_aligned --lambda-kf "$LAM" --rpbe-constrain --rpbe-constrain-mode additive
   run_one global "$s" --arm 2obs_aligned --lambda-kf "$LAM" --rpbe-constrain --rpbe-constrain-mode global
   run_one P0 "$s" --config P0
+  run_one additive "$s" --arm 2obs_aligned --lambda-kf "$LAM" --rpbe-constrain --rpbe-constrain-mode additive
 done
 echo "ALL_DONE_ABL_G3 $(date '+%H:%M:%S')" >> "$ROOT/run_abl_G3.log"

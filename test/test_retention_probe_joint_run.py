@@ -43,7 +43,10 @@ def _build_arm(noise_seed, informative, arm, sha, seed=0, n_cal=90, n_aud=90):
             # canonical label = position of the true candidate
             #   presented == pos -> canonical 0  ;  presented == neg -> canonical 1
             pres = {k: (pos[k] if bits[k] == 0 else neg[k]) for k in NODES}
-            t_root = 10.0 + i
+            # audit events sit strictly after the calibration block in time, as
+            # they do in the real stream (the calib->audit future-time purge
+            # would otherwise drop every calibration row)
+            t_root = (10.0 if split == "calib" else 10000.0) + i
             manifest.append({
                 "pair_id": list(pid), "root_event_id": pid[0], "t_root": t_root,
                 "nodes": nodes, "pos_cand": pos, "neg_cand": neg,

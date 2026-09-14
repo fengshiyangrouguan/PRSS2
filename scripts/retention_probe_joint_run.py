@@ -31,6 +31,33 @@ Comparisons are restricted to PRE-REGISTERED same-seed, one-direction pairs
 aggregation is reported separately.  The formal p-value is a paired time-block
 sign-flip randomization test; the percentile bootstrap supplies the CIs.
 
+How to read the numbers (do not skip this):
+  * ``J_hat`` is the held-out predictive gain of THIS restricted probe family --
+    the operational definition of usable information (Xu et al.) and of the
+    q0(T|B) vs q1(T|B,Z) comparison in conditional probing.  It is not Shannon
+    mutual information.
+  * A NEGATIVE ``J_hat`` on finite data means the fitted full probe scored worse
+    on the evaluation rows.  It is not "negative information".
+  * The full family CONTAINS the base family, but that only guarantees the
+    OPTION of ignoring the state; it does not guarantee the calibration-selected
+    full probe generalises better than the base on the audit block.
+  * A fallback zero means the pipeline CHOSE not to use the state.  It does not
+    show the state carries no information, and a fixed-predictor [0, 0]
+    interval cannot support that conclusion.
+  * Readout, use and path-specific retention are DIFFERENT claims (Amnesic
+    Probing).  This runner measures what a probe can READ OUT of a state; it
+    does not by itself show the model USES the signal, nor that the signal
+    travelled the designated path -- another branch may carry it too.  The
+    native task-intervention measurement is the separate evidence for "used".
+  * Audit blocks already used for design decisions are no longer an independent
+    final test; report such results as exploratory unless a confirmation split
+    untouched by those decisions is used.
+
+Time boundaries: OUTER -- a calibration row whose supervised future
+``t_end = max(t_future_s, t_future_pa(s))`` lands at or after the audit block
+starts is dropped, with one retained list shared by every arm; INNER -- lambda
+and the base-vs-full family choice use out-of-fold fits purged the same way.
+
 Fail-closed: the runner aborts unless the full rows/schema audit passes, the
 encoder verifies against its recorded hash/rank/cutoff/dataset hash, the
 future-event-id table is validated, and the chosen fits converge.
@@ -397,6 +424,31 @@ def main():
 
         Phi_c, C_c, y_c, t_c, te_c = _pair_arrays(cal_keys, "calib")
         Phi_a, C_a, y_a, t_a, _ = _pair_arrays(aud_keys, "audit")
+
+        # ---- OUTER time boundary ------------------------------------------
+        # A calibration row whose supervised future lands at or after the audit
+        # block starts leaks that window's events into the probe's fit, so drop
+        # it.  Purifying only the OOF folds is not enough.  T_A is fixed by the
+        # audit block alone, EVERY arm shares this retained list, and no audit
+        # label is touched here.
+        t_a_start = float(np.min(t_a))
+        keep_c = te_c < t_a_start
+        n_dropped = int((~keep_c).sum())
+        if n_dropped:
+            print("[purge] {}: dropping {}/{} calib pairs whose future reaches "
+                  "the audit block (T_A={:.0f}, max calib t_end={:.0f})"
+                  .format(line, n_dropped, keep_c.size, t_a_start, te_c.max()),
+                  flush=True)
+            cal_keys = [k for k, ok in zip(cal_keys, keep_c) if bool(ok)]
+            Phi_c, C_c, y_c, t_c, te_c = (Phi_c[keep_c], C_c[keep_c],
+                                          y_c[keep_c], t_c[keep_c],
+                                          te_c[keep_c])
+        if len(cal_keys) < 2 * int(args.min_fold_rows):
+            raise RunnerError(
+                "line {}: only {} calibration pairs survive the calib->audit "
+                "future-time purge (T_A={:.0f}); too few to fit".format(
+                    line, len(cal_keys), t_a_start))
+
         count_c = rj.require_all_classes(y_c, where="{} calib".format(line))
         count_a = rj.require_all_classes(y_a, where="{} audit".format(line))
         folds, fold_attempts = build_folds(t_c, te_c, y_c, line,
@@ -440,6 +492,8 @@ def main():
             j_src_pt = (rj.gain_bits(nll0_a, nll1[origin])
                         if origin in phys_set else None)
             out = {"n_calib_pairs": len(cal_keys), "n_audit_pairs": len(aud_keys),
+                   "calib_pairs_dropped_by_purge": int(n_dropped),
+                   "audit_start_time": t_a_start,
                    "n_folds": len(folds), "fold_attempts": fold_attempts,
                    "class_counts_calib": count_c, "class_counts_audit": count_a,
                    "audit_pair_keys": aud_keys,

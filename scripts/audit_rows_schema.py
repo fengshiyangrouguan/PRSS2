@@ -148,6 +148,7 @@ def arm_records(d, label_kind):
     intra = {"label_kind": label_kind, "n_rows": 0,
              "rows_missing_manifest": 0, "label_conflict": 0,
              "duplicate_row_keys": 0, "split_overlap": 0,
+             "head_overlap": 0,
              "manifest_duplicate_pair_ids": len(dups)}
     seen = {}
     for split in SPLITS:
@@ -166,10 +167,17 @@ def arm_records(d, label_kind):
                 intra["label_conflict"] += 1
             bare = (rj.pair_key(pid), r["line"], int(r["phys"]))
             if bare in seen:
-                if seen[bare] == split:
+                prev = seen[bare]
+                if prev == split:
                     intra["duplicate_row_keys"] += 1
-                else:
+                elif {prev, split} == {"calib", "audit"}:
+                    # leak-critical: the probe fits on calib and scores audit
                     intra["split_overlap"] += 1
+                else:
+                    # the optional head-calibration block re-scans the stream
+                    # head by construction; it is not used by the probe, so an
+                    # overlap with calib is informational, not a failure
+                    intra["head_overlap"] += 1
             else:
                 seen[bare] = split
             recs[(split, rj.pair_key(pid), r["line"], int(r["phys"]))] = {

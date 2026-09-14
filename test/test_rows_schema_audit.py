@@ -197,6 +197,22 @@ def test_missing_checkpoint_meta_and_duplicate_identity_fail():
     assert any("duplicate arm identities" in p for p in rep2["problems"])
 
 
+def test_head_overlap_is_informational_not_fatal():
+    """The optional head block re-scans the stream head by construction.
+
+    It overlaps calib, but the probe never reads it, so that overlap must be
+    counted and reported rather than failing the audit -- only a calib<->audit
+    overlap is leak-critical.
+    """
+    a, b = _mk_arms()
+    for d in (a, b):
+        d["head"] = [dict(r) for r in d["audit"][:3]]   # same keys as audit
+    rep = ars.full_audit([a, b])
+    assert rep["ok"], (rep["problems"], rep["compare"]["mismatch_counts"])
+    assert rep["per_arm"][0]["head_overlap"] > 0
+    assert rep["per_arm"][0]["split_overlap"] == 0
+
+
 def test_meta_layout_mismatch_fails():
     a, b = _mk_arms()
     b["meta"] = dict(b["meta"], layout={"audit_block": [9, 9]})

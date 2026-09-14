@@ -1022,6 +1022,26 @@ def main():
         str(_dd / "ml_{}_node.npy".format(args.data_name))])
     # shared manifest: write once (from any arm) and record its SHA so every
     # arm can be proven to have consumed the identical candidate set.
+    # The same root event can be seen by more than one pass -- the optional
+    # head-calibration block re-scans the stream head and may overlap the calib
+    # block -- so keep exactly one manifest row per pair_id.  Duplicates would
+    # make the shared candidate record ambiguous (and are caught by the
+    # schema audit); conflicting payloads for the same pair_id are a real bug.
+    _by_pid, _dedup = {}, []
+    for _m in manifest_rows:
+        _k = tuple(int(x) for x in _m["pair_id"])
+        if _k in _by_pid:
+            if _m != _by_pid[_k]:
+                raise RuntimeError(
+                    "manifest pair_id {} has two different rows".format(_k))
+            continue
+        _by_pid[_k] = _m
+        _dedup.append(_m)
+    if len(_dedup) != len(manifest_rows):
+        print("[manifest] de-duplicated {} repeated pair_id(s) ({} -> {})"
+              .format(len(manifest_rows) - len(_dedup), len(manifest_rows),
+                      len(_dedup)), flush=True)
+    manifest_rows = _dedup
     _mrows_json = json.dumps(manifest_rows, sort_keys=True, default=str)
     manifest_sha = hashlib.sha256(_mrows_json.encode()).hexdigest()
     if args.manifest_out:

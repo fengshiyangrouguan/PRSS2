@@ -601,10 +601,30 @@ class TGBPairLinkLoop:
                     j, g_pos, diag = win.close_replay(
                         _MapsAdapter(self, tau))
                     if j is None:
+                        # Per-tree Est. audit: record the estimation-failure
+                        # rate so the ablation report can say "degradation
+                        # coincides with ill-conditioned tree-level estimates"
+                        # instead of guessing from the final AP alone.
+                        extra = {"est_mode": self.est_mode}
+                        if isinstance(diag, dict):
+                            extra["n_tree_failed"] = diag.get(
+                                "n_tree_failed")
+                            extra["M_estimated_trees"] = diag.get(
+                                "M_estimated_trees")
+                        self.window_diag[-1].update(extra)
                         below += 1
                         continue
                     n_closed += 1
                     closed_tau[tau] = j
+                    # Per-tree Est. audit (success path): per-window failure
+                    # rate of tree-level estimates, recorded even when some
+                    # trees fail but the window still closes.
+                    if isinstance(diag, dict) and "n_tree_failed" in diag:
+                        self.window_diag[-1].update({
+                            "est_mode": self.est_mode,
+                            "n_tree_failed": diag.get("n_tree_failed"),
+                            "M_estimated_trees": diag.get(
+                                "M_estimated_trees")})
                     for pos_in_tau, g in g_pos.items():
                         # key by pair_id: pass 2 rebuilds fresh record objects
                         # whose pair_ids match (RNG/oid restored), but whose

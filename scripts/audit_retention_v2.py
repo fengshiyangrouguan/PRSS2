@@ -353,6 +353,10 @@ def main():
                     help="override: start the audit window here (default: "
                          "train tail = --audit-batches worth of batches)")
     ap.add_argument("--n-bootstrap", type=int, default=200)
+    ap.add_argument("--no-stats", action="store_true",
+                    help="stop after dumping retention_rows.pkl; skip the "
+                         "legacy in-process v2 statistics (superseded by the "
+                         "offline B2 runner, and hours-slow on large streams)")
     ap.add_argument("--n-null", type=int, default=200)
     ap.add_argument("--n-dir", type=int, default=5,
                     help="number of fixed predictive directions extracted for "
@@ -1057,6 +1061,10 @@ def main():
                      "manifest": manifest_rows}, f)
     print("[dump] rows saved to", dump_path, flush=True)
 
+    if args.no_stats:
+        print("[stats] skipped (--no-stats); rows are the deliverable here",
+              flush=True)
+        return
     run_stats(calib_rows, audit_rows, calib_h_rows, args, mem_parity,
               layout={"audit_batches": args.audit_batches,
                       "audit_block": [audit_lo, audit_hi],

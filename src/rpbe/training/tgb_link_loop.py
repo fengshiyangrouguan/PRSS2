@@ -1063,6 +1063,11 @@ class TGBPairLinkLoop:
         add_batch = 1 << 30 if zero_slack else 1
 
         t_g = t.float().to(dev)  # single GPU copy, shared across rounds
+        # release caching-allocator fragments before the QP: late-epoch dense
+        # groups need a ~7GB H block while training holds ~24GB; the
+        # reserved-but-unallocated pool (15GB+) blocks it otherwise.
+        if dev.type == "cuda":
+            torch.cuda.empty_cache()
 
         def _solve_active(active_keys):
             # dense groups (P1 late epochs / κ=0) push the active set to

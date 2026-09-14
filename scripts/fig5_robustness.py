@@ -58,17 +58,17 @@ def scan_dir(root, name):
     return mean_std(pts) if pts else (None, None)
 
 
-def anchor(root, sub, seeds=(0, 1, 2)):
-    """Table-2 four-card anchor: mean +- std over seeds."""
-    root = Path(root)
-    aps = []
-    for s in seeds:
-        p = root / "seed{}_TGN_UCI_3L10N".format(s) / sub / "summary.json"
-        if p.exists():
-            aps.append(load_ap(p))
-    if not aps:
-        raise SystemExit("anchor {} missing under {}".format(sub, root))
-    return mean_std(aps)
+def anchor(root, sub, seed=1):
+    """Table-2 four-card anchor: SINGLE seed (Fig-5 is 1-seed everywhere).
+
+    seed 1 is the fixed anchor seed for all three panels; every new Fig-5
+    point is also seed 0-1 of its own run, so the figure stays consistent.
+    """
+    p = Path(root) / "seed{}_TGN_UCI_3L10N".format(seed) / sub / "summary.json"
+    if not p.exists():
+        raise SystemExit("anchor {} seed{} missing under {}".format(
+            sub, seed, root))
+    return load_ap(p), 0.0
 
 
 def main():

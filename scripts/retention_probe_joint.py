@@ -73,15 +73,38 @@ def build_svd_encoder(train_src, train_dst, n_nodes, rank=16, random_state=0):
                "embedding_hash": _sha16(E), "train_edges": int(len(train_src))}
 
 
+# --------------------------------------------------------------- label kinds
+# CANONICAL: Y_v = the PRESENTATION POSITION of the true candidate (0 or 1).
+# LEGACY (audit_retention_v2 rows): Y_v = 1 iff the presented candidate is the
+# true future destination, i.e. Y_canonical = 1 - Y_legacy.
+CANONICAL_LABEL_KIND = "true_candidate_position"
+LEGACY_LABEL_KIND = "presented_is_positive"
+LABEL_KINDS = (CANONICAL_LABEL_KIND, LEGACY_LABEL_KIND)
+
+
+def canonical_bits(man, key):
+    """Canonical label for one node: 0 iff the true candidate sits at pos 0."""
+    return 0 if int(man["presented"][key]) == int(man["pos_cand"][key]) else 1
+
+
+def row_label_to_canonical(y_row, label_kind):
+    """Map a stored row label into the canonical convention."""
+    if label_kind == CANONICAL_LABEL_KIND:
+        return int(y_row)
+    if label_kind == LEGACY_LABEL_KIND:
+        return 1 - int(y_row)
+    raise ValueError("unknown label_kind {!r}".format(label_kind))
+
+
 # --------------------------------------------------------------- feature build
 def ordered_pair_ids(man, sk, pk):
     """Presentation-ordered candidate ids for the (source, parent) nodes.
 
     ``man`` is one manifest row; ``sk``/``pk`` are the node keys (e.g.
     ``"leaf"``/``"a2"``).  Position 0 is the PRESENTED candidate and position 1
-    is the other one, matching the swap bit recorded in the manifest.  The new
-    label is ``Y_v = 0`` iff the presented candidate is the true future, i.e.
-    the true candidate sits at position 0.
+    is the other one, so the canonical label ``Y_v`` is the position of the true
+    candidate.  These labels come from the manifest alone and are therefore
+    independent of whatever convention the stored rows use.
     """
     out = {}
     for key in (sk, pk):
@@ -89,9 +112,7 @@ def ordered_pair_ids(man, sk, pk):
         pos = int(man["pos_cand"][key])
         neg = int(man["neg_cand"][key])
         out[key] = (pres, neg if pres == pos else pos)
-    ys = 0 if int(man["presented"][sk]) == int(man["pos_cand"][sk]) else 1
-    yp = 0 if int(man["presented"][pk]) == int(man["pos_cand"][pk]) else 1
-    return out[sk], out[pk], int(ys), int(yp)
+    return out[sk], out[pk], canonical_bits(man, sk), canonical_bits(man, pk)
 
 
 def phi_tensor(E, s_pair, p_pair):
@@ -172,6 +193,10 @@ def _loss_grad(theta, Phi, Cs, Zs, y, lam, d_phi, d_c, d_z):
     return loss, np.concatenate(parts)
 
 
+class ProbeFitError(RuntimeError):
+    """The convex fit did not converge cleanly; the number is not reportable."""
+
+
 def fit_joint(Phi, C, Z, y, lam, use_state=True, sC=None, sZ=None,
               max_iter=500):
     """Fit the joint probe; base when ``use_state=False``.
@@ -179,6 +204,10 @@ def fit_joint(Phi, C, Z, y, lam, use_state=True, sC=None, sZ=None,
     ``Z`` is the real state ``(N, d_z)``; ignored when ``use_state=False``.
     Scalers are learned on THIS set unless passed in, so a caller doing an inner
     time split must pass the train-side scalers for the tune set.
+
+    Raises ``ProbeFitError`` if the optimiser reports failure, if any parameter
+    is non-finite, or if the objective is NaN -- an unconverged fit must never
+    silently become a number.
     """
     from scipy.optimize import minimize
     Phi = np.asarray(Phi, dtype=np.float64)
@@ -194,14 +223,26 @@ def fit_joint(Phi, C, Z, y, lam, use_state=True, sC=None, sZ=None,
     Cs = C / sC
     Zs = (np.asarray(Z, dtype=np.float64) / (sZ or 1.0)) if use_state else None
     x0 = np.zeros(d_phi + d_phi * d_c + d_phi * d_z)
-    res = minimize(_loss_grad, x0, jac=True, method="L-BFGS-B",
-                   args=(Phi, Cs, Zs, y, lam, d_phi, d_c, d_z),
-                   options={"maxiter": int(max_iter)})
+    try:
+        res = minimize(_loss_grad, x0, jac=True, method="L-BFGS-B",
+                       args=(Phi, Cs, Zs, y, lam, d_phi, d_c, d_z),
+                       options={"maxiter": int(max_iter)})
+    except Exception as e:                       # noqa: BLE001
+        raise ProbeFitError(
+            "joint probe fit raised (lam={}, use_state={}, n={}): {}".format(
+                lam, use_state, len(y), e)) from e
+    if (not res.success) or (not np.all(np.isfinite(res.x))) \
+            or (not np.isfinite(res.fun)):
+        raise ProbeFitError(
+            "joint probe fit failed (lam={}, use_state={}, n={}): status={} "
+            "success={} nit={} fun={} msg={}".format(
+                lam, use_state, len(y), res.status, res.success, res.nit,
+                res.fun, res.message))
     w_phi, W_C, W_Z = _unpack(res.x, d_phi, d_c, d_z)
     return {"w_phi": w_phi, "W_C": W_C, "W_Z": W_Z, "sC": float(sC),
             "sZ": float(sZ) if use_state else 1.0, "use_state": bool(use_state),
             "fun": float(res.fun), "nit": int(res.nit),
-            "success": bool(res.success),
+            "success": bool(res.success), "status": int(res.status),
             "n_params": int(x0.size), "lam": float(lam)}
 
 
@@ -234,40 +275,49 @@ def params_hash(params):
     return h.hexdigest()[:16]
 
 
+def oof_nll(Phi, C, Z, y, folds, lam, use_state=True, max_iter=500):
+    """Out-of-fold NLL: every fold fits on ``fit`` and scores ``tune``.
+
+    Nothing from ``tune`` ever enters the parameters used to score it, so this
+    is a genuine held-out estimate of the family's generalisation.
+    """
+    per = []
+    for fit, tune in folds:
+        p = fit_joint(Phi[fit], C[fit], Z[fit], y[fit], lam,
+                      use_state=use_state, max_iter=max_iter)
+        per.append(float(joint_row_nll(
+            p, Phi[tune], C[tune], Z[tune], y[tune]).mean()))
+    return float(np.mean(per))
+
+
 def select_joint(Phi, C, Z, y, folds,
                  lams=(1e-4, 1e-3, 1e-2, 1e-1, 1.0, 10.0, 100.0),
-                 use_state=True, fallback_fn=None, max_iter=500):
-    """Pick lambda by mean inner-fold validation NLL (ties -> larger lambda).
+                 use_state=True, fallback=None, max_iter=500, tol=0.0):
+    """Pick lambda on OUT-OF-FOLD NLL, then refit on all rows once.
 
-    ``folds`` is a list of ``(fit_idx, tune_idx)`` index arrays into the rows --
-    an expanding-window time split with a purge gap.  ``fallback_fn`` returns an
-    optional simpler probe (e.g. the fitted base reproduced with W_Z = 0) that
-    the result must beat; on a tie the simpler one wins.
+    ``folds``: ``(fit_idx, tune_idx)`` pairs (expanding-window time split).
+    Selection uses only out-of-fold predictions; the returned parameters are a
+    single refit on the full row set with the chosen lambda, and the audit set
+    is never touched.  Ties go to the LARGER lambda (the simpler model).
+
+    ``fallback``: optional ``(params, oof_nll)`` for a simpler family that must
+    not be beaten before the richer family is used (e.g. the base reproduced
+    with ``W_Z = 0``).  Its ``oof_nll`` must have been computed on the same
+    folds.  On a tie the fallback wins.
+
+    Returns ``(params, oof_nll)``.
     """
-    def val_of(p):
-        return float(np.mean([
-            float(joint_row_nll(p, Phi[t], C[t], Z[t], y[t]).mean())
-            for _, t in folds]))
-
-    best = None
+    best_lam, best_oof = None, None
     for lam in sorted([float(x) for x in lams], reverse=True):
-        tot = 0.0
-        for fit, tune in folds:
-            p = fit_joint(Phi[fit], C[fit], Z[fit], y[fit], lam,
-                          use_state=use_state, max_iter=max_iter)
-            tot += float(joint_row_nll(
-                p, Phi[tune], C[tune], Z[tune], y[tune]).mean())
-        key = (tot / len(folds), lam)          # ties -> larger lambda = simpler
-        if best is None or key < best[0]:
-            best = (key, lam)
-    params = fit_joint(Phi, C, Z, y, best[1], use_state=use_state,
+        v = oof_nll(Phi, C, Z, y, folds, lam, use_state=use_state,
+                    max_iter=max_iter)
+        if best_oof is None or v < best_oof - tol:   # ties -> larger lambda
+            best_lam, best_oof = lam, v
+    if use_state and fallback is not None and fallback[1] <= best_oof + 1e-12:
+        return fallback[0], float(fallback[1])
+    params = fit_joint(Phi, C, Z, y, best_lam, use_state=use_state,
                        max_iter=max_iter)
-    val = val_of(params)
-    if use_state and fallback_fn is not None:
-        fb = fallback_fn()
-        if fb is not None and val_of(fb) <= val + 1e-12:
-            return fb, val_of(fb)
-    return params, val
+    return params, float(best_oof)
 
 
 def base_as_full(base_params, d_z):
@@ -338,21 +388,96 @@ def paired_bootstrap(idx_sets, nll0, nll1_by_pos):
     return out
 
 
-def ratio_ci(j_src, j_pos, alpha=0.05):
-    """Paired R = J_pos / J_src from replicate vectors.
+def ratio_ci(j_src_reps, j_pos_reps, j_src_point, j_pos_point, alpha=0.05):
+    """Paired R = J_pos / J_src from replicate vectors and the point estimates.
 
-    Returns ``(R_point, lo, hi, identifiable)``.  ``identifiable`` is False when
-    a non-trivial share of replicates has a source denominator at or below
-    zero, in which case the ratio is not bounded and no CI is reported (the
-    negative-denominator replicates are never dropped to fake a narrow one).
+    Returns ``(R_point, lo, hi, identifiable)``.  Identifiability is decided by
+    whether the percentile CI of the SOURCE gain has a lower bound above zero.
+    When it does, the CI uses ALL paired replicates (never dropping the ones
+    with a non-positive denominator, which would fake a narrow interval); when
+    it does not, the ratio is unbounded and reported as not identifiable.  The
+    point estimate is strictly ``J_point,pos / J_point,src`` -- it is never
+    replaced by a bootstrap mean.
     """
-    j_src = np.asarray(j_src, dtype=np.float64)
-    j_pos = np.asarray(j_pos, dtype=np.float64)
-    ok = j_src > 1e-12
-    frac_ok = float(ok.mean()) if j_src.size else 0.0
-    if frac_ok < 0.95:
+    j_src = np.asarray(j_src_reps, dtype=np.float64)
+    j_pos = np.asarray(j_pos_reps, dtype=np.float64)
+    if j_src.size == 0 or not np.isfinite(j_src_point) \
+            or not np.isfinite(j_pos_point):
         return (float("nan"), float("nan"), float("nan"), False)
-    r = j_pos[ok] / j_src[ok]
-    return (float(np.mean(j_pos) / np.mean(j_src)),
+    lo_src = float(np.percentile(j_src, 100 * alpha / 2))
+    if not np.isfinite(lo_src) or lo_src <= 0.0:
+        return (float("nan"), float("nan"), float("nan"), False)
+    r = j_pos / j_src
+    return (float(j_pos_point) / float(j_src_point),
             float(np.percentile(r, 100 * alpha / 2)),
             float(np.percentile(r, 100 * (1 - alpha / 2))), True)
+
+
+def paired_diff_ci(a_reps, b_reps, a_point, b_point, alpha=0.05):
+    """Paired difference ``a - b`` across shared replicates.
+
+    Returns ``(diff_point, lo, hi, p_boot)``.  The p-value is the two-sided
+    bootstrap sign test over the paired replicates; the point estimate uses the
+    two point estimates, not the replicate means.
+    """
+    d = np.asarray(a_reps, dtype=np.float64) - np.asarray(b_reps, dtype=np.float64)
+    if d.size == 0:
+        return (float("nan"),) * 4
+    p = 2.0 * min(float((d <= 0).mean()), float((d >= 0).mean()))
+    p = min(1.0, max(p, 1.0 / (d.size + 1)))
+    return (float(a_point) - float(b_point),
+            float(np.percentile(d, 100 * alpha / 2)),
+            float(np.percentile(d, 100 * (1 - alpha / 2))), float(p))
+
+
+def holm_adjust(pvals):
+    """Holm step-down adjustment; returns an array in the input order."""
+    p = np.asarray(pvals, dtype=np.float64)
+    m = p.size
+    if m == 0:
+        return p
+    order = np.argsort(p)
+    adj = np.empty(m, dtype=np.float64)
+    running = 0.0
+    for rank, idx in enumerate(order):
+        running = max(running, float(m - rank) * float(p[idx]))
+        adj[idx] = min(1.0, running)
+    return adj
+
+
+def verify_encoder(E, meta, expect_rank=None, cutoff_max=None,
+                   dataset_hash=None):
+    """Return a list of problems with a supplied/locked SVD table (empty = ok).
+
+    A precomputed ``E`` must be provably the table it claims to be: the stored
+    embedding hash must equal the recomputed one, the rank must match the array
+    width, the cutoff must not be later than the earliest probe fit time, and
+    the dataset hash must match when one is available.
+    """
+    problems = []
+    E = np.asarray(E, dtype=np.float64)
+    stored = meta.get("embedding_hash")
+    if stored is None:
+        problems.append("encoder meta has no embedding_hash")
+    elif str(stored) != _sha16(E):
+        problems.append("embedding_hash mismatch: stored {} != recomputed {}"
+                        .format(stored, _sha16(E)))
+    width = int(E.shape[1]) if E.ndim == 2 else -1
+    if int(meta.get("svd_rank", width)) != width:
+        problems.append("svd_rank {} != E width {}".format(
+            meta.get("svd_rank"), width))
+    if expect_rank is not None and width != int(expect_rank):
+        problems.append("E width {} != expected rank {}".format(
+            width, int(expect_rank)))
+    if cutoff_max is not None:
+        if "cutoff_time" not in meta:
+            problems.append("encoder meta has no cutoff_time")
+        elif float(meta["cutoff_time"]) > float(cutoff_max):
+            problems.append(
+                "encoder cutoff {} is after the earliest calib time {}"
+                .format(meta["cutoff_time"], cutoff_max))
+    if dataset_hash is not None and meta.get("dataset_hash") not in (
+            None, dataset_hash):
+        problems.append("dataset_hash mismatch: {} != {}".format(
+            meta.get("dataset_hash"), dataset_hash))
+    return problems

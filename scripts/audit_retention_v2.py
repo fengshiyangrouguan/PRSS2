@@ -438,6 +438,13 @@ def main():
           flush=True)
 
     fut = FutureIndex(ds)
+    # future-event TIMES by edge index, so the manifest can record when each
+    # supervised future actually happens (needed to purge probe fits by future
+    # time).  edge_idxs is a row index into the edge feature table, not
+    # necessarily the stream position, so map it rather than assume identity.
+    _eidx_all = np.asarray(ds.full.edge_idxs, np.int64)
+    eid2time = np.zeros(int(_eidx_all.max()) + 1, dtype=np.float64)
+    eid2time[_eidx_all] = np.asarray(ds.full.timestamps, np.float64)
 
     # ---- leaf-to-root path-tracking compute (re-implemented hook) ----
     # n_neighbors / n_layers come from args (must match the checkpoint)
@@ -822,6 +829,10 @@ def main():
                 "presented_bits": {k: (0 if F[k]["presented"] == F[k]["dpos"]
                                        else 1) for k in F},
                 "pos_future_event_id": {k: F[k]["eid"] for k in F},
+                # when each supervised future event actually happens, so a
+                # probe fit can be purged by future time without re-extraction
+                "future_event_time": {k: float(eid2time[int(F[k]["eid"])])
+                                      for k in F},
                 "candidate_seed": {k: F[k]["cand_seed"] for k in F},
                 "sampler_formula_version":
                     "seed=(v*1000003+root_t)%2**31;dneg=randint;bit=randint",
@@ -1006,6 +1017,11 @@ def main():
                  "neg_collisions": int(neg_collisions),
                  "manifest_in": args.manifest_in,
                  "memory_parity": mem_parity,
+                 # the rows store Y = 1 iff the PRESENTED candidate is the true
+                 # future; the canonical probe label is the true candidate's
+                 # presentation POSITION, so Y_canonical = 1 - Y_row
+                 "row_label_kind": "presented_is_positive",
+                 "schema_version": 2,
                  "layout": {"audit_block": [audit_lo, audit_hi],
                             "same_tail_calib_block": [calib_lo, calib_hi],
                             "head_calib_block": [0, transfer_hi]}})

@@ -223,6 +223,44 @@ def test_audit_labels_do_not_change_the_fit():
     assert abs(s1["lam"] - s2["lam"]) < 1e-15
 
 
+# ------------------------------------------- 7b. selection is truly out-of-fold
+def test_selection_uses_out_of_fold_not_a_refit_on_all():
+    """The reported CV value must be the honest OOF, not a refit-on-all score.
+
+    High-capacity features + pure-noise labels: an all-row refit nearly
+    memorises the tune block, so scoring it on tune looks far better than the
+    true out-of-fold number.  The old implementation returned that leaky value.
+    """
+    rng = np.random.RandomState(11)
+    n = 150
+    E = rng.randn(6, 16)
+    s_pair, p_pair = _pairs(n)
+    Phi = rj.phi_tensor(E, s_pair, p_pair)
+    C = rng.randn(n, 32)                 # 48 + 1536 params -> memorises easily
+    Z = np.zeros((n, 1))
+    y = rng.randint(0, 4, size=n)        # no generalisable signal at all
+    folds = [(np.arange(50), np.arange(50, 100)),
+             (np.arange(100), np.arange(100, 150))]
+    lams = (1e-4,)
+    params, oof = rj.select_joint(Phi, C, Z, y, folds, lams=lams,
+                                  use_state=False)
+    leaky = float(np.mean([
+        rj.joint_row_nll(params, Phi[t], C[t], Z[t], y[t]).mean()
+        for _, t in folds]))
+    assert oof > leaky + 0.05, (oof, leaky)
+    # the returned value is exactly the fold-based estimate
+    manual = rj.oof_nll(Phi, C, Z, y, folds, lams[0], use_state=False)
+    assert abs(oof - manual) < 1e-12, (oof, manual)
+
+
+def test_fit_failure_is_loud():
+    Phi = np.full((50, 4, 48), np.nan)
+    C, Z, y = np.zeros((50, 32)), np.zeros((50, 1)), np.zeros(50, dtype=int)
+    import pytest
+    with pytest.raises(rj.ProbeFitError):
+        rj.fit_joint(Phi, C, Z, y, 1e-2, use_state=False)
+
+
 # ------------------------------------------------ 8. scale / rotation invariance
 def test_state_scale_and_rotation_invariance():
     for seed in (0, 1):
@@ -275,13 +313,34 @@ def test_block_bootstrap_shares_indices_and_guards_ratio():
     # the same index sets apply to every arm/metric by construction
     J = rj.paired_bootstrap(idx, nll0, nll1)
     assert J[3].mean() > J[1].mean()
-    R, lo, hi, ok = rj.ratio_ci(J[3], J[1])
+    pt_src = rj.gain_bits(nll0, nll1[3])
+    pt_pos = rj.gain_bits(nll0, nll1[1])
+    R, lo, hi, ok = rj.ratio_ci(J[3], J[1], pt_src, pt_pos)
     assert ok and lo < R < hi
+    # the point estimate is J_pos/J_src, never a bootstrap mean
+    assert abs(R - pt_pos / pt_src) < 1e-12
 
-    # a source whose denominator straddles zero is not identifiable
+    # a source whose percentile CI lower bound is <= 0 is not identifiable
     Jsrc = np.concatenate([np.full(100, -0.01), np.full(100, 0.01)])
-    _, _, _, ok2 = rj.ratio_ci(Jsrc, np.abs(Jsrc) + 0.1)
+    _, _, _, ok2 = rj.ratio_ci(Jsrc, np.abs(Jsrc) + 0.1, 0.0, 0.1)
     assert not ok2
+
+
+def test_ratio_ci_keeps_all_replicates_when_identifiable():
+    """Identifiable ratios must use every paired replicate (no cherry-picking)."""
+    rng = np.random.RandomState(3)
+    src = 0.5 + 0.02 * rng.randn(2000)
+    pos = 0.25 + 0.02 * rng.randn(2000)
+    R, lo, hi, ok = rj.ratio_ci(src, pos, float(src.mean()), float(pos.mean()))
+    assert ok
+    assert abs(R - float(pos.mean()) / float(src.mean())) < 1e-9
+    # the CI must widen if a few denominators are near zero: those replicates
+    # are still included rather than silently dropped
+    hijack = src.copy()
+    hijack[:200] = 1e-6
+    _, lo2, hi2, ok2 = rj.ratio_ci(hijack, pos, float(src.mean()),
+                                   float(pos.mean()))
+    assert ok2 and (hi2 - lo2) > (hi - lo)
 
 
 def test_time_blocks_are_contiguous():
@@ -289,3 +348,35 @@ def test_time_blocks_are_contiguous():
     b = rj.time_blocks(t, 10)
     assert b.min() == 0 and b.max() == 9
     assert np.all(np.diff(b) >= 0)
+
+
+# ------------------------------------------------- 11. label conventions
+def test_legacy_label_flip_and_canonical():
+    man = {"presented": {"leaf": 7, "a2": 9, "a1": 11, "root": 13},
+           "pos_cand": {"leaf": 7, "a2": 8, "a1": 11, "root": 12},
+           "neg_cand": {"leaf": 6, "a2": 9, "a1": 10, "root": 13}}
+    # leaf: presented 7 == pos 7 -> true candidate at position 0 -> canonical 0
+    # a2:   presented 9 != pos 8 -> true candidate at position 1 -> canonical 1
+    assert rj.canonical_bits(man, "leaf") == 0
+    assert rj.canonical_bits(man, "a2") == 1
+    s_pair, p_pair, ys, yp = rj.ordered_pair_ids(man, "leaf", "a2")
+    assert s_pair == (7, 6) and p_pair == (9, 8)
+    assert (ys, yp) == (0, 1)
+    # legacy rows store 1 iff presented is the true candidate
+    assert rj.row_label_to_canonical(1, rj.LEGACY_LABEL_KIND) == 0
+    assert rj.row_label_to_canonical(0, rj.LEGACY_LABEL_KIND) == 1
+    assert rj.row_label_to_canonical(0, rj.CANONICAL_LABEL_KIND) == 0
+
+
+# ------------------------------------------------- 12. paired diff + Holm
+def test_paired_diff_and_holm():
+    rng = np.random.RandomState(5)
+    a = 0.30 + 0.05 * rng.randn(4000)
+    b = 0.10 + 0.05 * rng.randn(4000)
+    d, lo, hi, p = rj.paired_diff_ci(a, b, 0.30, 0.10)
+    assert abs(d - 0.20) < 1e-9 and lo < d < hi and p < 0.01
+    # the Holm step-down never decreases a p-value below its raw value
+    raw = [0.01, 0.04, 0.03]
+    adj = rj.holm_adjust(raw)
+    assert adj[0] == 0.03 and adj[1] == 0.06 and adj[2] == 0.06
+    assert all(a_ >= r_ - 1e-12 for a_, r_ in zip(adj, raw))

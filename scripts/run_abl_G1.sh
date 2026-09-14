@@ -32,8 +32,9 @@ run_one() {
   echo "DONE $abl s$seed rc=$? $(date '+%H:%M:%S')" >> "$ROOT/run_abl_G1.log"
 }
 
+# k0（κ=0）已按审阅 gate 移除：full-run 约束覆盖率跌破 60%，
+# 附录措辞 "could not be reliably certified with our solver on UCI"。
 for s in 0 1 2; do
-  run_one k0 "$s" --arm 2obs_aligned --lambda-kf "$LAM" --rpbe-constrain --rpbe-constrain-mode treewise --rpbe-kappa 0
   run_one C1 "$s" --config C1 --rpbe-constrain --rpbe-constrain-mode treewise --rpbe-kappa 0.05
   run_one B1 "$s" --config B1 --rpbe-constrain --rpbe-constrain-mode treewise --rpbe-kappa 0.05
 done

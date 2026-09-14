@@ -1,5 +1,7 @@
 #!/bin/bash
-# G3 (21954): additive / global / P0  × 3 seeds
+# G3 (21954): P1 / P2 / R0  × 3 seeds（接管 G4 的原队列）
+# G4（35360）当前被 additive s1 插队占用，additive 跑完后 G4 的
+# P1/P2/R0 行会因本组已完成的 summary 触发 SKIP，不重复。
 ROOT=/root/autodl-tmp/PRSS2_uci_v2/outputs/uci_formal_v2
 DATA_DIR=/root/autodl-tmp/benchtemp/data_uci
 LAM=0.00668
@@ -32,11 +34,9 @@ run_one() {
   echo "DONE $abl s$seed rc=$? $(date '+%H:%M:%S')" >> "$ROOT/run_abl_G3.log"
 }
 
-# additive s1 由 G4（35360）优先跑；本组顺序 global -> P0 -> additive，
-# 跑到 additive 时 G4 若已完成则 SKIP（run_one 幂等保护），不重复。
 for s in 0 1 2; do
-  run_one global "$s" --arm 2obs_aligned --lambda-kf "$LAM" --rpbe-constrain --rpbe-constrain-mode global
-  run_one P0 "$s" --config P0
-  run_one additive "$s" --arm 2obs_aligned --lambda-kf "$LAM" --rpbe-constrain --rpbe-constrain-mode additive
+  run_one P1 "$s" --config P1 --rpbe-constrain --rpbe-constrain-mode treewise --rpbe-kappa 0.05
+  run_one P2 "$s" --config P2 --rpbe-constrain --rpbe-constrain-mode treewise --rpbe-kappa 0.05
+  run_one R0 "$s" --arm 2obs_aligned --lambda-kf "$LAM" --rpbe-constrain --rpbe-constrain-mode treewise --rpbe-kappa 0.05
 done
 echo "ALL_DONE_ABL_G3 $(date '+%H:%M:%S')" >> "$ROOT/run_abl_G3.log"

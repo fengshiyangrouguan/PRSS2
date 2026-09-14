@@ -125,9 +125,10 @@ def test_runner_end_to_end(tmp_path, capsys):
     assert all(c > 0 for c in ours["class_counts_audit"])
     assert ours["RootGain_millibits"] > 100, ours
     assert abs(other["RootGain_millibits"]) < 100, other
-    assert abs(ours["positions"][0]["R"] - 1.0) < 1e-9
+    assert abs(ours["positions"][0]["retention_ratio"] - 1.0) < 1e-9
     for e in ours["positions"].values():
-        assert e["R"] == "ratio_not_identifiable" or np.isfinite(e["R"])
+        rr = e["retention_ratio"]
+        assert rr == "ratio_not_identifiable" or np.isfinite(rr)
     # lambda handling is recorded and no candidate was silently dropped
     assert ours["positions"][0]["probe"]["n_invalid_lambda"] >= 0
     assert isinstance(ours["positions"][0]["probe"]["lambda_trials"], list)
@@ -140,10 +141,21 @@ def test_runner_end_to_end(tmp_path, capsys):
     assert hops["3"]["p_signflip"] < 0.05 and hops["3"]["significant_05"]
     across = rep["comparisons_across_seed"]["ours - taskonly"]
     assert across["3"]["n_seeds"] == 1
+    assert across["3"]["ci_claimed"] is False
     assert (out / "joint_probe.json").exists()
     assert (out / "joint_probe_rows.pkl").exists()
     with open(out / "joint_probe_rows.pkl", "rb") as f:
         tab = pickle.load(f)
+    # the sign-flip p-value is computed from the RAW paired audit rows
+    lo_ours = tab["row_losses"][("ours|seed0|aaaa", "Y_leaf", 3)]
+    lo_oth = tab["row_losses"][("taskonly|seed0|bbbb", "Y_leaf", 3)]
+    d_rows = (lo_oth["nll_full"] - lo_ours["nll_full"]) / np.log(2.0)
+    blocks = np.asarray(ours["audit_block_ids"])
+    assert len(blocks) == len(d_rows)
+    p_check = rj.block_signflip_p(d_rows, blocks, n_perm=2000, seed=0 + 3,
+                                  alternative="greater")
+    assert abs(p_check - hops["3"]["p_signflip"]) < 1e-12, \
+        (p_check, hops["3"]["p_signflip"])
     loss = tab["row_losses"][("ours|seed0|aaaa", "Y_leaf", 0)]
     j = (loss["nll_base"].mean() - loss["nll_full"].mean()) / np.log(2.0)
     assert abs(j - ours["positions"][0]["J_point"]) < 1e-9
@@ -165,10 +177,59 @@ def test_comparisons_are_same_seed_and_one_direction(tmp_path):
                     "ours|seed1|aaa2 - taskonly|seed1|bbb2 (seed 1)"], keys
     for k in keys:                       # never the reverse direction
         assert not k.startswith("taskonly")
-    # cross-seed aggregation is reported separately
+    # cross-seed aggregation is reported separately, one delta per seed
     across = rep["comparisons_across_seed"]["ours - taskonly"]
     assert across["3"]["n_seeds"] == 2
-    assert len(across["3"]["diffs"]) == 2
+    assert across["3"]["ci_claimed"] is False
+    per_seed = {x["seed"]: x["diff_point"] for x in across["3"]["per_seed"]}
+    assert set(per_seed) == {0, 1}
+    # the per-seed deltas are exactly the same-seed comparison point diffs --
+    # no rows were pooled across seeds
+    for k, hops in rep["comparisons"].items():
+        seed = 0 if "(seed 0)" in k else 1
+        assert abs(per_seed[seed] - hops["3"]["diff_point"]) < 1e-12
+    assert abs(across["3"]["mean_diff_point"]
+               - np.mean(list(per_seed.values()))) < 1e-12
+
+
+class _Stub:
+    pass
+
+
+def _stub_ds(edge_idxs, timestamps):
+    s = _Stub()
+    s.edge_idxs = np.asarray(edge_idxs, np.int64)
+    s.timestamps = np.asarray(timestamps, np.float64)
+    d = _Stub()
+    d.full = s
+    return d
+
+
+def test_eid_time_map_allows_padding_id_zero():
+    """0 may be padding with real edges from 1; ids need not be contiguous."""
+    ds = _stub_ds([1, 2, 3, 7], [10.0, 20.0, 30.0, 70.0])
+    m = run.build_eid_time_map(ds)
+    assert m.size == 8
+    assert np.isnan(m[0])                     # padding slot is unassigned
+    assert m[1] == 10.0 and m[7] == 70.0
+    man = {"pos_future_event_id": {"leaf": 1, "a2": 2}}
+    assert run._future_end(man, "leaf", "a2", m) == 20.0
+    # an id the stream never produced must be an error, not a silent 0.0
+    bad = {"pos_future_event_id": {"leaf": 0, "a2": 3}}
+    try:
+        run._future_end(bad, "leaf", "a2", m)
+        raise AssertionError("expected RunnerError for an unassigned id")
+    except run.RunnerError as e:
+        assert "never occurred" in str(e) or "not an edge id" in str(e)
+
+
+def test_eid_time_map_rejects_duplicate_ids():
+    ds = _stub_ds([1, 1, 2], [10.0, 20.0, 30.0])
+    try:
+        run.build_eid_time_map(ds)
+        raise AssertionError("expected RunnerError for duplicate edge ids")
+    except run.RunnerError as e:
+        assert "bijection" in str(e)
 
 
 def test_runner_refuses_on_schema_mismatch(tmp_path):

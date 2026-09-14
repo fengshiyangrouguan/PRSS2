@@ -201,6 +201,20 @@ def _ctx_vector(root_id, leaf_id, node_times, edge_feats, edge_times,
 CTX_MODEL_DEP_BLOCKS = ((0, 16), (24, 40), (48, 64))
 
 
+def _future_time_of(eid, eid2time):
+    """Timestamp of a future event, refusing an id the stream never produced."""
+    j = int(eid)
+    if not (0 <= j < eid2time.size):
+        raise RuntimeError(
+            "future_event_id {} is outside the edge-id table (size {})".format(
+                j, eid2time.size))
+    t = float(eid2time[j])
+    if not np.isfinite(t):
+        raise RuntimeError(
+            "future_event_id {} was never assigned a timestamp".format(j))
+    return t
+
+
 def ctx_shared_only(ctx):
     """Zero the three model-dependent other-neighbor blocks of a stored C."""
     out = np.array(ctx, dtype=np.float64, copy=True)
@@ -442,8 +456,15 @@ def main():
     # supervised future actually happens (needed to purge probe fits by future
     # time).  edge_idxs is a row index into the edge feature table, not
     # necessarily the stream position, so map it rather than assume identity.
+    # Ids must be unique (a duplicate would silently overwrite) and are not
+    # assumed to start at 0 (0 may be a padding id), so unassigned slots stay
+    # NaN and a bad lookup is detectable rather than a silent time of 0.0.
     _eidx_all = np.asarray(ds.full.edge_idxs, np.int64)
-    eid2time = np.zeros(int(_eidx_all.max()) + 1, dtype=np.float64)
+    if np.unique(_eidx_all).size != _eidx_all.size:
+        raise RuntimeError(
+            "edge_idxs is not a bijection; the edge_id -> future_event_time "
+            "map would silently overwrite entries")
+    eid2time = np.full(int(_eidx_all.max()) + 1, np.nan, dtype=np.float64)
     eid2time[_eidx_all] = np.asarray(ds.full.timestamps, np.float64)
 
     # ---- leaf-to-root path-tracking compute (re-implemented hook) ----
@@ -831,7 +852,7 @@ def main():
                 "pos_future_event_id": {k: F[k]["eid"] for k in F},
                 # when each supervised future event actually happens, so a
                 # probe fit can be purged by future time without re-extraction
-                "future_event_time": {k: float(eid2time[int(F[k]["eid"])])
+                "future_event_time": {k: _future_time_of(F[k]["eid"], eid2time)
                                       for k in F},
                 "candidate_seed": {k: F[k]["cand_seed"] for k in F},
                 "sampler_formula_version":

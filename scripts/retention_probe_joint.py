@@ -38,6 +38,19 @@ base.  Objective is mean joint NLL + (lam/2)*||W||_F^2, which is convex in the
 parameters, so L-BFGS-B converges reliably.
 
 Everything here is pure numpy; no torch, no model, no GPU.
+
+Terminology (fixed)
+-------------------
+  * ``J_{s->k}`` -- held-out PREDICTIVE GAIN of the state at position k about
+    the source's joint local future, under the restricted probe family.  It is
+    NOT Shannon mutual information, and a negative value is a finite-sample
+    failure of the fitted probe, not negative information.
+  * ``R_{s->k} = J_{s->k} / J_{s->s}`` -- predictive-signal retention ratio.
+  * ``R_{s->s} = 1`` -- only the normalisation origin; it does not mean the
+    source carries one bit.
+  * ``RootGain_h`` -- predictive gain at the root of the h-hop source signal.
+  * ``p_tail_boot`` -- Monte-Carlo bootstrap tail probability (descriptive);
+    the formal test is ``block_signflip_p``.
 """
 
 import hashlib

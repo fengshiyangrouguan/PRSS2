@@ -69,6 +69,23 @@ HOP_LINE = {3: "Y_leaf", 2: "Y_a2", 1: "Y_a1"}
 # positions the extractor emits for each line; a pair missing one is an error
 EXPECTED_PHYS = {"Y_leaf": (0, 1, 2, 3), "Y_a2": (1, 2, 3), "Y_a1": (2, 3)}
 
+# Terminology is fixed; the numbers below are probe-estimated predictive gains
+# under a restricted family, not Shannon mutual information.
+NAMING = {
+    "J_s_k": "held-out predictive gain (bits per joint query) of the state at "
+             "position k about the source's joint local future -- NOT mutual "
+             "information",
+    "retention_ratio": "R_{s->k} = J_{s->k} / J_{s->s} -- predictive-signal "
+                       "retention ratio",
+    "RootGain_h": "predictive gain at the root of the h-hop source signal",
+    "R_source": "R_{s->s} = 1 is only the normalisation origin; it does not "
+                "mean the source carries one bit",
+    "p_signflip": "paired time-block sign-flip randomization p-value "
+                  "(one-sided, pre-registered direction)",
+    "p_tail_boot": "Monte-Carlo bootstrap tail probability (descriptive; not "
+                   "a sign test, not used for the Holm decision)",
+}
+
 
 # ------------------------------------------------------------------ helpers
 class RunnerError(RuntimeError):
@@ -157,7 +174,14 @@ def _role_seed(d):
 
 
 def build_eid_time_map(ds):
-    """edge_id -> timestamp, validated (unique ids, full coverage)."""
+    """edge_id -> timestamp, validated.
+
+    Edge ids are only required to be UNIQUE and lookable-up; they are NOT
+    required to run contiguously from 0 (UCI/BenchTemp may reserve 0 as padding
+    with real edges from 1).  Unassigned slots stay NaN so that looking up an id
+    that never appears in the stream is a detectable error rather than a silent
+    time of 0.0.
+    """
     eid = np.asarray(ds.full.edge_idxs, np.int64)
     if eid.size == 0:
         raise RunnerError("edge_idxs is empty; cannot map future event ids")
@@ -169,8 +193,11 @@ def build_eid_time_map(ds):
             "edge_idxs is not a bijection ({} distinct of {} rows); an "
             "edge_id -> time map would silently overwrite entries".format(
                 n_uniq, eid.size))
-    out = np.zeros(int(eid.max()) + 1, dtype=np.float64)
-    out[eid] = np.asarray(ds.full.timestamps, np.float64)
+    out = np.full(int(eid.max()) + 1, np.nan, dtype=np.float64)
+    ts = np.asarray(ds.full.timestamps, np.float64)
+    if not np.all(np.isfinite(ts)):
+        raise RunnerError("stream timestamps contain non-finite values")
+    out[eid] = ts
     if not np.all(np.isfinite(out[eid])):
         raise RunnerError("some edge_id -> time assignments are not finite")
     return out
@@ -180,8 +207,8 @@ def _future_end(man, sk, pk, fut_map):
     """``max(t_future_s, t_future_p)`` for one pair.
 
     Prefers ``manifest['future_event_time']`` (new schema); otherwise maps the
-    stored future EVENT ID through the validated edge-id -> time table,
-    checking that every referenced id exists.
+    stored future EVENT ID through the validated edge-id -> time table.  An id
+    that is out of range or was never assigned a timestamp is an error.
     """
     ft = man.get("future_event_time")
     if ft is not None:
@@ -198,7 +225,12 @@ def _future_end(man, sk, pk, fut_map):
             raise RunnerError(
                 "future_event_id {} (node {}) is outside the edge-id table "
                 "(size {})".format(j, k, fut_map.size))
-        vals.append(float(fut_map[j]))
+        v = float(fut_map[j])
+        if not np.isfinite(v):
+            raise RunnerError(
+                "future_event_id {} (node {}) is not an edge id that occurs in "
+                "the stream (no timestamp assigned)".format(j, k))
+        vals.append(v)
     return max(vals)
 
 
@@ -328,6 +360,7 @@ def main():
     fut_map = build_eid_time_map(ds) if ds is not None else None
 
     report = {"encoder": emb_meta, "labels": labels, "rows": args.rows,
+              "naming": NAMING,
               "schema": {"ok": audit["ok"], "problems": audit["problems"],
                          "label_kinds": [a["label_kind"]
                                          for a in audit["per_arm"]]},
@@ -409,6 +442,8 @@ def main():
             out = {"n_calib_pairs": len(cal_keys), "n_audit_pairs": len(aud_keys),
                    "n_folds": len(folds), "fold_attempts": fold_attempts,
                    "class_counts_calib": count_c, "class_counts_audit": count_a,
+                   "audit_pair_keys": aud_keys,
+                   "audit_block_ids": [int(b) for b in blocks],
                    "base_probe": {"cv_oof_nll": float(cv_base),
                                   "lam": float(base_params["lam"]),
                                   "n_invalid_lambda": int(base_diag["n_invalid"])},
@@ -423,8 +458,9 @@ def main():
                 if j_src is not None and j_src_pt is not None:
                     R, rlo, rhi, ident = rj.ratio_ci(
                         j_src, jrep[p], j_src_pt, pt)
-                    e["R"] = R if ident else "ratio_not_identifiable"
-                    e["R_ci95"] = [rlo, rhi] if ident else None
+                    e["retention_ratio"] = (R if ident
+                                            else "ratio_not_identifiable")
+                    e["retention_ratio_ci95"] = [rlo, rhi] if ident else None
                 out["positions"][int(p)] = e
             out["J_source"] = j_src_pt
             out["RootGain_millibits"] = (
@@ -442,7 +478,7 @@ def main():
     by_seed = {}
     for lab, (role, seed) in info.items():
         by_seed.setdefault(seed, {})[role] = lab
-    comparisons, skipped = {}, []
+    comparisons, skipped = [], []
     for seed in sorted(by_seed, key=lambda s: (s is None, s)):
         roles = by_seed[seed]
         ours = roles.get(args.ours_role)
@@ -462,7 +498,10 @@ def main():
                 dpt, lo, hi, p_tail = rj.paired_diff_ci(
                     root[ka]["reps"], root[kb]["reps"],
                     root[ka]["point"], root[kb]["point"])
-                # per-row paired contribution to the RootGain difference
+                # formal test: sign-flip the RAW paired audit rows, not the
+                # bootstrap replicates.  d_i = (NLL1_other,i - NLL1_ours,i)/ln2
+                # is exactly the per-row contribution to
+                # RootGain_ours - RootGain_other.
                 d_rows = (root[kb]["nll1"] - root[ka]["nll1"]) / np.log(2.0)
                 p_sf = rj.block_signflip_p(
                     d_rows, blocks, n_perm=args.n_perm, seed=args.seed + h,
@@ -478,20 +517,31 @@ def main():
             for k, p in zip(keys, adj):
                 hops[k]["p_holm"] = float(p)
                 hops[k]["significant_05"] = bool(p < 0.05)
-            comparisons["{} - {} (seed {})".format(ours, base, seed)] = hops
+            comparisons.append({
+                "name": "{} - {} (seed {})".format(ours, base, seed),
+                "ours": ours, "ours_role": info[ours][0], "base": base,
+                "base_role": role, "seed": seed, "hops": hops})
 
-    # ---- cross-seed summary, reported separately ---------------------------
+    # ---- cross-seed summary: seed is the OUTER independent replicate ------
+    # Each seed contributes ONE already-paired delta per hop; rows are never
+    # pooled across seeds (that would fake a narrow interval).  With 2-3 seeds
+    # no cross-seed interval is claimed -- only the mean and the seed points.
     across = {}
-    for cmp_name, hops in comparisons.items():
-        base_role = info[re.search(r" - (\S+) \(seed", cmp_name).group(1)][0]
-        for h, e in hops.items():
-            key = "{} - {}".format(args.ours_role, base_role)
-            across.setdefault(key, {}).setdefault(h, []).append(e["diff_point"])
-    report["comparisons"] = comparisons
+    for cmp_ in comparisons:
+        key = "{} - {}".format(cmp_["ours_role"], cmp_["base_role"])
+        for h, e in cmp_["hops"].items():
+            across.setdefault(key, {}).setdefault(h, []).append(
+                {"seed": cmp_["seed"], "diff_point": e["diff_point"]})
+    report["comparisons"] = {c["name"]: c["hops"] for c in comparisons}
     report["comparisons_skipped"] = skipped
     report["comparisons_across_seed"] = {
-        k: {h: {"n_seeds": len(v), "mean_diff_point": float(np.mean(v)),
-                "diffs": [float(x) for x in v]} for h, v in hs.items()}
+        k: {h: {"n_seeds": len(v),
+                "mean_diff_point": float(np.mean([x["diff_point"]
+                                                  for x in v])),
+                "per_seed": sorted(v, key=lambda x: (x["seed"] is None,
+                                                     x["seed"])),
+                "ci_claimed": False}
+            for h, v in hs.items()}
         for k, hs in across.items()}
 
     with open(out_dir / "joint_probe_rows.pkl", "wb") as f:

@@ -311,6 +311,12 @@ def main():
                     help="override the stored-row label convention")
     ap.add_argument("--ours-role", default="ours",
                     help="role compared as the primary arm (pre-registered)")
+    ap.add_argument("--no-fallback", action="store_true",
+                    help="never substitute the base for the full probe.  The "
+                         "reported J is then the fitted full probe's own held-out "
+                         "gain at every position (can be negative) instead of an "
+                         "exact 0 whenever the out-of-fold comparison preferred "
+                         "the base.  lambda is still chosen inside calibration.")
     ap.add_argument("--n-folds", type=int, default=3)
     ap.add_argument("--min-fold-rows", type=int, default=20)
     ap.add_argument("--n-blocks", type=int, default=20)
@@ -473,7 +479,9 @@ def main():
                                for k in cal_keys])
                 Za = np.stack([np.asarray(d_aud[k]["rows"][p]["keep"], np.float64)
                                for k in aud_keys])
-                fb = (rj.base_as_full(base_params, d_z=Zc.shape[1]), cv_base)
+                fb = (None if args.no_fallback
+                      else (rj.base_as_full(base_params, d_z=Zc.shape[1]),
+                            cv_base))
                 full, cv_full, diag = rj.select_joint(
                     Phi_c, C_c, Zc, y_c, folds, lams=lams, use_state=True,
                     fallback=fb)

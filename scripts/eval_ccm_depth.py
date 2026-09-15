@@ -100,7 +100,7 @@ def eval_split(model, collator, dialogs, device, limit, name,
                     out = model(
                         input_ids=batch["input_ids"].to(device),
                         attention_mask=batch["attention_mask"].to(device))
-                s, n = tc.task_ce_shifted(out, batch["labels"], device)
+                s, n = eval_ce_shifted_noeos(out, batch["labels"], device)
                 total += float(s.detach())
                 n_tok += n
         nll = total / max(n_tok, 1)
@@ -120,7 +120,51 @@ def load_ccm_arm(args, device, ckpt):
     tc.attach_gamma(model, hidden=args.gamma_hidden)
     dummy = torch.optim.AdamW(
         [p for p in model.parameters() if p.requires_grad], lr=1e-3)
-    tc.load_trainable(ckpt, model, dummy, device)
+    # R9: eval never needs optimizer state (the checkpoint may carry a
+    # two-group rpbe-lr layout that a single-group dummy cannot load).
+    tc.load_trainable(ckpt, model, dummy, device, load_optimizer=False)
+    return tokenizer, model
+
+
+def eval_ce_shifted_noeos(out, labels, device):
+    """Official _loglikelihood_clm semantics: shifted CE that ignores
+    padding (-100) AND the EOS token (review fix 2026-09-15: the paper
+    protocol excludes EOS; the training CE includes it, which had been
+    lowering every eval number by 0.6-0.9 PPL)."""
+    logits = out.logits
+    labs = labels.to(device)
+    shift_logits = logits[..., :-1, :].contiguous()
+    shift_labels = labs[..., 1:].contiguous()
+    shift_labels = shift_labels.masked_fill(shift_labels == 2, -100)
+    n_valid = int((shift_labels != -100).sum())
+    loss = torch.nn.functional.cross_entropy(
+        shift_logits.view(-1, shift_logits.shape[-1]),
+        shift_labels.view(-1), ignore_index=-100, reduction="sum")
+    return loss, n_valid
+
+
+def load_official_host_arm(args, device, ckpt):
+    """R8 official-host checkpoint: build_official_host + Gamma + ckpt."""
+    import os as _os
+    import types as _types
+    tokenizer = tc.build_tokenizer(args)
+    our_args = _types.SimpleNamespace(
+        arm="ours", model_name_or_path=args.model_name_or_path,
+        relative_embedding="skip", lora_r=8, gamma_hidden=64,
+        foundation=_os.environ.get("FOUNDATION",
+                                   "/root/autodl-tmp/result/dialog/llama-7b-no"),
+        official_adapter=_os.environ.get(
+            "OFFICIAL_ADAPTER",
+            "/root/autodl-tmp/result/dialog/llama-7b-no-online-merge_recur-ntok2"),
+        official_host=True)
+    model = tc.build_official_host(our_args, device)
+    tc.attach_gamma(model, hidden=our_args.gamma_hidden)
+    dummy = torch.optim.AdamW(
+        [p for p in model.parameters() if p.requires_grad], lr=1e-3)
+    # R9: eval never needs optimizer state (checkpoints may carry a
+    # two-group rpbe-lr layout a single-group dummy cannot load).
+    tc.load_trainable(ckpt, model, dummy, device, load_optimizer=False)
+    model.eval()
     return tokenizer, model
 
 
@@ -152,24 +196,21 @@ def load_official_adapter(args, device, adapter_path):
     return model
 
 
-# Official Table 25 time steps (truncation protocol).  The official
-# time step IS the compression-step count L: a dialogue of L+2 turns
-# (L compressed-history turns + 1 immediate context + 1 target turn,
-# the sample_dialog structure).  L=1 -> 3 turns, L=2 -> 4, L=4 -> 6,
-# L=8 -> 10, L=13 -> 15 — the official _subsample n_turn buckets
-# (3/4/6/10/15) are exactly this L+2 pattern.  The official deepest
-# table step (12) is the same concept as our L=13.
-TIME_STEPS = [1, 2, 4, 8, 13]   # L = compression steps
+# official Table 25 time steps (truncation protocol); t=1 omitted: the
+# official t=1 construction is not recoverable from the released code
+# (prepare_input's n=1 branch degenerates), and the paper numbers for
+# t=1 can only be cited, not reproduced.
+# TIME_STEPS = L (compression steps); dialogue turns = L + 2
+TIME_STEPS = [1, 2, 4, 8, 13]
 
 
 def eval_truncated(model, collator, dialogs, device, limit, name,
                    use_ccm=True):
     """Official truncation protocol: every test dialogue with
-    len >= L+2 is truncated to dialog[:L+2] turns (L compression steps
-    -> L+2 turns) and the CE is scored on the last turn only
-    (sample_dialog predicts dialog[-1]).  The sample set is identical
-    across time steps up to the len >= L+2 filter (matching the
-    official Table 23 note)."""
+    len >= t is truncated to dialog[:t] and the CE is scored on the
+    t-th turn only (sample_dialog predicts dialog[-1]).  The sample set
+    is identical across time steps up to the len >= t filter (matching
+    the official Table 23 note)."""
     per_t = {}
     for t in TIME_STEPS:
         turns = int(t) + 2
@@ -189,7 +230,7 @@ def eval_truncated(model, collator, dialogs, device, limit, name,
                     out = model(
                         input_ids=batch["input_ids"].to(device),
                         attention_mask=batch["attention_mask"].to(device))
-                s, n = tc.task_ce_shifted(out, batch["labels"], device)
+                s, n = eval_ce_shifted_noeos(out, batch["labels"], device)
                 total += float(s.detach())
                 n_tok += n
         nll = total / max(n_tok, 1)
@@ -247,7 +288,11 @@ def main():
                             ("taskonly", a.taskonly_ckpt)]):
             if not ckpt:
                 continue
-            _, model = load_ccm_arm(args, device, ckpt)
+            import os as _os
+            if _os.environ.get("OFFICIAL_HOST_EVAL") == "1":
+                _, model = load_official_host_arm(args, device, ckpt)
+            else:
+                _, model = load_ccm_arm(args, device, ckpt)
             if a.truncate:
                 results[name] = eval_truncated(model, collator,
                                                eval_dialogs, device,

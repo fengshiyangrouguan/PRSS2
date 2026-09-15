@@ -206,6 +206,27 @@ def parse_args():
                         "from theta_0 on the raw LLaMA (single-stage).")
     p.add_argument("--calibrate-lambda", action="store_true",
                    help="measure r_eff on the first closed window and exit")
+    # Tree-wise feasibility projection (TGN final-spec alignment,
+    # 2026-09-15: row-normalized half spaces + 1e-6 full certificate +
+    # CERT_FAIL => skip the representation step; ported from
+    # tgb_link_loop._cstr_group_close_treewise, the b523cf3 lineage)
+    p.add_argument("--rpbe-constrain-mode", default="aggregate",
+                   choices=["aggregate", "treewise"],
+                   help="aggregate = classic summed RPBE surrogate "
+                        "(additive update, no projection); "
+                        "treewise = per-tree half-space feasibility "
+                        "projection on the Gamma scope (final spec)")
+    p.add_argument("--rpbe-kappa", type=float, default=0.05,
+                   help="treewise guardrail: g_i.d >= -kappa||g_i||||t|| "
+                        "(LARGER is looser; kappa>=1 never binds)")
+    p.add_argument("--proj-iters", type=int, default=400,
+                   help="FISTA iterations for the treewise dual QP")
+    p.add_argument("--rpbe-lr", type=float, default=None,
+                   help="independent AdamW lr for the Gamma params "
+                        "(None = unified args.lr for all params; "
+                        "the scheduler scales both groups by the same "
+                        "warmup/cosine factor, so the ratio rpbe_lr/lr "
+                        "is preserved through training)")
     # monitoring
     p.add_argument("--log-every", type=int, default=10)
     p.add_argument("--checkpoint-every", type=int, default=250)
@@ -666,6 +687,160 @@ def batch_surrogate(z_rows_by_oid, batch_terms, lam, device):
     return -lam * sum(terms), len(terms)
 
 
+def _fista_nonneg(Q, c, iters):
+    """min_{mu>=0} 1/2 mu^T Q mu - c^T mu (Q PSD) by accelerated projected
+    GD.  Tiny (N x N, N~128-300) dual of the tree-wise feasibility QP.
+    (TGN final-spec port, 2026-09-15: eigvalsh exact step 1/lambda_max —
+    the TGN loop uses 30 power iterations to estimate the same bound; at
+    CCM's N the exact value is both cheaper and at least as tight.)"""
+    L = float(torch.linalg.eigvalsh(Q).max().clamp(min=1e-12))
+    mu = torch.zeros_like(c)
+    y = mu.clone()
+    tk = 1.0
+    for _ in range(iters):
+        grad = Q @ y - c
+        mu_new = torch.clamp(y - grad / L, min=0.0)
+        tk_new = 0.5 * (1.0 + math.sqrt(1.0 + 4.0 * tk * tk))
+        y = mu_new + ((tk - 1.0) / tk_new) * (mu_new - mu)
+        mu, tk = mu_new, tk_new
+    return mu
+
+
+def _json_safe(obj):
+    """NaN/Inf -> None for jsonl writes (NaN is not valid JSON and
+    breaks strict parsers; None serializes as a legal null)."""
+    if isinstance(obj, dict):
+        return {k: _json_safe(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_json_safe(v) for v in obj]
+    if isinstance(obj, float) and not math.isfinite(obj):
+        return None
+    return obj
+
+
+def treewise_feasibility_projection(g_task_gamma, gamma_params, G, kappa,
+                                    iters=400, cert_tol=1e-6, min_norm=1e-9):
+    """Tree-wise RPBE Feasibility Projection — TGN final-spec alignment
+    (2026-09-15, ported from tgb_link_loop._cstr_group_close_treewise,
+    the b523cf3 lineage; the Cimmino refinement there is kappa=0-only and
+    is NOT needed on the kappa>0 path CCM runs).
+
+    One global task direction t = -g_task; every per-oid RPBE direction
+    g_j stays SEPARATE and contributes one half-space
+    g_j.d >= -kappa*||g_j||*||t||.  Solve
+
+        d* = argmin_d 1/2||d - t||^2   s.t.  H d >= b,  b_j = -kappa*||t||
+
+    with the ROW-NORMALIZED H (rows g_j/||g_j||; final-spec
+    normalization — the same constraint set, a far better-conditioned
+    dual), through the N x N dual (mu >= 0): d* = t + H^T mu.  After
+    solving, EVERY row is certified against the 1e-6 tolerance (the
+    final-spec full certificate).  On success writes ONLY Gamma:
+    p.grad = g_task - sum_j mu_j g_j.  On certificate FAILURE returns
+    ok=False WITHOUT writing anything — the caller must SKIP the
+    representation step (reviewer requirement: no constrained update is
+    executed on an uncertified solution).
+
+    CCM scale note: the window keeps N ~ 1-3 hundred directions, far
+    below the TGN 2000+ regime, so the ACTIVE SET is the full row set
+    (the TGN 3-round one-row-at-a-time expansion is a solver-capacity
+    device for large N and would only add rounds here).  The projection
+    runs on SCALED (fp16 GradScaler) gradients — the QP is invariant to
+    a uniform positive rescaling of t and G, so the math is unaffected."""
+    sizes = [p.numel() for p in gamma_params]
+    t = torch.cat([-x.flatten().float() for x in g_task_gamma])
+    nt = float(t.norm())
+    diag = {"n_dirs": int(G.shape[0]) if G is not None else 0,
+            "task_norm": nt, "cos_mean": None, "cos_med": None,
+            "cos_p5": None, "cos_min": None, "frac_below": None,
+            "frac_below_grid": None, "feasible_d0": None,
+            "active": 0, "n_viol": None, "max_viol": None,
+            "corr_ratio": 0.0, "d_norm_ratio": None,
+            "fista_iter": 0, "note": None, "cert_fail": False,
+            # CCM-specific legacy fields (kept for cross-line digests)
+            "proj_n_valid": 0, "proj_n_active_init": 0,
+            "proj_n_mu_pos": 0, "proj_cos_min": 0.0,
+            "proj_min_slack_after": None,
+            "proj_max_viol_before": 0.0}
+
+    def _write_task_only():
+        # Gamma .grad <- the aggregate task gradient alone (d = t), the
+        # degenerate / feasible / probe close semantics.
+        for gt, p in zip(g_task_gamma, gamma_params):
+            p.grad = gt
+
+    if G is None or G.numel() == 0:
+        diag["note"] = "no_dirs"
+        return True, diag
+    if nt <= 1e-12:
+        diag["note"] = "zero_task"
+        _write_task_only()
+        return True, diag
+    Gf = G.flatten(1).float()
+    ng = Gf.norm(dim=1)
+    valid = ng > min_norm
+    if not bool(valid.any()):
+        diag["note"] = "no_valid_dirs"
+        _write_task_only()
+        return True, diag
+    Gv = Gf[valid]
+    n_valid = int(Gv.shape[0])
+    # ---- row-normalized half spaces (final spec) ----------------------
+    H = Gv / Gv.norm(dim=1, keepdim=True).clamp(min=min_norm)
+    cos = (H @ t) / nt          # h_j^T t / ||t|| = cos(g_j, t)
+    cos_np = cos.detach().cpu().numpy()
+    diag["proj_n_valid"] = n_valid
+    diag["cos_mean"] = float(np.mean(cos_np))
+    diag["cos_med"] = float(np.median(cos_np))
+    diag["cos_p5"] = float(np.percentile(cos_np, 5.0))
+    diag["cos_min"] = float(np.min(cos_np))
+    diag["proj_cos_min"] = float(np.min(cos_np))
+    diag["frac_below"] = float(np.mean(cos_np < -kappa))
+    diag["frac_below_grid"] = {
+        ("%.2f" % kk): float(np.mean(cos_np < -kk))
+        for kk in (0.0, 0.02, 0.05, 0.1, 0.15, 0.2, 0.3)}
+    diag["feasible_d0"] = bool(np.all(cos_np >= -kappa))
+    diag["proj_max_viol_before"] = float(
+        np.clip(-cos_np - kappa, 0.0, None).max())
+    viol0 = np.flatnonzero(cos_np < -kappa)
+    diag["proj_n_active_init"] = int(len(viol0))
+    if len(viol0) == 0:
+        # d0 = t is already feasible: task-only close (final-spec path)
+        diag["note"] = "feasible_d0"
+        diag["max_viol"] = 0.0
+        _write_task_only()
+        return True, diag
+    # ---- full-set QP: K = H H^T, c = b - H t, b_j = -kappa*||t|| -------
+    b = -kappa * nt * torch.ones(n_valid, device=t.device)
+    K = H @ H.t()
+    c = b - (H @ t)
+    mu = _fista_nonneg(K, c, iters)
+    corr = H.t() @ mu              # = sum_j mu_j h_j  (= d* - t)
+    d = t + corr
+    # ---- full certificate: every row must satisfy h_j d >= -kappa*||t||
+    viol = (-kappa * nt - (H @ d)) / (nt + 1e-30)
+    max_viol = float(viol.max()) if viol.numel() else 0.0
+    diag["active"] = int((mu > 1e-8).sum())
+    diag["proj_n_mu_pos"] = int((mu > 1e-8).sum())
+    diag["fista_iter"] = iters
+    diag["n_viol"] = int(max_viol > cert_tol)
+    diag["max_viol"] = max_viol
+    diag["corr_ratio"] = float((d - t).norm() / max(nt, 1e-12))
+    diag["d_norm_ratio"] = float(d.norm()) / max(nt, 1e-12)
+    diag["proj_min_slack_after"] = float(viol.min())
+    if max_viol > cert_tol:
+        # Hard certificate FAILED: write NOTHING (final-spec CERT_FAIL —
+        # the caller skips the representation step for this window).
+        diag["note"] = "cert_fail"
+        diag["cert_fail"] = True
+        return False, diag
+    with torch.no_grad():
+        for p, cp, gt in zip(gamma_params, torch.split(corr, sizes),
+                             g_task_gamma):
+            p.grad = gt - cp.view_as(p)   # grad = -d* = g_task - sum mu h_j
+    return True, diag
+
+
 def repr_grad_norm(params):
     total = 0.0
     n = 0
@@ -737,15 +912,50 @@ def save_trainable(path, model, **extra):
     torch.save(payload, path)
 
 
-def load_trainable(path, model, optimizer, device):
+def _remap_optimizer_state(ckpt_opt, optimizer, params):
+    """R9 (2026-09-16): adapt a checkpoint optimizer state to the current
+    param-group layout (single-group <-> --rpbe-lr two-group switch).
+
+    Same code + same build => the checkpoint's flat param order equals
+    the current process's, so per-param state entries map by flat index;
+    the CURRENT group definitions (with their lr choices) are kept, so a
+    resumed run applies the new rpbe_lr instead of the checkpoint's."""
+    old_groups = ckpt_opt["param_groups"]
+    n_new = sum(len(g["params"]) for g in optimizer.param_groups)
+    if len(old_groups) != 1 or len(old_groups[0]["params"]) != len(params):
+        return ckpt_opt   # unknown layout: let load_state_dict surface it
+    # current groups' flattened order -> global param index
+    idx_of = {id(p): i for i, p in enumerate(params)}
+    flat = [idx_of[id(p)] for g in optimizer.param_groups
+            for p in g["params"]]
+    if sorted(flat) != list(range(len(params))):
+        raise RuntimeError("param groups do not partition the params")
+    pos_of = {old_i: p for p, old_i in enumerate(flat)}
+    state = {pos_of[int(k)]: v for k, v in ckpt_opt["state"].items()}
+    groups = []
+    off = 0
+    for g in optimizer.param_groups:
+        ng = dict(g)
+        ng["params"] = list(range(off, off + len(g["params"])))
+        off += len(g["params"])
+        groups.append(ng)
+    return {"state": state, "param_groups": groups}
+
+
+def load_trainable(path, model, optimizer, device,
+                   load_optimizer: bool = True):
     payload = torch.load(path, map_location=device, weights_only=False)
     missing, unexpected = model.load_state_dict(payload["model"],
                                                 strict=False)
     if unexpected:
         raise RuntimeError("unexpected keys in checkpoint: {}"
                            .format(sorted(unexpected)[:5]))
-    if "optimizer" in payload:
-        optimizer.load_state_dict(payload["optimizer"])
+    if load_optimizer and "optimizer" in payload:
+        opt_ckpt = payload["optimizer"]
+        if len(opt_ckpt["param_groups"]) != len(optimizer.param_groups):
+            params = [p for p in model.parameters() if p.requires_grad]
+            opt_ckpt = _remap_optimizer_state(opt_ckpt, optimizer, params)
+        optimizer.load_state_dict(opt_ckpt)
     return payload
 
 
@@ -783,6 +993,17 @@ def main():
     if use_rpbe:
         attach_gamma(model, hidden=args.gamma_hidden)
     cfg = model.model.config
+    # Tree-wise projection scope: the Gamma parameters of every layer.
+    gamma_params = []
+    if use_rpbe:
+        _base = model
+        while not hasattr(_base, "layers") and hasattr(_base, "model"):
+            _base = _base.model
+        for _layer in _base.layers:
+            _g = getattr(_layer.self_attn, "gamma", None)
+            if _g is not None:
+                gamma_params.extend(list(_g.parameters()))
+    gamma_set = {id(p) for p in gamma_params}
 
     # RNG protocol precondition: zero dropout everywhere (pass-1/pass-2
     # replay must be identical; LLaMA ships with dropout 0).
@@ -828,7 +1049,19 @@ def main():
     # Official CCM protocol (L6.5 review P0-2): AdamW with weight_decay=0,
     # cosine decay to zero, 3% warmup, and the official Trainer's default
     # max_grad_norm=1.0.  Same scheduler on all three arms (per-step).
-    optimizer = torch.optim.AdamW(params, lr=args.lr, weight_decay=0.0)
+    # --rpbe-lr (R9 add, 2026-09-16): an independent base lr for the
+    # Gamma group; the single scheduler multiplies BOTH groups by the
+    # same warmup/cosine factor, so the group ratio is preserved.
+    if args.rpbe_lr is not None and gamma_params:
+        gamma_ids = {id(p) for p in gamma_params}
+        optimizer = torch.optim.AdamW(
+            [{"params": [p for p in params if id(p) in gamma_ids],
+              "lr": args.rpbe_lr},
+             {"params": [p for p in params if id(p) not in gamma_ids],
+              "lr": args.lr}],
+            lr=args.lr, weight_decay=0.0)
+    else:
+        optimizer = torch.optim.AdamW(params, lr=args.lr, weight_decay=0.0)
     total_steps = max(1, int(args.schedule_total_steps
                             if args.schedule_total_steps is not None
                             else args.max_steps))
@@ -930,6 +1163,9 @@ def main():
     optimizer_steps_executed = 0
     amp_skipped_steps = 0
     scheduler_steps = 0
+    # treewise final-spec: windows whose QP certificate failed at 1e-6
+    # close WITHOUT a representation step (TGN CERT_FAIL semantics).
+    cert_skip_steps = 0
     total_task_sum = 0.0
     total_tokens = 0
     total_microbatches = 0
@@ -1009,7 +1245,16 @@ def main():
         if "scheduler" in payload:
             # Audit #3: without the scheduler state a resumed 1000-step
             # run restarts the LR phase (warmup + cosine) from zero.
-            scheduler.load_state_dict(payload["scheduler"])
+            # R9: a single-group checkpoint scheduler has one base_lr;
+            # the rpbe-lr two-group run needs one per group (the group
+            # ratio is carried by the optimizer's lr, so the scheduler's
+            # base_lrs are rebuilt from the CURRENT group lrs).
+            sch_ckpt = payload["scheduler"]
+            if len(sch_ckpt.get("base_lrs", [])) != len(scheduler.base_lrs):
+                sch_ckpt = dict(sch_ckpt)
+                sch_ckpt["base_lrs"] = [float(g["lr"])
+                                        for g in optimizer.param_groups]
+            scheduler.load_state_dict(sch_ckpt)
         if "builder_oid" in payload and builder is not None:
             builder.next_oid = int(payload["builder_oid"])
         # Counters (review ruling: full resume of the aggregate counters
@@ -1019,6 +1264,8 @@ def main():
             optimizer_steps_executed = int(payload["optimizer_steps_executed"])
         if "amp_skipped_steps" in payload:
             amp_skipped_steps = int(payload["amp_skipped_steps"])
+        if "cert_skip_steps" in payload:
+            cert_skip_steps = int(payload["cert_skip_steps"])
         if "scheduler_steps" in payload:
             scheduler_steps = int(payload["scheduler_steps"])
         if "total_task_sum" in payload:
@@ -1043,7 +1290,7 @@ def main():
             for line in data_flow_path.open():
                 row = json.loads(line)
                 data_flow_hash.update(struct.pack(
-                    ">qq", int(row["sid"]) % n_items, int(row["k"])))
+                    ">qq", int(row["did"]) % n_items, int(row["k"])))
                 data_flow_len += 1
             if data_flow_len != int(payload.get("data_flow_len",
                                                 data_flow_len)):
@@ -1237,7 +1484,7 @@ def main():
                 # dialogue-grouped shuffle diagnostic per window.
                 _d = diag.get(MEM_TAU, {}) if isinstance(diag, dict) else {}
                 with (out / "window_diag.jsonl").open("a") as _f:
-                    _f.write(json.dumps({
+                    _f.write(json.dumps(_json_safe({
                         "step": int(step),
                         "M_unique": _d.get("M_unique"),
                         "M_rows": _d.get("M_rows"),
@@ -1253,7 +1500,7 @@ def main():
                         # statistics, detached by construction).
                         "alpha_z": _d.get("alpha_z"),
                         "alpha_p": _d.get("alpha_p"),
-                    }) + "\n")
+                    })) + "\n")
                 # P0-1 fix: capture the REAL post-pass-1 data-stream RNG
                 # position; pass 2 replays from the window start and the
                 # stream resumes from the captured position afterwards.
@@ -1360,30 +1607,120 @@ def main():
                 optimizer.zero_grad(set_to_none=True)
                 task_sum = 0.0
                 n_tokens = 0
-                for i, (b, sid) in enumerate(pending):
-                    task_mean, task_raw, n_valid, aux, n_terms = pass2_one(
-                        b, cut_records[i], g_by_oid,
-                        0.0 if args.arm == "gamma_task_only"
-                        else lambda_kf)
-                    # Per-microbatch normalization: the official Trainer
-                    # scales each microbatch MEAN loss by 1/accumulation,
-                    # so the gradient scale is window-length independent
-                    # (L6.5 review P0-2).  The KF surrogate is NOT
-                    # rescaled: it is the exact window-J gradient.
-                    loss = task_mean / float(len(pending)) + aux
-                    _t = time.perf_counter()
-                    scaler.scale(loss).backward()
-                    _pf("pass2_bwd", _t)
-                    if os.environ.get("CCM_AUX_DIAG") == "1":
-                        named = [(n, p) for n, p in model.named_parameters()
-                                 if p.requires_grad and p.grad is not None]
-                        bad = bad_grad_names(named, k=2)
-                        if bad:
-                            print("AUXDIAG mb={} BAD after bwd: {}"
-                                  .format(i, bad), flush=True)
-                    task_sum += float(task_raw.detach())
-                    n_tokens += n_valid
-                    aux_terms += n_terms
+                treewise = (args.rpbe_constrain_mode == "treewise"
+                            and args.arm == "ours")
+                if treewise:
+                    # Tree-wise feasibility projection (TGN final-spec
+                    # port, 2026-09-15): pass 1 = task CE alone (snapshot
+                    # grads); pass 2 = per-oid surrogate backwards collect
+                    # per-tree Gamma influence dirs (never summed);
+                    # non-Gamma params accumulate the ordinary summed aux
+                    # gradient.  The QP projects the Gamma task gradient
+                    # into the intersection of the per-tree half-spaces
+                    # and certifies EVERY row at 1e-6; a failed
+                    # certificate skips the representation step below.
+                    for i, (b, sid) in enumerate(pending):
+                        task_mean, task_raw, n_valid, _aux, _n = pass2_one(
+                            b, cut_records[i], g_by_oid, 0.0)
+                        scaler.scale(
+                            task_mean / float(len(pending))).backward()
+                        task_sum += float(task_raw.detach())
+                        n_tokens += n_valid
+                    task_grads = {id(p): p.grad.detach().clone()
+                                  for p in params if p.grad is not None}
+                    optimizer.zero_grad(set_to_none=True)
+                    aux_other = {id(p): torch.zeros_like(p)
+                                 for p in params
+                                 if id(p) not in gamma_set}
+                    dirs = []
+                    for i, (b, sid) in enumerate(pending):
+                        fwd_out = run_forward(model, b, device,
+                                              grad_enabled=True)
+                        for meta, oid in cut_records[i]:
+                            g = g_by_oid.get(oid)
+                            if g is None:
+                                continue
+                            optimizer.zero_grad(set_to_none=True)
+                            z = collect_replay_z(meta, adapter, device)
+                            gd = g.detach()
+                            aux_i = -lambda_kf * ((gd * z).sum()
+                                                  - (gd * z.detach()).sum())
+                            aux_i.backward()
+                            dirs.append(torch.cat(
+                                [p.grad.reshape(-1).float()
+                                 for p in gamma_params]))
+                            for p in params:
+                                if id(p) not in gamma_set \
+                                        and p.grad is not None:
+                                    aux_other[id(p)].add_(p.grad.detach())
+                        adapter.clear()
+                    optimizer.zero_grad(set_to_none=True)
+                    g_task_gamma = [
+                        task_grads.get(id(p), torch.zeros_like(p))
+                        for p in gamma_params]
+                    proj_ok, proj_diag = treewise_feasibility_projection(
+                        g_task_gamma, gamma_params,
+                        torch.stack(dirs) if dirs else None,
+                        args.rpbe_kappa, iters=args.proj_iters)
+                    cert_fail = bool(proj_diag.get("cert_fail"))
+                    if not proj_ok:
+                        # CERT_FAIL: no constrained update is executed —
+                        # zero the non-Gamma grads too and skip the
+                        # representation step (final-spec reviewer
+                        # requirement; TGN: "skipping repr step").
+                        for p in params:
+                            if id(p) in gamma_set:
+                                p.grad = None
+                            else:
+                                p.grad = torch.zeros_like(p)
+                    else:
+                        for p in params:
+                            if id(p) in gamma_set:
+                                continue  # projection already wrote .grad
+                            p.grad = (task_grads.get(
+                                id(p), torch.zeros_like(p))
+                                + aux_other.get(id(p),
+                                                torch.zeros_like(p)))
+                    with (out / "window_diag.jsonl").open("a") as _f:
+                        _f.write(json.dumps(_json_safe(
+                            {"step": int(step), "event": "treewise_proj",
+                             **proj_diag})) + "\n")
+                    if cert_fail:
+                        print("[rpbe-cstr] window={} CERT_FAIL "
+                              "max_viol={:.3e} skipping repr step".format(
+                                  kf_closed + 1,
+                                  proj_diag.get("max_viol", float("inf"))),
+                              flush=True)
+                    aux_terms += n_cut_win
+                else:
+                    for i, (b, sid) in enumerate(pending):
+                        task_mean, task_raw, n_valid, aux, n_terms = \
+                            pass2_one(
+                                b, cut_records[i], g_by_oid,
+                                0.0 if args.arm == "gamma_task_only"
+                                else lambda_kf)
+                        # Per-microbatch normalization: the official
+                        # Trainer scales each microbatch MEAN loss by
+                        # 1/accumulation, so the gradient scale is
+                        # window-length independent (L6.5 review P0-2).
+                        # The KF surrogate is NOT rescaled: it is the
+                        # exact window-J gradient.
+                        loss = task_mean / float(len(pending)) + aux
+                        _t = time.perf_counter()
+                        scaler.scale(loss).backward()
+                        _pf("pass2_bwd", _t)
+                        if os.environ.get("CCM_AUX_DIAG") == "1":
+                            named = [(n, p)
+                                     for n, p in model.named_parameters()
+                                     if p.requires_grad
+                                     and p.grad is not None]
+                            bad = bad_grad_names(named, k=2)
+                            if bad:
+                                print("AUXDIAG mb={} BAD after bwd: {}"
+                                      .format(i, bad), flush=True)
+                        task_sum += float(task_raw.detach())
+                        n_tokens += n_valid
+                        aux_terms += n_terms
                 if aux_terms - aux_before != n_cut_win:
                     raise RuntimeError(
                         "not every cut was replayed exactly once: "
@@ -1399,7 +1736,16 @@ def main():
                               repr_grad_norm(params), scaler.get_scale(),
                               bad_grad_names(named, k=3)), flush=True)
                 _t = time.perf_counter()
-                grad_step()  # counters live inside grad_step (nonlocal)
+                if treewise and cert_fail:
+                    # Final-spec CERT_FAIL: the QP certificate did not
+                    # hold at 1e-6 — NO representation update is executed
+                    # for this window (TGN: "skipping repr step").  The
+                    # window still closes: data stream, step counter,
+                    # boundary records and checkpoint cadence advance
+                    # identically to a successful close.
+                    cert_skip_steps += 1
+                else:
+                    grad_step()  # counters live inside grad_step (nonlocal)
                 _pf("grad_step", _t)
                 if profile:
                     n_cut = sum(1 for cr in cut_records for _ in cr)
@@ -1429,10 +1775,16 @@ def main():
                 # cadence identity is checkable window by window, not
                 # only through the final data-flow hash.  n_cut_win was
                 # computed before pass 2 (audit #3 replay integrity).
-                boundary_hash.update("w{}:{}:{}:".format(
-                    kf_closed, len(pending), n_cut_win).encode())
-                boundary_records.append("w{}:{}:{}:".format(
-                    kf_closed, len(pending), n_cut_win))
+                # A CERT_FAIL close appends ":SKIP" so the hash honestly
+                # reflects that this window executed no update.
+                _skip_tag = (":SKIP" if (treewise and cert_fail) else "")
+                boundary_hash.update(
+                    "w{}:{}:{}{}".format(
+                        kf_closed, len(pending), n_cut_win,
+                        _skip_tag).encode())
+                boundary_records.append(
+                    "w{}:{}:{}{}".format(
+                        kf_closed, len(pending), n_cut_win, _skip_tag))
                 close_depth_window(len(pending), step, n_cut_win)
                 pending = []
                 cut_records = []
@@ -1515,6 +1867,7 @@ def main():
             row = {"step": step,
                    "optimizer_steps_executed": optimizer_steps_executed,
                    "amp_skipped_steps": amp_skipped_steps,
+                   "cert_skip_steps": cert_skip_steps,
                    "scheduler_steps": scheduler_steps,
                    "task_ce_token": total_task_sum / max(total_tokens, 1),
                    "task_microbatches": total_microbatches,
@@ -1523,10 +1876,12 @@ def main():
                    "kf_score": total_kf / max(kf_closed, 1),
                    "aux_terms": aux_terms, "lambda": lambda_kf,
                    "elapsed": elapsed}
-            print("step={} executed={} skips={} sched={} ce_token={:.4f} "
+            print("step={} executed={} skips={} cert={} sched={} "
+                  "ce_token={:.4f} "
                   "mbs={} kf_closed={} kf_score={:.4f} aux={} sec={:.1f}"
                   .format(step, optimizer_steps_executed,
-                          amp_skipped_steps, scheduler_steps,
+                          amp_skipped_steps, cert_skip_steps,
+                          scheduler_steps,
                           row["task_ce_token"], total_microbatches,
                           kf_closed, row["kf_score"], aux_terms, elapsed),
                   flush=True)
@@ -1548,6 +1903,7 @@ def main():
                            rng=_rng_state(),
                            optimizer_steps_executed=optimizer_steps_executed,
                            amp_skipped_steps=amp_skipped_steps,
+                           cert_skip_steps=cert_skip_steps,
                            scheduler_steps=scheduler_steps,
                            total_task_sum=total_task_sum,
                            total_tokens=total_tokens,
@@ -1571,6 +1927,7 @@ def main():
         "steps": step,
         "optimizer_steps_executed": optimizer_steps_executed,
         "amp_skipped_steps": amp_skipped_steps,
+        "cert_skip_steps": cert_skip_steps,
         "scheduler_steps": scheduler_steps,
         "amp_scale": float(scaler.get_scale()),
         # Token-normalized CE: the only cross-arm comparable task number
@@ -1581,6 +1938,8 @@ def main():
         "kf_closed": kf_closed,
         "mean_kf_score": total_kf / max(kf_closed, 1),
         "aux_terms": aux_terms, "lambda_kf": lambda_kf,
+        "rpbe_lr": (float(args.rpbe_lr)
+                    if args.rpbe_lr is not None else float(args.lr)),
         "paired_seed_hash": paired_seed_hash(args.seed, model)
         if use_rpbe else "n/a",
         "data_flow_hash": data_flow_hash.hexdigest(),
@@ -1593,6 +1952,7 @@ def main():
                                       optimizer_steps_executed,
                                       "amp_skipped_steps":
                                       amp_skipped_steps,
+                                      "cert_skip_steps": cert_skip_steps,
                                       "scheduler_steps":
                                       scheduler_steps})
     print(json.dumps(summary, indent=2), flush=True)

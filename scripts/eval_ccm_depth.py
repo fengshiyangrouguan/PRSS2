@@ -152,24 +152,29 @@ def load_official_adapter(args, device, adapter_path):
     return model
 
 
-# official Table 25 time steps (truncation protocol); t=1 omitted: the
-# official t=1 construction is not recoverable from the released code
-# (prepare_input's n=1 branch degenerates), and the paper numbers for
-# t=1 can only be cited, not reproduced.
-TIME_STEPS = [2, 4, 8, 12, 20]
+# Official Table 25 time steps (truncation protocol).  The official
+# time step IS the compression-step count L: a dialogue of L+2 turns
+# (L compressed-history turns + 1 immediate context + 1 target turn,
+# the sample_dialog structure).  L=1 -> 3 turns, L=2 -> 4, L=4 -> 6,
+# L=8 -> 10, L=13 -> 15 — the official _subsample n_turn buckets
+# (3/4/6/10/15) are exactly this L+2 pattern.  The official deepest
+# table step (12) is the same concept as our L=13.
+TIME_STEPS = [1, 2, 4, 8, 13]   # L = compression steps
 
 
 def eval_truncated(model, collator, dialogs, device, limit, name,
                    use_ccm=True):
     """Official truncation protocol: every test dialogue with
-    len >= t is truncated to dialog[:t] and the CE is scored on the
-    t-th turn only (sample_dialog predicts dialog[-1]).  The sample set
-    is identical across time steps up to the len >= t filter (matching
-    the official Table 23 note)."""
+    len >= L+2 is truncated to dialog[:L+2] turns (L compression steps
+    -> L+2 turns) and the CE is scored on the last turn only
+    (sample_dialog predicts dialog[-1]).  The sample set is identical
+    across time steps up to the len >= L+2 filter (matching the
+    official Table 23 note)."""
     per_t = {}
     for t in TIME_STEPS:
-        items = [{"dialog": d[:t], "act": [], "is_train": False}
-                 for d in dialogs if len(d) >= t]
+        turns = int(t) + 2
+        items = [{"dialog": d[:turns], "act": [], "is_train": False}
+                 for d in dialogs if len(d) >= turns]
         if limit:
             items = items[:limit]
         total = 0.0

@@ -325,6 +325,20 @@ code path with the projection provably inactive), so the peak cannot be
 attributed to the projection rather than to Gamma training itself.  This is
 the single biggest gap in the result.
 
+**Post-hoc alignment (diagnostic, NOT the result).** The lowest val action loss
+recovered anywhere in this line is **0.0685 at absolute step 18500** (the s8h
+continuation, 3500 steps in), and the highest rollout is **25.0% at absolute
+step 17000** —— the two optima fall in the same 17000-18500 window, 1500 steps
+apart (`ours_best_val_best_rollout.png`).  That is the alignment one would
+want if the val objective tracked task success at all.
+
+It is nevertheless not the reported result, for three reasons stated plainly:
+the val points either side of that minimum are 0.0686-0.0689, i.e. within
+4e-4 —— the same flat band, on a 3-demo val set; the rollout side of the
+window is a single 20-demo measurement inside a +/-9.3% band; and choosing the
+window after seeing both curves is the selection this protocol exists to
+prevent.  The pre-registered endpoint remains **15000 / 21.7%**.
+
 ## Constraint-audit evidence (the algorithm doing what it claims)
 
 From the 15000-step run (`gamma-only_ours_s8g`):

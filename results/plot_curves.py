@@ -265,6 +265,70 @@ def plot_avg_vs_ours(runs, path):
     print("wrote", path)
 
 
+def plot_alignment(path):
+    """Where ours' best val and best rollout sit, on one absolute-step axis.
+
+    Two axes because the two metrics have different units.  Left = val action
+    loss (blue), right = weighted_success (grey).  s8g points are filled, s8h
+    continuation points hollow: the two segments are weight-initialised, not a
+    bit-exact resume, so they must stay distinguishable.
+    """
+    fig, ax = plt.subplots(figsize=(10.6, 5.8))
+    ax2 = ax.twinx()
+
+    g = [(500, .0694), (1000, .0695), (1500, .0694), (2000, .0690),
+         (2500, .0694), (3000, .0690), (3500, .0690), (4000, .0688),
+         (8000, .0688), (8500, .0686), (10000, .0687)]
+    h = [(15500, .0689), (18500, .0685)]
+
+    ax.plot([p[0] for p in g], [p[1] for p in g], "-o", color="#1f77b4",
+            lw=2.2, ms=5, label="ours val -- s8g (500-10000)")
+    ax.plot([p[0] for p in h], [p[1] for p in h], "--o", color="#1f77b4",
+            lw=2.0, ms=7, mfc="white", mew=2.0,
+            label="ours val -- s8h continuation (abs 15500 / 18500)")
+    ax.axvspan(17000, 18500, color="#d62728", alpha=0.08, zorder=0)
+
+    ax.annotate("ours val minimum recovered anywhere\n"
+                "0.0685  @ absolute 18500", (18500, 0.0685),
+                xytext=(-12, 26), textcoords="offset points", fontsize=8.5,
+                color="#1f77b4", ha="right")
+    ax.plot([18500], [0.0685], "*", color="#1f77b4", ms=17, zorder=6)
+
+    roll = [(8000, 15.0), (10000, 20.0), (13000, 20.0), (15000, 21.7),
+            (17000, 25.0), (19000, 23.3), (21000, 18.3)]
+    ax2.plot([p[0] for p in roll], [p[1] for p in roll], "-s",
+             color="#444444", lw=2.0, ms=6, label="ours rollout (20 demos)")
+    ax2.axhline(23.3, color="#111111", lw=1.6, ls="--")
+    ax2.annotate("host baseline 23.3%", (4600, 23.3), xytext=(0, 4),
+                 textcoords="offset points", fontsize=8.5)
+    ax2.plot([17000], [25.0], "*", color="#444444", ms=17, zorder=6)
+    ax2.annotate("ours rollout maximum\n25.0%  @ absolute 17000",
+                 (17000, 25.0), xytext=(-6, 10), textcoords="offset points",
+                 fontsize=8.5, ha="right")
+    ax2.annotate("both optima\nin this window\n(1500 steps apart)",
+                 (17750, 12.2), fontsize=8.5, color="#d62728", ha="center")
+
+    ax.set_xlabel("optimizer step (absolute; s8g 0-15000, s8h 15000-22000)")
+    ax.set_ylabel("val action loss  (3 fixed demos)", color="#1f77b4")
+    ax2.set_ylabel("weighted_success  (20 demos)", color="#444444")
+    ax.tick_params(axis="y", colors="#1f77b4")
+    ax2.tick_params(axis="y", colors="#444444")
+    ax.set_ylim(0.0680, 0.0700)
+    ax2.set_ylim(8, 32)
+    ax.set_xlim(0, 22000)
+    ax.set_title("ours: where the best val and the best rollout sit\n"
+                 "diagnostic alignment, NOT the reported result -- the "
+                 "pre-registered endpoint is 15000",
+                 fontsize=11)
+    lines = ax.get_legend_handles_labels()[0] + ax2.get_legend_handles_labels()[0]
+    labs = ax.get_legend_handles_labels()[1] + ax2.get_legend_handles_labels()[1]
+    ax.legend(lines, labs, loc="lower left", fontsize=8.5, framealpha=0.95)
+    ax.grid(alpha=0.22)
+    fig.tight_layout()
+    fig.savefig(path, dpi=170)
+    print("wrote", path)
+
+
 if __name__ == "__main__":
     runs = load()
     plot_val(runs, os.path.join(HERE, "val_curves.png"))
@@ -272,3 +336,4 @@ if __name__ == "__main__":
     plot_rollout(os.path.join(HERE, "rollout_curve.png"))
     plot_host_rollout(os.path.join(HERE, "avg_host_rollout.png"))
     plot_avg_vs_ours(runs, os.path.join(HERE, "val_avg_vs_ours.png"))
+    plot_alignment(os.path.join(HERE, "ours_best_val_best_rollout.png"))

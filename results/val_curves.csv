@@ -37,6 +37,7 @@ ours_gamma-only_ours_s8g(proposal-space),8000,0.0688
 ours_gamma-only_ours_s8g(proposal-space),8500,0.0686
 ours_gamma-only_ours_s8g(proposal-space),10000,0.0687
 ours_gamma-only_ours_s8h(continuation),500,0.0689
+ours_gamma-only_ours_s8h(continuation),3500,0.0685
 gamma-only_s42_s8f(GAMMA_FROZEN),500,0.0694
 gamma-only_s42_s8f(GAMMA_FROZEN),1000,0.0695
 gamma-only_s42_s8f(GAMMA_FROZEN),1500,0.0693

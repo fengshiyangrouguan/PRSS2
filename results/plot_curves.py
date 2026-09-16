@@ -213,9 +213,62 @@ def plot_host_rollout(path):
     print("wrote", path)
 
 
+def plot_avg_vs_ours(runs, path):
+    """avg vs ours only -- the pair, with the recovery boundary drawn."""
+    fig, ax = plt.subplots(figsize=(10.4, 5.6))
+    a = runs["avg_s42_stage5_official"]
+    o = runs["ours_gamma-only_ours_s8g(proposal-space)"]
+
+    ax.plot([p[0] for p in a], [p[1] for p in a], "-o", color="#111111",
+            lw=2.4, ms=6, label="avg host (Stage5, official)  -- 18k endpoint")
+    ax.plot([p[0] for p in o], [p[1] for p in o], "-o", color="#d62728",
+            lw=2.4, ms=6,
+            label="ours (gamma-only + proposal-space)  -- 15k endpoint")
+
+    # the frozen-control band: it is why val cannot select a checkpoint
+    ax.axhspan(0.0684, 0.0695, color="#7f7f7f", alpha=0.13, zorder=0)
+    ax.annotate("gamma-FROZEN control band 0.0684-0.0695  (ours sits inside it)",
+                (600, 0.0687), xytext=(0, 3), textcoords="offset points",
+                fontsize=8, color="#555555")
+
+    # the recovery boundary: nothing of ours survives past 10000
+    ax.axvline(10000, color="#d62728", lw=1.2, ls=":", zorder=1)
+    ax.axvspan(10000, 18800, color="#d62728", alpha=0.05, zorder=0)
+    ax.annotate("no `ours` val line survived past 10000:\n"
+                "the 10500-15000 evals were only ever written to the box",
+                (10450, 0.0955), fontsize=8, color="#d62728", va="top")
+
+    # nearest surviving measurement to ours' endpoint: s8h step 500 (absolute
+    # 15500), i.e. ours@15000 weights after 500 more continuation steps
+    ax.plot([15500], [0.0689], "o", mfc="white", mec="#d62728", mew=2.0,
+            ms=8, zorder=6)
+    ax.annotate("s8h @ 500 (absolute 15500) = 0.0689\n"
+                "ours@15000 weights + 500 continuation steps",
+                (15500, 0.0689), xytext=(-8, -34), textcoords="offset points",
+                fontsize=8, color="#d62728", ha="right")
+
+    for x, y, lab in [(18000, 0.0694, "0.0694"), (10000, 0.0687, "0.0687"),
+                      (500, 0.0694, "0.0694")]:
+        ax.annotate(lab, (x, y), xytext=(4, 7), textcoords="offset points",
+                    fontsize=8.5)
+    ax.set_xlabel("optimizer step")
+    ax.set_ylabel("val action loss  (3 fixed demos)")
+    ax.set_title("avg vs ours -- the only two curves the result rests on\n"
+                 "ours starts where the host ends: same level, no separation",
+                 fontsize=11)
+    ax.legend(loc="upper right", fontsize=9, framealpha=0.95)
+    ax.grid(alpha=0.25)
+    ax.set_ylim(0.062, 0.10)
+    ax.set_xlim(0, 19000)
+    fig.tight_layout()
+    fig.savefig(path, dpi=170)
+    print("wrote", path)
+
+
 if __name__ == "__main__":
     runs = load()
     plot_val(runs, os.path.join(HERE, "val_curves.png"))
     plot_avg_only(runs, os.path.join(HERE, "avg_host_curve.png"))
     plot_rollout(os.path.join(HERE, "rollout_curve.png"))
     plot_host_rollout(os.path.join(HERE, "avg_host_rollout.png"))
+    plot_avg_vs_ours(runs, os.path.join(HERE, "val_avg_vs_ours.png"))

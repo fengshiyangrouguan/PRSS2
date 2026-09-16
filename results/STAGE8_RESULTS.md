@@ -95,6 +95,19 @@ Reading:
   cannot tell "Gamma moves" from "Gamma frozen"** —— which is exactly why the
   rollout had to be measured by hand, and why val is not the checkpoint
   selector (see "Checkpoint selection" below).
+- **ours' recovered curve stops at 10000, and that is a recovery boundary,
+  not a plateau.** The full val dump for `s8g` was taken once, at ~opt 10300
+  (`valcmp.sh`); every later health check grepped only `opt N/15000`, which
+  strips the val field, so the 10500-15000 evals were written to that box's
+  `train.log` and never entered the transcript. They are lost with the box.
+  The nearest surviving measurement to ours' endpoint is `s8h` step 500
+  (absolute 15500) = **0.0689** —— the ours@15000 weights after 500 more
+  continuation steps —— and it lands inside the same flat band.
+  `val_avg_vs_ours.png` draws this boundary explicitly.
+
+`val_avg_vs_ours.png` is the pair on its own: the host falls from 0.0959 to
+0.0694 while ours sits flat from its very first eval at the level the host
+only reaches at the end. That is the whole val story.
 
 ## The host: which avg checkpoint, and why that one
 

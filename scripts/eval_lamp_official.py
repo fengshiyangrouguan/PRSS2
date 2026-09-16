@@ -48,6 +48,18 @@ def parse_args():
     p.add_argument("--adapter",
                    default="result/lamp/finetune/llama-7b-no-online-merge-ntok4")
     p.add_argument("--n_tok", type=int, default=4)
+    p.add_argument("--attn_type", default="merge",
+                   choices=["merge", "merge_recur"],
+                   help="host attention type. 'merge' = official LaMP CCM "
+                        "(n_tok=4, one-shot Gamma); 'merge_recur' = unified "
+                        "recursive protocol (n_tok=2, recursive Gamma). "
+                        "Defaults preserve the historical official-merge "
+                        "reference numbers.")
+    p.add_argument("--k", type=int, default=16,
+                   help="number of retrieved profiles = memory depth. The "
+                        "retriever's eval path always draws 16 profiles and "
+                        "then truncates to k, so k=1/2/4/8/16 are nested "
+                        "prefixes of the same seeded draw.")
     p.add_argument("--device", default="cuda")
     p.add_argument("--fp16_eval", action="store_true",
                    help="cast the whole host to fp16 before eval (official "
@@ -67,9 +79,6 @@ def parse_args():
     return p.parse_args()
 
 
-N_TOK = 4  # COMP tokens; merge doubles it to 8 (COMP + SUM)
-
-
 def build_host(args, device):
     """Official merge host for LaMP-2 (dialog-line build_official_host
     pattern; see review round 7).  fp32 throughout; comp_embeddings and
@@ -83,7 +92,7 @@ def build_host(args, device):
 
     config = LlamaConfig.from_pretrained(args.model_name_or_path)
     config.comp_relative_embedding = "skip"
-    config.attn_type = "merge"
+    config.attn_type = args.attn_type
     base_dtype = (torch.float16 if args.fp16_weights else torch.float32)
     model = LlamaForCausalLM_CCM.from_pretrained(
         args.model_name_or_path, config=config, torch_dtype=base_dtype)
@@ -104,11 +113,17 @@ def build_host(args, device):
     load_lora_weight(args.adapter, model, merge=False)
 
     if args.with_gamma:
-        # ours arm: attach GammaOnetime so the merge structure matches
-        # training; the checkpoint overlay covers the gamma params too.
+        # ours arm: attach Gamma so the merge structure matches training;
+        # the checkpoint overlay covers the gamma params too.  The
+        # recursive host uses the sequential GammaResidual (attach_gamma,
+        # n_tok=2); the official one-shot host uses GammaOnetime (n_tok=4).
         sys.path.insert(0, "/root/autodl-tmp/src")
-        from rpbe.hosts.ccm.ccm_patch import attach_gamma_onetime
-        attach_gamma_onetime(model, hidden=args.gamma_hidden)
+        if args.attn_type == "merge_recur":
+            from rpbe.hosts.ccm.ccm_patch import attach_gamma
+            attach_gamma(model, hidden=args.gamma_hidden)
+        else:
+            from rpbe.hosts.ccm.ccm_patch import attach_gamma_onetime
+            attach_gamma_onetime(model, hidden=args.gamma_hidden)
 
     for _p in model.parameters():
         _p.requires_grad_(False)
@@ -174,20 +189,20 @@ def build_dataset_and_collator(tokenizer, model, args):
     split_name = "validation" if args.split == "dev" else "test"
     ds = load_dataset("src/data/lamp/lamp.py", name="lamp2",
                       cache_dir=None, split=split_name)
-    comp_args = CompressionArguments(attn_type="merge",
+    comp_args = CompressionArguments(attn_type=args.attn_type,
                                      num_comp_tokens=args.n_tok,
                                      add_comp_token=True,
                                      relative_embedding="skip")
     col = lamp_collator.LLaMACollatorForLaMP(
         tokenizer=tokenizer,
-        retriever=retriever.BaseRetriever(k=16),
+        retriever=retriever.BaseRetriever(k=args.k),
         comp_args=comp_args,
         model=model,
         padding="longest",
         comp_token=tokenizer.comp_token_id,
         sum_token=tokenizer.sum_token_id,
         pad_token=tokenizer.pad_token_id,
-        k=16,
+        k=args.k,
     )
     return ds, col
 
@@ -275,11 +290,13 @@ def main():
     ds, collator = build_dataset_and_collator(tokenizer, model, args)
 
     dataset = ds
-    print(f"[lamp-eval] split={args.split} n={len(dataset)}", flush=True)
+    print(f"[lamp-eval] split={args.split} n={len(dataset)} k={args.k}",
+          flush=True)
 
     acc = evaluate_lamp_cls(model, dataset, collator, 2, device,
                             args.eval_batch_size)
     print(f"ACC_{args.split.upper()} = {acc:.2f}%")
+    print(f"ACC_{args.split.upper()}_K{args.k} = {acc:.2f}%")
     if args.split == "test":
         print("official reference (Table 24, k=16): CCM-merge 83.9%")
 

@@ -1,0 +1,2051 @@
+#!/usr/bin/env python3
+"""CCM-merge x RPBE training entry (plan v2 L5).
+
+Three arms, identical task samples / seed / cadence:
+
+  ccm_merge       official protocol: LoRA on merge_recur, one pass, one
+                  optimizer step per ``grad_accum`` microbatch.
+  gamma_task_only  Gamma attached, LoRA, the SAME two-pass window replay
+                  as ours with lambda = 0 (matched control).
+  ours            Gamma + RPBE: pass 1 (no grad) collects cut rows
+                  incrementally into a KFMomentWindow that closes at
+                  >= kf_min_cuts effective cuts; pass 2 replays the whole
+                  window's microbatch dicts and trains task CE plus the
+                  exact surrogate (numerically zero, gradient = window
+                  J).  One optimizer step per closed window.
+
+RNG protocol (plan L5): each microbatch's pass-1 forward runs under a
+saved RNG state that is restored right after (builder counters are NOT
+restored — cut ids stay monotonic), so the data-sampling stream matches
+the official single-pass arm exactly.  The model carries zero dropout
+(LLaMA default), so pass-2 replays the identical forward; this is
+asserted at startup (L6 test 3).  Pass 2 restores the window-start state
+(RNG + builder counter) so occurrence ids align with the replay plan.
+
+Lambda follows the r_eff calibration rule (plan L5); --calibrate-lambda
+measures r_eff = ||g_KF|| / ||g_task|| on the first closed window and
+exits with the derived lambda.
+"""
+
+import argparse
+import dataclasses
+import hashlib
+import json
+import math
+import os
+import random
+import struct
+import sys
+import time
+from pathlib import Path
+
+for _k in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS"):
+    os.environ.setdefault(_k, "1")
+
+import numpy as np
+import torch
+
+torch.set_num_threads(int(os.environ["OMP_NUM_THREADS"]))
+
+HERE = Path(__file__).resolve().parent
+SRC = HERE.parent / "src"
+CCM = HERE.parent / "third_party" / "ccm"
+for p in (str(SRC), str(CCM)):
+    if p not in sys.path:
+        sys.path.insert(0, p)
+
+from rpbe.hosts.ccm.adapter import CCMHostAdapter
+from rpbe.hosts.ccm.ccm_patch import (N_TOK_LOCK, attach_gamma,
+                                      paired_seed_hash, wrap_lora)
+from rpbe.llm.lamp_records import (LampCutBuilder, LampMeta, LampLlmmaps,
+                                   MEM_TAU)
+from rpbe.llm.utterance_embed import UtteranceEmbed
+from rpbe.loss import KFMomentWindow
+from rpbe.training.checkpoint import _restore_rng, _rng_state
+
+
+class BranchEnsembleWindow:
+    """Review round 8: four independent 32-dim sketch branches.
+
+    Wraps one :class:`KFMomentWindow` per measurement branch.  Each
+    branch sees the same rows with ``p_override`` sliced to its own
+    32-dim sketch; branches close independently and the ensemble score
+    is ``J_ens = (1/N) sum_r J_r``.  The branches are NEVER concatenated
+    into one 128-dim covariance — that would restore the small-sample
+    ill-conditioning the ensemble exists to avoid.  The replay gradient
+    is the branch-mean of the per-cut adjoints (dJ_ens/dz = (1/N) sum_r
+    dJ_r/dz; a failed branch contributes zero).
+    """
+
+    def __init__(self, branches):
+        self.ws = list(branches)
+        self.nb = len(self.ws)
+
+    def add(self, rows):
+        for br, w in enumerate(self.ws):
+            sub = [dataclasses.replace(r, p_override=r.p_override[br])
+                   for r in rows]
+            w.add(sub)
+        return {}, {}, []
+
+    def window_ready(self) -> bool:
+        return all(w.window_ready() for w in self.ws)
+
+    def _threshold(self, tau: str) -> float:
+        return self.ws[0]._threshold(tau)
+
+    def close_replay(self):
+        closed: dict = {}
+        plans = []
+        diags = []
+        j_branches = []
+        for br, w in enumerate(self.ws):
+            c, p, d = w.close_replay()
+            for tau, j in c.items():
+                closed[tau] = closed.get(tau, 0.0) + float(j) / self.nb
+            plans.append(p)
+            diags.append(d)
+            j_branches.append({tau: float(jj) for tau, jj in c.items()})
+        plan: dict = {}
+        diag: dict = {}
+        for tau in closed:
+            oid_all = set()
+            for p in plans:
+                oid_all |= set(p.get(tau, {}).get("by_oid", {}).keys())
+            by_oid = {}
+            for oid in oid_all:
+                gs = [p.get(tau, {}).get("by_oid", {}).get(oid)
+                      for p in plans]
+                gs = [g for g in gs if g is not None]
+                if gs:
+                    by_oid[oid] = (sum(gs) / self.nb).float()
+            plan[tau] = {"by_batch": [[]], "by_oid": by_oid}
+            d0 = None
+            for p_d in diags:
+                if tau in p_d:
+                    d0 = dict(p_d[tau])
+                    break
+            if d0 is None:
+                diag[tau] = {"failed": None, "below_threshold": True}
+            else:
+                d0["J_branches"] = [jb.get(tau, float("nan"))
+                                    for jb in j_branches]
+                d0["J_ens"] = closed.get(tau, 0.0)
+                if d0.get("J_shuffled") is not None:
+                    d0["J_real_minus_shuffled"] = (
+                        float(closed.get(tau, 0.0))
+                        - float(d0["J_shuffled"]))
+                diag[tau] = d0
+        return closed, plan, diag
+
+N_TOK = N_TOK_LOCK  # comp slots; 2 comp + 2 sum = 4 added tokens
+
+
+def parse_args():
+    p = argparse.ArgumentParser("CCM x RPBE training (plan v2 L5)")
+    p.add_argument("--arm", required=True,
+                   choices=["ccm_merge", "gamma_task_only", "ours",
+                            "ccm_merge_official"],
+                   help="ccm_merge_official: official fixed-accumulation "
+                        "cadence reproduction arm (frozen cadence is "
+                        "window-matched for the three main arms; the "
+                        "official arm is reported separately)")
+    p.add_argument("--model-name-or-path", required=True)
+    p.add_argument("--k", type=int, default=16,
+                   help="LaMP: number of retrieved profiles per sample, "
+                        "i.e. the length of the recursive memory chain "
+                        "M_1..M_k.  The official LaMP protocol uses 16.")
+    p.add_argument("--output", required=True)
+    p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--gpu", type=int, default=0)
+    p.add_argument("--max-steps", type=int, default=1000)
+    p.add_argument("--schedule-total-steps", type=int, default=None,
+                   help="LR schedule length (warmup+cosine); defaults to max_steps. The e50 pilot keeps 1000 to preserve the original schedule while stopping at 500.")
+    p.add_argument("--grad-accum", type=int, default=128,
+                   help="microbatch per update in --merge-cadence official "
+                        "(official-reproduction arm only)")
+    p.add_argument("--merge-cadence", default="window-matched",
+                   choices=["window-matched", "official"],
+                   help="window-matched: the ccm_merge arm fires an update "
+                        "on the same adaptive boundary as the RPBE arms "
+                        "(>= min-effective-cuts dialogues with k>=3), so "
+                        "task exposure and scheduler cadence are identical "
+                        "across the three arms (frozen_method.json "
+                        "cadence; review P0-2).  official: fixed "
+                        "grad-accum microbatch cadence for the "
+                        "ccm_merge_official reproduction reference.")
+    p.add_argument("--lr", type=float, default=3e-4)
+    p.add_argument("--lora-r", type=int, default=8)
+    p.add_argument("--grad-clip", type=float, default=1.0,
+                   help="max_grad_norm (official Trainer default 1.0; "
+                        "frozen_method.json training.grad_clip is "
+                        "authoritative and an explicit override is "
+                        "refused)")
+    p.add_argument("--relative-embedding", default="skip",
+                   choices=["skip", "base"])
+    # RPBE
+    p.add_argument("--kf-lambda", type=float, default=1e-3)
+    p.add_argument("--kf-min-cuts", type=int, default=128,
+                   help="effective-cuts gate (window closes at >= this)")
+    p.add_argument("--ridge-eps", type=float, default=1e-3)
+    p.add_argument("--sketch-dim", type=int, default=64)
+    p.add_argument("--z-dim", type=int, default=128)
+    p.add_argument("--rpbe-seed", type=int, default=0)
+    p.add_argument("--gamma-hidden", type=int, default=64)
+    p.add_argument("--official-host", action="store_true",
+                   help="review round 7: build the REAL official host — "
+                        "SeparatedEmbedding + trainable COMP/SUM embeddings "
+                        "+ the released Step-2 compression adapter on top of "
+                        "the Step-1 foundation merge (no resize+freeze).")
+    p.add_argument("--official-adapter", default="",
+                   help="path to the released Step-2 compression adapter "
+                        "(llama-7b-no-online-merge_recur-ntok2)")
+    p.add_argument("--foundation", default="",
+                   help="path to an official Step-1 default-LoRA adapter "
+                        "dir (e.g. llama-7b-no); its weights are MERGED "
+                        "into the base model before training — the "
+                        "official two-stage protocol.  Empty = train "
+                        "from theta_0 on the raw LLaMA (single-stage).")
+    p.add_argument("--calibrate-lambda", action="store_true",
+                   help="measure r_eff on the first closed window and exit")
+    # Tree-wise feasibility projection (TGN final-spec alignment,
+    # 2026-09-15: row-normalized half spaces + 1e-6 full certificate +
+    # CERT_FAIL => skip the representation step; ported from
+    # tgb_link_loop._cstr_group_close_treewise, the b523cf3 lineage)
+    p.add_argument("--rpbe-constrain-mode", default="aggregate",
+                   choices=["aggregate", "treewise"],
+                   help="aggregate = classic summed RPBE surrogate "
+                        "(additive update, no projection); "
+                        "treewise = per-tree half-space feasibility "
+                        "projection on the Gamma scope (final spec)")
+    p.add_argument("--rpbe-kappa", type=float, default=0.05,
+                   help="treewise guardrail: g_i.d >= -kappa||g_i||||t|| "
+                        "(LARGER is looser; kappa>=1 never binds)")
+    p.add_argument("--proj-iters", type=int, default=400,
+                   help="FISTA iterations for the treewise dual QP")
+    p.add_argument("--rpbe-lr", type=float, default=None,
+                   help="independent AdamW lr for the Gamma params "
+                        "(None = unified args.lr for all params; "
+                        "the scheduler scales both groups by the same "
+                        "warmup/cosine factor, so the ratio rpbe_lr/lr "
+                        "is preserved through training)")
+    p.add_argument("--rpbe-gamma-only", action="store_true",
+                   help="R10 structure (review 2026-09-16): the RPBE "
+                        "surrogate updates GAMMA ONLY — task CE keeps "
+                        "training LoRA/COMP embeddings/Gamma, but the "
+                        "auxiliary gradient on non-Gamma params is "
+                        "discarded.  The global lambda calibration no "
+                        "longer dilutes r_eff across LoRA/COMP.")
+    # monitoring
+    p.add_argument("--log-every", type=int, default=10)
+    p.add_argument("--checkpoint-every", type=int, default=250)
+    p.add_argument("--resume-from", default="",
+                   help="resume from an adapter-only checkpoint.pt")
+    p.add_argument("--max-pending-mbs", type=int, default=2048,
+                   help="degenerate-window guard: pending cap before abort")
+    p.add_argument("--max-windows", type=int, default=0,
+                   help="verification runs: stop after this many closed "
+                        "windows (0 = run to max_steps).  max_steps stays "
+                        "frozen at 1000, so short verification runs use "
+                        "this instead of changing the step budget.")
+    return p.parse_args()
+
+
+def seed_all(seed):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
+def save_json(path, obj):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w") as f:
+        json.dump(obj, f, indent=2, allow_nan=True)
+
+
+FROZEN_PATH = Path(__file__).resolve().parents[1] / "configs" / "ccm" \
+    / "frozen_method.json"
+
+
+def enforce_frozen(args):
+    """The frozen method spec is authoritative (review P0-3 tail).
+
+    The trainer entry point MUST read configs/ccm/frozen_method.json and
+    refuse an inconsistent CLI override — a silent drift (e.g. a leftover
+    grad_clip=5.0 default while the reported protocol is the official
+    1.0) would train a different method than the one reviewed and
+    frozen.  Every bound key is checked here; values the CLI does not
+    carry are read back for logging only.
+
+    Review ruling #2 extends the binds to the full method vector
+    (lambda_kf, z_dim, gamma_hidden, merge_cadence, max_steps, LoRA rank)
+    and pins the arm/cadence pairing: the ccm_merge_official reproduction
+    arm is the ONLY arm allowed the fixed official cadence, the three main
+    arms must use the machine value "window-matched", and lambda_kf is
+    either null (calibration-only run permitted, anything else refused)
+    or a committed number that overrides the CLI.
+    """
+    with open(FROZEN_PATH, encoding="utf-8") as f:
+        fz = json.load(f)
+    binds = [
+        ("--ridge-eps", "ridge_eps", fz["rpbe"]["ridge_eps"]),
+        ("--sketch-dim", "sketch_dim", fz["rpbe"]["sketch_dim_m"]),
+        ("--rpbe-seed", "rpbe_seed", fz["rpbe"]["rpbe_map_seed"]),
+        ("--kf-min-cuts", "kf_min_cuts",
+         fz["window"]["min_effective_cuts"]),
+        ("--grad-clip", "grad_clip", fz["training"]["grad_clip"]),
+        ("--z-dim", "z_dim", fz["rpbe"]["z_v_dim"]),
+        ("--gamma-hidden", "gamma_hidden", fz["gamma"]["hidden"]),
+        ("--lora-r", "lora_r", fz["adapter"]["lora_r"]),
+        ("--max-steps", "max_steps", fz["training"]["steps"]),
+        ("--schedule-total-steps", "schedule_total_steps",
+         fz["training"].get("schedule_total_steps", fz["training"]["steps"])),
+    ]
+    for flag, name, frozen_val in binds:
+        cli_val = getattr(args, name)
+        if cli_val != frozen_val:
+            raise SystemExit(
+                "[frozen] {}={} conflicts with frozen_method.json (={}); "
+                "the frozen spec is authoritative — edit the spec file "
+                "to override".format(flag, cli_val, frozen_val))
+    # Arm/cadence pairing: only the official reproduction arm may run
+    # the fixed accumulation cadence; the three main arms share the
+    # adaptive "window-matched" boundary (review P0-2 / ruling #2).
+    if args.arm == "ccm_merge_official":
+        if args.merge_cadence != "official":
+            raise SystemExit(
+                "[frozen] ccm_merge_official must run with "
+                "--merge-cadence official (frozen_method.json "
+                "training.merge_cadence = window-matched applies to the "
+                "three main arms only)")
+    elif args.merge_cadence != "window-matched":
+        raise SystemExit(
+            "[frozen] arm {} must run with the frozen window-matched "
+            "cadence; --merge-cadence official is reserved for "
+            "ccm_merge_official".format(args.arm))
+    # Lambda authority: the calibration-only run writes the derived
+    # lambda into the frozen spec; afterwards the number overrides any
+    # CLI value and re-calibration is refused.
+    # Calibration measures r_eff on theta_0 — resuming first would run
+    # several optimizer steps, so the calibration branch would be skipped
+    # and the run would silently continue as normal training (audit #3).
+    if args.calibrate_lambda and args.resume_from:
+        raise SystemExit(
+            "[frozen] lambda calibration must start from fresh theta_0; "
+            "--calibrate-lambda and --resume-from are mutually exclusive")
+    lam = fz["rpbe"]["lambda_calibration"]["lambda_kf"]
+    if args.arm == "ours":
+        if lam is None:
+            if not args.calibrate_lambda:
+                raise SystemExit(
+                    "[frozen] rpbe.lambda_calibration.lambda_kf is null — "
+                    "the ours arm may only run the calibration-only pass "
+                    "(--calibrate-lambda).  Commit its derived_lambda "
+                    "into configs/ccm/frozen_method.json before the "
+                    "formal runs.")
+        else:
+            if args.calibrate_lambda:
+                raise SystemExit(
+                    "[frozen] lambda_kf={} is committed in "
+                    "frozen_method.json; re-running --calibrate-lambda "
+                    "would retrain the calibration.  Delete the field "
+                    "first if a recalibration is really intended.".format(
+                        lam))
+            if args.kf_lambda != lam:
+                print("[frozen] CLI --kf-lambda={} overridden by the "
+                      "committed lambda_kf={} "
+                      "(frozen_method.json)".format(args.kf_lambda, lam),
+                      flush=True)
+                args.kf_lambda = lam
+    elif args.calibrate_lambda:
+        raise SystemExit(
+            "[frozen] --calibrate-lambda measures r_eff of the surrogate "
+            "(arm 'ours'); arm '{}' does not train the auxiliary "
+            "term".format(args.arm))
+    return fz
+
+
+def build_tokenizer(args):
+    from transformers import LlamaTokenizer
+    tok = LlamaTokenizer.from_pretrained(args.model_name_or_path)
+    tok.pad_token = tok.eos_token
+    tok.pad_token_id = tok.pad_token_id if tok.pad_token_id is not None \
+        else tok.eos_token_id
+    tok.bos_token_id = tok.bos_token_id or 1
+    tok.eos_token_id = tok.eos_token_id or 2
+    tok.padding_side = "left"
+    added = [f"<COMP{k}>" for k in range(N_TOK)] \
+        + [f"<SUM{k}>" for k in range(N_TOK)]
+    tok.add_special_tokens({"additional_special_tokens": added})
+    ids = tok.additional_special_tokens_ids[-2 * N_TOK:]
+    tok.comp_token_id = ids[:N_TOK]
+    tok.sum_token_id = ids[N_TOK:]
+    return tok
+
+
+def build_model(args, device):
+    from transformers.models.llama.configuration_llama import LlamaConfig
+    from src.arch.ccm_llama import LlamaForCausalLM_CCM
+    config = LlamaConfig.from_pretrained(args.model_name_or_path)
+    config.comp_relative_embedding = args.relative_embedding
+    model = LlamaForCausalLM_CCM.from_pretrained(
+        args.model_name_or_path, config=config,
+        torch_dtype=torch.float16 if device.type == "cuda" else torch.float32)
+    model.resize_token_embeddings(32000 + 2 * N_TOK)
+    model.update_comp_token([32000 + k for k in range(N_TOK)],
+                            [32000 + N_TOK + k for k in range(N_TOK)])
+    return model.to(device)
+
+
+def build_official_host(args, device):
+    """Review round 7: the REAL official host.  The Step-1 default LoRA
+    is merged into the base weights; the 4 COMP/SUM tokens live in a
+    SeparatedEmbedding whose comp_embeddings are TRAINABLE (the official
+    protocol trains them); the released Step-2 compression adapter is
+    loaded through the official conditional-LoRA (peft_custom) wrapper.
+    Everything is frozen except comp_embeddings + the adapter LoRA
+    params."""
+    from transformers.models.llama.configuration_llama import LlamaConfig
+    from src.arch.ccm_llama import LlamaForCausalLM_CCM
+    from src.model import load_lora_weight, peft_custom
+    from src.utils import SeparatedEmbedding
+    from peft import LoraConfig
+    config = LlamaConfig.from_pretrained(args.model_name_or_path)
+    config.comp_relative_embedding = args.relative_embedding
+    # fp32 throughout (review round 7): the official separate-embed path
+    # keeps comp_embeddings in fp32, and mixing fp16 weights with fp32
+    # embed outputs breaks the peft conditional-LoRA forward.
+    model = LlamaForCausalLM_CCM.from_pretrained(
+        args.model_name_or_path, config=config, torch_dtype=torch.float32)
+    model = model.to(device)
+    load_lora_weight(args.foundation, model, merge=True)
+    model.update_comp_token([32000 + k for k in range(N_TOK)],
+                            [32000 + N_TOK + k for k in range(N_TOK)])
+    model.model.embed_tokens = SeparatedEmbedding(model.model.embed_tokens,
+                                                  2 * N_TOK)
+    # fp32 already (model is fp32)
+    adapter_dir = args.official_adapter
+    lora_cfg = LoraConfig().from_pretrained(adapter_dir)
+    model = peft_custom.get_peft_model(model, lora_cfg)
+    load_lora_weight(adapter_dir, model, merge=False)
+    for _p in model.parameters():
+        _p.requires_grad_(False)
+    # peft wraps one level deeper: PeftModel -> base Llama -> LlamaModel
+    model.base_model.model.model.embed_tokens.comp_embeddings.weight \
+        .requires_grad_(True)
+    for _n, _p in model.named_parameters():
+        if "lora_" in _n:
+            _p.requires_grad_(True)
+    model._official_host = True
+    print("[official-host] SeparatedEmbedding + trainable comp embeddings "
+          "+ Step-2 adapter loaded", flush=True)
+    return model
+
+
+def wrap_lora(model, r):
+    from rpbe.hosts.ccm.ccm_patch import wrap_lora as _wrap
+    return _wrap(model, r=int(r))
+
+
+def build_dataset(args, tokenizer, model):
+    """LaMP data path (the ONLY line-specific layer).
+
+    Same recursive compression host as the dialogue line: the collator
+    emits one COMP+SUM block per retrieved profile under merge_recur, so
+    a single forward carries the whole M_1..M_N memory chain.
+    """
+    from datasets import load_dataset
+    from src.arguments import CompressionArguments
+    from src.data.lamp import retriever as lamp_retriever
+    from src.data.lamp import collator as lamp_collator
+    comp_args = CompressionArguments(attn_type="merge_recur",
+                                     num_comp_tokens=N_TOK,
+                                     comp_type="online",
+                                     add_comp_token=True,
+                                     relative_embedding=args.relative_embedding)
+    ds = load_dataset("src/data/lamp/lamp.py", name="lamp2",
+                      cache_dir=None, split="train")
+    collator = lamp_collator.LLaMACollatorForLaMP(
+        tokenizer=tokenizer,
+        retriever=lamp_retriever.BaseRetriever(k=args.k),
+        comp_args=comp_args,
+        model=model,
+        padding="longest",
+        comp_token=tokenizer.comp_token_id,
+        sum_token=tokenizer.sum_token_id,
+        pad_token=tokenizer.pad_token_id,
+        k=args.k,
+    )
+    return ds, collator
+
+
+# ---------------------------------------------------------------------
+# ---------------------------------------------------------------------
+# LaMP NOTE: the dialogue line's depth-stratified sampling (candidate
+# pools + q_L ~ 1/sqrt(n_L) over compressed-history depths) is
+# DELIBERATELY absent here.  That machinery exists because deep turn-14
+# cuts are scarce in DailyDialog; LaMP emits EVERY legal cut
+# j = 1..N-1 from a single forward, so no recursion depth is ever
+# scarce.  Sampling is uniform over unseen samples (see next_batch).
+# ---------------------------------------------------------------------
+
+
+def parse_meta(batch, comp_ids, sum_ids, sample_id_global, user_ids=None):
+    """LaMP per-sample metadata from the padded collator batch.
+
+    Same [C0, C1, S0, S1] block layout as the dialogue line, but the
+    blocks are PROFILE blocks (one per retrieved profile) and the
+    trailing blockless span is the query.  The observation sequence is
+    therefore O_1..O_N = profiles, O_{N+1} = query, and ``blocks[j-1]``
+    locates the memory state M_j (the j-th SUM row).
+    """
+    ids = batch["input_ids"]
+    labels = batch["labels"]
+    B, L = ids.shape
+    metas = []
+    for b in range(B):
+        row = ids[b]
+        c0 = (row == comp_ids[0]).nonzero(as_tuple=False).flatten().tolist()
+        blocks = []
+        ok = True
+        for pos in c0:
+            if pos + 3 >= L or row[pos + 1] != comp_ids[1] \
+                    or row[pos + 2] not in sum_ids \
+                    or row[pos + 3] not in sum_ids:
+                ok = False
+                break
+            blocks.append((pos, pos + 2))  # (C0 pos, S0 pos)
+        n_profile = len(blocks)
+        n_completion = int((labels[b] != -100).sum())
+        prompt_end = L - n_completion
+        obs_spans = []
+        prev_end = -1
+        for (c0_pos, _s0) in blocks:
+            obs_spans.append((prev_end + 1, c0_pos))
+            prev_end = c0_pos + 3  # S1 position
+        obs_spans.append((prev_end + 1, prompt_end))  # O_{N+1} = query
+        metas.append({"sample_id": int(sample_id_global) + b, "row": b,
+                      "n_profile": n_profile,
+                      "blocks": blocks,
+                      "obs_spans": obs_spans,
+                      "prompt_end": prompt_end, "ok": ok,
+                      "user_id": int(user_ids[b]) if user_ids is not None
+                      else -1})
+    return metas
+
+
+def run_forward(model, batch, device, grad_enabled):
+    # labels are NOT passed here: the task CE is computed once by
+    # task_ce (passing them would compute the same loss a second time).
+    # attention_mask_comp IS passed: the official merge_recur collator
+    # derives it from the SUM tokens and the vendored LlamaModel folds
+    # it into the attention mask (comp/sum positions blocked from the
+    # causal stream), so omitting it silently trains a DIFFERENT
+    # attention pattern than the official protocol (caught by the L6.5
+    # gate-2 parity run).  fp16 autocast matches the official Trainer:
+    # the vendored conditional-LoRA layer computes its lora branch in
+    # fp32, so the forward MUST run under autocast (mixed fp16/fp32
+    # without autocast raises on the fp16 base path).
+    ctx = torch.enable_grad() if grad_enabled else torch.no_grad()
+    amc = batch.get("attention_mask_comp")
+    # LOCAL FIX (r7 official host): the official host is built fp32
+    # throughout (build_official_host), so autocast is disabled there --
+    # under autocast the merge_recur residual scatter (ccm_llama.py
+    # index_add onto key_states) mixes fp32 key_states with fp16
+    # res_all buffers and raises.  Autocast remains for the legacy fp16
+    # resize host (its fp16 base path requires the mixed-mode forward).
+    _official = bool(getattr(model, "_official_host", False))
+    with ctx:
+        with torch.autocast(device_type="cuda", dtype=torch.float16,
+                            enabled=(device.type == "cuda" and not _official)):
+            return model(input_ids=batch["input_ids"].to(device),
+                         attention_mask=batch["attention_mask"].to(device),
+                         attention_mask_comp=amc.to(device)
+                         if amc is not None else None)
+
+
+def task_ce_shifted(out, labels, device):
+    """Official CCM task CE: SHIFTED sum + valid count.
+
+    The vendored model's internal loss (ccm_llama.py ~line 922) shifts
+    logits/labels by one ("tokens < n predict n") before the CE; the
+    official CompSeq2SeqTrainer backprops that per-microbatch loss
+    directly.  This helper returns (shifted_sum, n_valid) so callers can
+    build the per-microbatch MEAN (= sum / valid, the official
+    reduction) and normalize by the window size where the L6.5 review
+    requires it.  The token-normalized CE log line uses sum / total
+    valid tokens.
+    """
+    logits = out.logits
+    labs = labels.to(device)
+    shift_logits = logits[..., :-1, :].contiguous()
+    shift_labels = labs[..., 1:].contiguous()
+    n_valid = int((shift_labels != -100).sum())
+    loss = torch.nn.functional.cross_entropy(
+        shift_logits.view(-1, shift_logits.shape[-1]),
+        shift_labels.view(-1), ignore_index=-100, reduction="sum")
+    return loss, n_valid
+
+
+def collect_replay_z(meta, adapter, device, j=None):
+    """Pass-2 extraction ONLY: z at LaMP cut position j (gradient-
+    connected).  No builder, no chi, no p — those finished their job at
+    the pass-1 window close.
+
+    LaMP cut j (1..N-1) is the memory state after the first j profile
+    blocks, i.e. the j-th SUM row, so the position lookup is
+    ``blocks[j - 1]``.  j=None keeps the deepest legal cut.
+    """
+    if j is None:
+        j = meta["n_profile"] - 1
+    s0_pos = meta["blocks"][j - 1][1]
+    sum_positions = torch.tensor([[s0_pos, s0_pos + 1]],
+                                 dtype=torch.long, device=device)
+    return adapter.extract_z(sum_positions)[0]
+
+
+def collect_rows(meta, adapter, builder, utter_embed, phi_embed,
+                 embed_tokens, batch, device):
+    """LaMP CHAIN-WISE pass-1 rows (aligned 2Obs closure).
+
+    cut j (j = 1..N-1) is the memory state M_j after the first j profile
+    blocks, supervised by its adjacent observation pair
+
+        row 1:  C = O_{j+1},                        Y = O_{j+2}
+        row 2:  C = (O_{j+1}, O_{j+2}) combined,    Y = O_{j+3}
+
+    where O_1..O_N are the profiles and O_{N+1} is the query.  The
+    overlap (cut j's second observation IS cut j+1's first) is what makes
+    this the aligned closure rather than 1Obs; the query enters ONLY as
+    the local observation of the last cuts, never as a target repeated
+    across the chain.  z is gradient-connected; the sketches are frozen
+    input-embedding probes (no extra LLaMA forward).
+    """
+    if not meta["ok"] or meta["n_profile"] < 3:
+        return []
+    n = int(meta["n_profile"])
+    n_cuts = n - 1
+    # extract_z's gather expands sum_positions along the BATCH dim, so
+    # extract one cut at a time (each call is a cheap per-layer gather).
+    zs = [adapter.extract_z(torch.tensor(
+        [[meta["blocks"][j - 1][1], meta["blocks"][j - 1][1] + 1]],
+        dtype=torch.long, device=device))[0]
+        for j in range(1, n_cuts + 1)]          # [n_cuts, z_dim]
+    ids = batch["input_ids"][meta["row"]]
+    spans = meta["obs_spans"]
+    chi1, chi2, phi1, phi2 = {}, {}, {}, {}
+    for j in range(1, n_cuts + 1):
+        o1 = ids[spans[j][0]:spans[j][1]].unsqueeze(0).to(device)
+        o2 = ids[spans[j + 1][0]:spans[j + 1][1]].unsqueeze(0).to(device)
+        chi1[j] = utter_embed(embed_tokens, o1, tag=0)
+        phi1[j] = phi_embed(embed_tokens, o2, tag=0)
+        chi2[j] = utter_embed.combine(embed_tokens, o1, o2, tag=1)
+        if (j + 2) <= n:                        # O_{j+3} exists
+            o3 = ids[spans[j + 2][0]:spans[j + 2][1]].unsqueeze(0).to(device)
+            phi2[j] = phi_embed(embed_tokens, o3, tag=0)
+    lm = LampMeta(sample_id=int(meta["sample_id"]),
+                  user_id=int(meta["user_id"]), n_profile=n)
+    return builder.build(lm, zs, chi1, chi2, phi1, phi2)
+
+
+def batch_surrogate(z_rows_by_oid, batch_terms, lam, device):
+    """Numerically zero surrogate; gradient = exact window J (plan L5).
+
+    K = 1 here (one optimizer step per closed window), so the auxiliary
+    is simply -lambda * sum_v (<sg(g_v), z_v> - sg(<g_v, z_v>)).
+
+    ``batch_terms`` is ``[(occurrence_id, g), ...]`` for ONE replay batch
+    only — the caller resolves which of the window's gradients belong to
+    this batch through occurrence ids (review P0-1: never slice the
+    window plan by batch position; the plan covers only the
+    cut-producing batches while the pending list mixes in k < 4
+    microbatches)."""
+    terms = []
+    for oid, g in batch_terms:
+        z = z_rows_by_oid.get(oid)
+        if z is None:
+            continue
+        gd = g.detach()
+        terms.append((gd * z).sum() - (gd * z.detach()).sum())
+    if not terms:
+        return torch.zeros((), device=device), 0
+    return -lam * sum(terms), len(terms)
+
+
+def _fista_nonneg(Q, c, iters):
+    """min_{mu>=0} 1/2 mu^T Q mu - c^T mu (Q PSD) by accelerated projected
+    GD.  Tiny (N x N, N~128-300) dual of the tree-wise feasibility QP.
+    (TGN final-spec port, 2026-09-15: eigvalsh exact step 1/lambda_max —
+    the TGN loop uses 30 power iterations to estimate the same bound; at
+    CCM's N the exact value is both cheaper and at least as tight.)"""
+    L = float(torch.linalg.eigvalsh(Q).max().clamp(min=1e-12))
+    mu = torch.zeros_like(c)
+    y = mu.clone()
+    tk = 1.0
+    for _ in range(iters):
+        grad = Q @ y - c
+        mu_new = torch.clamp(y - grad / L, min=0.0)
+        tk_new = 0.5 * (1.0 + math.sqrt(1.0 + 4.0 * tk * tk))
+        y = mu_new + ((tk - 1.0) / tk_new) * (mu_new - mu)
+        mu, tk = mu_new, tk_new
+    return mu
+
+
+def _json_safe(obj):
+    """NaN/Inf -> None for jsonl writes (NaN is not valid JSON and
+    breaks strict parsers; None serializes as a legal null)."""
+    if isinstance(obj, dict):
+        return {k: _json_safe(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_json_safe(v) for v in obj]
+    if isinstance(obj, float) and not math.isfinite(obj):
+        return None
+    return obj
+
+
+def treewise_feasibility_projection(g_task_gamma, gamma_params, G, kappa,
+                                    iters=400, cert_tol=1e-6, min_norm=1e-9):
+    """Tree-wise RPBE Feasibility Projection — TGN final-spec alignment
+    (2026-09-15, ported from tgb_link_loop._cstr_group_close_treewise,
+    the b523cf3 lineage; the Cimmino refinement there is kappa=0-only and
+    is NOT needed on the kappa>0 path CCM runs).
+
+    One global task direction t = -g_task; every per-oid RPBE direction
+    g_j stays SEPARATE and contributes one half-space
+    g_j.d >= -kappa*||g_j||*||t||.  Solve
+
+        d* = argmin_d 1/2||d - t||^2   s.t.  H d >= b,  b_j = -kappa*||t||
+
+    with the ROW-NORMALIZED H (rows g_j/||g_j||; final-spec
+    normalization — the same constraint set, a far better-conditioned
+    dual), through the N x N dual (mu >= 0): d* = t + H^T mu.  After
+    solving, EVERY row is certified against the 1e-6 tolerance (the
+    final-spec full certificate).  On success writes ONLY Gamma:
+    p.grad = g_task - sum_j mu_j g_j.  On certificate FAILURE returns
+    ok=False WITHOUT writing anything — the caller must SKIP the
+    representation step (reviewer requirement: no constrained update is
+    executed on an uncertified solution).
+
+    CCM scale note: the window keeps N ~ 1-3 hundred directions, far
+    below the TGN 2000+ regime, so the ACTIVE SET is the full row set
+    (the TGN 3-round one-row-at-a-time expansion is a solver-capacity
+    device for large N and would only add rounds here).  The projection
+    runs on SCALED (fp16 GradScaler) gradients — the QP is invariant to
+    a uniform positive rescaling of t and G, so the math is unaffected."""
+    sizes = [p.numel() for p in gamma_params]
+    t = torch.cat([-x.flatten().float() for x in g_task_gamma])
+    nt = float(t.norm())
+    diag = {"n_dirs": int(G.shape[0]) if G is not None else 0,
+            "task_norm": nt, "cos_mean": None, "cos_med": None,
+            "cos_p5": None, "cos_min": None, "frac_below": None,
+            "frac_below_grid": None, "feasible_d0": None,
+            "active": 0, "n_viol": None, "max_viol": None,
+            "corr_ratio": 0.0, "d_norm_ratio": None,
+            "fista_iter": 0, "note": None, "cert_fail": False,
+            # CCM-specific legacy fields (kept for cross-line digests)
+            "proj_n_valid": 0, "proj_n_active_init": 0,
+            "proj_n_mu_pos": 0, "proj_cos_min": 0.0,
+            "proj_min_slack_after": None,
+            "proj_max_viol_before": 0.0}
+
+    def _write_task_only():
+        # Gamma .grad <- the aggregate task gradient alone (d = t), the
+        # degenerate / feasible / probe close semantics.
+        for gt, p in zip(g_task_gamma, gamma_params):
+            p.grad = gt
+
+    if G is None or G.numel() == 0:
+        diag["note"] = "no_dirs"
+        return True, diag
+    if nt <= 1e-12:
+        diag["note"] = "zero_task"
+        _write_task_only()
+        return True, diag
+    Gf = G.flatten(1).float()
+    ng = Gf.norm(dim=1)
+    valid = ng > min_norm
+    if not bool(valid.any()):
+        diag["note"] = "no_valid_dirs"
+        _write_task_only()
+        return True, diag
+    Gv = Gf[valid]
+    n_valid = int(Gv.shape[0])
+    # ---- row-normalized half spaces (final spec) ----------------------
+    H = Gv / Gv.norm(dim=1, keepdim=True).clamp(min=min_norm)
+    cos = (H @ t) / nt          # h_j^T t / ||t|| = cos(g_j, t)
+    cos_np = cos.detach().cpu().numpy()
+    diag["proj_n_valid"] = n_valid
+    diag["cos_mean"] = float(np.mean(cos_np))
+    diag["cos_med"] = float(np.median(cos_np))
+    diag["cos_p5"] = float(np.percentile(cos_np, 5.0))
+    diag["cos_min"] = float(np.min(cos_np))
+    diag["proj_cos_min"] = float(np.min(cos_np))
+    diag["frac_below"] = float(np.mean(cos_np < -kappa))
+    diag["frac_below_grid"] = {
+        ("%.2f" % kk): float(np.mean(cos_np < -kk))
+        for kk in (0.0, 0.02, 0.05, 0.1, 0.15, 0.2, 0.3)}
+    diag["feasible_d0"] = bool(np.all(cos_np >= -kappa))
+    diag["proj_max_viol_before"] = float(
+        np.clip(-cos_np - kappa, 0.0, None).max())
+    viol0 = np.flatnonzero(cos_np < -kappa)
+    diag["proj_n_active_init"] = int(len(viol0))
+    if len(viol0) == 0:
+        # d0 = t is already feasible: task-only close (final-spec path)
+        diag["note"] = "feasible_d0"
+        diag["max_viol"] = 0.0
+        _write_task_only()
+        return True, diag
+    # ---- full-set QP: K = H H^T, c = b - H t, b_j = -kappa*||t|| -------
+    b = -kappa * nt * torch.ones(n_valid, device=t.device)
+    K = H @ H.t()
+    c = b - (H @ t)
+    mu = _fista_nonneg(K, c, iters)
+    corr = H.t() @ mu              # = sum_j mu_j h_j  (= d* - t)
+    d = t + corr
+    # ---- full certificate: every row must satisfy h_j d >= -kappa*||t||
+    viol = (-kappa * nt - (H @ d)) / (nt + 1e-30)
+    max_viol = float(viol.max()) if viol.numel() else 0.0
+    diag["active"] = int((mu > 1e-8).sum())
+    diag["proj_n_mu_pos"] = int((mu > 1e-8).sum())
+    diag["fista_iter"] = iters
+    diag["n_viol"] = int(max_viol > cert_tol)
+    diag["max_viol"] = max_viol
+    diag["corr_ratio"] = float((d - t).norm() / max(nt, 1e-12))
+    diag["d_norm_ratio"] = float(d.norm()) / max(nt, 1e-12)
+    diag["proj_min_slack_after"] = float(viol.min())
+    if max_viol > cert_tol:
+        # Hard certificate FAILED: write NOTHING (final-spec CERT_FAIL —
+        # the caller skips the representation step for this window).
+        diag["note"] = "cert_fail"
+        diag["cert_fail"] = True
+        return False, diag
+    with torch.no_grad():
+        for p, cp, gt in zip(gamma_params, torch.split(corr, sizes),
+                             g_task_gamma):
+            p.grad = gt - cp.view_as(p)   # grad = -d* = g_task - sum mu h_j
+    return True, diag
+
+
+def repr_grad_norm(params):
+    total = 0.0
+    n = 0
+    for p in params:
+        if p.grad is not None:
+            total += float((p.grad.detach().double() ** 2).sum())
+            n += 1
+    return math.sqrt(total) if n else 0.0
+
+
+def bad_grad_names(params, k=3):
+    """Names of the first k parameters whose grad is non-finite
+    (CCM_AUX_DIAG diagnostic: which param carries the NaN/Inf)."""
+    bad = []
+    for n, p in params:
+        if p.grad is not None and not bool(
+                torch.isfinite(p.grad.detach()).all()):
+            bad.append(n)
+            if len(bad) >= k:
+                break
+    return bad
+
+
+def params_digest(params):
+    """sha256 over the trainable weights (CPU copy).  The lambda
+    calibration asserts the digest is unchanged across its measurements
+    so the r_eff values really live on theta_0 (review P0-4)."""
+    h = hashlib.sha256()
+    for p in params:
+        h.update(np.ascontiguousarray(
+            p.detach().cpu().numpy()).tobytes())
+    return h.hexdigest()
+
+
+def trainable_state_dict(model):
+    """LoRA + Gamma + any other trainable params ONLY (the frozen 7B
+    backbone is NOT stored; a full state_dict costs ~13GB per file)."""
+    return {n: p.detach().cpu() for n, p in model.named_parameters()
+            if p.requires_grad}
+
+
+def new_token_rows(model):
+    """The COMP/SUM rows appended by resize_token_embeddings are frozen
+    (never in trainable_state_dict) BUT their concrete random values
+    affect inference through the comp-token embedding lookup.  Save
+    them explicitly so the eval-side build can restore the exact rows
+    (review ruling 2026-09-05: eval must reconstruct the SAME model).
+
+    Legacy resize path only: the --official-host path keeps COMP/SUM in
+    a SeparatedEmbedding whose comp_embeddings are TRAINABLE and are
+    already part of trainable_state_dict."""
+    if getattr(model, "_official_host", False):
+        return None
+    emb = model.get_input_embeddings()
+    lm = model.lm_head
+    n = 2 * N_TOK
+    return {
+        "input_embed_rows": emb.weight[-n:].detach().cpu(),
+        "lm_head_rows": lm.weight[-n:].detach().cpu(),
+    }
+
+
+def save_trainable(path, model, **extra):
+    payload = {"model": trainable_state_dict(model)}
+    _ntr = new_token_rows(model)
+    if _ntr is not None:
+        payload["new_token_rows"] = _ntr
+    payload.update(extra)
+    torch.save(payload, path)
+
+
+def _remap_optimizer_state(ckpt_opt, optimizer, params):
+    """R9 (2026-09-16): adapt a checkpoint optimizer state to the current
+    param-group layout (single-group <-> --rpbe-lr two-group switch).
+
+    Same code + same build => the checkpoint's flat param order equals
+    the current process's, so per-param state entries map by flat index;
+    the CURRENT group definitions (with their lr choices) are kept, so a
+    resumed run applies the new rpbe_lr instead of the checkpoint's."""
+    old_groups = ckpt_opt["param_groups"]
+    n_new = sum(len(g["params"]) for g in optimizer.param_groups)
+    if len(old_groups) != 1 or len(old_groups[0]["params"]) != len(params):
+        return ckpt_opt   # unknown layout: let load_state_dict surface it
+    # current groups' flattened order -> global param index
+    idx_of = {id(p): i for i, p in enumerate(params)}
+    flat = [idx_of[id(p)] for g in optimizer.param_groups
+            for p in g["params"]]
+    if sorted(flat) != list(range(len(params))):
+        raise RuntimeError("param groups do not partition the params")
+    pos_of = {old_i: p for p, old_i in enumerate(flat)}
+    state = {pos_of[int(k)]: v for k, v in ckpt_opt["state"].items()}
+    groups = []
+    off = 0
+    for g in optimizer.param_groups:
+        ng = dict(g)
+        ng["params"] = list(range(off, off + len(g["params"])))
+        off += len(g["params"])
+        groups.append(ng)
+    return {"state": state, "param_groups": groups}
+
+
+def load_trainable(path, model, optimizer, device,
+                   load_optimizer: bool = True):
+    payload = torch.load(path, map_location=device, weights_only=False)
+    missing, unexpected = model.load_state_dict(payload["model"],
+                                                strict=False)
+    if unexpected:
+        raise RuntimeError("unexpected keys in checkpoint: {}"
+                           .format(sorted(unexpected)[:5]))
+    # Fail-fast (review 2026-09-16): a missing key that is a CURRENT
+    # trainable param would silently keep its init value (e.g. an old
+    # checkpoint without Gamma leaves a zero-init Gamma).
+    trainable_names = {n for n, p in model.named_parameters()
+                       if p.requires_grad}
+    bad_missing = sorted(set(missing) & trainable_names)
+    if bad_missing:
+        raise RuntimeError(
+            "checkpoint is missing trainable params (stale ckpt?): {}"
+            .format(bad_missing[:5]))
+    if load_optimizer and "optimizer" in payload:
+        opt_ckpt = payload["optimizer"]
+        if len(opt_ckpt["param_groups"]) != len(optimizer.param_groups):
+            params = [p for p in model.parameters() if p.requires_grad]
+            opt_ckpt = _remap_optimizer_state(opt_ckpt, optimizer, params)
+        optimizer.load_state_dict(opt_ckpt)
+    return payload
+
+
+def main():
+    args = parse_args()
+    enforce_frozen(args)  # review P0-3: frozen spec is authoritative
+    seed_all(args.seed)
+    device = torch.device(f"cuda:{args.gpu}" if torch.cuda.is_available()
+                          else "cpu")
+    out = Path(args.output)
+    out.mkdir(parents=True, exist_ok=True)
+    log_path = out / "log.jsonl"
+
+    tokenizer = build_tokenizer(args)
+    if args.official_host:
+        model = build_official_host(args, device)
+    else:
+        model = build_model(args, device)
+    if args.foundation and not args.official_host:
+        # Official two-stage protocol: merge the Step-1 default LoRA
+        # (llama-7b-no) into the base weights BEFORE attaching our
+        # conditional LoRA / Gamma.  The official merge path adds
+        # (B @ A) * scaling to the frozen params directly and needs no
+        # LoRA structure on the model.
+        from src.model import load_lora_weight
+        load_lora_weight(args.foundation, model, merge=True)
+        print("[foundation] merged {}".format(args.foundation), flush=True)
+    if not args.official_host:
+        model = wrap_lora(model, args.lora_r)
+        # The PEFT wrap can replace the CausalLM wrapper; re-assert the
+        # comp/sum token registration on the wrapped object.
+        model.update_comp_token([32000 + k for k in range(N_TOK)],
+                                [32000 + N_TOK + k for k in range(N_TOK)])
+    use_rpbe = args.arm in ("ours", "gamma_task_only")
+    if use_rpbe:
+        attach_gamma(model, hidden=args.gamma_hidden)
+    cfg = model.model.config
+    # Tree-wise projection scope: the Gamma parameters of every layer.
+    gamma_params = []
+    if use_rpbe:
+        _base = model
+        while not hasattr(_base, "layers") and hasattr(_base, "model"):
+            _base = _base.model
+        for _layer in _base.layers:
+            _g = getattr(_layer.self_attn, "gamma", None)
+            if _g is not None:
+                gamma_params.extend(list(_g.parameters()))
+    gamma_set = {id(p) for p in gamma_params}
+
+    # RNG protocol precondition: zero dropout everywhere (pass-1/pass-2
+    # replay must be identical; LLaMA ships with dropout 0).
+    assert getattr(cfg, "attention_dropout", 0.0) == 0.0 \
+        and getattr(cfg, "hidden_dropout", 0.0) == 0.0, \
+        "two-pass replay requires zero model dropout"
+    if args.lora_r:
+        pass  # lora_dropout pinned to 0.0 in wrap_lora
+
+    adapter = maps = builder = utter_embed = window = None
+    if use_rpbe:
+        adapter = CCMHostAdapter(model, n_layers=cfg.num_hidden_layers,
+                                 n_heads=cfg.num_attention_heads,
+                                 head_dim=cfg.hidden_size
+                                 // cfg.num_attention_heads,
+                                 z_dim=args.z_dim, seed=args.rpbe_seed)
+        # Review round 8: FOUR independent 32-dim sketch branches (the
+        # single 64-dim sketch had too much collision variance for the
+        # rare turn-14 rows).  J_ens = mean_r J_r at window close; the
+        # branches share d_chi = 64 and the depth bucket encoding.
+        maps = LampLlmmaps(d_chi=64, d_phi=32, m=32,
+                           n_branches=LampLlmmaps.N_BRANCHES,
+                           seed=args.rpbe_seed).to(device)
+        builder = LampCutBuilder(maps, z_dim=args.z_dim,
+                                 seed=args.rpbe_seed)
+        utter_embed = UtteranceEmbed(hidden_dim=cfg.hidden_size, d_chi=64,
+                                     seed=args.rpbe_seed,
+                                     combine_dim=1).to(device)
+        phi_embed = UtteranceEmbed(hidden_dim=cfg.hidden_size, d_chi=32,
+                                   seed=args.rpbe_seed + 100).to(device)
+        branches = [KFMomentWindow({MEM_TAU: args.z_dim}, min_ratio=2.0,
+                                   min_abs=args.kf_min_cuts,
+                                   eps=args.ridge_eps, fixed_maps=maps,
+                                   strict=False, autoclose=False,
+                                   # Review round 8: paired OAS shrinkage;
+                                   # the fixed ridge keeps only its
+                                   # numerical-safety role.
+                                   oas=True)
+                    for _ in range(LampLlmmaps.N_BRANCHES)]
+        window = BranchEnsembleWindow(branches)
+
+    params = [p for p in model.parameters() if p.requires_grad]
+    # Official CCM protocol (L6.5 review P0-2): AdamW with weight_decay=0,
+    # cosine decay to zero, 3% warmup, and the official Trainer's default
+    # max_grad_norm=1.0.  Same scheduler on all three arms (per-step).
+    # --rpbe-lr (R9 add, 2026-09-16): an independent base lr for the
+    # Gamma group; the single scheduler multiplies BOTH groups by the
+    # same warmup/cosine factor, so the group ratio is preserved.
+    if args.rpbe_lr is not None and gamma_params:
+        gamma_ids = {id(p) for p in gamma_params}
+        optimizer = torch.optim.AdamW(
+            [{"params": [p for p in params if id(p) in gamma_ids],
+              "lr": args.rpbe_lr},
+             {"params": [p for p in params if id(p) not in gamma_ids],
+              "lr": args.lr}],
+            lr=args.lr, weight_decay=0.0)
+    else:
+        optimizer = torch.optim.AdamW(params, lr=args.lr, weight_decay=0.0)
+    total_steps = max(1, int(args.schedule_total_steps
+                            if args.schedule_total_steps is not None
+                            else args.max_steps))
+    warmup_steps = max(1, int(0.03 * total_steps))
+
+    def _lr_lambda(s):
+        if s < warmup_steps:
+            return float(s) / float(warmup_steps)
+        progress = float(s - warmup_steps) / float(
+            max(1, total_steps - warmup_steps))
+        return max(0.0, 0.5 * (1.0 + math.cos(math.pi * progress)))
+
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, _lr_lambda)
+    scaler = torch.cuda.amp.GradScaler(
+        enabled=(device.type == "cuda"
+                 and not getattr(model, "_official_host", False)))
+
+    dialog, collator = build_dataset(args, tokenizer, model)
+    comp_ids = tokenizer.comp_token_id
+    sum_ids = tokenizer.sum_token_id
+    pad_id = tokenizer.pad_token_id
+    embed_tokens = model.get_input_embeddings()
+
+    train_items = ds
+    n_items = len(train_items)
+    sample_cursor = 0
+    # LaMP sampling is UNIFORM: there is no depth stratification here.
+    # The dialogue line needs it because deep turn-14 cuts are scarce;
+    # LaMP emits every legal cut j = 1..N-1 from a single forward, so no
+    # recursion depth is ever scarce.  One sample per window is kept as
+    # the tree-identity dedup, matching the dialogue line's window rule.
+    pool_all = list(range(n_items))
+    seen_dialogs = set()  # one sample per window (cleared at every close)
+
+    def next_batch():
+        """Draw one LaMP sample not yet used in this window.
+
+        The same RNG stream drives both arms (seed_all), so task-only and
+        ours see the identical sampling stream.
+        """
+        nonlocal sample_cursor
+        cand = [i for i in pool_all if i not in seen_dialogs]
+        if not cand:
+            raise RuntimeError(
+                "degenerate window: every LaMP sample already seen "
+                "(window grew past the whole pool)")
+        orig_id = int(random.choice(cand))
+        seen_dialogs.add(orig_id)
+        item = train_items[orig_id]
+        sample_cursor += 1
+        return collator([dict(item)]), sample_cursor - 1, orig_id
+
+    threshold = window._threshold(MEM_TAU) if window else None
+    save_json(out / "config.json", {
+        "arm": args.arm, "seed": args.seed, "cli": vars(args),
+        "paired_seed_hash": paired_seed_hash(args.seed, model)
+        if use_rpbe else "n/a",
+        "threshold": threshold,
+    })
+    print("arm={} seed={} threshold={} n_train={}".format(
+        args.arm, args.seed, threshold, n_items), flush=True)
+
+    step = 0
+    last_logged_step = 0  # dedup: log only when step changes (L7 smoke)
+    last_saved_step = -1
+    # Review ruling: ``step`` counts global window attempts (HF Trainer
+    # global_step, advances even on AMP skips; the frozen 1000-step budget
+    # is GLOBAL steps, not applied-update count).  optimizer_steps_executed
+    # counts optimizer.step() invocations (an lr=0 warmup-first execution
+    # counts too — "executed", not "applied"); amp_skipped_steps counts
+    # GradScaler overflow skips; scheduler_steps counts scheduler.step()
+    # calls and must equal optimizer_steps_executed (Trainer 4.44.2: LR
+    # advances only on a real step).
+    optimizer_steps_executed = 0
+    amp_skipped_steps = 0
+    scheduler_steps = 0
+    # treewise final-spec: windows whose QP certificate failed at 1e-6
+    # close WITHOUT a representation step (TGN CERT_FAIL semantics).
+    cert_skip_steps = 0
+    total_task_sum = 0.0
+    total_tokens = 0
+    total_microbatches = 0
+    total_kf = 0.0
+    kf_closed = 0
+    aux_terms = 0
+    below_threshold = 0
+    lambda_kf = args.kf_lambda
+    t_start = time.time()
+    t_win_start = t_start
+    # CCM_PROFILE=1: per-window breakdown of pass1/collect/pass2/bwd
+    # wall time (diagnostic for the L6.5 step-time gate).
+    profile = os.environ.get("CCM_PROFILE") == "1"
+    PROF = {}
+
+    def _pf(key, t0):
+        PROF[key] = PROF.get(key, 0.0) + time.perf_counter() - t0
+
+    pending = []
+    cut_records = []
+    pass1_rngs = []          # per-microbatch pass-1 RNG (P0 fix, R10)
+    window_start_state = None
+    # Review P0-2: the ccm_merge arm counts effective cuts (dialogues
+    # with k >= 3, review round 8: depth L = 1 contributes cuts too) in
+    # the same stream and fires its update on the same boundary as the
+    # RPBE windows, so all three arms see the same task samples at the
+    # same scheduler step.
+    merge_eff_cuts = 0
+    # L6.5 gate 1: every arm hashes its (sample_id, k) data stream so the
+    # three arms can be compared bit-for-bit after a run; the raw stream
+    # is also written for prefix comparison across unequal window sizes.
+    data_flow_hash = hashlib.sha256()
+    data_flow_len = 0
+    # Review (cadence collision): per-window boundary records
+    # w{ordinal}:{n_mb}:{n_cut_mb} hashed into boundary_hash so the three
+    # arms' window boundaries are comparable window by window, not only
+    # through the final data-flow hash.  boundary_records keeps the raw
+    # window strings so a resumed run can rebuild boundary_hash from
+    # scratch (sha256 state is not serializable); data_flow.jsonl plays
+    # the same role for data_flow_hash.
+    boundary_hash = hashlib.sha256()
+    boundary_records = []
+    data_flow_path = out / "data_flow.jsonl"
+    # Review round 8 statistical report: per-window depth-stratified
+    # coverage (per-level cut counts, unique dialogues, duplication rate,
+    # row-level ESS, turn-14 coverage).  Written on every window close;
+    # the dedup set and per-window counters reset with the window.
+    depth_diag_path = out / "depth_diag.jsonl"
+
+    def close_depth_window(n_mb, step_val, n_cuts):
+        uniq = len(seen_dialogs)
+        with depth_diag_path.open("a") as f:
+            f.write(json.dumps({
+                "step": int(step_val),
+                "n_mb": int(n_mb),
+                "unique_samples": int(uniq),
+                "dup_rate": float(1.0 - uniq / max(int(n_mb), 1)),
+                "n_cuts": int(n_cuts),
+                # rows w=0.5: ESS = 2*n_cuts
+                "ess_rows": float(2 * n_cuts),
+            }) + "\n")
+        seen_dialogs.clear()
+    if args.resume_from:
+        payload = load_trainable(args.resume_from, model, optimizer, device)
+        step = int(payload.get("step", 0))
+        lambda_kf = float(payload.get("lambda_kf", args.kf_lambda))
+        # R10 recalibration (review 2026-09-16): the committed frozen
+        # lambda is authoritative — a resume payload carrying the OLD
+        # lambda must not silently override a freshly calibrated one.
+        if abs(lambda_kf - float(args.kf_lambda)) > 1e-12:
+            print("[frozen] resume payload lambda={} overridden by "
+                  "committed lambda={}".format(lambda_kf, args.kf_lambda),
+                  flush=True)
+            lambda_kf = float(args.kf_lambda)
+        if "sample_cursor" in payload:
+            sample_cursor = int(payload["sample_cursor"])
+        if "rng" in payload:
+            _restore_rng(payload["rng"])
+        if "scaler" in payload:
+            scaler.load_state_dict(payload["scaler"])
+        if "scheduler" in payload:
+            # Audit #3: without the scheduler state a resumed 1000-step
+            # run restarts the LR phase (warmup + cosine) from zero.
+            # R9: a single-group checkpoint scheduler has one base_lr;
+            # the rpbe-lr two-group run needs one per group (the group
+            # ratio is carried by the optimizer's lr, so the scheduler's
+            # base_lrs are rebuilt from the CURRENT group lrs).
+            sch_ckpt = payload["scheduler"]
+            if len(sch_ckpt.get("base_lrs", [])) != len(scheduler.base_lrs):
+                sch_ckpt = dict(sch_ckpt)
+                sch_ckpt["base_lrs"] = [float(g["lr"])
+                                        for g in optimizer.param_groups]
+            scheduler.load_state_dict(sch_ckpt)
+        if "builder_oid" in payload and builder is not None:
+            builder.next_oid = int(payload["builder_oid"])
+        # Counters (review ruling: full resume of the aggregate counters
+        # so a resumed run's final summary covers the WHOLE run, not just
+        # the post-resume part).
+        if "optimizer_steps_executed" in payload:
+            optimizer_steps_executed = int(payload["optimizer_steps_executed"])
+        if "amp_skipped_steps" in payload:
+            amp_skipped_steps = int(payload["amp_skipped_steps"])
+        if "cert_skip_steps" in payload:
+            cert_skip_steps = int(payload["cert_skip_steps"])
+        if "scheduler_steps" in payload:
+            scheduler_steps = int(payload["scheduler_steps"])
+        if "total_task_sum" in payload:
+            total_task_sum = float(payload["total_task_sum"])
+        if "total_tokens" in payload:
+            total_tokens = int(payload["total_tokens"])
+        if "total_microbatches" in payload:
+            total_microbatches = int(payload["total_microbatches"])
+        if "total_kf" in payload:
+            total_kf = float(payload["total_kf"])
+        if "kf_closed" in payload:
+            kf_closed = int(payload["kf_closed"])
+        if "aux_terms" in payload:
+            aux_terms = int(payload["aux_terms"])
+        if "boundary_records" in payload:
+            boundary_records = list(payload["boundary_records"])
+        # Rebuild the stream hashes from the on-disk records.  The jsonl
+        # is kept (append mode) across resume; a fresh run truncates it.
+        for rec in boundary_records:
+            boundary_hash.update(str(rec).encode())
+        if data_flow_path.exists():
+            for line in data_flow_path.open():
+                row = json.loads(line)
+                data_flow_hash.update(struct.pack(
+                    ">qq", int(row["did"]) % n_items, int(row["k"])))
+                data_flow_len += 1
+            if data_flow_len != int(payload.get("data_flow_len",
+                                                data_flow_len)):
+                raise RuntimeError(
+                    "resume: data_flow.jsonl rows ({}) != checkpoint "
+                    "data_flow_len ({})".format(
+                        data_flow_len, payload.get("data_flow_len")))
+        elif payload.get("data_flow_len", 0):
+            raise RuntimeError(
+                "resume: data_flow.jsonl missing but checkpoint recorded "
+                "{} rows".format(payload.get("data_flow_len")))
+        print("RESUME step={} lambda={} cursor={} executed={} skips={} "
+              "sched={} ce_sum={:.2f} tokens={} aux={} boundary={}"
+              .format(step, lambda_kf, sample_cursor,
+                      optimizer_steps_executed, amp_skipped_steps,
+                      scheduler_steps, total_task_sum, total_tokens,
+                      aux_terms, len(boundary_records)),
+              flush=True)
+    else:
+        data_flow_path.unlink(missing_ok=True)
+
+    def pass1_one(batch, meta_list):
+        """Incremental pass 1: forward (no grad) + rows into the window.
+        Returns [(meta, occurrence_id)] per cut in this batch (the pass-2
+        replay contract; builder counters stay monotonic)."""
+        batch_cuts = []
+        with torch.no_grad():
+            _t = time.perf_counter()
+            run_forward(model, batch, device, grad_enabled=False)
+            _pf("pass1_fwd", _t)
+            for meta in meta_list:
+                _t = time.perf_counter()
+                rows = collect_rows(meta, adapter, builder, utter_embed,
+                                     phi_embed,
+                                    embed_tokens, batch, device)
+                _pf("collect_rows", _t)
+                if rows:
+                    _t = time.perf_counter()
+                    window.add(rows)
+                    _pf("window_add", _t)
+                    # R10 chain-wise: every cut of the dialogue is
+                    # replayed — record (meta, oid, v) ONCE per cut
+                    # (2 horizon rows per cut, EXCEPT the deepest cut
+                    # whose context-turn obs1 is skipped -> 1 row).
+                    _seen_oids = set()
+                    for r in rows:
+                        if r.occurrence_id in _seen_oids:
+                            continue
+                        _seen_oids.add(r.occurrence_id)
+                        batch_cuts.append(
+                            (meta, r.occurrence_id,
+                             int(r.context["cut_turn"])))
+            adapter.clear()
+        return batch_cuts
+
+    def pass2_one(batch, cut_meta, g_by_oid, lam):
+        """Pass-2 replay: task CE (official MEAN per microbatch, divided
+        by the window size below) + exact surrogate.  ``cut_meta`` is the
+        pass-1 [(meta, oid)] record — NO builder/chi/p here (L6.5
+        review: pass 2 only re-extracts the gradient-connected z).
+
+        Gradients are mapped through OCCURRENCE IDs (review P0-1): this
+        batch's cuts carry their pass-1 occurrence ids; a cut is replayed
+        iff its id is in the window plan's ``by_oid``.  Batch positions
+        are never used to slice the plan (k < 4 microbatches interleave
+        and the plan covers only cut-producing batches)."""
+        _t = time.perf_counter()
+        out = run_forward(model, batch, device, grad_enabled=True)
+        _pf("pass2_fwd", _t)
+        task_sum, n_valid = task_ce_shifted(out, batch["labels"], device)
+        task_mean = task_sum / max(n_valid, 1)
+        aux = torch.zeros((), device=device)
+        n_terms = 0
+        if g_by_oid:
+            z_by_oid = {}
+            batch_terms = []
+            _t = time.perf_counter()
+            for meta, oid, v in cut_meta:
+                g = g_by_oid.get(oid)
+                if g is not None:
+                    z_by_oid[oid] = collect_replay_z(meta, adapter,
+                                                     device, j=v)
+                    batch_terms.append((oid, g))
+            adapter.clear()
+            _pf("collect_z", _t)
+            _t = time.perf_counter()
+            aux, n_terms = batch_surrogate(z_by_oid, batch_terms, lam,
+                                           device)
+            _pf("surrogate", _t)
+            if os.environ.get("CCM_AUX_DIAG") == "1":
+                # Diagnostic (acceptance zero-update-diff investigation):
+                # is the surrogate gradient actually connected to the
+                # replay forward graph on the GPU/fp16 path?
+                z_req = sum(1 for z in z_by_oid.values()
+                            if z.requires_grad)
+                print("AUXDIAG mb={} n_terms={} lam={} z_req={}/{} "
+                      "aux.requires_grad={} aux_abs={:.3e}".format(
+                          len(batch_terms), n_terms, lam, z_req,
+                          len(z_by_oid), aux.requires_grad,
+                          abs(float(aux))), flush=True)
+        return task_mean, task_sum, n_valid, aux, n_terms
+
+    def grad_step():
+        # Review ruling (2026-09-02, L6.5 CONDITIONAL PASS pending item):
+        # HF Trainer 4.44.2 advances the scheduler ONLY when the optimizer
+        # step actually ran; an AMP overflow skip (GradScaler backs the
+        # scale off and discards the update) must NOT change the LR.
+        # The skip is detected by the scale backoff (the same signal
+        # Accelerator uses), not by params_digest — a digest compare
+        # cannot tell "optimizer ran with lr=0" from "optimizer skipped".
+        nonlocal optimizer_steps_executed, amp_skipped_steps
+        nonlocal scheduler_steps
+        scale_before = float(scaler.get_scale())
+        if os.environ.get("CCM_AUX_DIAG") == "1":
+            digest_before = params_digest(params)
+        scaler.unscale_(optimizer)
+        if os.environ.get("CCM_AUX_DIAG") == "1":
+            # Diagnostic (NaN investigation): after unscale_, is the raw
+            # gradient finite?  If the BAD grads vanish here, the NaN was
+            # fp16 scaled-overflow (GradScaler cold start); if they
+            # persist, the backward graph itself produces non-finite grads.
+            named = [(n, p) for n, p in model.named_parameters()
+                     if p.requires_grad and p.grad is not None]
+            bad = bad_grad_names(named, k=5)
+            norm = repr_grad_norm(params) if not bad else float("nan")
+            print("AUXDIAG unscale norm={:.6f} bad={}".format(
+                norm, bad), flush=True)
+        torch.nn.utils.clip_grad_norm_(params, args.grad_clip)
+        scaler.step(optimizer)
+        scaler.update()
+        amp_skipped = (scaler.is_enabled()
+                       and float(scaler.get_scale()) < scale_before)
+        optimizer_steps_executed += 1
+        if not amp_skipped:
+            scheduler.step()
+            scheduler_steps += 1
+        else:
+            amp_skipped_steps += 1
+        # Review ruling: the independent scheduler counter must stay glued
+        # to the real-execution counter (Trainer 4.44.2): every optimizer
+        # execution advances either the scheduler or the skip counter.
+        assert optimizer_steps_executed == scheduler_steps + amp_skipped_steps, (
+            "step counters diverged: executed={} sched={} skips={}".format(
+                optimizer_steps_executed, scheduler_steps,
+                amp_skipped_steps))
+        if os.environ.get("CCM_AUX_DIAG") == "1":
+            digest_changed = params_digest(params) != digest_before
+            print("AUXDIAG grad_step digest_changed={} amp_skipped={} "
+                  "scale_now={:.0f}".format(
+                      digest_changed, amp_skipped, scaler.get_scale()),
+                  flush=True)
+        return not amp_skipped
+
+    while step < args.max_steps:
+        batch, sample_id, orig_id = next_batch()
+        # Data-stream hash for every arm (parse_meta is pure, no RNG).
+        # Review round 8: the stream records the STABLE dialogue id and
+        # its depth level — the per-step cursor is no longer the identity.
+        metas = parse_meta(batch, comp_ids, sum_ids, sample_id,
+                           user_ids=[orig_id])
+        for m in metas:
+            data_flow_hash.update(struct.pack(
+                ">qq", int(m["user_id"]) if m["user_id"] >= 0
+                else int(m["sample_id"]) % n_items, int(m["n_profile"])))
+            data_flow_len += 1
+        with data_flow_path.open("a") as f:
+            for m in metas:
+                # LaMP: the sample identity is the stable user id and the
+                # chain length is the number of profile blocks actually
+                # present (the collator pops trailing profiles that do not
+                # fit max_length).
+                f.write(json.dumps({
+                    "did": int(m["user_id"]) if m["user_id"] >= 0
+                    else int(m["sample_id"]) % n_items,
+                    "n_profile": int(m["n_profile"]),
+                    "k": int(m["n_profile"]) + 1}) + "\n")
+        if window_start_state is None:
+            # Builder counters are NOT rewound here: pass 2 never touches
+            # the builder, so occurrence ids stay monotonic across the
+            # whole run (L6.5 review P0-1).
+            window_start_state = {"rng": _rng_state()}
+        pending.append((batch, sample_id))
+        if use_rpbe:
+            # Incremental pass 1: RNG restored after each microbatch so
+            # the data-sampling stream matches the single-pass arm; the
+            # cut rows and their occurrence ids accumulate monotonically.
+            # Microbatches with NO possible cut (k < 4) skip the pass-1
+            # forward entirely: no row can come from them (L6.5 perf:
+            # DailyDialog's effective-cut rate is ~50%, halving the
+            # pass-1 cost).
+            # P0 fix (R10, review 2026-09-16): the official Step-2 LoRA
+            # carries lora_dropout=0.05 and the model is in TRAIN mode —
+            # dropout consumes CUDA RNG inside the forward.  Pass 1
+            # restores the SAME state after every microbatch (all masks
+            # identical); pass 2 replays the forward stream linearly, so
+            # WITHOUT per-microbatch restoration z_pass2 != z_pass1 and
+            # the exact-replay surrogate is broken.  Keep each
+            # microbatch's pre-forward RNG and restore it before its
+            # pass-2 forward: mask_i^pass2 == mask_i^pass1.
+            state = {"rng": _rng_state()}
+            pass1_rngs.append(state["rng"])
+            if any(m["ok"] and m["k"] >= 3 for m in metas):
+                batch_cuts = pass1_one(batch, metas)
+            else:
+                batch_cuts = []
+            cut_records.append(batch_cuts)
+            _restore_rng(state["rng"])
+            if window.window_ready():
+                _t = time.perf_counter()
+                closed, plan, diag = window.close_replay()
+                _pf("close_replay", _t)
+                # Review round 5 (CCA saturation audit): persist the
+                # dialogue-grouped shuffle diagnostic per window.
+                _d = diag.get(MEM_TAU, {}) if isinstance(diag, dict) else {}
+                with (out / "window_diag.jsonl").open("a") as _f:
+                    _f.write(json.dumps(_json_safe({
+                        "step": int(step),
+                        "M_unique": _d.get("M_unique"),
+                        "M_rows": _d.get("M_rows"),
+                        "M_unique_trees": _d.get("M_unique_trees"),
+                        "J_real_minus_shuffled":
+                            _d.get("J_real_minus_shuffled"),
+                        "J_shuffled_mean": _d.get("J_shuffled"),
+                        "J_shuffled_n": _d.get("J_shuffled_n"),
+                        # R9 (review 2026-09-16): within-depth null — the
+                        # depth bucket b_L lives in p, so the GLOBAL
+                        # shuffle breaks depth pairing and can stay large
+                        # on pure depth identity.  within-L keeps depth
+                        # intact; only future CONTENT is deranged.
+                        "J_shuffled_within_L":
+                            _d.get("J_shuffled_within_L"),
+                        "J_real_minus_shuffled_within_L":
+                            _d.get("J_real_minus_shuffled_within_L"),
+                        # Review round 8: per-branch scores + ensemble.
+                        "J_ens": _d.get("J_ens"),
+                        "J_branches": _d.get("J_branches"),
+                        # OAS shrinkage intensities (branch 0's window
+                        # statistics, detached by construction).
+                        "alpha_z": _d.get("alpha_z"),
+                        "alpha_p": _d.get("alpha_p"),
+                    })) + "\n")
+                # P0-1 fix: capture the REAL post-pass-1 data-stream RNG
+                # position; pass 2 replays from the window start and the
+                # stream resumes from the captured position afterwards.
+                resume_rng = _rng_state()
+                _restore_rng(window_start_state["rng"])
+                # Review P0-1: consume the window gradients through the
+                # occurrence-id index.  The legacy per-batch slice was
+                # aligned to the CUT-PRODUCING batches only, so indexing
+                # it with the pending position silently dropped ~99% of
+                # the cuts once k < 4 microbatches interleaved
+                # (aux_terms was 11 over 7 windows instead of 896).
+                g_by_oid = plan.get(MEM_TAU, {}).get("by_oid", {})
+                # Audit #3: plan completeness — every cut pass 1 recorded
+                # must carry a window gradient.  Without this assert a
+                # numeric window failure (strict=False returns an empty
+                # by_oid) would silently decay ours toward
+                # gamma_task_only for the REST of the run — the 11/896
+                # class of bug, now fail-fast on every window (checked
+                # for the calibration window too).
+                n_cut_win = sum(1 for cr in cut_records for _ in cr)
+                if len(g_by_oid) != n_cut_win:
+                    raise RuntimeError(
+                        "RPBE replay incomplete: plan={} cuts={} diag={}"
+                        .format(len(g_by_oid), n_cut_win,
+                                diag.get(MEM_TAU)))
+                if args.calibrate_lambda and kf_closed == 0 \
+                        and not args.resume_from:
+                    # Review P0-4 (lambda calibration timing): the
+                    # calibration must run on theta_0 — BEFORE this
+                    # window's optimizer/scheduler step — replaying the
+                    # theta_0 adjoint plan against theta_0 z's.  The
+                    # previous order ran the real pass 2 and grad_step
+                    # first, then measured on theta_1: the surrogate
+                    # became J_z(theta_1)^T dJ/dz|_{theta_0} (mixed
+                    # point) and the task gradient was measured at
+                    # theta_1 too, so the derived lambda was not the
+                    # frozen spec's r_eff calibration value.  Asserts:
+                    # trainable params unchanged and no optimizer /
+                    # scheduler step has fired.
+                    digest0 = params_digest(params)
+                    assert step == 0, \
+                        "lambda calibration must fire before the first " \
+                        "optimizer step (step={})".format(step)
+                    # r_eff on this window: separate norm measurements.
+                    # g_task uses the real training scale (per-microbatch
+                    # MEAN divided by len(pending)); g_kf uses the real
+                    # pass-2 scale (aux NOT divided — review P0-3).
+                    optimizer.zero_grad(set_to_none=True)
+                    _restore_rng(window_start_state["rng"])
+                    for b, sid in pending:
+                        fwd_out = run_forward(model, b, device,
+                                              grad_enabled=True)
+                        task_sum_m, n_valid_m = task_ce_shifted(
+                            fwd_out, b["labels"], device)
+                        (task_sum_m / max(n_valid_m, 1)
+                         / float(len(pending))).backward()
+                    g_task = repr_grad_norm(gamma_params)
+                    g_task_all = repr_grad_norm(params)
+                    optimizer.zero_grad(set_to_none=True)
+                    _restore_rng(window_start_state["rng"])
+                    for i, (b, sid) in enumerate(pending):
+                        fwd_out = run_forward(model, b, device,
+                                              grad_enabled=True)
+                        # Same occurrence-id mapping as pass 2 (P0-1):
+                        # only this batch's cuts, resolved via by_oid.
+                        z_by_oid = {}
+                        batch_terms = []
+                        for meta, oid, v in cut_records[i]:
+                            g = g_by_oid.get(oid)
+                            if g is not None:
+                                z_by_oid[oid] = collect_replay_z(
+                                    meta, adapter, device, j=v)
+                                batch_terms.append((oid, g))
+                        adapter.clear()
+                        aux, n_aux = batch_surrogate(
+                            z_by_oid, batch_terms, 1.0, device)
+                        # A microbatch without terms (k < 4) contributes
+                        # nothing; its zero aux has no grad_fn, so skip.
+                        if n_aux:
+                            aux.backward()
+                    _restore_rng(resume_rng)
+                    g_kf = repr_grad_norm(gamma_params)
+                    g_kf_all = repr_grad_norm(params)
+                    if params_digest(params) != digest0:
+                        raise RuntimeError(
+                            "lambda calibration changed the trainable "
+                            "params — theta_0 violated")
+                    r_eff = g_kf / max(g_task, 1e-30)
+                    r_eff_all = g_kf_all / max(g_task_all, 1e-30)
+                    derived = 0.1 / max(r_eff, 1e-30)
+                    save_json(out / "calibration.json", {
+                        "g_task_gamma": g_task, "g_kf_gamma": g_kf,
+                        "r_eff_gamma": r_eff,
+                        "g_task_all": g_task_all, "g_kf_all": g_kf_all,
+                        "r_eff_all": r_eff_all,
+                        "derived_lambda": derived,
+                        "optimizer_steps": 0, "scheduler_steps": 0,
+                        "rule": "R10 gamma-scope calibration "
+                                "(review 2026-09-16): lambda = 0.1 / "
+                                "r_eff measured on the GAMMA group only "
+                                "at theta_0, chain-wise window"})
+                    print(json.dumps({"g_task_gamma": g_task,
+                                      "g_kf_gamma": g_kf,
+                                      "r_eff_gamma": r_eff,
+                                      "r_eff_all": r_eff_all,
+                                      "derived_lambda": derived,
+                                      "theta0_verified": True},
+                                     indent=2), flush=True)
+                    return
+                # Audit #3: pass 2 must replay every planned cut exactly
+                # once (n_cut_win and the plan-completeness check ran
+                # above, before the calibration branch).
+                aux_before = aux_terms
+                optimizer.zero_grad(set_to_none=True)
+                task_sum = 0.0
+                n_tokens = 0
+                treewise = (args.rpbe_constrain_mode == "treewise"
+                            and args.arm == "ours")
+                if treewise:
+                    # Tree-wise feasibility projection (TGN final-spec
+                    # port, 2026-09-15): pass 1 = task CE alone (snapshot
+                    # grads); pass 2 = per-oid surrogate backwards collect
+                    # per-tree Gamma influence dirs (never summed);
+                    # non-Gamma params accumulate the ordinary summed aux
+                    # gradient.  The QP projects the Gamma task gradient
+                    # into the intersection of the per-tree half-spaces
+                    # and certifies EVERY row at 1e-6; a failed
+                    # certificate skips the representation step below.
+                    for i, (b, sid) in enumerate(pending):
+                        _restore_rng(pass1_rngs[i])   # P0: mask == pass1
+                        task_mean, task_raw, n_valid, _aux, _n = pass2_one(
+                            b, cut_records[i], g_by_oid, 0.0)
+                        scaler.scale(
+                            task_mean / float(len(pending))).backward()
+                        task_sum += float(task_raw.detach())
+                        n_tokens += n_valid
+                    task_grads = {id(p): p.grad.detach().clone()
+                                  for p in params if p.grad is not None}
+                    optimizer.zero_grad(set_to_none=True)
+                    aux_other = {id(p): torch.zeros_like(p)
+                                 for p in params
+                                 if id(p) not in gamma_set}
+                    dirs = []
+                    for i, (b, sid) in enumerate(pending):
+                        _restore_rng(pass1_rngs[i])  # P0: mask == pass1
+                        fwd_out = run_forward(model, b, device,
+                                              grad_enabled=True)
+                        for meta, oid, v in cut_records[i]:
+                            g = g_by_oid.get(oid)
+                            if g is None:
+                                continue
+                            optimizer.zero_grad(set_to_none=True)
+                            z = collect_replay_z(meta, adapter, device,
+                                                 j=v)
+                            gd = g.detach()
+                            aux_i = -lambda_kf * ((gd * z).sum()
+                                                  - (gd * z.detach()).sum())
+                            aux_i.backward()
+                            dirs.append(torch.cat(
+                                [p.grad.reshape(-1).float()
+                                 for p in gamma_params]))
+                            for p in params:
+                                if id(p) not in gamma_set \
+                                        and p.grad is not None:
+                                    aux_other[id(p)].add_(p.grad.detach())
+                        adapter.clear()
+                    optimizer.zero_grad(set_to_none=True)
+                    g_task_gamma = [
+                        task_grads.get(id(p), torch.zeros_like(p))
+                        for p in gamma_params]
+                    proj_ok, proj_diag = treewise_feasibility_projection(
+                        g_task_gamma, gamma_params,
+                        torch.stack(dirs) if dirs else None,
+                        args.rpbe_kappa, iters=args.proj_iters)
+                    cert_fail = bool(proj_diag.get("cert_fail"))
+                    if not proj_ok:
+                        # CERT_FAIL: no constrained update is executed —
+                        # zero the non-Gamma grads too and skip the
+                        # representation step (final-spec reviewer
+                        # requirement; TGN: "skipping repr step").
+                        for p in params:
+                            if id(p) in gamma_set:
+                                p.grad = None
+                            else:
+                                p.grad = torch.zeros_like(p)
+                    else:
+                        for p in params:
+                            if id(p) in gamma_set:
+                                continue  # projection already wrote .grad
+                            p.grad = task_grads.get(
+                                id(p), torch.zeros_like(p))
+                            if not args.rpbe_gamma_only:
+                                # R10 structure: discard the non-Gamma
+                                # auxiliary gradient (review 2026-09-16)
+                                p.grad = (p.grad + aux_other.get(
+                                    id(p), torch.zeros_like(p)))
+                    with (out / "window_diag.jsonl").open("a") as _f:
+                        _f.write(json.dumps(_json_safe(
+                            {"step": int(step), "event": "treewise_proj",
+                             **proj_diag})) + "\n")
+                    if cert_fail:
+                        print("[rpbe-cstr] window={} CERT_FAIL "
+                              "max_viol={:.3e} skipping repr step".format(
+                                  kf_closed + 1,
+                                  proj_diag.get("max_viol", float("inf"))),
+                              flush=True)
+                    aux_terms += n_cut_win
+                else:
+                    for i, (b, sid) in enumerate(pending):
+                        _restore_rng(pass1_rngs[i])   # P0: mask == pass1
+                        task_mean, task_raw, n_valid, aux, n_terms = \
+                            pass2_one(
+                                b, cut_records[i], g_by_oid,
+                                0.0 if args.arm == "gamma_task_only"
+                                else lambda_kf)
+                        # Per-microbatch normalization: the official
+                        # Trainer scales each microbatch MEAN loss by
+                        # 1/accumulation, so the gradient scale is
+                        # window-length independent (L6.5 review P0-2).
+                        # The KF surrogate is NOT rescaled: it is the
+                        # exact window-J gradient.
+                        if args.rpbe_gamma_only and n_terms:
+                            # R10 structure: task and RPBE backwards are
+                            # SPLIT; the auxiliary gradient is kept on
+                            # Gamma only, non-Gamma params keep the pure
+                            # task gradient (review 2026-09-16: a global
+                            # r_eff=0.1 does not mean Gamma received 10%
+                            # of the RPBE signal when LoRA/COMP absorb
+                            # most of it).
+                            scaler.scale(
+                                task_mean / float(len(pending))).backward(
+                                    retain_graph=True)
+                            task_snap = {id(p): p.grad.detach().clone()
+                                         for p in params
+                                         if p.grad is not None
+                                         and id(p) not in gamma_set}
+                            if os.environ.get("CCM_GRAD_GROUP") == "1":
+                                task_snap_all = {
+                                    id(p): p.grad.detach().clone()
+                                    for p in params if p.grad is not None}
+                            scaler.scale(aux).backward()
+                            if os.environ.get("CCM_GRAD_GROUP") == "1":
+                                # per-group r_eff (review 2026-09-16):
+                                # task vs RPBE gradient norms for
+                                # Gamma / LoRA / COMP embeddings.  The
+                                # aux loss already carries lambda, so
+                                # aux_norm/task_norm IS the group r_eff.
+                                groups = {"gamma": [], "lora": [],
+                                          "comp": [], "other": []}
+                                for n, p in model.named_parameters():
+                                    if p.requires_grad and p.grad is not None:
+                                        if id(p) in gamma_set:
+                                            groups["gamma"].append((n, p))
+                                        elif "lora_" in n:
+                                            groups["lora"].append((n, p))
+                                        elif "comp" in n or "embedding" in n:
+                                            groups["comp"].append((n, p))
+                                        else:
+                                            groups["other"].append((n, p))
+                                _t0 = task_snap_all
+                                for _gn, _gps in groups.items():
+                                    if not _gps:
+                                        continue
+                                    _nt = sum(float((_t0[id(p)].double()
+                                                     ** 2).sum())
+                                              for _n, p in _gps
+                                              if id(p) in _t0) ** 0.5
+                                    _na = sum(float(((p.grad.detach()
+                                                      - _t0.get(id(p),
+                                                                torch.zeros_like(p.grad)))
+                                                     .double() ** 2).sum())
+                                              for _n, p in _gps
+                                              if p.grad is not None) ** 0.5
+                                    print("GRADGROUP {} n={} "
+                                          "|g_task|={:.4e} "
+                                          "|g_rpbe|={:.4e} "
+                                          "r={:.4f}".format(
+                                              _gn, len(_gps), _nt, _na,
+                                              _na / max(_nt, 1e-30)),
+                                          flush=True)
+                            for p in params:
+                                if id(p) not in gamma_set:
+                                    p.grad = task_snap.get(id(p))
+                        else:
+                            loss = task_mean / float(len(pending)) + aux
+                            _t = time.perf_counter()
+                            scaler.scale(loss).backward()
+                            _pf("pass2_bwd", _t)
+                        if os.environ.get("CCM_AUX_DIAG") == "1":
+                            named = [(n, p)
+                                     for n, p in model.named_parameters()
+                                     if p.requires_grad
+                                     and p.grad is not None]
+                            bad = bad_grad_names(named, k=2)
+                            if bad:
+                                print("AUXDIAG mb={} BAD after bwd: {}"
+                                      .format(i, bad), flush=True)
+                        task_sum += float(task_raw.detach())
+                        n_tokens += n_valid
+                        aux_terms += n_terms
+                if aux_terms - aux_before != n_cut_win:
+                    raise RuntimeError(
+                        "not every cut was replayed exactly once: "
+                        "replayed={} cuts={}".format(
+                            aux_terms - aux_before, n_cut_win))
+                if os.environ.get("CCM_AUX_DIAG") == "1":
+                    # Scaled by the fp16 scaler at this point; the ratio
+                    # task-only vs +aux is what matters.
+                    named = [(n, p) for n, p in model.named_parameters()
+                             if p.requires_grad]
+                    print("AUXDIAG win-grads norm={:.6f} (scaled) "
+                          "scale={:.0f} bad={}".format(
+                              repr_grad_norm(params), scaler.get_scale(),
+                              bad_grad_names(named, k=3)), flush=True)
+                _t = time.perf_counter()
+                if treewise and cert_fail:
+                    # Final-spec CERT_FAIL: the QP certificate did not
+                    # hold at 1e-6 — NO representation update is executed
+                    # for this window (TGN: "skipping repr step").  The
+                    # window still closes: data stream, step counter,
+                    # boundary records and checkpoint cadence advance
+                    # identically to a successful close.
+                    cert_skip_steps += 1
+                else:
+                    grad_step()  # counters live inside grad_step (nonlocal)
+                _pf("grad_step", _t)
+                if profile:
+                    n_cut = sum(1 for cr in cut_records for _ in cr)
+                    parts = ["profile win={} n_mb={} n_cut_mb={}:".format(
+                        kf_closed + 1, len(pending), n_cut)]
+                    for key in ("pass1_fwd", "collect_rows", "window_add",
+                                "close_replay", "pass2_fwd", "collect_z",
+                                "surrogate", "pass2_bwd", "grad_step"):
+                        if PROF.get(key, 0.0) > 0:
+                            parts.append("{}={:.1f}s".format(
+                                key, PROF[key]))
+                    parts.append("wall={:.1f}s".format(
+                        time.time() - t_win_start))
+                    print(" ".join(parts), flush=True)
+                    for key in PROF:
+                        PROF[key] = 0.0
+                    t_win_start = time.time()
+                _restore_rng(resume_rng)  # data stream continues correctly
+                total_task_sum += task_sum
+                total_tokens += n_tokens
+                total_microbatches += len(pending)
+                total_kf += float(sum(closed.values()))
+                kf_closed += 1
+                step += 1
+                # Per-window boundary record (review): every arm hashes
+                # (window ordinal, n_mb, n_cut_mb) into boundary_hash so
+                # cadence identity is checkable window by window, not
+                # only through the final data-flow hash.  n_cut_win was
+                # computed before pass 2 (audit #3 replay integrity).
+                # A CERT_FAIL close appends ":SKIP" so the hash honestly
+                # reflects that this window executed no update.
+                _skip_tag = (":SKIP" if (treewise and cert_fail) else "")
+                boundary_hash.update(
+                    "w{}:{}:{}{}".format(
+                        kf_closed, len(pending), n_cut_win,
+                        _skip_tag).encode())
+                boundary_records.append(
+                    "w{}:{}:{}{}".format(
+                        kf_closed, len(pending), n_cut_win, _skip_tag))
+                close_depth_window(len(pending), step, n_cut_win)
+                pending = []
+                cut_records = []
+                pass1_rngs = []
+                window_start_state = None
+                if args.max_windows and step >= args.max_windows:
+                    break
+            elif len(pending) >= args.max_pending_mbs:
+                raise RuntimeError(
+                    "degenerate window: {} microbatch collected fewer "
+                    "than {} effective cuts".format(
+                        len(pending), args.kf_min_cuts))
+        else:
+            # Review P0-2: the official arm runs on the same dialogue
+            # stream and fires on the same adaptive boundary (accumulated
+            # effective cuts) as the RPBE arms.  Previously it stepped
+            # every grad_accum=128 microbatches while ours/gamma stepped
+            # every ~266 (one 128-cut window), so after 1000 steps the
+            # first two arms had consumed ~2.07x the task data of
+            # ccm_merge — a silent breach of the frozen cadence
+            # requirement.  window-matched restores identical task
+            # exposure; --merge-cadence official keeps the fixed cadence
+            # for the ccm_merge_official reproduction reference only.
+            eff = sum(1 for m in metas
+                      if m["ok"] and m["k"] >= 3)
+            if args.merge_cadence == "window-matched":
+                merge_eff_cuts += eff
+            fire = (args.merge_cadence == "window-matched"
+                    and merge_eff_cuts >= args.kf_min_cuts) \
+                or (args.merge_cadence == "official"
+                    and len(pending) >= args.grad_accum)
+            if fire:
+                optimizer.zero_grad(set_to_none=True)
+                task_sum = 0.0
+                n_tokens = 0
+                for b, sid in pending:
+                    fwd_out = run_forward(model, b, device, grad_enabled=True)
+                    task_raw, n_valid = task_ce_shifted(
+                        fwd_out, b["labels"], device)
+                    # Official Trainer protocol (verified against
+                    # accelerate 1.14 Accelerator.backward + HF 4.44 in
+                    # scripts/ccm_parity.py): the per-microbatch MEAN
+                    # loss is divided by the window size BEFORE backward
+                    # — accelerate does
+                    # `loss = loss / self.gradient_accumulation_steps`
+                    # inside backward().  Normalizing by len(pending)
+                    # makes the task gradient scale independent of the
+                    # window length, identical across all three arms.
+                    # This division also keeps the fp16 backward on the
+                    # safe side of overflow.
+                    task_mean = task_raw / max(n_valid, 1)
+                    scaler.scale(task_mean / float(len(pending))).backward()
+                    task_sum += float(task_raw.detach())
+                    n_tokens += n_valid
+                grad_step()  # counters live inside grad_step (nonlocal)
+                total_task_sum += task_sum
+                total_tokens += n_tokens
+                total_microbatches += len(pending)
+                step += 1
+                if args.merge_cadence == "window-matched":
+                    # Same per-window boundary record as the RPBE arms
+                    # (review): (ordinal, n_mb, n_cut_mb) per window.
+                    print("win={} n_mb={} n_cut_mb={} (matched cadence)"
+                          .format(step, len(pending), merge_eff_cuts),
+                          flush=True)
+                    boundary_hash.update("w{}:{}:{}:".format(
+                        step, len(pending), merge_eff_cuts).encode())
+                    boundary_records.append("w{}:{}:{}:".format(
+                        step, len(pending), merge_eff_cuts))
+                    merge_eff_cuts = 0
+                close_depth_window(len(pending), step, merge_eff_cuts)
+                pending = []
+                if args.max_windows and step >= args.max_windows:
+                    break
+        if (step and step != last_logged_step
+                and step % args.log_every == 0):
+            # L7 smoke: without the dedup this block re-prints the same
+            # row on every non-fire loop iteration (~260 rows/window).
+            last_logged_step = step
+            elapsed = time.time() - t_start
+            row = {"step": step,
+                   "optimizer_steps_executed": optimizer_steps_executed,
+                   "amp_skipped_steps": amp_skipped_steps,
+                   "cert_skip_steps": cert_skip_steps,
+                   "scheduler_steps": scheduler_steps,
+                   "task_ce_token": total_task_sum / max(total_tokens, 1),
+                   "task_microbatches": total_microbatches,
+                   "task_valid_tokens": total_tokens,
+                   "kf_closed": kf_closed,
+                   "kf_score": total_kf / max(kf_closed, 1),
+                   "aux_terms": aux_terms, "lambda": lambda_kf,
+                   "elapsed": elapsed}
+            print("step={} executed={} skips={} cert={} sched={} "
+                  "ce_token={:.4f} "
+                  "mbs={} kf_closed={} kf_score={:.4f} aux={} sec={:.1f}"
+                  .format(step, optimizer_steps_executed,
+                          amp_skipped_steps, cert_skip_steps,
+                          scheduler_steps,
+                          row["task_ce_token"], total_microbatches,
+                          kf_closed, row["kf_score"], aux_terms, elapsed),
+                  flush=True)
+            with log_path.open("a") as f:
+                f.write(json.dumps(row) + "\n")
+        if (args.checkpoint_every and step and step % args.checkpoint_every == 0
+                and step != last_saved_step):
+            # per-N-step immutable snapshot (eval-safe: no overwrite race);
+            # save exactly once per step (review 2026-09-05: the old guard
+            # re-saved on every remaining microbatch of the window)
+            last_saved_step = step
+            save_trainable(out / f"checkpoint_step{step}.pt", model, step=step,
+                           optimizer=optimizer.state_dict(),
+                           scaler=scaler.state_dict(),
+                           scheduler=scheduler.state_dict(),
+                           builder_oid=builder.next_oid if builder else 0,
+                           lambda_kf=lambda_kf,
+                           sample_cursor=sample_cursor,
+                           rng=_rng_state(),
+                           optimizer_steps_executed=optimizer_steps_executed,
+                           amp_skipped_steps=amp_skipped_steps,
+                           cert_skip_steps=cert_skip_steps,
+                           scheduler_steps=scheduler_steps,
+                           total_task_sum=total_task_sum,
+                           total_tokens=total_tokens,
+                           total_microbatches=total_microbatches,
+                           total_kf=total_kf,
+                           kf_closed=kf_closed,
+                           aux_terms=aux_terms,
+                           data_flow_len=data_flow_len,
+                           boundary_records=boundary_records)
+    save_trainable(out / "final.pt", model, step=step, lambda_kf=lambda_kf)
+    summary = {
+        "arm": args.arm, "seed": args.seed,
+        # Review ruling: "steps" is the global window-attempt counter
+        # (HF Trainer global_step semantics: advances on AMP skips too);
+        # the frozen 1000-step budget is THIS counter (1000 global steps),
+        # not "1000 non-zero-LR updates".  optimizer_steps_executed counts
+        # optimizer.step() invocations (includes the lr=0 warmup-first
+        # execution), amp_skipped_steps the GradScaler overflows, and
+        # scheduler_steps is an INDEPENDENT counter that must equal
+        # executed - skips (Trainer 4.44.2 protocol, asserted per step).
+        "steps": step,
+        "optimizer_steps_executed": optimizer_steps_executed,
+        "amp_skipped_steps": amp_skipped_steps,
+        "cert_skip_steps": cert_skip_steps,
+        "scheduler_steps": scheduler_steps,
+        "amp_scale": float(scaler.get_scale()),
+        # Token-normalized CE: the only cross-arm comparable task number
+        # (L6.5 review; per-microbatch sums vary with the window length).
+        "mean_task_ce_per_token": total_task_sum / max(total_tokens, 1),
+        "task_microbatches": total_microbatches,
+        "task_valid_tokens": total_tokens,
+        "kf_closed": kf_closed,
+        "mean_kf_score": total_kf / max(kf_closed, 1),
+        "aux_terms": aux_terms, "lambda_kf": lambda_kf,
+        "rpbe_lr": (float(args.rpbe_lr)
+                    if args.rpbe_lr is not None else float(args.lr)),
+        "paired_seed_hash": paired_seed_hash(args.seed, model)
+        if use_rpbe else "n/a",
+        "data_flow_hash": data_flow_hash.hexdigest(),
+        "data_flow_len": data_flow_len,
+        "boundary_hash": boundary_hash.hexdigest(),
+    }
+    save_json(out / "summary.json", summary)
+    save_json(out / "_SUCCESS.json", {"status": "complete", "steps": step,
+                                      "optimizer_steps_executed":
+                                      optimizer_steps_executed,
+                                      "amp_skipped_steps":
+                                      amp_skipped_steps,
+                                      "cert_skip_steps": cert_skip_steps,
+                                      "scheduler_steps":
+                                      scheduler_steps})
+    print(json.dumps(summary, indent=2), flush=True)
+
+
+if __name__ == "__main__":
+    main()

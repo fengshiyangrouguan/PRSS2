@@ -174,7 +174,9 @@ def parse_args():
                         "cadence; review P0-2).  official: fixed "
                         "grad-accum microbatch cadence for the "
                         "ccm_merge_official reproduction reference.")
-    p.add_argument("--lr", type=float, default=3e-4)
+    p.add_argument("--lr", type=float, default=3e-5,
+                   help="LaMP formal R10 config: LoRA/COMP lr 3e-5 "
+                        "(the dialogue line's frozen R10 value).")
     p.add_argument("--lora-r", type=int, default=8)
     p.add_argument("--grad-clip", type=float, default=1.0,
                    help="max_grad_norm (official Trainer default 1.0; "
@@ -223,13 +225,16 @@ def parse_args():
                         "(LARGER is looser; kappa>=1 never binds)")
     p.add_argument("--proj-iters", type=int, default=400,
                    help="FISTA iterations for the treewise dual QP")
-    p.add_argument("--rpbe-lr", type=float, default=None,
+    p.add_argument("--rpbe-lr", type=float, default=5e-5,
                    help="independent AdamW lr for the Gamma params "
-                        "(None = unified args.lr for all params; "
+                        "(LaMP formal R10 config: 5e-5, the dialogue "
+                        "line's frozen R10 value; None = unified args.lr "
+                        "for all params; "
                         "the scheduler scales both groups by the same "
                         "warmup/cosine factor, so the ratio rpbe_lr/lr "
                         "is preserved through training)")
-    p.add_argument("--rpbe-gamma-only", action="store_true",
+    p.add_argument("--rpbe-gamma-only", action=argparse.BooleanOptionalAction,
+                   default=True,
                    help="R10 structure (review 2026-09-16): the RPBE "
                         "surrogate updates GAMMA ONLY — task CE keeps "
                         "training LoRA/COMP embeddings/Gamma, but the "
@@ -238,7 +243,7 @@ def parse_args():
                         "longer dilutes r_eff across LoRA/COMP.")
     # monitoring
     p.add_argument("--log-every", type=int, default=10)
-    p.add_argument("--checkpoint-every", type=int, default=250)
+    p.add_argument("--checkpoint-every", type=int, default=50)
     p.add_argument("--resume-from", default="",
                    help="resume from an adapter-only checkpoint.pt")
     p.add_argument("--max-pending-mbs", type=int, default=2048,
@@ -377,8 +382,13 @@ def build_tokenizer(args):
     tok.bos_token_id = tok.bos_token_id or 1
     tok.eos_token_id = tok.eos_token_id or 2
     tok.padding_side = "left"
-    added = [f"<COMP{k}>" for k in range(N_TOK)] \
-        + [f"<SUM{k}>" for k in range(N_TOK)]
+    # LaMP token naming: the vendored LaMP collator writes the SUM slots as
+    # "<COMP{n}..COMP{2n-1}>" (generate_inputs folds the sum run into
+    # maybe_comp_str), NOT as "<SUMk>".  Registering "<SUMk>" instead would
+    # leave "<COMP2>/<COMP3>" to be split as ordinary text, so the SUM ids
+    # would never appear in input_ids and the whole recursive chain would
+    # silently vanish.  Token IDS are identical either way (32000..32003).
+    added = [f"<COMP{k}>" for k in range(2 * N_TOK)]
     tok.add_special_tokens({"additional_special_tokens": added})
     ids = tok.additional_special_tokens_ids[-2 * N_TOK:]
     tok.comp_token_id = ids[:N_TOK]
@@ -609,22 +619,25 @@ def collect_replay_z(meta, adapter, device, j=None):
 
 def collect_rows(meta, adapter, builder, utter_embed, phi_embed,
                  embed_tokens, batch, device):
-    """LaMP CHAIN-WISE pass-1 rows (aligned 2Obs closure).
+    """LaMP CHAIN-WISE pass-1 rows (aligned 2Obs closure, R10 parity).
 
     cut j (j = 1..N-1) is the memory state M_j after the first j profile
-    blocks, supervised by its adjacent observation pair
+    blocks.  Mirroring the dialogue line's R10 closure EXACTLY, every cut
+    carries one LOCAL future and one FINAL TASK future:
 
-        row 1:  C = O_{j+1},                        Y = O_{j+2}
-        row 2:  C = (O_{j+1}, O_{j+2}) combined,    Y = O_{j+3}
+        row 1 (local):  C = O_{j+1},                      Y = O_{j+2}
+        row 2 (task):   C = (O_{j+1}, O_{j+2}) combined,  Y = A
 
-    where O_1..O_N are the profiles and O_{N+1} is the query.  The
-    overlap (cut j's second observation IS cut j+1's first) is what makes
-    this the aligned closure rather than 1Obs; the query enters ONLY as
-    the local observation of the last cuts, never as a target repeated
-    across the chain.  z is gradient-connected; the sketches are frozen
-    input-embedding probes (no extra LLaMA forward).
+    where O_1..O_N are the profiles, O_{N+1} is the query and A is the
+    query ANSWER — the task target, shared by every cut exactly as the
+    dialogue line shares its final u_k.
+
+    The deepest cut j = N-1 would need O_{N+2} for its local row; Q is
+    decoder-visible at that position, so the local row is dropped and the
+    surviving task row takes weight 1.0 (the dialogue line's endpoint
+    rule).  Rows = 2*(N-2) + 1 = 29 for the official N = 16.
     """
-    if not meta["ok"] or meta["n_profile"] < 3:
+    if not meta["ok"] or meta["n_profile"] < 2:
         return []
     n = int(meta["n_profile"])
     n_cuts = n - 1
@@ -635,17 +648,21 @@ def collect_rows(meta, adapter, builder, utter_embed, phi_embed,
         dtype=torch.long, device=device))[0]
         for j in range(1, n_cuts + 1)]          # [n_cuts, z_dim]
     ids = batch["input_ids"][meta["row"]]
+    labs = batch["labels"][meta["row"]]
     spans = meta["obs_spans"]
-    chi1, chi2, phi1, phi2 = {}, {}, {}, {}
+    # A = the task answer: valid label tokens minus the EOS, tag=1 (the
+    # dialogue line's phi2 convention for the shared final future).
+    valid_pos = (labs != -100).nonzero(as_tuple=False).flatten()
+    uk_pos = valid_pos[:-1] if len(valid_pos) > 1 else valid_pos
+    phi2 = phi_embed(embed_tokens, ids[uk_pos].unsqueeze(0).to(device),
+                     tag=1)
+    chi1, chi2, phi1 = {}, {}, {}
     for j in range(1, n_cuts + 1):
         o1 = ids[spans[j][0]:spans[j][1]].unsqueeze(0).to(device)
         o2 = ids[spans[j + 1][0]:spans[j + 1][1]].unsqueeze(0).to(device)
         chi1[j] = utter_embed(embed_tokens, o1, tag=0)
         phi1[j] = phi_embed(embed_tokens, o2, tag=0)
         chi2[j] = utter_embed.combine(embed_tokens, o1, o2, tag=1)
-        if (j + 2) <= n:                        # O_{j+3} exists
-            o3 = ids[spans[j + 2][0]:spans[j + 2][1]].unsqueeze(0).to(device)
-            phi2[j] = phi_embed(embed_tokens, o3, tag=0)
     lm = LampMeta(sample_id=int(meta["sample_id"]),
                   user_id=int(meta["user_id"]), n_profile=n)
     return builder.build(lm, zs, chi1, chi2, phi1, phi2)
@@ -1077,7 +1094,7 @@ def main():
         enabled=(device.type == "cuda"
                  and not getattr(model, "_official_host", False)))
 
-    dialog, collator = build_dataset(args, tokenizer, model)
+    ds, collator = build_dataset(args, tokenizer, model)
     comp_ids = tokenizer.comp_token_id
     sum_ids = tokenizer.sum_token_id
     pad_id = tokenizer.pad_token_id
@@ -1319,7 +1336,7 @@ def main():
                         _seen_oids.add(r.occurrence_id)
                         batch_cuts.append(
                             (meta, r.occurrence_id,
-                             int(r.context["cut_turn"])))
+                             int(r.context["cut_pos"])))
             adapter.clear()
         return batch_cuts
 
@@ -1469,7 +1486,7 @@ def main():
             # pass-2 forward: mask_i^pass2 == mask_i^pass1.
             state = {"rng": _rng_state()}
             pass1_rngs.append(state["rng"])
-            if any(m["ok"] and m["k"] >= 3 for m in metas):
+            if any(m["ok"] and m["n_profile"] >= 2 for m in metas):
                 batch_cuts = pass1_one(batch, metas)
             else:
                 batch_cuts = []
@@ -1897,7 +1914,7 @@ def main():
             # exposure; --merge-cadence official keeps the fixed cadence
             # for the ccm_merge_official reproduction reference only.
             eff = sum(1 for m in metas
-                      if m["ok"] and m["k"] >= 3)
+                      if m["ok"] and m["n_profile"] >= 2)
             if args.merge_cadence == "window-matched":
                 merge_eff_cuts += eff
             fire = (args.merge_cadence == "window-matched"

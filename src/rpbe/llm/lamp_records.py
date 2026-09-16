@@ -18,23 +18,29 @@ Observations are the profile-side events plus the query:
 
     O_1..O_N   = the N profile blocks
     O_{N+1}    = the query
+    A          = the query ANSWER (the task target)
 
-and the RPBE rows realise the ALIGNED 2Obs CLOSURE frozen in the method
-section: cut j is supervised by the adjacent pair
+and the RPBE rows mirror the dialogue line's R10 freeze EXACTLY — every
+cut carries one LOCAL future and one FINAL TASK future:
 
-    cut j   : (O_{j+1}, O_{j+2})
-    cut j+1 : (O_{j+2}, O_{j+3})
+    cut j (1 <= j < N-1):
+        row 1 (local):  C = O_{j+1},                      Y = O_{j+2}
+        row 2 (task):   C = (O_{j+1}, O_{j+2}) combined,  Y = A
 
-i.e. the second observation of one interface IS the first observation of
-the next one.  Two rows per cut (horizon 1 and 2), exactly mirroring
-``DialogueCutBuilder``:
+    cut j = N-1 (deepest):  row 2 only, weight 1.0
+        C = (O_N, O_{N+1}) combined, Y = A
 
-    row 1: (z_j, p_{j,1})   chi = O_{j+1},                     phi = O_{j+2}
-    row 2: (z_j, p_{j,2})   chi = combine(O_{j+1}, O_{j+2}),   phi = O_{j+3}
+The deepest cut's local row is dropped because its next observation is
+the query, which the decoder already sees — the same endpoint rule the
+dialogue line applies to its decoder-visible context turn.  A is shared
+by every cut, exactly as the dialogue line shares its final u_k; it is
+the TASK target, not a sliding profile future.
 
-The final query therefore enters ONLY as the local observation of the
-last cuts (O_{N+1} = Q), never as a target copied onto every cut: the
-query answer is not repeated across the chain.
+The final query therefore enters as the local observation of the last
+cuts, and the answer enters as the shared task future — never copied as
+a per-position target.
+
+Row count for the official N = 16: 2*(N-2) + 1 = 29.
 
 ``L`` is the ACTUAL recursion position j (not None), which is what makes
 ``J_real_minus_shuffled_within_L`` stratify by recursion depth instead of
@@ -104,23 +110,25 @@ class LampCutBuilder:
 
     def build(self, meta: LampMeta, z_list: torch.Tensor,
               chi1: List[torch.Tensor], chi2: List[torch.Tensor],
-              phi1: List[torch.Tensor], phi2: List[torch.Tensor],
+              phi1: List[torch.Tensor], phi2: torch.Tensor,
               ) -> List[CutRecord]:
-        """One sample -> up to 2*(N-1) rows.
+        """One sample -> 2*(N-2) + 1 rows (29 for the official N = 16).
 
-        ``z_list`` is [N, z_dim]: row j is the memory state after j
-        profile blocks (z_list[j-1] == M_j).  The per-cut sketch lists
-        are indexed by cut position j = 1..N-1 and hold the observations
-        O_{j+1}, O_{j+2}, O_{j+3} as described in the module docstring.
-        All z rows keep their graph; the sketches are frozen constants.
+        Every cut carries one LOCAL future (horizon 1) and one FINAL TASK
+        future (horizon 2, the shared answer sketch ``phi2``) — the same
+        "one local + one task" structure the dialogue line's R10 freeze
+        uses.  ``z_list`` is [N-1, z_dim] with row j-1 == M_j (the memory
+        after j profile blocks); the sketches are frozen constants.
 
-        Returns [] when the chain is too short to carry a 2-step closure
-        (N < 3), mirroring the dialogue line's ``k < MIN_K`` guard: the
-        task CE keeps its own gradient and the sample simply carries no
-        RPBE row.
+        The deepest cut j = N-1 has NO legal local future: its next
+        observation is the query, which the decoder already sees, so the
+        local row is dropped and the surviving task row takes the full
+        cut weight (weight 1.0) — the dialogue line's endpoint rule.
+
+        Returns [] for N < 2 (no cut exists).
         """
         n = int(meta.n_profile)
-        if n < 3:
+        if n < 2:
             return []
         n_cuts = n - 1                      # j = 1 .. N-1
         rows: List[CutRecord] = []
@@ -128,16 +136,12 @@ class LampCutBuilder:
             z = z_list[j - 1]
             cut_occurrence = self._next_oid
             self._next_oid += 1
-            # Tail handling: cut j's second horizon needs O_{j+3}; the
-            # last cuts that would reach past O_{N+1} keep only their
-            # horizon-1 row and take the full weight (the dialogue line's
-            # R10 endpoint principle).
-            horizons = (1, 2) if (j + 2) <= n else (1,)
+            horizons = (1, 2) if j < n_cuts else (2,)
             for horizon in horizons:
                 if horizon == 1:
                     chi, phi = chi1[j], phi1[j]
                 else:
-                    chi, phi = chi2[j], phi2[j]
+                    chi, phi = chi2[j], phi2
                 if chi.dim() == 2:
                     chi = chi[0]
                 if phi.dim() == 2:

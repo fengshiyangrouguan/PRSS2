@@ -96,6 +96,65 @@ Reading:
   rollout had to be measured by hand, and why val is not the checkpoint
   selector (see "Checkpoint selection" below).
 
+## The host: which avg checkpoint, and why that one
+
+Every arm in this document starts from **`avg_s42_stage5_official/best.pt`**:
+the avg arm (merge = plain average) of the Stage5 official-budget run,
+diffusion action head, ~18k optimizer steps, checkpoint dated 2026-09-10
+17:46.  It is the host because it is the only checkpoint in this line that
+could do the task at all.  All three rows below were measured with the same
+tiered protocol used everywhere in this document (demo_1..demo_20, exec=8,
+maxsteps=370, seed 42):
+
+| arm | head | steps | weighted_success | >=1 cycle |
+|---|---|---|---|---|
+| **avg host** `avg_s42_stage5_official/best.pt` | diffusion | 18k | **23.3%** | 10/20 |
+| `gamma-task_s42_s8` | reg-head | 8k | 0.0% | 0/20 |
+| `gamma-rpbe_s42_s8` | reg-head | 8k | 3.3% | 2/20 |
+
+The two fine-tuned arms had already destroyed the host (reg-head + every
+module in AdamW + long budget), so the host for Stage8 could not be any
+checkpoint lying around: it had to be one that still rolls out, or every
+comparison below would be 0% vs 0%.  The diffusion-head avg Stage5 checkpoint
+was that checkpoint, and the search for it is what produced the 23.3% number.
+
+### The host's own test result, in detail
+
+`23.3%` = 14/60 tier units with `tier_dist = {0:10, 1:6, 2:4, 3:0}`: 10 demos
+never finished a cycle, 6 finished one, 4 finished two, **0 ever finished
+three**.  Measured twice, with identical output:
+
+- during the search for a strong diffusion avg checkpoint;
+- re-run under the identical protocol on 2026-09-13 (`eval_s8f/host_rerun.log`)
+  —— **bit-identical `tier_dist`**.
+
+That reproduction is why 23.3% is used as a fixed reference line rather than a
+single-sample baseline.
+
+### The host is noisier than one number suggests
+
+A 5-seed sweep of the SAME checkpoint also exists (demo_81..demo_100, exec=4,
+maxsteps=370).  It is the only multi-seed evidence we have about the host's
+test behaviour:
+
+| seed | 42 | 7 | 123 | 99 | 11 | mean (4 known) |
+|---|---|---|---|---|---|---|
+| weighted_success | 10.5% | 12.3% | **24.6%** | 15.8% | not recovered | 15.8% |
+
+(seed 11's log was written on the box but its summary line never reached the
+transcript; n=19 demos in that sweep, so the denominator is 57, not 60.)
+
+So the host's rollout rate is somewhere in 10-25% depending on seed and demo
+subset, and 23.3% is the seed-42 / demo_1..20 draw.  This is the same ~9-point
+noise band that makes the 25.0-vs-23.3 gap insignificant, and it is why the
+host is drawn as a line with a +/-1 sigma band in `rollout_curve.png` and as
+the scatter in `avg_host_rollout.png`.
+
+**Older, NOT comparable** (different data generation, protocol and
+checkpoint): avg stage2 `20.0%` (6/30, 10 demos); avg stage3-wloss `15.0%`
+(9/60) and `16.7%` (5/30).  Do not put these on the same axis as the table
+above.
+
 ## Checkpoint selection: why the 15000 endpoint, not the 17000 peak
 
 Every arm is reported at its **fixed-budget endpoint**, and the budget was

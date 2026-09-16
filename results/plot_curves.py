@@ -161,8 +161,61 @@ def plot_rollout(path):
     print("wrote", path)
 
 
+def plot_host_rollout(path):
+    """avg host rollout: the reported protocol, plus the seed sweep."""
+    fig, ax = plt.subplots(figsize=(9.6, 5.4))
+    labels, vals, cols, hatches = [], [], [], []
+
+    # protocol used for every number in STAGE8_RESULTS.md
+    for i, lab in enumerate(["run 1", "run 2\n(bit-identical)"]):
+        labels.append(lab)
+        vals.append(23.3)
+        cols.append("#111111")
+        hatches.append("")
+    # the pre-existing 5-seed sweep: demo 81-100, exec=4
+    for seed, v in [(42, 10.5), (7, 12.3), (123, 24.6), (99, 15.8), (11, None)]:
+        labels.append(f"seed {seed}")
+        vals.append(v)
+        cols.append("#1f77b4")
+        hatches.append("" if v is not None else "//")
+
+    xs = list(range(len(labels)))
+    for i, (x, v, c, h) in enumerate(zip(xs, vals, cols, hatches)):
+        if v is None:
+            ax.bar(x, 30.0, color="white", edgecolor="#1f77b4", hatch=h,
+                   linewidth=1.2, zorder=3)
+            ax.annotate("not recovered", (x, 30.0), xytext=(0, -26),
+                        textcoords="offset points", fontsize=8, ha="center",
+                        color="#1f77b4", rotation=90)
+        else:
+            ax.bar(x, v, color=c, zorder=3)
+            ax.annotate(f"{v:.1f}%", (x, v), xytext=(0, 3),
+                        textcoords="offset points", fontsize=9, ha="center")
+
+    ax.axhline(HOST, color="#d62728", lw=1.4, ls="--", zorder=2)
+    ax.axhspan(HOST - HOST_SIGMA, HOST + HOST_SIGMA, color="#d62728",
+               alpha=0.07, zorder=0)
+    ax.annotate("reported host baseline 23.3%\n(+/-1 sigma, n=20 -> 9.3%)",
+                (0.4, HOST), xytext=(0, 5), textcoords="offset points",
+                fontsize=8.5, color="#d62728")
+
+    ax.set_xticks(xs)
+    ax.set_xticklabels(labels, fontsize=9)
+    ax.set_ylabel("weighted_success  (20 demos, maxsteps=370)")
+    ax.set_title("avg host `avg_s42_stage5_official/best.pt` -- its test results\n"
+                 "black: demo_1..20, exec=8, seed 42 (the protocol used "
+                 "throughout)   blue: demo_81..100, exec=4",
+                 fontsize=10.5)
+    ax.set_ylim(0, 36)
+    ax.grid(alpha=0.25, axis="y")
+    fig.tight_layout()
+    fig.savefig(path, dpi=170)
+    print("wrote", path)
+
+
 if __name__ == "__main__":
     runs = load()
     plot_val(runs, os.path.join(HERE, "val_curves.png"))
     plot_avg_only(runs, os.path.join(HERE, "avg_host_curve.png"))
     plot_rollout(os.path.join(HERE, "rollout_curve.png"))
+    plot_host_rollout(os.path.join(HERE, "avg_host_rollout.png"))

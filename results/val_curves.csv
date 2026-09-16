@@ -84,9 +84,14 @@ gamma-lora_s42_r1,750,0.0682
 gamma-lora_s42_r1,1000,0.0679
 gamma-lora_s42_r1,1250,0.0682
 gamma-lora_s42_r1,1500,0.0681
-s5r(gamma-only,diffusion,earlier_stage),2000,0.0697
-s5r(gamma-only,diffusion,earlier_stage),4000,0.0662
-s5r(gamma-only,diffusion,earlier_stage),6000,0.0658
-s5r(gamma-only,diffusion,earlier_stage),8000,0.065
-s5r(gamma-only,diffusion,earlier_stage),10000,0.064
-s5r(gamma-only,diffusion,earlier_stage),12000,0.0646
+gamma-rpbe_s42_s5r(OLD additive RPBE, runs to 20k),1000,0.0752
+gamma-rpbe_s42_s5r(OLD additive RPBE, runs to 20k),2000,0.0697
+gamma-rpbe_s42_s5r(OLD additive RPBE, runs to 20k),4000,0.0662
+gamma-rpbe_s42_s5r(OLD additive RPBE, runs to 20k),6000,0.0658
+gamma-rpbe_s42_s5r(OLD additive RPBE, runs to 20k),8000,0.065
+gamma-rpbe_s42_s5r(OLD additive RPBE, runs to 20k),10000,0.064
+gamma-rpbe_s42_s5r(OLD additive RPBE, runs to 20k),12000,0.0646
+gamma-rpbe_s42_s5r(OLD additive RPBE, runs to 20k),14000,0.062
+gamma-rpbe_s42_s5r(OLD additive RPBE, runs to 20k),16000,0.0631
+gamma-rpbe_s42_s5r(OLD additive RPBE, runs to 20k),18000,0.0619
+gamma-rpbe_s42_s5r(OLD additive RPBE, runs to 20k),20000,0.0623

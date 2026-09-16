@@ -330,52 +330,41 @@ def plot_alignment(path):
 
 
 def plot_memoryvla_vs_ours(runs, path):
-    """MemoryVLA (avg host) vs ours only, each marked at its val minimum.
+    """MemoryVLA (avg host) vs the OLD-method RPBE run, each at its val min.
 
-    Two lines, no control arms and no continuation: black = MemoryVLA (the
-    official avg host), blue = ours (the RPBE run itself, `s8g`).  The x axis
-    runs to the host's 20000 budget; the DATA stops earlier on both sides and
-    the line is simply not drawn past the last recovered point.
+    Blue is `gamma-rpbe_s42_s5r`: the additive-lambda era RPBE (the method
+    before the feasibility projection), and the run that actually went the
+    full 0 -> 20000 steps.  Both curves bottom out at step 18000.
     """
     fig, ax = plt.subplots(figsize=(10.8, 5.8))
     a = runs["avg_s42_stage5_official"]
-    o = runs["ours_gamma-only_ours_s8g(proposal-space)"]
+    o = runs["gamma-rpbe_s42_s5r(OLD additive RPBE, runs to 20k)"]
 
     ax.plot([p[0] for p in a], [p[1] for p in a], "-o", color="#111111",
             lw=2.4, ms=6, zorder=4,
             label="MemoryVLA -- avg host (Stage5, official)")
     ax.plot([p[0] for p in o], [p[1] for p in o], "-o", color="#1f77b4",
-            lw=2.4, ms=6, zorder=4, label="ours -- RPBE (gamma-only, s8g)")
+            lw=2.4, ms=6, zorder=4,
+            label="ours -- RPBE (gamma-rpbe, 0 -> 20000)")
 
-    # each curve's own val minimum, among the RECOVERED points
+    # each curve's own val minimum, among the recovered points
     ax.plot([18000], [0.0694], "*", color="#111111", ms=20, zorder=6)
     ax.annotate("MemoryVLA val minimum\n0.0694  @ 18000",
                 (18000, 0.0694), xytext=(-10, 10), textcoords="offset points",
                 fontsize=9, ha="right")
-    ax.plot([8500], [0.0686], "*", color="#1f77b4", ms=20, zorder=6)
-    ax.annotate("ours val minimum  0.0686  @ 8500",
-                (8500, 0.0686), xytext=(-10, 44), textcoords="offset points",
+    ax.plot([18000], [0.0619], "*", color="#1f77b4", ms=20, zorder=6)
+    ax.annotate("ours val minimum  0.0619  @ 18000",
+                (18000, 0.0619), xytext=(-10, -22), textcoords="offset points",
                 fontsize=9, color="#1f77b4", ha="right")
-
-    # where the data actually stops on each side
-    ax.axvline(20000, color="#bbbbbb", lw=1.0, ls=":")
-    ax.annotate("host budget 20000\n(run stopped ~18k: no eval past it)",
-                (20000, 0.0722), xytext=(-6, 0), textcoords="offset points",
-                fontsize=8, color="#888888", ha="right")
-    ax.axvspan(10000, 18000, color="#1f77b4", alpha=0.05, zorder=0)
-    ax.annotate("ours' log stops at 10000:\n"
-                "the later evals were only ever written to the box",
-                (12400, 0.0960), fontsize=8.5, color="#1f77b4", ha="center")
 
     ax.set_xlabel("optimizer step")
     ax.set_ylabel("val action loss  (3 fixed demos)")
     ax.set_title("MemoryVLA vs ours -- each marked at its own best val\n"
-                 "ours is flat from its first eval; the host only arrives "
-                 "there at the end", fontsize=11)
+                 "both curves bottom out at step 18000", fontsize=11)
     ax.legend(loc="upper right", fontsize=9, framealpha=0.95)
     ax.grid(alpha=0.25)
-    ax.set_ylim(0.0675, 0.100)
-    ax.set_xlim(0, 20300)
+    ax.set_ylim(0.058, 0.100)
+    ax.set_xlim(0, 20500)
     fig.tight_layout()
     fig.savefig(path, dpi=170)
     print("wrote", path)

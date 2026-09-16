@@ -13,14 +13,14 @@ MemoryVLA (avg host, Stage5 official),15000,0.0703
 MemoryVLA (avg host, Stage5 official),16000,0.0708
 MemoryVLA (avg host, Stage5 official),17000,0.0701
 MemoryVLA (avg host, Stage5 official),18000,0.0694
-ours (RPBE, s8g),500,0.0694
-ours (RPBE, s8g),1000,0.0695
-ours (RPBE, s8g),1500,0.0694
-ours (RPBE, s8g),2000,0.069
-ours (RPBE, s8g),2500,0.0694
-ours (RPBE, s8g),3000,0.069
-ours (RPBE, s8g),3500,0.069
-ours (RPBE, s8g),4000,0.0688
-ours (RPBE, s8g),8000,0.0688
-ours (RPBE, s8g),8500,0.0686
-ours (RPBE, s8g),10000,0.0687
+ours (RPBE, gamma-rpbe_s42_s5r),1000,0.0752
+ours (RPBE, gamma-rpbe_s42_s5r),2000,0.0697
+ours (RPBE, gamma-rpbe_s42_s5r),4000,0.0662
+ours (RPBE, gamma-rpbe_s42_s5r),6000,0.0658
+ours (RPBE, gamma-rpbe_s42_s5r),8000,0.065
+ours (RPBE, gamma-rpbe_s42_s5r),10000,0.064
+ours (RPBE, gamma-rpbe_s42_s5r),12000,0.0646
+ours (RPBE, gamma-rpbe_s42_s5r),14000,0.062
+ours (RPBE, gamma-rpbe_s42_s5r),16000,0.0631
+ours (RPBE, gamma-rpbe_s42_s5r),18000,0.0619
+ours (RPBE, gamma-rpbe_s42_s5r),20000,0.0623

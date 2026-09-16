@@ -29,6 +29,23 @@ _CCM_AUDIT_GAMMA = _os.environ.get("CCM_AUDIT_GAMMA", "") == "1"
 _CCM_AUDIT_FP32_DIFF = _os.environ.get("CCM_AUDIT_FP32_DIFF", "") == "1"
 _AUDIT_BUFFER = []
 
+# Oracle ceiling test hook (R9 2026-09-16): when not None, the SUM-row
+# merge weights come from per-dialogue prefix-softmaxed logits instead of
+# the official uniform 1/j.  Zero logits reproduce the official mask
+# bit-for-bit (sanity gate).  Managed via set/clear_oracle_logits.
+_ORACLE_LOGITS = None
+
+
+def set_oracle_logits(logits):
+    """[B, t_max] float tensor or None; per-dialogue merge-weight logits."""
+    global _ORACLE_LOGITS
+    _ORACLE_LOGITS = logits
+
+
+def clear_oracle_logits():
+    global _ORACLE_LOGITS
+    _ORACLE_LOGITS = None
+
 
 def _make_causal_mask(input_ids_shape: torch.Size, dtype: torch.dtype,
                       device: torch.device,
@@ -650,8 +667,33 @@ class LlamaModelCCM(LlamaPreTrainedModel):
 
                 sum_attn_mask = torch.tril(sum_attn_mask)
 
-                sum_attn_mask = sum_attn_mask / torch.clamp(sum_attn_mask.sum(-1, keepdim=True),
-                                                            min=0.1)
+                if _ORACLE_LOGITS is not None:
+                    # Oracle ceiling test: replace the uniform 1/j SUM
+                    # weights with per-dialogue prefix-normalized softmax
+                    # weights alpha_i in Delta^t (shared across layers
+                    # and SUM rows; row j uses alpha[:j] renormalized).
+                    # Zero logits => softmax(0)=1/j => official mask
+                    # bit-for-bit (the caller's sanity gate).
+                    _lg = _ORACLE_LOGITS
+                    for _b in range(batch_size):
+                        for _k in range(len(self.sum_token)):
+                            _spos = (input_ids[_b] == self.sum_token[_k]
+                                     ).nonzero(as_tuple=False).flatten()
+                            _cpos = (input_ids[_b] == self.comp_token[_k]
+                                     ).nonzero(as_tuple=False).flatten()
+                            for _j, _p in enumerate(_spos):
+                                _nh = int((_cpos < _p).sum().item())
+                                if _nh <= 0:
+                                    continue
+                                _w = torch.softmax(
+                                    _lg[_b, :_nh].float(), dim=0)
+                                sum_attn_mask[_b, _p,
+                                              _cpos[:_nh]] = _w.to(
+                                    sum_attn_mask.dtype)
+                else:
+                    sum_attn_mask = sum_attn_mask / torch.clamp(
+                        sum_attn_mask.sum(-1, keepdim=True),
+                        min=0.1)
 
                 #####################################################
                 ##### RPBE modification (L2/L6.5): Gamma row index ######

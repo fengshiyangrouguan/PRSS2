@@ -24,6 +24,7 @@ Numerical contract (after the cloud crash review, 2026-08-27):
 """
 
 import math
+import os
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
@@ -472,9 +473,15 @@ class WeightedWelford:
         self.n_batches = 0
 
     def add(self, z_b: torch.Tensor, p_b: torch.Tensor,
-            w_b: torch.Tensor, cut_ids_b: List[tuple]):
+            w_b: torch.Tensor, cut_ids_b: List[tuple],
+            tree_ids_b: Optional[List] = None):
         """Merge one batch: ``z_b`` [n, dim_z] (detached), ``p_b`` [n, dim_p]
-        (constant), ``w_b`` [n] weights, ``cut_ids_b`` per row."""
+        (constant), ``w_b`` [n] weights, ``cut_ids_b`` per row.
+
+        R10 (review 2026-09-16): cluster W2 uses TREE ids when given —
+        chain-wise RPBE emits several highly-correlated cuts per dialogue
+        tree, so cut-level clustering overstates the effective sample
+        size; the independent unit is the dialogue/tree."""
         z = z_b.detach().double()
         p = p_b.detach().double()
         w = w_b.detach().double().reshape(-1)
@@ -504,9 +511,11 @@ class WeightedWelford:
         M2_zz_b = (zc * sw).t() @ (zc * sw)
         M2_pp_b = (pc * sw).t() @ (pc * sw)
         M2_zp_b = (zc * sw).t() @ (pc * sw)
-        # Cluster W2: rows of one cut share z; its weight is the row sum.
+        # Cluster W2: rows of one cluster share z; its weight is the row
+        # sum.  R10: the cluster is the TREE (dialogue) when ids given.
         wsum = {}
-        for cid, wv in zip(cut_ids_b, w.tolist()):
+        ids = tree_ids_b if tree_ids_b is not None else cut_ids_b
+        for cid, wv in zip(ids, w.tolist()):
             wsum[cid] = wsum.get(cid, 0.0) + wv
         W2_b = float(sum(v * v for v in wsum.values()))
         # Chan merge into the running statistics.
@@ -953,11 +962,22 @@ class KFMomentWindow:
             row_ids, cut_ids, tree_ids, zs, ps, weights = dedup_cut_rows(
                 tau_rows, self.fixed_maps,
                 u_as_z=(self.variant == "reconstruction"))
+            # R9 depth bookkeeping (review 2026-09-16): the per-cut depth
+            # k = L + 1 rides in row.context; kept for the within-depth
+            # shuffle null (a global shuffle confounds depth identity
+            # with future content — the depth bucket b_L lives in p).
+            k_of_row = {}
+            for r in tau_rows:
+                _k = -1
+                if getattr(r, "context", None):
+                    _k = int(r.context.get("k", -1))
+                k_of_row[r.row_id] = _k
             win = self._windows.get(tau)
             if win is None:
                 win = {"zs_list": [], "ps_list": [], "weights_list": [],
                        "row_seen": set(), "cut_seen": set(),
                        "cut_ids_list": [], "batch_cut_counts": [],
+                       "k_list": [], "tree_ids_list": [],
                        "tree_seen": set()}
                 self._windows[tau] = win
             # Cross-batch dedupe on row_id (cut + horizon).  cut_id is
@@ -977,6 +997,8 @@ class KFMomentWindow:
                 win["cut_seen"].add(cut_ids[i])
                 win["tree_seen"].add(tree_ids[i])
                 win["cut_ids_list"].append(cut_ids[i])
+                win["k_list"].append(k_of_row.get(row_ids[i], -1))
+                win["tree_ids_list"].append(tree_ids[i])
             win["batch_cut_counts"].append(len(fresh))
             # Graph-connected rows (float32); the close stacks them once
             # and casts to float64.  P is already gradient-free.
@@ -1055,10 +1077,14 @@ class KFMomentWindow:
             w = torch.cat(win["weights_list"], dim=0)
             m_rows = float(z_all.shape[0])
             W = float(w.sum())
-            wsum_by_cut: Dict[tuple, float] = {}
-            for cid, wv in zip(win["cut_ids_list"], w.tolist()):
-                wsum_by_cut[cid] = wsum_by_cut.get(cid, 0.0) + wv
-            W2_cut = float(sum(v * v for v in wsum_by_cut.values()))
+            # R10 (review 2026-09-16): cluster W2 by TREE (dialogue) —
+            # chain-wise cuts of one dialogue share their history, so
+            # the effective sample unit is the tree, not the cut.
+            wsum_by_tree: Dict = {}
+            for tid, wv in zip(win.get("tree_ids_list",
+                                       win["cut_ids_list"]), w.tolist()):
+                wsum_by_tree[tid] = wsum_by_tree.get(tid, 0.0) + wv
+            W2_cut = float(sum(v * v for v in wsum_by_tree.values()))
             D = W - W2_cut / W
             # DIALOGUE-GROUPED shuffle (review round 5): the two horizon
             # rows of one cut move TOGETHER to another dialogue's z;
@@ -1073,17 +1099,67 @@ class KFMomentWindow:
                 row_groups.setdefault(_cid, []).append(_i)
             mu_z = (z_all * wc).sum(0, keepdim=True) / W
             zc = (z_all - mu_z).double()
+            # R9 (review 2026-09-16): TWO shuffle nulls.
+            #  global — the historical cross-everything permutation;
+            #  within-L — permute p only among cuts of the SAME depth k.
+            # The depth bucket b_L lives in p, so a global shuffle breaks
+            # the z_L <-> b_L pairing and J_real - J_shuffled can stay
+            # large on pure depth identity alone.  within-L keeps depth
+            # pairing intact: only the future CONTENT is deranged.
+            # J_real - J_shuffled_within_L is the honest future signal.
+            k_of_cut = {}
+            for _cid, _k in zip(win["cut_ids_list"], win["k_list"]):
+                k_of_cut.setdefault(_cid, _k)
+            by_k = {}
+            for _cid in unique_cuts:
+                by_k.setdefault(k_of_cut.get(_cid, -1), []).append(_cid)
+            # tree grouping (review 2026-09-16): the independent sample
+            # unit is the DIALOGUE, not the cut — a tree-grouped null
+            # permutes whole dialogues among same k.
+            row_groups_tree = {}
+            k_of_tree = {}
+            for _i, _tid in enumerate(win.get("tree_ids_list",
+                                              win["cut_ids_list"])):
+                row_groups_tree.setdefault(_tid, []).append(_i)
+                k_of_tree.setdefault(_tid, win["k_list"][_i])
+            trees_by_k = {}
+            for _tid in row_groups_tree:
+                trees_by_k.setdefault(k_of_tree[_tid], []).append(_tid)
             j_shuff_list = []
+            j_shuff_within_list = []
+            j_shuff_tree_list = []
             for _s in range(n_shuffles):
                 perm = torch.randperm(len(unique_cuts), generator=rng_gen)
                 remap = {_cid: int(perm[_i])
                          for _i, _cid in enumerate(unique_cuts)}
+                # within-depth remap: independent permutation per k
+                remap_w = {}
+                for _k, _cuts in by_k.items():
+                    _perm = torch.randperm(len(_cuts), generator=rng_gen)
+                    for _i, _cid in enumerate(_cuts):
+                        remap_w[_cid] = _cuts[int(_perm[_i])]
+                # tree-grouped remap: whole dialogues among same k
+                remap_t = {}
+                for _k, _trees in trees_by_k.items():
+                    _perm = torch.randperm(len(_trees), generator=rng_gen)
+                    for _i, _t in enumerate(_trees):
+                        remap_t[_t] = _trees[int(_perm[_i])]
                 new_p = p_all.clone()
+                new_pw = p_all.clone()
+                new_pt = p_all.clone()
                 for _cid, _rows in row_groups.items():
                     _target = unique_cuts[remap[_cid]]
                     _trows = row_groups[_target]
                     for _a, _b in zip(_rows, _trows):
                         new_p[_a] = p_all[_b]
+                    _target_w = remap_w[_cid]
+                    _trows_w = row_groups[_target_w]
+                    for _a, _b in zip(_rows, _trows_w):
+                        new_pw[_a] = p_all[_b]
+                for _tid, _rows in row_groups_tree.items():
+                    _trows = row_groups_tree[remap_t[_tid]]
+                    for _a, _b in zip(_rows, _trows):
+                        new_pt[_a] = p_all[_b]
                 _mu_p = (new_p * wc).sum(0, keepdim=True) / W
                 _pc = (new_p - _mu_p).double()
                 _czzs, _cpps, _czps, _ = _covs(zc, _pc, D, w=w)
@@ -1097,8 +1173,38 @@ class KFMomentWindow:
                 _js, _ = _score_from_covs(_czzs, _czps, _cpps, self.eps)
                 if _js is not None:
                     j_shuff_list.append(float(_js))
+                _mu_pw = (new_pw * wc).sum(0, keepdim=True) / W
+                _pcw = (new_pw - _mu_pw).double()
+                _czzs_w, _cpps_w, _czps_w, _ = _covs(zc, _pcw, D, w=w)
+                if self.oas:
+                    _czzs_w, _czps_w, _cpps_w, _ = _oas_shrink(
+                        _czzs_w, _czps_w, _cpps_w, D)
+                _jsw, _ = _score_from_covs(
+                    _czzs_w, _czps_w, _cpps_w, self.eps)
+                if _jsw is not None:
+                    j_shuff_within_list.append(float(_jsw))
+                _mu_pt = (new_pt * wc).sum(0, keepdim=True) / W
+                _pct = (new_pt - _mu_pt).double()
+                _czzs_t, _cpps_t, _czps_t, _ = _covs(zc, _pct, D, w=w)
+                if self.oas:
+                    _czzs_t, _czps_t, _cpps_t, _ = _oas_shrink(
+                        _czzs_t, _czps_t, _cpps_t, D)
+                _jst, _ = _score_from_covs(
+                    _czzs_t, _czps_t, _cpps_t, self.eps)
+                if _jst is not None:
+                    j_shuff_tree_list.append(float(_jst))
+                elif os.environ.get("CCM_TREE_SHUFF_DIAG") == "1":
+                    print("[tree-shuff] score failed: "
+                          "sz={} sp={} D={}".format(
+                              float(_czzs_t.diagonal().mean()),
+                              float(_cpps_t.diagonal().mean()),
+                              float(D)), flush=True)
             j_shuffled = (float(np.mean(j_shuff_list))
                           if j_shuff_list else float("nan"))
+            j_shuffled_within = (float(np.mean(j_shuff_within_list))
+                                 if j_shuff_within_list else float("nan"))
+            j_shuffled_tree = (float(np.mean(j_shuff_tree_list))
+                               if j_shuff_tree_list else float("nan"))
             d = {"M_unique": int(len(win["cut_seen"])),
                  "M_rows": int(m_rows),
                  "M_unique_trees": int(len(win["tree_seen"])),
@@ -1109,8 +1215,15 @@ class KFMomentWindow:
                  "J_shuffled": j_shuffled,
                  "J_shuffled_list": j_shuff_list,
                  "J_shuffled_n": len(j_shuff_list),
+                 "J_shuffled_within_L": j_shuffled_within,
+                 "J_shuffled_within_L_list": j_shuff_within_list,
+                 "J_shuffled_within_L_tree": j_shuffled_tree,
                  "J_real_minus_shuffled":
                      (float(j.detach()) - j_shuffled),
+                 "J_real_minus_shuffled_within_L":
+                     (float(j.detach()) - j_shuffled_within),
+                 "J_real_minus_shuffled_within_L_tree":
+                     (float(j.detach()) - j_shuffled_tree),
                  "symmetry_error": sym_err,
                  "joint_min_eig": _joint_min_eig(czz, czp, cpp),
                  "failed": score_diag["failed"]}
@@ -1168,7 +1281,8 @@ class KFMomentWindow:
             p_all = torch.cat(win["ps_list"], dim=0)
             w = torch.cat(win["weights_list"], dim=0)
             wf = WeightedWelford(int(z_all.shape[1]), int(p_all.shape[1]))
-            wf.add(z_all, p_all, w, win["cut_ids_list"])
+            wf.add(z_all, p_all, w, win["cut_ids_list"],
+                   win.get("tree_ids_list"))
             r = wf.result()
             j, g_by_cut, score_diag = latent_z_adjoint(
                 z_all, p_all, w, win["cut_ids_list"],

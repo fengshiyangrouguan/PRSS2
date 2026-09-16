@@ -198,12 +198,20 @@ class DialogueCutBuilder:
     def build(self, meta: DialogueMeta, z_v: torch.Tensor,
               chi_1: torch.Tensor, chi_2: torch.Tensor,
               phi_1: torch.Tensor, phi_2: torch.Tensor,
-              stats: Optional[dict] = None) -> List[CutRecord]:
-        """One cut (v = k - 3) -> two horizon rows sharing the cut_id.
+              stats: Optional[dict] = None,
+              v: Optional[int] = None,
+              skip_context_obs: bool = True) -> List[CutRecord]:
+        """One cut -> two horizon rows sharing the cut_id.
+
+        R10 chain-wise RPBE (review 2026-09-16): ``v`` selects the cut
+        position (default k - 3 = the historical penultimate-memory cut);
+        callers enumerate EVERY legal v (0..k-3) so the window realizes
+        the Theorem-4 local-defect SUM over the chain, not a single
+        position.
 
         ``z_v`` keeps its graph (pass 2 replays the exact gradient);
         ``chi_1/2`` are constants (the UtteranceEmbed path is no_grad).
-        Returns [] for k < 4 (task CE keeps its own gradient, w_RPBE=0).
+        Returns [] for k < MIN_K (task CE keeps its own gradient).
         """
         k = int(meta.k)
         if k < MIN_K:
@@ -211,11 +219,20 @@ class DialogueCutBuilder:
                 stats.setdefault("skipped_k_lt_3", 0)
                 stats["skipped_k_lt_3"] += 1
             return []
-        v = k - 3
+        if v is None:
+            v = k - 3
         cut_occurrence = self._next_oid
         self._next_oid += 1
         rows: List[CutRecord] = []
-        for horizon in (1, 2):
+        # R10 (review 2026-09-16): the DEEPEST cut (v == k - 3) has
+        # obs1 Y = u_{v+2} = u_{k-1} = the immediate CONTEXT turn —
+        # a non-compressed, decoder-visible utterance that must NOT be
+        # supervised as a predictive target (invalid supervision: the
+        # context turn is not compressed and predicting it serves the
+        # final target in no causal way).  Skip obs1 there and give the
+        # single obs2 row the full cut weight 1.0.
+        horizons = (2,) if (v == k - 3 and skip_context_obs) else (1, 2)
+        for horizon in horizons:
             chi = chi_1 if horizon == 1 else chi_2
             phi = phi_1 if horizon == 1 else phi_2
             if chi.dim() == 2:
@@ -243,7 +260,8 @@ class DialogueCutBuilder:
                          "chi_tag": 0 if horizon == 1 else 1},
                 outcome=1.0,  # no binary label; p is the content sketch
                 outcome_id=(int(meta.sample_id), cut_occurrence, horizon),
-                weight=HORIZON_WEIGHTS[horizon - 1],
+                weight=(1.0 if len(horizons) == 1
+                        else HORIZON_WEIGHTS[horizon - 1]),
                 p_override=p,
             ))
         return rows

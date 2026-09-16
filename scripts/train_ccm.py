@@ -227,6 +227,13 @@ def parse_args():
                         "the scheduler scales both groups by the same "
                         "warmup/cosine factor, so the ratio rpbe_lr/lr "
                         "is preserved through training)")
+    p.add_argument("--rpbe-gamma-only", action="store_true",
+                   help="R10 structure (review 2026-09-16): the RPBE "
+                        "surrogate updates GAMMA ONLY — task CE keeps "
+                        "training LoRA/COMP embeddings/Gamma, but the "
+                        "auxiliary gradient on non-Gamma params is "
+                        "discarded.  The global lambda calibration no "
+                        "longer dilutes r_eff across LoRA/COMP.")
     # monitoring
     p.add_argument("--log-every", type=int, default=10)
     p.add_argument("--checkpoint-every", type=int, default=250)
@@ -614,11 +621,14 @@ def task_ce_shifted(out, labels, device):
     return loss, n_valid
 
 
-def collect_replay_z(meta, adapter, device):
-    """Pass-2 extraction ONLY: z_v at the cut position (gradient-
+def collect_replay_z(meta, adapter, device, v=None):
+    """Pass-2 extraction ONLY: z_v at cut position v (gradient-
     connected).  No builder, no chi, no p — those finished their job at
-    the pass-1 window close (L6.5 review structural fix)."""
-    v = meta["k"] - 3
+    the pass-1 window close (L6.5 review structural fix).  R10: v=None
+    keeps the historical penultimate cut; the chain-wise replay passes
+    the per-cut v explicitly."""
+    if v is None:
+        v = meta["k"] - 3
     s0_pos = meta["blocks"][v][1]
     sum_positions = torch.tensor([[s0_pos, s0_pos + 1]],
                                  dtype=torch.long, device=device)
@@ -627,29 +637,32 @@ def collect_replay_z(meta, adapter, device):
 
 def collect_rows(meta, adapter, builder, utter_embed, phi_embed,
                  embed_tokens, batch, device):
-    """CONDITIONAL 2Obs (review round 5, restoring plan Test D):
+    """CONDITIONAL 2Obs, R10 CHAIN-WISE (review 2026-09-16):
 
       obs1: C = u_{v+1},              Y = u_{v+2}        (both in prompt)
       obs2: C = (u_{v+1}, u_{v+2}, one-update), Y = u_k (labels, EOS out)
 
-    z_v is the memory at v = k - 3; the two rows share cut_id and enter
-    the same Ky Fan window with weights 0.5/0.5.  chi/phi are frozen
+    The historical single cut v = k - 3 supervised only the penultimate
+    merge; Theorem 4 sums local defects over the WHOLE chain, so every
+    legal cut position v in {0, ..., k - 3} (t = v + 1 merges) now emits
+    its own two horizon rows (one occurrence id per cut).  z extraction
+    is batched (extract_z takes [n_cuts, 2]); chi/phi stay frozen
     input-embedding sketches (no extra LLaMA forward, no grad flow)."""
     if not meta["ok"] or meta["k"] < 3:
         return []
-    v = meta["k"] - 3
-    s0_pos = meta["blocks"][v][1]
-    sum_positions = torch.tensor([[s0_pos, s0_pos + 1]],
-                                 dtype=torch.long, device=device)
-    z = adapter.extract_z(sum_positions)  # [1, z_dim]
+    k = meta["k"]
+    n_cuts = k - 2          # v = 0 .. k - 3 (one cut per merge depth)
+    # extract_z's gather expands sum_positions along the BATCH dim, so
+    # a multi-row [n_cuts, 2] input would index batch 1..n_cuts against
+    # a batch-1 cache.  Extract one cut at a time (each call is a cheap
+    # per-layer gather, not a forward).
+    zs = [adapter.extract_z(torch.tensor(
+        [[meta["blocks"][v][1], meta["blocks"][v][1] + 1]],
+        dtype=torch.long, device=device))[0]
+        for v in range(n_cuts)]  # [n_cuts, z_dim]
     spans = meta["utterance_spans"]
     ids = batch["input_ids"][meta["row"]]
     labs = batch["labels"][meta["row"]]
-    u_v1 = ids[spans[v + 1][0]:spans[v + 1][1]].unsqueeze(0).to(device)
-    u_v2 = ids[spans[v + 2][0]:spans[v + 2][1]].unsqueeze(0).to(device)
-    chi1 = utter_embed(embed_tokens, u_v1, tag=0)
-    phi1 = phi_embed(embed_tokens, u_v2, tag=0)
-    chi2 = utter_embed.combine(embed_tokens, u_v1, u_v2, tag=1)
     # u_k = the target utterance: valid label tokens minus the EOS
     valid_pos = (labs != -100).nonzero(as_tuple=False).flatten()
     uk_pos = valid_pos[:-1] if len(valid_pos) > 1 else valid_pos
@@ -660,7 +673,16 @@ def collect_rows(meta, adapter, builder, utter_embed, phi_embed,
                                      in meta["blocks"]],
                       utterance_spans=list(meta["utterance_spans"]),
                       orig_id=int(meta.get("orig_id", -1)))
-    return builder.build(dm, z, chi1[0], chi2[0], phi1[0], phi2[0])
+    rows = []
+    for v in range(n_cuts):
+        u_v1 = ids[spans[v + 1][0]:spans[v + 1][1]].unsqueeze(0).to(device)
+        u_v2 = ids[spans[v + 2][0]:spans[v + 2][1]].unsqueeze(0).to(device)
+        chi1 = utter_embed(embed_tokens, u_v1, tag=0)
+        phi1 = phi_embed(embed_tokens, u_v2, tag=0)
+        chi2 = utter_embed.combine(embed_tokens, u_v1, u_v2, tag=1)
+        rows.extend(builder.build(dm, zs[v], chi1[0], chi2[0],
+                                  phi1[0], phi2[0], v=v))
+    return rows
 
 
 def batch_surrogate(z_rows_by_oid, batch_terms, lam, device):
@@ -950,6 +972,16 @@ def load_trainable(path, model, optimizer, device,
     if unexpected:
         raise RuntimeError("unexpected keys in checkpoint: {}"
                            .format(sorted(unexpected)[:5]))
+    # Fail-fast (review 2026-09-16): a missing key that is a CURRENT
+    # trainable param would silently keep its init value (e.g. an old
+    # checkpoint without Gamma leaves a zero-init Gamma).
+    trainable_names = {n for n, p in model.named_parameters()
+                       if p.requires_grad}
+    bad_missing = sorted(set(missing) & trainable_names)
+    if bad_missing:
+        raise RuntimeError(
+            "checkpoint is missing trainable params (stale ckpt?): {}"
+            .format(bad_missing[:5]))
     if load_optimizer and "optimizer" in payload:
         opt_ckpt = payload["optimizer"]
         if len(opt_ckpt["param_groups"]) != len(optimizer.param_groups):
@@ -1186,6 +1218,7 @@ def main():
 
     pending = []
     cut_records = []
+    pass1_rngs = []          # per-microbatch pass-1 RNG (P0 fix, R10)
     window_start_state = None
     # Review P0-2: the ccm_merge arm counts effective cuts (dialogues
     # with k >= 3, review round 8: depth L = 1 contributes cuts too) in
@@ -1236,6 +1269,14 @@ def main():
         payload = load_trainable(args.resume_from, model, optimizer, device)
         step = int(payload.get("step", 0))
         lambda_kf = float(payload.get("lambda_kf", args.kf_lambda))
+        # R10 recalibration (review 2026-09-16): the committed frozen
+        # lambda is authoritative — a resume payload carrying the OLD
+        # lambda must not silently override a freshly calibrated one.
+        if abs(lambda_kf - float(args.kf_lambda)) > 1e-12:
+            print("[frozen] resume payload lambda={} overridden by "
+                  "committed lambda={}".format(lambda_kf, args.kf_lambda),
+                  flush=True)
+            lambda_kf = float(args.kf_lambda)
         if "sample_cursor" in payload:
             sample_cursor = int(payload["sample_cursor"])
         if "rng" in payload:
@@ -1331,7 +1372,18 @@ def main():
                     _t = time.perf_counter()
                     window.add(rows)
                     _pf("window_add", _t)
-                    batch_cuts.append((meta, rows[0].occurrence_id))
+                    # R10 chain-wise: every cut of the dialogue is
+                    # replayed — record (meta, oid, v) ONCE per cut
+                    # (2 horizon rows per cut, EXCEPT the deepest cut
+                    # whose context-turn obs1 is skipped -> 1 row).
+                    _seen_oids = set()
+                    for r in rows:
+                        if r.occurrence_id in _seen_oids:
+                            continue
+                        _seen_oids.add(r.occurrence_id)
+                        batch_cuts.append(
+                            (meta, r.occurrence_id,
+                             int(r.context["cut_turn"])))
             adapter.clear()
         return batch_cuts
 
@@ -1357,10 +1409,11 @@ def main():
             z_by_oid = {}
             batch_terms = []
             _t = time.perf_counter()
-            for meta, oid in cut_meta:
+            for meta, oid, v in cut_meta:
                 g = g_by_oid.get(oid)
                 if g is not None:
-                    z_by_oid[oid] = collect_replay_z(meta, adapter, device)
+                    z_by_oid[oid] = collect_replay_z(meta, adapter,
+                                                     device, v=v)
                     batch_terms.append((oid, g))
             adapter.clear()
             _pf("collect_z", _t)
@@ -1465,11 +1518,20 @@ def main():
             # the data-sampling stream matches the single-pass arm; the
             # cut rows and their occurrence ids accumulate monotonically.
             # Microbatches with NO possible cut (k < 4) skip the pass-1
-            # forward entirely: no row can come from them, and with zero
-            # dropout the forward consumes no RNG, so the replay stream
-            # is unchanged (L6.5 perf: DailyDialog's effective-cut rate
-            # is ~50%, halving the pass-1 cost).
+            # forward entirely: no row can come from them (L6.5 perf:
+            # DailyDialog's effective-cut rate is ~50%, halving the
+            # pass-1 cost).
+            # P0 fix (R10, review 2026-09-16): the official Step-2 LoRA
+            # carries lora_dropout=0.05 and the model is in TRAIN mode —
+            # dropout consumes CUDA RNG inside the forward.  Pass 1
+            # restores the SAME state after every microbatch (all masks
+            # identical); pass 2 replays the forward stream linearly, so
+            # WITHOUT per-microbatch restoration z_pass2 != z_pass1 and
+            # the exact-replay surrogate is broken.  Keep each
+            # microbatch's pre-forward RNG and restore it before its
+            # pass-2 forward: mask_i^pass2 == mask_i^pass1.
             state = {"rng": _rng_state()}
+            pass1_rngs.append(state["rng"])
             if any(m["ok"] and m["k"] >= 3 for m in metas):
                 batch_cuts = pass1_one(batch, metas)
             else:
@@ -1493,6 +1555,15 @@ def main():
                             _d.get("J_real_minus_shuffled"),
                         "J_shuffled_mean": _d.get("J_shuffled"),
                         "J_shuffled_n": _d.get("J_shuffled_n"),
+                        # R9 (review 2026-09-16): within-depth null — the
+                        # depth bucket b_L lives in p, so the GLOBAL
+                        # shuffle breaks depth pairing and can stay large
+                        # on pure depth identity.  within-L keeps depth
+                        # intact; only future CONTENT is deranged.
+                        "J_shuffled_within_L":
+                            _d.get("J_shuffled_within_L"),
+                        "J_real_minus_shuffled_within_L":
+                            _d.get("J_real_minus_shuffled_within_L"),
                         # Review round 8: per-branch scores + ensemble.
                         "J_ens": _d.get("J_ens"),
                         "J_branches": _d.get("J_branches"),
@@ -1557,7 +1628,8 @@ def main():
                             fwd_out, b["labels"], device)
                         (task_sum_m / max(n_valid_m, 1)
                          / float(len(pending))).backward()
-                    g_task = repr_grad_norm(params)
+                    g_task = repr_grad_norm(gamma_params)
+                    g_task_all = repr_grad_norm(params)
                     optimizer.zero_grad(set_to_none=True)
                     _restore_rng(window_start_state["rng"])
                     for i, (b, sid) in enumerate(pending):
@@ -1567,11 +1639,11 @@ def main():
                         # only this batch's cuts, resolved via by_oid.
                         z_by_oid = {}
                         batch_terms = []
-                        for meta, oid in cut_records[i]:
+                        for meta, oid, v in cut_records[i]:
                             g = g_by_oid.get(oid)
                             if g is not None:
                                 z_by_oid[oid] = collect_replay_z(
-                                    meta, adapter, device)
+                                    meta, adapter, device, v=v)
                                 batch_terms.append((oid, g))
                         adapter.clear()
                         aux, n_aux = batch_surrogate(
@@ -1581,21 +1653,30 @@ def main():
                         if n_aux:
                             aux.backward()
                     _restore_rng(resume_rng)
-                    g_kf = repr_grad_norm(params)
+                    g_kf = repr_grad_norm(gamma_params)
+                    g_kf_all = repr_grad_norm(params)
                     if params_digest(params) != digest0:
                         raise RuntimeError(
                             "lambda calibration changed the trainable "
                             "params — theta_0 violated")
                     r_eff = g_kf / max(g_task, 1e-30)
+                    r_eff_all = g_kf_all / max(g_task_all, 1e-30)
                     derived = 0.1 / max(r_eff, 1e-30)
                     save_json(out / "calibration.json", {
-                        "g_task": g_task, "g_kf": g_kf, "r_eff": r_eff,
+                        "g_task_gamma": g_task, "g_kf_gamma": g_kf,
+                        "r_eff_gamma": r_eff,
+                        "g_task_all": g_task_all, "g_kf_all": g_kf_all,
+                        "r_eff_all": r_eff_all,
                         "derived_lambda": derived,
                         "optimizer_steps": 0, "scheduler_steps": 0,
-                        "rule": "lambda = 0.1 / r_eff (plan L5), "
-                                "measured on theta_0 before any step"})
-                    print(json.dumps({"g_task": g_task, "g_kf": g_kf,
-                                      "r_eff": r_eff,
+                        "rule": "R10 gamma-scope calibration "
+                                "(review 2026-09-16): lambda = 0.1 / "
+                                "r_eff measured on the GAMMA group only "
+                                "at theta_0, chain-wise window"})
+                    print(json.dumps({"g_task_gamma": g_task,
+                                      "g_kf_gamma": g_kf,
+                                      "r_eff_gamma": r_eff,
+                                      "r_eff_all": r_eff_all,
                                       "derived_lambda": derived,
                                       "theta0_verified": True},
                                      indent=2), flush=True)
@@ -1620,6 +1701,7 @@ def main():
                     # and certifies EVERY row at 1e-6; a failed
                     # certificate skips the representation step below.
                     for i, (b, sid) in enumerate(pending):
+                        _restore_rng(pass1_rngs[i])   # P0: mask == pass1
                         task_mean, task_raw, n_valid, _aux, _n = pass2_one(
                             b, cut_records[i], g_by_oid, 0.0)
                         scaler.scale(
@@ -1634,14 +1716,16 @@ def main():
                                  if id(p) not in gamma_set}
                     dirs = []
                     for i, (b, sid) in enumerate(pending):
+                        _restore_rng(pass1_rngs[i])  # P0: mask == pass1
                         fwd_out = run_forward(model, b, device,
                                               grad_enabled=True)
-                        for meta, oid in cut_records[i]:
+                        for meta, oid, v in cut_records[i]:
                             g = g_by_oid.get(oid)
                             if g is None:
                                 continue
                             optimizer.zero_grad(set_to_none=True)
-                            z = collect_replay_z(meta, adapter, device)
+                            z = collect_replay_z(meta, adapter, device,
+                                                 v=v)
                             gd = g.detach()
                             aux_i = -lambda_kf * ((gd * z).sum()
                                                   - (gd * z.detach()).sum())
@@ -1677,10 +1761,13 @@ def main():
                         for p in params:
                             if id(p) in gamma_set:
                                 continue  # projection already wrote .grad
-                            p.grad = (task_grads.get(
+                            p.grad = task_grads.get(
                                 id(p), torch.zeros_like(p))
-                                + aux_other.get(id(p),
-                                                torch.zeros_like(p)))
+                            if not args.rpbe_gamma_only:
+                                # R10 structure: discard the non-Gamma
+                                # auxiliary gradient (review 2026-09-16)
+                                p.grad = (p.grad + aux_other.get(
+                                    id(p), torch.zeros_like(p)))
                     with (out / "window_diag.jsonl").open("a") as _f:
                         _f.write(json.dumps(_json_safe(
                             {"step": int(step), "event": "treewise_proj",
@@ -1694,6 +1781,7 @@ def main():
                     aux_terms += n_cut_win
                 else:
                     for i, (b, sid) in enumerate(pending):
+                        _restore_rng(pass1_rngs[i])   # P0: mask == pass1
                         task_mean, task_raw, n_valid, aux, n_terms = \
                             pass2_one(
                                 b, cut_records[i], g_by_oid,
@@ -1705,10 +1793,73 @@ def main():
                         # window-length independent (L6.5 review P0-2).
                         # The KF surrogate is NOT rescaled: it is the
                         # exact window-J gradient.
-                        loss = task_mean / float(len(pending)) + aux
-                        _t = time.perf_counter()
-                        scaler.scale(loss).backward()
-                        _pf("pass2_bwd", _t)
+                        if args.rpbe_gamma_only and n_terms:
+                            # R10 structure: task and RPBE backwards are
+                            # SPLIT; the auxiliary gradient is kept on
+                            # Gamma only, non-Gamma params keep the pure
+                            # task gradient (review 2026-09-16: a global
+                            # r_eff=0.1 does not mean Gamma received 10%
+                            # of the RPBE signal when LoRA/COMP absorb
+                            # most of it).
+                            scaler.scale(
+                                task_mean / float(len(pending))).backward(
+                                    retain_graph=True)
+                            task_snap = {id(p): p.grad.detach().clone()
+                                         for p in params
+                                         if p.grad is not None
+                                         and id(p) not in gamma_set}
+                            if os.environ.get("CCM_GRAD_GROUP") == "1":
+                                task_snap_all = {
+                                    id(p): p.grad.detach().clone()
+                                    for p in params if p.grad is not None}
+                            scaler.scale(aux).backward()
+                            if os.environ.get("CCM_GRAD_GROUP") == "1":
+                                # per-group r_eff (review 2026-09-16):
+                                # task vs RPBE gradient norms for
+                                # Gamma / LoRA / COMP embeddings.  The
+                                # aux loss already carries lambda, so
+                                # aux_norm/task_norm IS the group r_eff.
+                                groups = {"gamma": [], "lora": [],
+                                          "comp": [], "other": []}
+                                for n, p in model.named_parameters():
+                                    if p.requires_grad and p.grad is not None:
+                                        if id(p) in gamma_set:
+                                            groups["gamma"].append((n, p))
+                                        elif "lora_" in n:
+                                            groups["lora"].append((n, p))
+                                        elif "comp" in n or "embedding" in n:
+                                            groups["comp"].append((n, p))
+                                        else:
+                                            groups["other"].append((n, p))
+                                _t0 = task_snap_all
+                                for _gn, _gps in groups.items():
+                                    if not _gps:
+                                        continue
+                                    _nt = sum(float((_t0[id(p)].double()
+                                                     ** 2).sum())
+                                              for _n, p in _gps
+                                              if id(p) in _t0) ** 0.5
+                                    _na = sum(float(((p.grad.detach()
+                                                      - _t0.get(id(p),
+                                                                torch.zeros_like(p.grad)))
+                                                     .double() ** 2).sum())
+                                              for _n, p in _gps
+                                              if p.grad is not None) ** 0.5
+                                    print("GRADGROUP {} n={} "
+                                          "|g_task|={:.4e} "
+                                          "|g_rpbe|={:.4e} "
+                                          "r={:.4f}".format(
+                                              _gn, len(_gps), _nt, _na,
+                                              _na / max(_nt, 1e-30)),
+                                          flush=True)
+                            for p in params:
+                                if id(p) not in gamma_set:
+                                    p.grad = task_snap.get(id(p))
+                        else:
+                            loss = task_mean / float(len(pending)) + aux
+                            _t = time.perf_counter()
+                            scaler.scale(loss).backward()
+                            _pf("pass2_bwd", _t)
                         if os.environ.get("CCM_AUX_DIAG") == "1":
                             named = [(n, p)
                                      for n, p in model.named_parameters()
@@ -1788,6 +1939,7 @@ def main():
                 close_depth_window(len(pending), step, n_cut_win)
                 pending = []
                 cut_records = []
+                pass1_rngs = []
                 window_start_state = None
                 if args.max_windows and step >= args.max_windows:
                     break

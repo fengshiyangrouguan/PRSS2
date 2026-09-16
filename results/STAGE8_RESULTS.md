@@ -155,6 +155,33 @@ checkpoint): avg stage2 `20.0%` (6/30, 10 demos); avg stage3-wloss `15.0%`
 (9/60) and `16.7%` (5/30).  Do not put these on the same axis as the table
 above.
 
+### Which step is `best.pt`, and what the seed-42 run looks like
+
+`best.pt` is the **minimum-val checkpoint of that run's own val curve**, and
+that run is seed 42.  The within-seed curve (14 recovered points, 1000 ->
+18000) is in `val_curves.csv` and drawn in `avg_host_curve.png`:
+
+| step | 1000 | 2000 | 3000 | 4000 | 5000 | 6000 | 7000 | 8000 | 9000 |
+|---|---|---|---|---|---|---|---|---|---|
+| val | .0959 | .0871 | .0849 | .0780 | .0824 | .0754 | .0742 | .0757 | .0738 |
+
+| step | 14000 | 15000 | 16000 | 17000 | **18000** |
+|---|---|---|---|---|---|
+| val | .0723 | .0703 | .0708 | .0701 | **.0694** |
+
+The running minimum moved 9000 (.0738) -> 15000 (.0703) -> 17000 (.0701) ->
+**18000 (.0694)**, so `best.pt` is the **18000-step** weights -- the last eval
+of the run, because training was stopped at ~18k of its 20k budget.  The host
+is therefore "the best this seed reached over that many steps", which is
+exactly how it was selected.
+
+**There is no within-seed rollout curve.**  Only `best.pt` was ever rolled
+out; the planned snapshot eval (15k / 17.5k / 20k) never ran, and the
+snapshots were deleted during disk pruning.  So for the host we have one
+rollout number (measured twice, bit-identical) and a per-step val curve --
+not a per-step rollout curve.  `avg_host_rollout.png` deliberately shows the
+two rollout protocol variants and NOT a step axis, because none exists.
+
 ## Checkpoint selection: why the 15000 endpoint, not the 17000 peak
 
 Every arm is reported at its **fixed-budget endpoint**, and the budget was

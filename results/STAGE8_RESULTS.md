@@ -280,6 +280,38 @@ no arm's number was chosen by sweeping rollouts, and no arm is "its best".
 - **No matched control was run** (the box lost its second GPU), so the peak
   cannot be attributed to the projection rather than to Gamma training itself.
 
+## What this run does and does not establish
+
+Stated plainly, so the table above cannot be over-read:
+
+**The primary reading.** Under the pre-registered rule (fixed budget, both arms
+at their endpoint, both endpoints being what val-selection would have picked
+anyway): host **23.3%** (14/60) vs ours **21.7%** (13/60).  One tier unit
+apart, inside a noise band of ~9.3%.  **Ours does not beat the host at the
+reported checkpoint.**  The only number above the host anywhere in this line
+is the 17000 peak (25.0%), which is past the budget, within noise, and
+uncontrolled —— reporting it as the result is exactly the unfair checkpoint
+pick this protocol exists to prevent.
+
+**What it does establish.** Two things, both large and mechanical:
+
+1. The constraint holds. `abort = 0` over 15000 steps and the constraint
+   genuinely binds in 98.3% of constrained boundaries (details in the audit
+   section below).  This is a claim about the algorithm doing what it says,
+   not about task performance.
+2. Adaptation scope decides survival. Adapting **only Gamma** leaves the host
+   intact (21.7 / 23.3 / 21.7 vs the host's 23.3 over the first 1000 steps);
+   adapting **LoRA** destroys it (13.3 / 13.3 / 3.3 / 11.7 over the same
+   steps, and 8.3% at the 15000 endpoint against 21.7% for Gamma-only).  Note
+   this contrast is about scope, and RPBE was active in both —— it is not an
+   RPBE result.
+
+**What it does NOT establish.** Whether RPBE (the projection) beats plain
+Gamma training.  There is no matched Gamma-task control (kappa = 1.0, same
+code path with the projection provably inactive), so the peak cannot be
+attributed to the projection rather than to Gamma training itself.  This is
+the single biggest gap in the result.
+
 ## Constraint-audit evidence (the algorithm doing what it claims)
 
 From the 15000-step run (`gamma-only_ours_s8g`):

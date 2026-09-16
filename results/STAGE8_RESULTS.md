@@ -93,7 +93,50 @@ Reading:
 - **The gamma FROZEN run is indistinguishable from ours** (0.0684-0.0695 over
   500-15000; see the 30-point curve in the CSV). **Val action loss therefore
   cannot tell "Gamma moves" from "Gamma frozen"** —— which is exactly why the
-  rollout had to be measured by hand.
+  rollout had to be measured by hand, and why val is not the checkpoint
+  selector (see "Checkpoint selection" below).
+
+## Checkpoint selection: why the 15000 endpoint, not the 17000 peak
+
+Every arm is reported at its **fixed-budget endpoint**, and the budget was
+written down before the runs (`PRE_REGISTRATION.md`: `kappa=0.02`, `tau=3e-4`,
+15000 steps, seed 42, host `avg_s42_stage5_official/best.pt`). Two things are
+deliberately NOT used to choose a checkpoint:
+
+1. **Not the rollout.** The 20 evaluation demos are the only rollout set that
+   exists, so picking the best value on it is test-selection leakage. At n=20
+   the success standard deviation is ~9.3% (~1.9 tier units), which makes the
+   top of the table mostly noise: 25.0 vs 23.3 is one unit.
+2. **Not val action loss either** —— and this is the less obvious one, because
+   val is the metric that is *supposed* to be safe (it is held out and it is
+   not the test set). It fails here for two independent reasons:
+
+   - **No discriminative power.** The val curve for ours is FLAT:
+     0.0686-0.0695 over all 11 recovered points, and the gamma-FROZEN run is
+     point-for-point identical (0.0684-0.0695 over 30 points). A metric that
+     cannot separate "Gamma moved" from "Gamma frozen" cannot select a Gamma
+     checkpoint; ranking by it ranks by noise.
+   - **No stopping signal.** Val never rises. On ours it is flat, and on the
+     host it falls monotonically (0.0959 -> 0.0694). Read alone, val always
+     says "keep training" —— which is exactly what it said at 15000, when the
+     rollout had already turned.
+
+So "just look at val" is not an option: it would have selected an arbitrary
+point inside a flat line and would never have stopped.
+
+The run was therefore extended past the budget (15000 -> 21000,
+weight-initialised continuation) with one purpose: to test whether more steps
+help. They do not —— 25.0 -> 23.3 -> 18.3, with the 3-cycle column falling to
+0. **That decline is what makes the 15000 endpoint defensible**: it shows the
+endpoint is a pre-registered truncation, not a hiding place, and that the
+17000 peak cannot be promoted to "the result" without fitting the test set.
+The peak is reported as a diagnostic and nothing more.
+
+The host row sits in the same table, under the same protocol, for the same
+reason: 23.3% is the host checkpoint that **all arms start from**
+(`avg_s42_stage5_official/best.pt`), measured with the identical 20-demo
+rollout. So every row is an adaptation measured against a common origin ——
+no arm's number was chosen by sweeping rollouts, and no arm is "its best".
 
 ## Rollout (the metric that matters)
 

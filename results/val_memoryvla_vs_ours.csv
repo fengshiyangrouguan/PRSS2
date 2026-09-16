@@ -1,4 +1,4 @@
-series,absolute_step,val_action_loss
+series,step,val_action_loss
 MemoryVLA (avg host, Stage5 official),1000,0.0959
 MemoryVLA (avg host, Stage5 official),2000,0.0871
 MemoryVLA (avg host, Stage5 official),3000,0.0849
@@ -13,16 +13,14 @@ MemoryVLA (avg host, Stage5 official),15000,0.0703
 MemoryVLA (avg host, Stage5 official),16000,0.0708
 MemoryVLA (avg host, Stage5 official),17000,0.0701
 MemoryVLA (avg host, Stage5 official),18000,0.0694
-ours (s8g, gamma-only + RPBE),500,0.0694
-ours (s8g, gamma-only + RPBE),1000,0.0695
-ours (s8g, gamma-only + RPBE),1500,0.0694
-ours (s8g, gamma-only + RPBE),2000,0.069
-ours (s8g, gamma-only + RPBE),2500,0.0694
-ours (s8g, gamma-only + RPBE),3000,0.069
-ours (s8g, gamma-only + RPBE),3500,0.069
-ours (s8g, gamma-only + RPBE),4000,0.0688
-ours (s8g, gamma-only + RPBE),8000,0.0688
-ours (s8g, gamma-only + RPBE),8500,0.0686
-ours (s8g, gamma-only + RPBE),10000,0.0687
-ours (s8h continuation),15500,0.0689
-ours (s8h continuation),18500,0.0685
+ours (RPBE, s8g),500,0.0694
+ours (RPBE, s8g),1000,0.0695
+ours (RPBE, s8g),1500,0.0694
+ours (RPBE, s8g),2000,0.069
+ours (RPBE, s8g),2500,0.0694
+ours (RPBE, s8g),3000,0.069
+ours (RPBE, s8g),3500,0.069
+ours (RPBE, s8g),4000,0.0688
+ours (RPBE, s8g),8000,0.0688
+ours (RPBE, s8g),8500,0.0686
+ours (RPBE, s8g),10000,0.0687

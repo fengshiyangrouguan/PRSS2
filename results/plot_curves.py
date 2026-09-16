@@ -332,45 +332,40 @@ def plot_alignment(path):
 def plot_memoryvla_vs_ours(runs, path):
     """MemoryVLA (avg host) vs ours only, each marked at its val minimum.
 
-    Two lines, no control arms: black = MemoryVLA (the official avg host),
-    blue = ours.  The x axis runs to 20000 because that was the host's budget;
-    the DATA stops earlier than that on both sides and the line is simply not
-    drawn past the last recovered point.
+    Two lines, no control arms and no continuation: black = MemoryVLA (the
+    official avg host), blue = ours (the RPBE run itself, `s8g`).  The x axis
+    runs to the host's 20000 budget; the DATA stops earlier on both sides and
+    the line is simply not drawn past the last recovered point.
     """
     fig, ax = plt.subplots(figsize=(10.8, 5.8))
     a = runs["avg_s42_stage5_official"]
     o = runs["ours_gamma-only_ours_s8g(proposal-space)"]
-    # the continuation's steps are LOCAL to s8h; it started from the 15000
-    # endpoint, so shift them onto the absolute axis
-    c = [(15000 + s, v)
-         for s, v in runs["ours_gamma-only_ours_s8h(continuation)"]]
 
     ax.plot([p[0] for p in a], [p[1] for p in a], "-o", color="#111111",
             lw=2.4, ms=6, zorder=4,
             label="MemoryVLA -- avg host (Stage5, official)")
     ax.plot([p[0] for p in o], [p[1] for p in o], "-o", color="#1f77b4",
-            lw=2.4, ms=6, zorder=4, label="ours -- gamma-only + RPBE")
-    ax.plot([p[0] for p in c], [p[1] for p in c], "--o", color="#1f77b4",
-            lw=2.0, ms=8, mfc="white", mew=2.0, zorder=4,
-            label="ours -- continuation (weight-initialised)")
+            lw=2.4, ms=6, zorder=4, label="ours -- RPBE (gamma-only, s8g)")
 
-    # each curve's own val minimum
+    # each curve's own val minimum, among the RECOVERED points
     ax.plot([18000], [0.0694], "*", color="#111111", ms=20, zorder=6)
     ax.annotate("MemoryVLA val minimum\n0.0694  @ 18000",
                 (18000, 0.0694), xytext=(-10, 10), textcoords="offset points",
                 fontsize=9, ha="right")
-    ax.plot([18500], [0.0685], "*", color="#1f77b4", ms=20, zorder=6)
-    ax.annotate("ours val minimum  0.0685  @ 18500",
-                (18500, 0.0685), xytext=(-10, 44), textcoords="offset points",
+    ax.plot([8500], [0.0686], "*", color="#1f77b4", ms=20, zorder=6)
+    ax.annotate("ours val minimum  0.0686  @ 8500",
+                (8500, 0.0686), xytext=(-10, 44), textcoords="offset points",
                 fontsize=9, color="#1f77b4", ha="right")
 
     # where the data actually stops on each side
     ax.axvline(20000, color="#bbbbbb", lw=1.0, ls=":")
-    ax.annotate("host budget 20000\n(no eval past it: run stopped ~18k)",
-                (20000, 0.0715), xytext=(-6, 0), textcoords="offset points",
+    ax.annotate("host budget 20000\n(run stopped ~18k: no eval past it)",
+                (20000, 0.0722), xytext=(-6, 0), textcoords="offset points",
                 fontsize=8, color="#888888", ha="right")
-    ax.annotate("no `ours` val line survived\nbetween 10000 and 15500",
-                (12750, 0.0962), fontsize=8.5, color="#1f77b4", ha="center")
+    ax.axvspan(10000, 18000, color="#1f77b4", alpha=0.05, zorder=0)
+    ax.annotate("ours' log stops at 10000:\n"
+                "the later evals were only ever written to the box",
+                (12400, 0.0960), fontsize=8.5, color="#1f77b4", ha="center")
 
     ax.set_xlabel("optimizer step")
     ax.set_ylabel("val action loss  (3 fixed demos)")

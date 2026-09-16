@@ -182,6 +182,30 @@ rollout number (measured twice, bit-identical) and a per-step val curve --
 not a per-step rollout curve.  `avg_host_rollout.png` deliberately shows the
 two rollout protocol variants and NOT a step axis, because none exists.
 
+### Does the host's number depend on the selection rule?
+
+`best.pt` is written by the trainer's best-val rule, i.e. the conventional
+"report the best validation checkpoint" practice.  For this run **the two
+rules agree**, and that is the useful part: training was stopped at ~18k of
+its 20k budget when the eval was called, and the last val eval (18000,
+0.0694) was also the running minimum.  So 23.3% is simultaneously
+
+- the **endpoint** (last checkpoint of the run), and
+- the **val-best** checkpoint of that run.
+
+That removes the obvious objection "you compared our fixed endpoint against
+the host's best-found checkpoint": both arms are reported at their endpoint,
+and the host's endpoint happens to coincide with its val-best.  The rule
+choice does not decide the comparison, so nothing needs to be switched after
+the fact.
+
+For completeness, applying val-selection to OURS (min val among the recovered
+points) would pick **step 8500 (0.0686)**, where no rollout was ever measured;
+its nearest measured neighbour is 8000 = **15.0%**.  So val selection would
+not have improved our number —— which is the second reason not to switch: the
+rule was fixed before the runs, and the rule that looks "more conventional"
+would have produced a worse number for us, not a better one.
+
 ## Checkpoint selection: why the 15000 endpoint, not the 17000 peak
 
 Every arm is reported at its **fixed-budget endpoint**, and the budget was

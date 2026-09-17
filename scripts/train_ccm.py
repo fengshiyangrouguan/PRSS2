@@ -154,6 +154,9 @@ def parse_args():
                    help="backbone host: llama = vendored LlamaModelCCM "
                         "(R8-R10 line); qwen3 = Qwen3-4B CCM port "
                         "(feature_QWEN)")
+    p.add_argument("--frozen", default="",
+                   help="override the frozen spec path (llama v2 "
+                        "comp-trainable experiment)")
     p.add_argument("--micro-batch", type=int, default=1,
                    help="dialogues per collated batch (Qwen3-line "
                         "throughput option, 2026-09-17).  The per-dialogue "
@@ -291,8 +294,10 @@ FROZEN_PATH = Path(__file__).resolve().parents[1] / "configs" / "ccm" \
 
 
 def _frozen_path(args):
-    """Per-host frozen spec: the Qwen3 line keeps its own file so the
-    Llama line (R8-R10) stays untouched."""
+    """Per-host frozen spec.  --frozen overrides everything (used by the
+    llama v2 comp-trainable experiment)."""
+    if getattr(args, "frozen", ""):
+        return Path(args.frozen)
     name = "frozen_method_qwen3.json" if getattr(args, "host", "llama") \
         == "qwen3" else "frozen_method.json"
     return Path(__file__).resolve().parents[1] / "configs" / "ccm" / name
@@ -401,6 +406,7 @@ def enforce_frozen(args):
 def build_tokenizer(args):
     if args.host == "qwen3":
         from transformers import AutoTokenizer
+        from transformers.models.qwen3.configuration_qwen3 import Qwen3Config
         tok = AutoTokenizer.from_pretrained(args.model_name_or_path)
         # Qwen3 has no pad token: use <|endoftext|> (in the vocab) so the
         # pad id never collides with EOS (<|im_end|>), keeping the EOS
@@ -408,10 +414,24 @@ def build_tokenizer(args):
         if tok.pad_token_id is None:
             tok.pad_token = "<|endoftext|>"
         tok.padding_side = "left"
+        # CRITICAL alignment (2026-09-17): the Qwen3 tokenizer vocab is
+        # 151669 while the model config.vocab_size is 151936 (reserved
+        # rows).  Comp tokens must get ids >= 151936 so the
+        # SeparatedEmbedding routes them to the TRAINABLE comp rows;
+        # otherwise they fall on frozen pretrained main-table rows and
+        # comp_embeddings never receives a gradient (verified: grad 0).
+        cfg_vocab = Qwen3Config.from_pretrained(
+            args.model_name_or_path).vocab_size
+        if len(tok) < cfg_vocab:
+            tok.add_tokens(
+                ["<|extra_{}|>".format(i)
+                 for i in range(cfg_vocab - len(tok))])
         added = [f"<COMP{k}>" for k in range(N_TOK)] \
             + [f"<SUM{k}>" for k in range(N_TOK)]
         tok.add_special_tokens({"additional_special_tokens": added})
         ids = tok.additional_special_tokens_ids[-2 * N_TOK:]
+        assert ids[0] >= cfg_vocab, \
+            "comp ids must exceed config.vocab_size for SeparatedEmbedding"
         tok.comp_token_id = ids[:N_TOK]
         tok.sum_token_id = ids[N_TOK:]
         tok._qwen3_host = True  # eval collator dispatch marker

@@ -55,8 +55,8 @@
     "cadence": "identical task samples and scheduler cadence across the three arms"
   },
   "training": {
-    "steps": 1000,
-    "steps_note": "Qwen3 line Stage A = STRICT OFFICIAL Step-2 merge protocol (user ruling 2026-09-17): random_k truncation per sample, shuffled epoch-loop data stream (each dialogue once per epoch, ~12 epochs over 128k samples), fixed accum-128-dialogues cadence, lr 3e-4 cosine/warmup 3%, NO depth stratification / window dedup / RPBE machinery.  Stage B (ours) starts FROM the Stage-A checkpoint (--init-from), trainable = LoRA + COMP rows + Gamma (user ruling: COMP rows STAY trainable in stage 2, task gradients keep refining them; RPBE touches Gamma only).",
+    "steps": 100,
+    "steps_note": "Stage B (ours) budget = 100 windows (user ruling 2026-09-17; the R10 line capped at 50 — Gamma learns early and plateaus).  Stage A (merge) keeps the official 1000 optimizer steps, see official_protocol.  ours starts FROM the merge checkpoint_step700 (validation-curve best on the deep buckets, user ruling) via --init-from; trainable = LoRA + COMP rows + Gamma (COMP rows STAY trainable in stage 2, task gradients keep refining them; RPBE touches Gamma only).",
     "official_protocol": {
       "arm": "ccm_merge_official",
       "merge_cadence": "official",
@@ -79,9 +79,10 @@
     "seeds": 1,
     "seeds_note": "Qwen3 line starts with seed 0 only (user ruling, same as the R10 v5 line)",
     "eval": "matched-cohort depth curves on the clean test split (protocol C); primary metric = per-token NLL difference, EOS excluded",
-    "checkpoint_every": 50,
+    "checkpoint_every": 10,
+    "checkpoint_every_note": "Stage B 100-window budget -> 10 checkpoints (s10..s100) + final, fine evaluation curve (user ruling 2026-09-17)",
     "schedule_total_steps": 1000,
-    "schedule_note": "warmup/cosine over 1000 steps (warmup ratio 0.03)"
+    "schedule_note": "warmup/cosine over 1000 steps (warmup ratio 0.03): the 100-window Stage B runs inside the warmup-to-peak region of the original 1000-step schedule (same convention as the Llama line, where the e50 pilot kept the 1000-step schedule while stopping at 500)."
   },
   "sampling": {
     "depth_levels": [

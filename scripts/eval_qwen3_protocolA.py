@@ -1,17 +1,15 @@
 #!/usr/bin/env python3
-"""Protocol B (official pooled evaluate_perp semantics) for the Qwen3
-CCM port (feature_QWEN).
+"""Protocol A (5L record-mean) for the Qwen3 CCM port.
 
-Mirrors the Llama-line eval_ccm_official.py OUR_CKPT build-mode path on
-the official protocol: val+test MERGED (clean_split=False), five turn
-buckets (turn_3/4/6/10/14 with the turn-14 bucket using 15 turns),
-target-turn-only CE, EOS excluded, token-weighted perplexity as the
-primary field plus the record-mean loss field.
+Same protocol as the Llama-line turn14_audit_val.py: the clean
+validation cohort of dialogues with >= 15 turns; for each dialogue and
+each depth L in {1, 2, 4, 8, 13}: history = dialog[13-L:13] (L turns),
+context = dialog[13], target = dialog[14] (fixed 15th turn).  The CE is
+scored on the target turn only, EOS excluded, record-mean aggregation
+(dialogue-equal weights): PPL_L = exp(mean_dialogue NLL_L).
 
-Usage:
-  python scripts/eval_qwen3_pooled.py --ckpt /path/checkpoint_step50.pt \
-      --out eval_pooled_step50.json
-  (--ckpt INIT keeps the random trainable init: step-0 baseline.)
+Model build matches train_ccm (SeparatedEmbedding + conditional LoRA +
+optional Gamma); --no-gamma for merge-stage checkpoints.
 """
 import argparse
 import json
@@ -31,6 +29,8 @@ from torch.nn import functional as F
 
 import train_ccm as tc
 
+L_SUFFIXES = [1, 2, 4, 8, 13]
+
 
 def main():
     ap = argparse.ArgumentParser()
@@ -40,14 +40,15 @@ def main():
                     default="/root/autodl-tmp/dailydialog_mirror/"
                             "ijcnlp_dailydialog")
     ap.add_argument("--ckpt", required=True,
-                    help="checkpoint.pt (or INIT for the step-0 baseline)")
+                    help="checkpoint.pt (merge-stage or ours)")
     ap.add_argument("--no-gamma", action="store_true",
-                    help="ccm_merge-arm checkpoints carry no Gamma params "
-                         "(skip attach_gamma)")
+                    help="merge-stage checkpoint (no Gamma params)")
     ap.add_argument("--gpu", type=int, default=0)
-    ap.add_argument("--out", default="eval_qwen3_pooled.json")
-    ap.add_argument("--limit", type=int, default=0,
-                    help="per-bucket dialogue cap (debug)")
+    ap.add_argument("--out", default="eval_qwen3_protocolA.json")
+    ap.add_argument("--limit", type=int, default=0)
+    ap.add_argument("--pooled", action="store_true",
+                    help="val+test merged cohort (official clean_split=False "
+                         "口径, ~102 dialogues) instead of val-only")
     a = ap.parse_args()
 
     import os
@@ -65,9 +66,7 @@ def main():
     tokenizer = tc.build_tokenizer(args)
     eos_id = int(tokenizer.eos_token_id)
 
-    # Official-host build chain (train_ccm_merge semantics): the COMP/SUM
-    # input rows live in a trainable SeparatedEmbedding, the lm_head
-    # keeps the base vocab, no resize.
+    # model build: official layout + conditional LoRA + optional Gamma
     from transformers.models.qwen3.configuration_qwen3 import Qwen3Config
     from src.arch.ccm_qwen3 import Qwen3ForCausalLM_CCM
     from src.utils import SeparatedEmbedding
@@ -85,7 +84,6 @@ def main():
     model.update_comp_token(
         [tokenizer.comp_token_id[k] for k in range(tc.N_TOK)],
         [tokenizer.sum_token_id[k] for k in range(tc.N_TOK)])
-    # trainable set = LoRA + comp rows (same as train_ccm_merge)
     for _p in model.parameters():
         _p.requires_grad_(False)
     for _n, _p in model.named_parameters():
@@ -97,13 +95,9 @@ def main():
         tc.attach_gamma(model, hidden=args.gamma_hidden)
     dummy = torch.optim.AdamW(
         [p for p in model.parameters() if p.requires_grad], lr=1e-3)
-    if a.ckpt != "INIT":
-        tc.load_trainable(a.ckpt, model, dummy, device,
-                          load_optimizer=False)
-        print("[eval] checkpoint loaded: {}".format(a.ckpt), flush=True)
-    else:
-        print("[eval] INIT: random trainable init kept", flush=True)
+    tc.load_trainable(a.ckpt, model, dummy, device, load_optimizer=False)
     model.eval()
+    print("[eval] checkpoint loaded: {}".format(a.ckpt), flush=True)
 
     from src.arguments import CompressionArguments
     from src.data.dialogue.qwen3_data import (
@@ -112,60 +106,61 @@ def main():
                                      num_comp_tokens=tc.N_TOK,
                                      add_comp_token=True,
                                      relative_embedding="skip")
-    dialog = Qwen3DialogueDataset(tokenizer, mirror=a.dialog_mirror,
-                                  pooled=True)
+    dialog = Qwen3DialogueDataset(tokenizer, mirror=a.dialog_mirror)
     collator = Qwen3DialogueCollator(
         dataset=dialog, tokenizer=tokenizer, comp_args=comp_args,
         comp_token=tokenizer.comp_token_id,
         sum_token=tokenizer.sum_token_id,
         pad_token=tokenizer.pad_token_id, label_pad_token_id=-100)
 
+    # cohort: >= 15-turn dialogues (val only, or val+test pooled)
+    src_items = dialog.valset + dialog.testset if a.pooled \
+        else dialog.valset
+    cohort = [(i, d["dialog"]) for i, d in enumerate(src_items)
+              if len(d["dialog"]) >= 15]
+    if a.limit:
+        cohort = cohort[:a.limit]
+    print("[eval] cohort: {} dialogues >= 15 turns".format(len(cohort)),
+          flush=True)
+
     results = {}
-    for name, items in dialog.eval_dataset.items():
-        if a.limit:
-            items = items[:a.limit]
-        items = [dict(it) for it in items]
-        for it in items:
-            it["fixed_depth"] = True  # bucket turn count is authoritative
-        tot_nll = 0.0
-        tot_tok = 0
-        sum_dlg_mean = 0.0
-        n_dlg = 0
+    for L in L_SUFFIXES:
+        nlls = []
         with torch.no_grad():
-            for i in range(0, len(items), 8):
-                batch = collator(items[i:i + 8])
+            for _i, d in cohort:
+                # L history turns + context (turn 14) + fixed target
+                # (turn 15): L+2 turns so the collator compresses exactly
+                # the L history turns and predicts dialog[14].
+                item = {"dialog": list(d[13 - L:13]) + [list(d[13]),
+                                                        list(d[14])],
+                        "act": [], "orig": [], "split": "validation",
+                        "is_train": False, "fixed_depth": True}
+                batch = collator([item])
                 out = tc.run_forward(model, batch, device,
                                      grad_enabled=False)
                 logits = out.logits
                 labs = batch["labels"].to(device)
                 sh = logits[..., :-1, :].contiguous()
                 sl = labs[..., 1:].contiguous().clone()
-                # official _loglikelihood_clm: EOS excluded
                 sl = sl.masked_fill(sl == eos_id, -100)
-                B = sh.shape[0]
-                row_n = (sl != -100).sum(-1)  # [B]
-                row_loss = F.cross_entropy(
+                n = int((sl != -100).sum())
+                if n == 0:
+                    continue
+                loss = F.cross_entropy(
                     sh.view(-1, sh.shape[-1]), sl.reshape(-1),
-                    ignore_index=-100, reduction="none").view(
-                        B, -1).sum(-1)
-                tot_nll += float(row_loss.detach().sum())
-                tot_tok += int(row_n.sum())
-                row_mean = row_loss / row_n.clamp(min=1)
-                sum_dlg_mean += float(row_mean.detach().sum())
-                n_dlg += B
-        results[name] = {
-            "perplexity": math.exp(tot_nll / max(tot_tok, 1)),
-            "loss": sum_dlg_mean / max(n_dlg, 1),
-            "tokens": tot_tok,
-            "dialogues": n_dlg,
-        }
-        print("{}: perplexity={:.4f} loss={:.4f} ({} tok, {} dlg)".format(
-            name, results[name]["perplexity"], results[name]["loss"],
-            tot_tok, n_dlg), flush=True)
+                    ignore_index=-100, reduction="sum")
+                nlls.append(float(loss) / n)
+        mean_nll = sum(nlls) / max(len(nlls), 1)
+        results["L{}".format(L)] = {
+            "ppl": math.exp(mean_nll), "mean_nll": mean_nll,
+            "dialogues": len(nlls)}
+        print("L={}: PPL={:.4f} mean_nll={:.4f} ({} dlg)".format(
+            L, results["L{}".format(L)]["ppl"], mean_nll, len(nlls)),
+            flush=True)
 
     with open(a.out, "w") as f:
         json.dump(results, f, indent=2)
-    print("pooled protocol B done -> {}".format(a.out), flush=True)
+    print("protocol A done -> {}".format(a.out), flush=True)
 
 
 if __name__ == "__main__":

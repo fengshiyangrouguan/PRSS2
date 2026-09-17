@@ -1,0 +1,55 @@
+{
+  "_comment": "Llama-line v2 experiment (2026-09-17, user ruling): RPBE + comp JOINT training from the OFFICIAL merged model (Step-1 foundation merged + released Step-2 merge_recur adapter + trainable SeparatedEmbedding comp rows + Gamma). 60 windows, checkpoint every 10, protocol A (val+test pooled) evaluation.  The R10 frozen_method.json stays untouched.",
+  "backbone": {
+    "model": "llama-7b (original LLaMA-7B) + Step-1 llama-7b-no MERGED + released Step-2 adapter llama-7b-no-online-merge_recur-ntok2",
+    "hf_identifier": "huggyllama/llama-7b",
+    "attn_type": "merge_recur",
+    "n_tok_lock": 2,
+    "comp_trainable": "true (official SeparatedEmbedding semantics; comp rows train alongside Gamma — the JOINT experiment; task gradients update LoRA+comp, RPBE updates Gamma only under rpbe_gamma_only)"
+  },
+  "adapter": {
+    "lora_r": 8
+  },
+  "rpbe": {
+    "ridge_eps": 0.001,
+    "sketch_dim_m": 32,
+    "rpbe_map_seed": 0,
+    "z_v_dim": 128,
+    "horizon_weights": [0.5, 0.5],
+    "lambda_calibration": {
+      "rule": "r_eff ~ 0.1 on theta_0",
+      "lambda_kf": 0.005936691082765761,
+      "lambda_kf_note": "R10 value kept (user ruling 2026-09-18).  The joint-theta_0 recalibration returned r_eff_gamma=16.844 -> 0.005937 (diff ~3e-9 from this value); the R10 constant is authoritative for the joint run."
+    },
+    "sketch_ensemble_n_branches": 4,
+    "oas_shrinkage": {
+      "enabled": true
+    }
+  },
+  "gamma": {
+    "placement": "attached (ours arm)",
+    "hidden": 64,
+    "time_dim": 16
+  },
+  "window": {
+    "min_effective_cuts": 128,
+    "collection": "adaptive by effective cut count"
+  },
+  "training": {
+    "steps": 60,
+    "steps_note": "60 windows (user ruling 2026-09-17): RPBE + comp joint training from the official merged start.",
+    "grad_clip": 1.0,
+    "merge_cadence": "window-matched",
+    "rpbe_gamma_only": true,
+    "rpbe_lr": 0.00005,
+    "seeds": 1,
+    "checkpoint_every": 10,
+    "schedule_total_steps": 1000,
+    "schedule_note": "original 1000-step warmup/cosine schedule kept"
+  },
+  "sampling": {
+    "depth_levels": [1, 2, 4, 8, 13],
+    "k_of_L": "L + 2",
+    "rule": "R10 depth-stratified protocol (inverse-sqrt weights + 3x cap, one dialogue per window) — unchanged for the llama line"
+  }
+}

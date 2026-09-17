@@ -96,14 +96,25 @@ def save_json(path, obj):
 def build_tokenizer(args):
     if args.host == "qwen3":
         from transformers import AutoTokenizer
+        from transformers.models.qwen3.configuration_qwen3 import Qwen3Config
         tok = AutoTokenizer.from_pretrained(args.model_name_or_path)
         if tok.pad_token_id is None:
             tok.pad_token = "<|endoftext|>"
         tok.padding_side = "left"
+        # Align the tokenizer vocab to config.vocab_size so comp ids land
+        # >= 151936 and the SeparatedEmbedding routes them to the
+        # TRAINABLE comp rows (see train_ccm.build_tokenizer).
+        cfg_vocab = Qwen3Config.from_pretrained(
+            args.model_name_or_path).vocab_size
+        if len(tok) < cfg_vocab:
+            tok.add_tokens(
+                ["<|extra_{}|>".format(i)
+                 for i in range(cfg_vocab - len(tok))])
         added = [f"<COMP{k}>" for k in range(N_TOK)] \
             + [f"<SUM{k}>" for k in range(N_TOK)]
         tok.add_special_tokens({"additional_special_tokens": added})
         ids = tok.additional_special_tokens_ids[-2 * N_TOK:]
+        assert ids[0] >= cfg_vocab
         tok.comp_token_id = ids[:N_TOK]
         tok.sum_token_id = ids[N_TOK:]
         return tok

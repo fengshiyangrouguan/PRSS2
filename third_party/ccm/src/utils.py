@@ -66,6 +66,13 @@ class SeparatedEmbedding(nn.Module):
         input_ids_ -= self.n_vocab
         input_ids_[~mask] = 0  # mask out original tokens
         comp_token_embeds = self.comp_embeddings(input_ids_)
+        # dtype consistency (Qwen3-line fix 2026-09-17): comp_embeddings
+        # is fp32 (trainable storage) but the backbone runs bf16 — the
+        # mixed fp32/bf16 embeds would promote the whole forward chain
+        # to fp32 and break the Gamma index_add dtype contract.  Cast
+        # the lookup to the main embedding dtype (no-op on the fp32
+        # official host).
+        comp_token_embeds = comp_token_embeds.to(input_embeds.dtype)
 
         mask = mask.to(comp_token_embeds.dtype).unsqueeze(-1)
         embeds = mask * comp_token_embeds + (1 - mask) * input_embeds  # mix

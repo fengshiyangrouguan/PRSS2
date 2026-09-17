@@ -254,6 +254,13 @@ def parse_args():
     p.add_argument("--checkpoint-every", type=int, default=250)
     p.add_argument("--resume-from", default="",
                    help="resume from an adapter-only checkpoint.pt")
+    p.add_argument("--init-from", default="",
+                   help="two-stage flow (Qwen3 line): initialize the "
+                        "trainable weights (LoRA + COMP rows) from a "
+                        "merge-stage checkpoint and train from step 0 "
+                        "(no optimizer/data-stream state).  Gamma stays "
+                        "zero-init by design; non-Gamma missing keys "
+                        "still fail fast.")
     p.add_argument("--max-pending-mbs", type=int, default=2048,
                    help="degenerate-window guard: pending cap before abort")
     p.add_argument("--max-windows", type=int, default=0,
@@ -430,6 +437,7 @@ def build_model(args, device):
     if args.host == "qwen3":
         from transformers.models.qwen3.configuration_qwen3 import Qwen3Config
         from src.arch.ccm_qwen3 import Qwen3ForCausalLM_CCM
+        from src.utils import SeparatedEmbedding
         if args.official_host or args.foundation:
             raise SystemExit(
                 "[qwen3] --official-host/--foundation are Llama-line "
@@ -437,11 +445,15 @@ def build_model(args, device):
                 "theta_0 (frozen backbone + conditional LoRA)")
         config = Qwen3Config.from_pretrained(args.model_name_or_path)
         config.comp_relative_embedding = args.relative_embedding
+        # Two-stage official layout (train_ccm_merge semantics): the
+        # COMP/SUM rows live in a SeparatedEmbedding; the lm_head keeps
+        # the base vocab (no resize).
         model = Qwen3ForCausalLM_CCM.from_pretrained(
             args.model_name_or_path, config=config,
             torch_dtype=torch.bfloat16 if device.type == "cuda"
             else torch.float32)
-        model.resize_token_embeddings(config.vocab_size + 2 * N_TOK)
+        model.model.embed_tokens = SeparatedEmbedding(
+            model.model.embed_tokens, 2 * N_TOK)
         model.update_comp_token(
             [config.vocab_size + k for k in range(N_TOK)],
             [config.vocab_size + N_TOK + k for k in range(N_TOK)])
@@ -1139,6 +1151,13 @@ def main():
         model.update_comp_token(
             [tokenizer.comp_token_id[k] for k in range(N_TOK)],
             [tokenizer.sum_token_id[k] for k in range(N_TOK)])
+        if args.host == "qwen3":
+            # Two-stage flow (user ruling 2026-09-17): the COMP rows
+            # stay TRAINABLE in stage 2 — the merge checkpoint is the
+            # init, task gradients keep refining them (RPBE still
+            # touches Gamma only under --rpbe-gamma-only).
+            model.base_model.model.model.embed_tokens \
+                .comp_embeddings.weight.requires_grad_(True)
     use_rpbe = args.arm in ("ours", "gamma_task_only")
     if use_rpbe and args.micro_batch > 1:
         raise SystemExit(
@@ -1147,6 +1166,28 @@ def main():
             "protocols); batch>1 is currently a task-only option")
     if use_rpbe:
         attach_gamma(model, hidden=args.gamma_hidden)
+    if args.init_from:
+        # Two-stage init: the merge checkpoint carries LoRA + COMP rows
+        # (trainable in stage 2) but NO Gamma — Gamma keeps its zero
+        # init by design (stage 2 starts from the exact merge model).
+        _payload = torch.load(args.init_from, map_location=device,
+                              weights_only=False)
+        _missing, _unexpected = model.load_state_dict(
+            _payload["model"], strict=False)
+        if _unexpected:
+            raise RuntimeError("init-from unexpected keys: {}"
+                               .format(sorted(_unexpected)[:5]))
+        _trainable = {n for n, p in model.named_parameters()
+                      if p.requires_grad}
+        _bad = sorted(set(_missing) & _trainable)
+        # Gamma keys are the ONLY allowed missing trainable keys.
+        _bad = [k for k in _bad if "gamma" not in k]
+        if _bad:
+            raise RuntimeError(
+                "init-from checkpoint is missing trainable params: {}"
+                .format(_bad[:5]))
+        print("[init-from] loaded {} (Gamma zero-init kept)".format(
+            args.init_from), flush=True)
     cfg = model.model.config
     # Tree-wise projection scope: the Gamma parameters of every layer.
     gamma_params = []

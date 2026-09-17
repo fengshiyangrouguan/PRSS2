@@ -15,11 +15,16 @@ from torch import nn
 
 def _module_device(embed_tokens):
     """Device of an embedding module that may be an official
-    SeparatedEmbedding (no top-level .weight; it keeps .device)."""
+    SeparatedEmbedding (no top-level .weight; its .device attribute is
+    STALE — set at construction, before model.to(cuda) — so fall back
+    to a real parameter's device)."""
     try:
         return embed_tokens.weight.device
     except AttributeError:
-        return embed_tokens.device
+        pass
+    for _p in embed_tokens.parameters():
+        return _p.device
+    return embed_tokens.device
 
 
 

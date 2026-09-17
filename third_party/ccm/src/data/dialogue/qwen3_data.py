@@ -111,6 +111,8 @@ class Qwen3DialogueDataset:
         self.trainset = self._splits["train"]
         self.valset = self._splits["validation"]
         self.testset = self._splits["test"]
+        # train_ccm compatibility alias (next_batch consumes train_dataset)
+        self.train_dataset = self.trainset
         print("[qwen3-dialog] train {} / val {} / test {}".format(
             len(self.trainset), len(self.valset), len(self.testset)))
 

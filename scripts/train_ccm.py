@@ -500,7 +500,7 @@ def build_dataset(args, tokenizer):
             Qwen3DialogueDataset, Qwen3DialogueCollator)
         dialog = Qwen3DialogueDataset(tokenizer, mirror=args.dialog_mirror)
         collator = Qwen3DialogueCollator(
-            dialog=dialog, tokenizer=tokenizer, comp_args=comp_args,
+            dataset=dialog, tokenizer=tokenizer, comp_args=comp_args,
             comp_token=tokenizer.comp_token_id,
             sum_token=tokenizer.sum_token_id,
             pad_token=tokenizer.pad_token_id,

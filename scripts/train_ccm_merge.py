@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Qwen3-line Stage A: STRICT official CCM Step-2 merge training.
 
-Independent entry point (user ruling 2026-09-17) — NO RPBE machinery.
-The official protocol, verbatim where the host allows it:
+SELF-CONTAINED entry point (user ruling 2026-09-17) — no dependency on
+train_ccm.py, no RPBE machinery.  The official protocol, verbatim where
+the host allows it:
 
   - random_k truncation per sample (k ~ U[3, len] on train only);
   - shuffled epoch-loop data stream (each dialogue exactly once per
@@ -43,18 +44,14 @@ for p in (str(SRC), str(CCM), str(HERE)):
     if p not in sys.path:
         sys.path.insert(0, p)
 
-import train_ccm as tc  # reuse tokenizer/dataset/forward/CE helpers
-
-N_TOK = tc.N_TOK
+N_TOK = 2  # official dialog line: n_tok = 2 (2 COMP + 2 SUM)
 
 
 def parse_args():
     p = argparse.ArgumentParser(
-        "Qwen3 CCM merge training (official Step-2 protocol, no RPBE)")
+        "CCM merge training (official Step-2 protocol, self-contained)")
     p.add_argument("--model-name-or-path", required=True)
-    p.add_argument("--host", default="qwen3", choices=["llama", "qwen3"],
-                   help="backbone host (train_ccm_merge is the Qwen3-line "
-                        "official entry; llama kept for reference)")
+    p.add_argument("--host", default="qwen3", choices=["llama", "qwen3"])
     p.add_argument("--dialog-mirror", required=True)
     p.add_argument("--output", required=True)
     p.add_argument("--seed", type=int, default=0)
@@ -79,10 +76,61 @@ def parse_args():
     return p.parse_args()
 
 
+# ---------------------------------------------------------------------------
+# builders (shared logic, local copies so this entry stays standalone)
+# ---------------------------------------------------------------------------
+
+def seed_all(seed):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
+def save_json(path, obj):
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(obj, f, indent=2)
+
+
+def build_tokenizer(args):
+    if args.host == "qwen3":
+        from transformers import AutoTokenizer
+        tok = AutoTokenizer.from_pretrained(args.model_name_or_path)
+        if tok.pad_token_id is None:
+            tok.pad_token = "<|endoftext|>"
+        tok.padding_side = "left"
+        added = [f"<COMP{k}>" for k in range(N_TOK)] \
+            + [f"<SUM{k}>" for k in range(N_TOK)]
+        tok.add_special_tokens({"additional_special_tokens": added})
+        ids = tok.additional_special_tokens_ids[-2 * N_TOK:]
+        tok.comp_token_id = ids[:N_TOK]
+        tok.sum_token_id = ids[N_TOK:]
+        return tok
+    from transformers import LlamaTokenizer
+    tok = LlamaTokenizer.from_pretrained(args.model_name_or_path)
+    tok.pad_token = tok.eos_token
+    tok.pad_token_id = tok.pad_token_id if tok.pad_token_id is not None \
+        else tok.eos_token_id
+    tok.bos_token_id = tok.bos_token_id or 1
+    tok.eos_token_id = tok.eos_token_id or 2
+    tok.padding_side = "left"
+    added = [f"<COMP{k}>" for k in range(N_TOK)] \
+        + [f"<SUM{k}>" for k in range(N_TOK)]
+    tok.add_special_tokens({"additional_special_tokens": added})
+    ids = tok.additional_special_tokens_ids[-2 * N_TOK:]
+    tok.comp_token_id = ids[:N_TOK]
+    tok.sum_token_id = ids[N_TOK:]
+    return tok
+
+
 def build_model_merge(args, device):
-    """Official-host semantics on Qwen3: SeparatedEmbedding with
-    TRAINABLE COMP/SUM rows; the lm_head stays at the base vocab (comp
-    tokens have no output rows); no resize_token_embeddings."""
+    """Official-host semantics: SeparatedEmbedding with TRAINABLE
+    COMP/SUM rows; the lm_head stays at the base vocab (comp tokens have
+    no output rows); no resize_token_embeddings."""
+    if args.host != "qwen3":
+        raise NotImplementedError(
+            "train_ccm_merge currently targets the qwen3 host")
     from transformers.models.qwen3.configuration_qwen3 import Qwen3Config
     from src.arch.ccm_qwen3 import Qwen3ForCausalLM_CCM
     from src.utils import SeparatedEmbedding
@@ -92,9 +140,6 @@ def build_model_merge(args, device):
         args.model_name_or_path, config=config,
         torch_dtype=torch.bfloat16 if device.type == "cuda"
         else torch.float32)
-    # Official two-stage layout: input-side comp embeddings live in a
-    # separate trainable embedding; the frozen embedding/head keep the
-    # base vocab exactly.
     model.model.embed_tokens = SeparatedEmbedding(
         model.model.embed_tokens, 2 * N_TOK)
     model.update_comp_token(
@@ -108,9 +153,8 @@ def wrap_lora_merge(model, r, dropout):
     LoRA params + the SeparatedEmbedding comp rows."""
     from peft import LoraConfig
     from src import peft_custom
-    cfg = LoraConfig(r=int(r), lora_alpha=2 * int(r),
-                     lora_dropout=float(dropout), bias="none",
-                     task_type="CAUSAL_LM",
+    cfg = LoraConfig(r=int(r), lora_alpha=16, lora_dropout=float(dropout),
+                     bias="none", task_type="CAUSAL_LM",
                      target_modules=["q_proj", "k_proj", "v_proj",
                                      "o_proj"])
     model = peft_custom.get_peft_model(model, cfg)
@@ -126,24 +170,115 @@ def wrap_lora_merge(model, r, dropout):
     return model
 
 
+def build_dataset(args, tokenizer):
+    from src.arguments import CompressionArguments
+    os.environ["DIALOG_MIRROR"] = args.dialog_mirror
+    comp_args = CompressionArguments(attn_type="merge_recur",
+                                     num_comp_tokens=N_TOK,
+                                     add_comp_token=True,
+                                     relative_embedding=args.relative_embedding)
+    if args.host == "qwen3":
+        from src.data.dialogue.qwen3_data import (
+            Qwen3DialogueDataset, Qwen3DialogueCollator)
+        dialog = Qwen3DialogueDataset(tokenizer, mirror=args.dialog_mirror)
+        collator = Qwen3DialogueCollator(
+            dataset=dialog, tokenizer=tokenizer, comp_args=comp_args,
+            comp_token=tokenizer.comp_token_id,
+            sum_token=tokenizer.sum_token_id,
+            pad_token=tokenizer.pad_token_id,
+            label_pad_token_id=-100)
+        return dialog, collator
+    from src.data.dialogue.data import DialogueDataset
+    from src.data.dialogue.collator import DataCollatorForDialogue_LLAMA
+    dialog = DialogueDataset(tokenizer, comp_token=tokenizer.comp_token_id,
+                             online=True, add_comp_token=True,
+                             clean_split=True)
+    collator = DataCollatorForDialogue_LLAMA(
+        dialog=dialog, tokenizer=tokenizer, comp_args=comp_args,
+        comp_token=tokenizer.comp_token_id, sum_token=tokenizer.sum_token_id,
+        padding="left", pad_token=tokenizer.pad_token_id,
+        label_pad_token_id=-100)
+    return dialog, collator
+
+
+def run_forward(model, batch, device, grad_enabled):
+    """Forward with the visibility mask folded in (merge_recur).  The
+    autocast dtype follows the backbone weight dtype (bf16 Qwen3)."""
+    ctx = torch.enable_grad() if grad_enabled else torch.no_grad()
+    amc = batch.get("attention_mask_comp")
+    _dt = next(model.parameters()).dtype
+    _acast_dt = _dt if _dt in (torch.float16, torch.bfloat16) \
+        else torch.float16
+    with ctx:
+        with torch.autocast(device_type="cuda", dtype=_acast_dt,
+                            enabled=(device.type == "cuda")):
+            return model(input_ids=batch["input_ids"].to(device),
+                         attention_mask=batch["attention_mask"].to(device),
+                         attention_mask_comp=amc.to(device)
+                         if amc is not None else None)
+
+
+def task_ce_rows(out, labels, device):
+    """Per-dialogue-row shifted CE: (row_sum [B], row_n [B]).  The
+    row-wise reduction keeps the equal-weight-per-dialogue objective
+    intact when several dialogues share one collated batch."""
+    logits = out.logits
+    labs = labels.to(device)
+    shift_logits = logits[..., :-1, :].contiguous()
+    shift_labels = labs[..., 1:].contiguous()
+    B = shift_logits.shape[0]
+    row_n = (shift_labels != -100).sum(-1)
+    loss = torch.nn.functional.cross_entropy(
+        shift_logits.view(-1, shift_logits.shape[-1]),
+        shift_labels.reshape(-1), ignore_index=-100, reduction="none")
+    row_sum = loss.view(B, -1).sum(-1)
+    return row_sum, row_n
+
+
+def task_ce_shifted(out, labels, device):
+    """Official CCM task CE: shifted sum + valid count."""
+    logits = out.logits
+    labs = labels.to(device)
+    shift_logits = logits[..., :-1, :].contiguous()
+    shift_labels = labs[..., 1:].contiguous()
+    n_valid = int((shift_labels != -100).sum())
+    loss = torch.nn.functional.cross_entropy(
+        shift_logits.view(-1, shift_logits.shape[-1]),
+        shift_labels.view(-1), ignore_index=-100, reduction="sum")
+    return loss, n_valid
+
+
+def save_trainable(path, model, **extra):
+    """Trainable params only (LoRA + the SeparatedEmbedding comp rows;
+    the frozen backbone is not stored)."""
+    payload = {
+        "model": {n: p.detach().cpu() for n, p in model.named_parameters()
+                  if p.requires_grad},
+    }
+    payload.update(extra)
+    torch.save(payload, path)
+
+
+# ---------------------------------------------------------------------------
+# training loop (official protocol)
+# ---------------------------------------------------------------------------
+
 def main():
     args = parse_args()
-    tc.seed_all(args.seed)
+    seed_all(args.seed)
     device = torch.device(
         f"cuda:{args.gpu}" if torch.cuda.is_available() else "cpu")
     out = Path(args.output)
     out.mkdir(parents=True, exist_ok=True)
 
-    os.environ["DIALOG_MIRROR"] = args.dialog_mirror
-    tokenizer = tc.build_tokenizer(args)
+    tokenizer = build_tokenizer(args)
     model = build_model_merge(args, device)
     model = wrap_lora_merge(model, args.lora_r, args.lora_dropout)
-    # tokenizer ids == base vocab + k (SeparatedEmbedding routing)
     model.update_comp_token(
         [tokenizer.comp_token_id[k] for k in range(N_TOK)],
         [tokenizer.sum_token_id[k] for k in range(N_TOK)])
-    _, collator = tc.build_dataset(args, tokenizer)
-    train_items = collator.dialog.trainset
+    dialog, collator = build_dataset(args, tokenizer)
+    train_items = dialog.trainset
     n_items = len(train_items)
 
     params = [p for p in model.parameters() if p.requires_grad]
@@ -176,7 +311,7 @@ def main():
                 n_epochs += 1
             items.append(dict(train_items[int(shuf_order[epoch_pos])]))
             epoch_pos += 1
-        # NO fixed_depth -> collator applies the official random_k
+        # NO fixed_depth -> the collator applies the official random_k
         return collator(items)
 
     step = 0
@@ -196,21 +331,21 @@ def main():
             task_sum = 0.0
             n_tokens = 0
             for b in pending:
-                out = tc.run_forward(model, b, device, grad_enabled=True)
+                fwd_out = run_forward(model, b, device, grad_enabled=True)
                 if args.micro_batch > 1:
-                    row_sum, row_n = tc.task_ce_rows(out, b["labels"],
-                                                     device)
+                    row_sum, row_n = task_ce_rows(fwd_out, b["labels"],
+                                                  device)
                     row_mean = row_sum / row_n.clamp(min=1)
                     loss_scale = row_mean.sum() / float(n_dial)
                     task_sum += float(row_sum.detach().sum())
                     n_tokens += int(row_n.sum())
                 else:
-                    task_raw, n_valid = tc.task_ce_shifted(
-                        out, b["labels"], device)
-                    task_mean = task_raw / max(n_valid, 1)
+                    task_raw, n_valid = task_ce_shifted(
+                        fwd_out, b["labels"], device)
                     # official accelerate semantics: loss /
                     # gradient_accumulation_steps
-                    loss_scale = task_mean / float(len(pending))
+                    loss_scale = task_raw / max(n_valid, 1) \
+                        / float(len(pending))
                     task_sum += float(task_raw.detach())
                     n_tokens += n_valid
                 loss_scale.backward()
@@ -226,15 +361,15 @@ def main():
                 print("step={} ce_token={:.4f} mbs={} sec={:.1f} "
                       "epoch={}".format(
                           step, total_loss / max(total_tokens, 1),
-                          step * (args.grad_accum),
+                          step * args.grad_accum,
                           time.time() - t_start, n_epochs), flush=True)
             if step % args.checkpoint_every == 0:
-                tc.save_trainable(
-                    out / f"checkpoint_step{step}.pt", model, step=step)
+                save_trainable(out / f"checkpoint_step{step}.pt", model,
+                               step=step)
                 print("[ckpt] saved step {}".format(step), flush=True)
 
-    tc.save_trainable(out / "final.pt", model, step=step)
-    tc.save_json(out / "summary.json", {
+    save_trainable(out / "final.pt", model, step=step)
+    save_json(out / "summary.json", {
         "arm": "ccm_merge_official", "protocol": "official Step-2 merge",
         "seed": args.seed, "steps": step,
         "mean_task_ce_per_token": total_loss / max(total_tokens, 1),

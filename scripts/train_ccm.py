@@ -1014,6 +1014,11 @@ def new_token_rows(model):
     if getattr(model, "_official_host", False):
         return None
     emb = model.get_input_embeddings()
+    if not hasattr(emb, "weight"):
+        # SeparatedEmbedding (train_ccm_merge path): the comp rows are
+        # TRAINABLE and already part of trainable_state_dict — nothing
+        # extra to save.
+        return None
     lm = model.lm_head
     n = 2 * N_TOK
     return {

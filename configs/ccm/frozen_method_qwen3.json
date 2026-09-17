@@ -1,0 +1,83 @@
+{
+  "_comment": "Qwen3 line frozen method (feature_QWEN, 2026-09-17). Same machine-readable freeze contract as frozen_method.json, separate file so the Llama line (R8-R10) stays untouched. Sources: CCM paper two-stage protocol (skip Step-1 for aligned instruct backbones, official README rule), RPBE hyper-params carried from the Llama line EXCEPT lambda_kf which must be recalibrated on the Qwen3 geometry (constants are never reused across hosts).",
+  "frozen_source": "CCM official dialog protocol (max_steps 1000, lr 3e-4, accum-equivalent 128 effective cuts per window) + Llama-line RPBE structure (chain-wise multi-cut, gamma-only, window-matched cadence)",
+  "backbone": {
+    "model": "Qwen3-4B-Instruct-2507 (aligned instruct backbone: official Step-1 default-LoRA pretraining is SKIPPED per the CCM README rule)",
+    "hf_identifier": "Qwen/Qwen3-4B-Instruct-2507",
+    "revision": "cdbee75f17c01a7cc42f958dc650907174af0554",
+    "transformers": "4.56.2",
+    "vendored_commit": "a89dd08e2c9587ec9c6c3ad339bb154c33e6b41a",
+    "attn_type": "merge_recur",
+    "n_tok_lock": 2,
+    "torch_compile": "disabled on all three arms",
+    "dtype": "bf16"
+  },
+  "adapter": {
+    "lora_r": 8,
+    "lora_alpha": 16,
+    "lora_dropout": 0.0,
+    "lora_r_note": "r=8 q/k/v/o conditional LoRA (trainable count 5,898,240, matches the port spec allowlist bit-for-bit; verified in the 4B smoke)"
+  },
+  "rpbe": {
+    "ridge_eps": 0.001,
+    "sketch_dim_m": 32,
+    "rpbe_map_seed": 0,
+    "z_v_dim": 128,
+    "horizon_weights": [
+      0.5,
+      0.5
+    ],
+    "lambda_calibration": {
+      "rule": "r_eff = lambda * ||g_KF|| / ||g_task|| ~ 0.1, measured on theta_0 (calibration-only run, before ANY optimizer/scheduler step), calibrated once on the initial full window (training-only), then frozen for all seeds. GAMMA-scope measurement (R10 rule): r_eff is the gradient-norm ratio on the Gamma parameters only.",
+      "lambda_kf": null,
+      "lambda_kf_note": "PENDING Qwen3 recalibration: the Llama value 0.00594 (r_eff=16.84 on llama-7b K/V geometry) is NOT reused. Commit the derived lambda here before the formal ours runs."
+    },
+    "z_v_source": "J_mem(M_v) fixed adapter (TGN identity is its special case); GQA hosts lift the memory from the KV heads (8) with head_dim 128",
+    "witness": "none (main experiment)",
+    "sketch_ensemble_n_branches": 4,
+    "sketch_ensemble_note": "Four independent 32-dim branches (J_ens = mean_r J_r); depth bucket b(L_v) modulates the future signature phi_r.",
+    "oas_shrinkage": {
+      "enabled": true,
+      "rule": "paired OAS covariance shrinkage per branch; the fixed ridge keeps only its numerical-safety role."
+    }
+  },
+  "gamma": {
+    "placement": "one module per layer, shared across the K/V merges and the two COMP/SUM slots",
+    "hidden": 64,
+    "time_dim": 16,
+    "init_scale": 0.02,
+    "zero_init": "U0=0 zero-output projection init: R = U tanh(V [prev;cur;time(t)]) with U.weight exactly 0 and V small random. Step 0 residual is bit-for-bit zero (verified: max|dlogit|=0.0 on the 4B smoke).",
+    "parameter_budget": "36 layers (Qwen3-4B) x ~25.7k = ~925k < 1M"
+  },
+  "window": {
+    "min_effective_cuts": 128,
+    "collection": "adaptive by effective cut count (dialogues with k>=4), not a mechanical microbatch count",
+    "cadence": "identical task samples and scheduler cadence across the three arms"
+  },
+  "training": {
+    "steps": 1000,
+    "steps_note": "Qwen3 line: paper-standard 1000 optimizer-step-equivalent budget (window-matched cadence: 1000 windows x ~142 microbatch ~= the official 1000 steps x accum 128 sample volume). Stage A = ccm_merge on this budget; ours starts FROM the Stage-A checkpoint (paper two-stage flow), lambda recalibrated on that theta_0.",
+    "grad_clip": 1.0,
+    "grad_clip_source": "official HF Trainer default (max_grad_norm)",
+    "merge_cadence": "window-matched",
+    "merge_cadence_note": "all three arms fire an update on the same adaptive boundary (>= min_effective_cuts dialogues with k>=4)",
+    "two_pass_replay": "pass1 no-grad statistics forward, pass2 grad replay forward (training only)",
+    "seeds": 1,
+    "seeds_note": "Qwen3 line starts with seed 0 only (user ruling, same as the R10 v5 line)",
+    "eval": "matched-cohort depth curves on the clean test split (protocol C); primary metric = per-token NLL difference, EOS excluded",
+    "checkpoint_every": 50,
+    "schedule_total_steps": 1000,
+    "schedule_note": "warmup/cosine over 1000 steps (warmup ratio 0.03)"
+  },
+  "sampling": {
+    "depth_levels": [
+      1,
+      2,
+      4,
+      8,
+      13
+    ],
+    "k_of_L": "L + 2 (fixed prefix length per depth)",
+    "rule": "depth-stratified legal cuts: q_L ~ 1/sqrt(n_L) with 3x-uniform oversampling cap; ONE original dialogue per window (tree_id = stable original dialogue id); L=1 dialogues carry task CE only."
+  }
+}

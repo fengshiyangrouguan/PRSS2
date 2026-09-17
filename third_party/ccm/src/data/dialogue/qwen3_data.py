@@ -88,7 +88,7 @@ class Qwen3DialogueDataset:
     """
 
     def __init__(self, tokenizer, mirror, max_len_turn=128,
-                 max_len_total=400):
+                 max_len_total=400, pooled=False):
         self.tokenizer = tokenizer
         dataset = _read_mirror(mirror)
         self._splits = {}
@@ -113,8 +113,30 @@ class Qwen3DialogueDataset:
         self.testset = self._splits["test"]
         # train_ccm compatibility alias (next_batch consumes train_dataset)
         self.train_dataset = self.trainset
-        print("[qwen3-dialog] train {} / val {} / test {}".format(
-            len(self.trainset), len(self.valset), len(self.testset)))
+        if pooled:
+            # official clean_split=False protocol: val + test merged
+            # (protocol B, same as the Llama-line pooled evaluation)
+            self.valset = self.valset + self.testset
+        self.eval_dataset = {
+            "turn_{}".format(k):
+                self._subsample(self.valset, n_turn=k)
+            for k in (3, 4, 6, 10, 15)
+        }
+        print("[qwen3-dialog] train {} / val {} / test {}{}".format(
+            len(self.trainset), len(self.valset), len(self.testset),
+            " (pooled)" if pooled else ""))
+
+    def _subsample(self, items, n_turn):
+        """Official bucket semantics: keep dialogues with >= n_turn turns
+        truncated to the first n_turn (turn_14 bucket uses 15, same as
+        the official _subsample)."""
+        out = []
+        for item in items:
+            if len(item["dialog"]) >= n_turn:
+                it = dict(item)
+                it["dialog"] = list(item["dialog"])[:n_turn]
+                out.append(it)
+        return out
 
     # -- frozen block rendering -------------------------------------------
 

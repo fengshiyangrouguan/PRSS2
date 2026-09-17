@@ -154,6 +154,15 @@ def parse_args():
                    help="backbone host: llama = vendored LlamaModelCCM "
                         "(R8-R10 line); qwen3 = Qwen3-4B CCM port "
                         "(feature_QWEN)")
+    p.add_argument("--micro-batch", type=int, default=1,
+                   help="dialogues per collated batch (Qwen3-line "
+                        "throughput option, 2026-09-17).  The per-dialogue "
+                        "equal-weight gradient normalization is PRESERVED "
+                        "bit-for-bit (row-wise mean CE summed over the "
+                        "window's dialogue count), so batch>1 changes only "
+                        "numerical reorder inside the kernels, not the "
+                        "objective.  RPBE arms currently require 1 "
+                        "(fail-fast).")
     p.add_argument("--model-name-or-path", required=True)
     p.add_argument("--dialog-mirror", required=True,
                    help="DIALOG_MIRROR: ijcnlp_dailydialog layout dir")
@@ -272,6 +281,14 @@ FROZEN_PATH = Path(__file__).resolve().parents[1] / "configs" / "ccm" \
     / "frozen_method.json"
 
 
+def _frozen_path(args):
+    """Per-host frozen spec: the Qwen3 line keeps its own file so the
+    Llama line (R8-R10) stays untouched."""
+    name = "frozen_method_qwen3.json" if getattr(args, "host", "llama") \
+        == "qwen3" else "frozen_method.json"
+    return Path(__file__).resolve().parents[1] / "configs" / "ccm" / name
+
+
 def enforce_frozen(args):
     """The frozen method spec is authoritative (review P0-3 tail).
 
@@ -290,7 +307,7 @@ def enforce_frozen(args):
     either null (calibration-only run permitted, anything else refused)
     or a committed number that overrides the CLI.
     """
-    with open(FROZEN_PATH, encoding="utf-8") as f:
+    with open(_frozen_path(args), encoding="utf-8") as f:
         fz = json.load(f)
     binds = [
         ("--ridge-eps", "ridge_eps", fz["rpbe"]["ridge_eps"]),
@@ -305,6 +322,8 @@ def enforce_frozen(args):
         ("--max-steps", "max_steps", fz["training"]["steps"]),
         ("--schedule-total-steps", "schedule_total_steps",
          fz["training"].get("schedule_total_steps", fz["training"]["steps"])),
+        ("--checkpoint-every", "checkpoint_every",
+         fz["training"]["checkpoint_every"]),
     ]
     for flag, name, frozen_val in binds:
         cli_val = getattr(args, name)
@@ -675,6 +694,26 @@ def task_ce_shifted(out, labels, device):
         shift_logits.view(-1, shift_logits.shape[-1]),
         shift_labels.view(-1), ignore_index=-100, reduction="sum")
     return loss, n_valid
+
+
+def task_ce_rows(out, labels, device):
+    """Per-dialogue-row shifted CE (Qwen3-line micro_batch>1).
+
+    Returns (row_sum [B], row_n_valid [B]): the row-wise reduction keeps
+    the equal-weight-per-dialogue objective intact when several
+    dialogues share one collated batch (row_mean.sum()/N_dialogues ==
+    the batch=1 objective bit-for-bit)."""
+    logits = out.logits
+    labs = labels.to(device)
+    shift_logits = logits[..., :-1, :].contiguous()
+    shift_labels = labs[..., 1:].contiguous()
+    B = shift_logits.shape[0]
+    row_n = (shift_labels != -100).sum(-1)  # [B]
+    loss = torch.nn.functional.cross_entropy(
+        shift_logits.view(-1, shift_logits.shape[-1]),
+        shift_labels.reshape(-1), ignore_index=-100, reduction="none")
+    row_sum = loss.view(B, -1).sum(-1)  # [B]
+    return row_sum, row_n
 
 
 def collect_replay_z(meta, adapter, device, v=None):
@@ -1079,6 +1118,11 @@ def main():
             [tokenizer.comp_token_id[k] for k in range(N_TOK)],
             [tokenizer.sum_token_id[k] for k in range(N_TOK)])
     use_rpbe = args.arm in ("ours", "gamma_task_only")
+    if use_rpbe and args.micro_batch > 1:
+        raise SystemExit(
+            "[micro-batch] RPBE arms require --micro-batch 1 (the "
+            "two-pass replay and window machinery are batch=1 "
+            "protocols); batch>1 is currently a task-only option")
     if use_rpbe:
         attach_gamma(model, hidden=args.gamma_hidden)
     cfg = model.model.config
@@ -1216,26 +1260,38 @@ def main():
         # collate it at the FIXED prefix k_L = L + 2.  The same RNG stream
         # drives both arms (seed_all), so task-only and ours see the
         # identical sampling stream.
+        # micro_batch>1 (Qwen3 line): draw args.micro_batch dialogues the
+        # same way and collate them together; the window tail may return
+        # a short batch (fewer unseen dialogues remain).
         nonlocal sample_cursor
-        L = DEPTH_LEVELS[int(np.random.choice(len(DEPTH_LEVELS),
-                                              p=depth_probs))]
-        cand = [i for i in pools[L] if i not in seen_dialogs]
-        if not cand:
-            # Pool exhausted within this window: fall back to any unseen
-            # dialogue (dedup preserved; depth mix degrades gracefully).
-            cand = [i for i in pool_all if i not in seen_dialogs]
-        if not cand:
+        items = []
+        orig_ids = []
+        Ls = []
+        for _ in range(args.micro_batch):
+            L = DEPTH_LEVELS[int(np.random.choice(len(DEPTH_LEVELS),
+                                                  p=depth_probs))]
+            cand = [i for i in pools[L] if i not in seen_dialogs]
+            if not cand:
+                # Pool exhausted within this window: fall back to any
+                # unseen dialogue (dedup preserved; depth mix degrades).
+                cand = [i for i in pool_all if i not in seen_dialogs]
+            if not cand:
+                break  # window tail: return the short batch
+            orig_id = int(random.choice(cand))
+            seen_dialogs.add(orig_id)
+            item = dict(train_items[orig_id])
+            item["dialog"] = list(item["dialog"])[:K_OF_L[L]]
+            item["fixed_depth"] = True
+            items.append(item)
+            orig_ids.append(orig_id)
+            Ls.append(L)
+        if not items:
             raise RuntimeError(
                 "degenerate depth window: every dialogue already seen "
                 "(window grew past the whole pool)")
-        orig_id = int(random.choice(cand))
-        seen_dialogs.add(orig_id)
-        item = train_items[orig_id]
-        item = dict(item)
-        item["dialog"] = list(item["dialog"])[:K_OF_L[L]]
-        item["fixed_depth"] = True  # vendored collator LOCAL FIX honors it
-        sample_cursor += 1
-        return collator([item]), sample_cursor - 1, orig_id, L
+        batch = collator(items)
+        sample_cursor += len(items)
+        return batch, sample_cursor - len(items), orig_ids, Ls
 
     threshold = window._threshold(MEM_TAU) if window else None
     save_json(out / "config.json", {
@@ -1553,12 +1609,13 @@ def main():
 
     while step < args.max_steps:
         batch, sample_id, orig_id, L = next_batch()
-        depth_win[L] += 1
+        for _l in L:
+            depth_win[_l] += 1
         # Data-stream hash for every arm (parse_meta is pure, no RNG).
         # Review round 8: the stream records the STABLE dialogue id and
         # its depth level — the per-step cursor is no longer the identity.
         metas = parse_meta(batch, comp_ids, sum_ids, sample_id,
-                           orig_ids=[orig_id])
+                           orig_ids=orig_id)
         for m in metas:
             data_flow_hash.update(struct.pack(
                 ">qq", int(m["orig_id"]) if m["orig_id"] >= 0
@@ -2037,29 +2094,42 @@ def main():
                 optimizer.zero_grad(set_to_none=True)
                 task_sum = 0.0
                 n_tokens = 0
+                # micro_batch>1: the window objective is the sum of the
+                # per-dialogue mean CEs divided by the window's dialogue
+                # count — bit-identical to the batch=1 normalization.
+                n_dial_win = sum(int(b["input_ids"].shape[0])
+                                 for b, _sid in pending)
                 for b, sid in pending:
                     fwd_out = run_forward(model, b, device, grad_enabled=True)
-                    task_raw, n_valid = task_ce_shifted(
-                        fwd_out, b["labels"], device)
-                    # Official Trainer protocol (verified against
-                    # accelerate 1.14 Accelerator.backward + HF 4.44 in
-                    # scripts/ccm_parity.py): the per-microbatch MEAN
-                    # loss is divided by the window size BEFORE backward
-                    # — accelerate does
-                    # `loss = loss / self.gradient_accumulation_steps`
-                    # inside backward().  Normalizing by len(pending)
-                    # makes the task gradient scale independent of the
-                    # window length, identical across all three arms.
-                    # This division also keeps the fp16 backward on the
-                    # safe side of overflow.
-                    task_mean = task_raw / max(n_valid, 1)
-                    scaler.scale(task_mean / float(len(pending))).backward()
-                    task_sum += float(task_raw.detach())
-                    n_tokens += n_valid
+                    if args.micro_batch > 1:
+                        row_sum, row_n = task_ce_rows(
+                            fwd_out, b["labels"], device)
+                        row_mean = row_sum / row_n.clamp(min=1)
+                        loss_scale = row_mean.sum() / float(
+                            max(n_dial_win, 1))
+                        task_sum += float(row_sum.detach().sum())
+                        n_tokens += int(row_n.sum())
+                    else:
+                        task_raw, n_valid = task_ce_shifted(
+                            fwd_out, b["labels"], device)
+                        # Official Trainer protocol (verified against
+                        # accelerate 1.14 Accelerator.backward + HF 4.44
+                        # in scripts/ccm_parity.py): the per-microbatch
+                        # MEAN loss is divided by the window size BEFORE
+                        # backward — accelerate does
+                        # `loss = loss / self.gradient_accumulation_steps`
+                        # inside backward().  Normalizing by len(pending)
+                        # makes the task gradient scale independent of
+                        # the window length, identical across arms.
+                        task_mean = task_raw / max(n_valid, 1)
+                        loss_scale = task_mean / float(len(pending))
+                        task_sum += float(task_raw.detach())
+                        n_tokens += n_valid
+                    scaler.scale(loss_scale).backward()
                 grad_step()  # counters live inside grad_step (nonlocal)
                 total_task_sum += task_sum
                 total_tokens += n_tokens
-                total_microbatches += len(pending)
+                total_microbatches += n_dial_win
                 step += 1
                 if args.merge_cadence == "window-matched":
                     # Same per-window boundary record as the RPBE arms

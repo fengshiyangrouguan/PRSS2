@@ -573,24 +573,39 @@ def build_depth_pools(train_items):
     return pools
 
 
-def depth_sampling_probs(pools):
-    """q_L ~ 1/sqrt(n_L), normalized, with a 3x-uniform oversampling cap.
+def depth_sampling_probs(pools, alpha=None):
+    """Depth sampling weights.
 
-    Review round 8: sqrt-inverse-frequency re-weights the rare deep
-    (turn-14) dialogues UP without letting a handful of long dialogues
-    dominate training; the 3x cap bounds the maximum re-weighting.
-    """
-    w = np.array([1.0 / math.sqrt(max(len(pools[L]), 1))
-                  for L in DEPTH_LEVELS], dtype=np.float64)
-    q = w / w.sum()
-    for _ in range(20):
-        over = q > DEPTH_CAP
-        if not over.any():
-            break
+    Default (alpha=None): the R10 legacy rule q_L ~ 1/sqrt(n_L) with the
+    3x-uniform oversampling cap (Llama-line frozen spec; unchanged).
+
+    Qwen3-line (alpha from frozen_method_qwen3.json sampling.q_alpha,
+    user ruling 2026-09-17): q_L ∝ n_L^alpha (alpha=1 = natural
+    frequency).  Combined with the per-dialogue replay cap
+    (sampling.max_replays), q_L ∝ n_L makes every depth pool exhaust its
+    n_L x K sample budget at the SAME time — the depth mix stays stable
+    across the whole budget and every dialogue gets ~K exposures (the
+    official 12-epoch semantics).  The R10 inverse-sqrt upweighting is
+    retired on the Qwen3 line: it gave the L=13 pool ~60% of the stream
+    and replayed its 573 dialogues 52-120x each (turn_15 overfitting,
+    diagnosed 2026-09-17)."""
+    n = np.array([max(len(pools[L]), 1) for L in DEPTH_LEVELS],
+                 dtype=np.float64)
+    if alpha is None:
+        w = 1.0 / np.sqrt(n)
+        q = w / w.sum()
+        for _ in range(20):
+            over = q > DEPTH_CAP
+            if not over.any():
+                break
         excess = float((q[over] - DEPTH_CAP).sum())
         q[over] = DEPTH_CAP
         q[~over] += excess * q[~over] / q[~over].sum()
-    return q
+        return q
+
+    # q_L ∝ n_L^alpha (Qwen3-line natural-frequency family)
+    w = n ** float(alpha)
+    return (w / w.sum()).astype(np.float64)
 
 
 def parse_meta(batch, comp_ids, sum_ids, sample_id_global, orig_ids=None):
@@ -1095,7 +1110,7 @@ def load_trainable(path, model, optimizer, device,
 
 def main():
     args = parse_args()
-    enforce_frozen(args)  # review P0-3: frozen spec is authoritative
+    fz = enforce_frozen(args)  # review P0-3: frozen spec is authoritative
     seed_all(args.seed)
     device = torch.device(f"cuda:{args.gpu}" if torch.cuda.is_available()
                           else "cpu")
@@ -1241,7 +1256,17 @@ def main():
     # Persisted for the statistical report (per-level candidate counts,
     # unique dialogues, the q_L used, and the achieved per-window mix).
     pools = build_depth_pools(train_items)
-    depth_probs = depth_sampling_probs(pools)
+    # Qwen3-line sampling (frozen_method_qwen3.json sampling.*): natural
+    # frequency q_L ∝ n_L^q_alpha + per-dialogue replay cap.  The Llama
+    # line has neither field -> legacy R10 rule (alpha=None) and no cap.
+    _sampling = fz.get("sampling", {})
+    q_alpha = _sampling.get("q_alpha")
+    max_replays = int(_sampling.get("max_replays", 0))  # 0 = unlimited
+    depth_probs = depth_sampling_probs(pools, alpha=q_alpha)
+    replay_count = {}  # dialogue id -> samples taken so far
+    if max_replays:
+        print("[sampling] q_alpha={} max_replays={} (Qwen3 official-"
+              "semantics line)".format(q_alpha, max_replays), flush=True)
     pool_all = list(range(n_items))
     seen_dialogs = set()  # one ORIGINAL dialogue per window (cleared at
                           # every window close)
@@ -1252,8 +1277,11 @@ def main():
                    for i, L in enumerate(DEPTH_LEVELS)},
         "n_items": n_items,
         "k_of_L": {str(L): K_OF_L[L] for L in DEPTH_LEVELS},
-        "rule": "q_L ~ 1/sqrt(n_L), 3x-uniform oversampling cap; one "
-                "original dialogue per window; fixed k_L = L + 2",
+        "rule": ("q_L ~ 1/sqrt(n_L), 3x-uniform oversampling cap" if
+                 q_alpha is None else
+                 "q_L ~ n_L^{} (natural frequency) with per-dialogue "
+                 "replay cap {}".format(q_alpha, max_replays))
+        + "; one original dialogue per window; fixed k_L = L + 2",
         "note_L1": "depth L=1 dialogues (3 turns) carry task CE only: "
                    "the cut formula v = k - 3 >= 1 requires L >= 2, so "
                    "L=1 contributes no RPBE row (legacy protocol "
@@ -1262,11 +1290,17 @@ def main():
 
     def next_batch():
         # Review round 8 (depth-stratified legal cuts): draw depth L with
-        # q_L ~ 1/sqrt(n_L) (3x cap), then one dialogue from pool L that
-        # has NOT appeared in this window (one dialogue per window), and
-        # collate it at the FIXED prefix k_L = L + 2.  The same RNG stream
-        # drives both arms (seed_all), so task-only and ours see the
-        # identical sampling stream.
+        # q_L (legacy 1/sqrt(n_L) capped, or the Qwen3-line natural
+        # frequency), then one dialogue from pool L that has NOT appeared
+        # in this window (one dialogue per window), and collate it at the
+        # FIXED prefix k_L = L + 2.  The same RNG stream drives both arms
+        # (seed_all), so task-only and ours see the identical sampling
+        # stream.
+        # Qwen3-line replay cap: a dialogue leaves its pool after
+        # max_replays samples (official 12-epoch semantics); exhausted
+        # depth layers drop out of the draw (the q weights renormalize),
+        # and when every layer is exhausted the counters reset for the
+        # next replay cycle.
         # micro_batch>1 (Qwen3 line): draw args.micro_batch dialogues the
         # same way and collate them together; the window tail may return
         # a short batch (fewer unseen dialogues remain).
@@ -1275,9 +1309,24 @@ def main():
         orig_ids = []
         Ls = []
         for _ in range(args.micro_batch):
-            L = DEPTH_LEVELS[int(np.random.choice(len(DEPTH_LEVELS),
-                                                  p=depth_probs))]
-            cand = [i for i in pools[L] if i not in seen_dialogs]
+            avail = [L for L in DEPTH_LEVELS
+                     if any(replay_count.get(i, 0) < max_replays
+                            for i in pools[L])] if max_replays \
+                else list(DEPTH_LEVELS)
+            if not avail:
+                replay_count.clear()
+                avail = list(DEPTH_LEVELS)
+            q_avail = np.array([depth_probs[DEPTH_LEVELS.index(L)]
+                                for L in avail], dtype=np.float64)
+            q_avail = q_avail / q_avail.sum()
+            L = avail[int(np.random.choice(len(avail), p=q_avail))]
+            cand = [i for i in pools[L]
+                    if (replay_count.get(i, 0) < max_replays
+                        if max_replays else True)
+                    and i not in seen_dialogs]
+            if not cand and max_replays:
+                cand = [i for i in pools[L]
+                        if replay_count.get(i, 0) < max_replays]
             if not cand:
                 # Pool exhausted within this window: fall back to any
                 # unseen dialogue (dedup preserved; depth mix degrades).
@@ -1285,6 +1334,7 @@ def main():
             if not cand:
                 break  # window tail: return the short batch
             orig_id = int(random.choice(cand))
+            replay_count[orig_id] = replay_count.get(orig_id, 0) + 1
             seen_dialogs.add(orig_id)
             item = dict(train_items[orig_id])
             item["dialog"] = list(item["dialog"])[:K_OF_L[L]]

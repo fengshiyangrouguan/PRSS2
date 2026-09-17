@@ -88,6 +88,11 @@
       13
     ],
     "k_of_L": "L + 2 (fixed prefix length per depth)",
-    "rule": "depth-stratified legal cuts: q_L ~ 1/sqrt(n_L) with 3x-uniform oversampling cap; ONE original dialogue per window (tree_id = stable original dialogue id); L=1 dialogues carry task CE only."
+    "q_alpha": 1.0,
+    "q_alpha_note": "q_L ∝ n_L^q_alpha.  q_alpha=1 (natural frequency) RETIRES the R10 inverse-sqrt upweighting (which gave the L=13 pool ~60% of the stream and replayed its 573 dialogues 52-120x each — turn_15 overfitting, diagnosed 2026-09-17).  With the replay cap, every depth pool exhausts its n_L x K budget at the SAME time, so the depth mix stays stable over the whole budget.",
+    "max_replays": 12,
+    "max_replays_note": "per-dialogue exposure cap = official 12-epoch semantics (128k samples / 10546 dialogues).  A dialogue leaves its pool after K samples; exhausted depth layers drop out of the draw (q renormalizes over the remaining layers); when all layers are exhausted the counters reset for the next replay cycle.",
+    "rule": "depth-stratified legal cuts with natural-frequency depth weights + per-dialogue replay cap; ONE original dialogue per window (tree_id = stable original dialogue id); L=1 dialogues carry task CE only.",
+    "paired_report": "scripts/eval_ccm_paired.py (Llama line; Qwen3 line uses protocol C + protocol B curves)"
   }
 }

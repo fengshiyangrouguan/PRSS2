@@ -150,6 +150,10 @@ def parse_args():
                         "cadence reproduction arm (frozen cadence is "
                         "window-matched for the three main arms; the "
                         "official arm is reported separately)")
+    p.add_argument("--host", default="llama", choices=["llama", "qwen3"],
+                   help="backbone host: llama = vendored LlamaModelCCM "
+                        "(R8-R10 line); qwen3 = Qwen3-4B CCM port "
+                        "(feature_QWEN)")
     p.add_argument("--model-name-or-path", required=True)
     p.add_argument("--dialog-mirror", required=True,
                    help="DIALOG_MIRROR: ijcnlp_dailydialog layout dir")
@@ -367,6 +371,23 @@ def enforce_frozen(args):
 
 
 def build_tokenizer(args):
+    if args.host == "qwen3":
+        from transformers import AutoTokenizer
+        tok = AutoTokenizer.from_pretrained(args.model_name_or_path)
+        # Qwen3 has no pad token: use <|endoftext|> (in the vocab) so the
+        # pad id never collides with EOS (<|im_end|>), keeping the EOS
+        # exclusion semantics clean.
+        if tok.pad_token_id is None:
+            tok.pad_token = "<|endoftext|>"
+        tok.padding_side = "left"
+        added = [f"<COMP{k}>" for k in range(N_TOK)] \
+            + [f"<SUM{k}>" for k in range(N_TOK)]
+        tok.add_special_tokens({"additional_special_tokens": added})
+        ids = tok.additional_special_tokens_ids[-2 * N_TOK:]
+        tok.comp_token_id = ids[:N_TOK]
+        tok.sum_token_id = ids[N_TOK:]
+        tok._qwen3_host = True  # eval collator dispatch marker
+        return tok
     from transformers import LlamaTokenizer
     tok = LlamaTokenizer.from_pretrained(args.model_name_or_path)
     tok.pad_token = tok.eos_token
@@ -385,6 +406,25 @@ def build_tokenizer(args):
 
 
 def build_model(args, device):
+    if args.host == "qwen3":
+        from transformers.models.qwen3.configuration_qwen3 import Qwen3Config
+        from src.arch.ccm_qwen3 import Qwen3ForCausalLM_CCM
+        if args.official_host or args.foundation:
+            raise SystemExit(
+                "[qwen3] --official-host/--foundation are Llama-line "
+                "artifacts; the Qwen3 host trains single-stage from "
+                "theta_0 (frozen backbone + conditional LoRA)")
+        config = Qwen3Config.from_pretrained(args.model_name_or_path)
+        config.comp_relative_embedding = args.relative_embedding
+        model = Qwen3ForCausalLM_CCM.from_pretrained(
+            args.model_name_or_path, config=config,
+            torch_dtype=torch.bfloat16 if device.type == "cuda"
+            else torch.float32)
+        model.resize_token_embeddings(config.vocab_size + 2 * N_TOK)
+        model.update_comp_token(
+            [config.vocab_size + k for k in range(N_TOK)],
+            [config.vocab_size + N_TOK + k for k in range(N_TOK)])
+        return model.to(device)
     from transformers.models.llama.configuration_llama import LlamaConfig
     from src.arch.ccm_llama import LlamaForCausalLM_CCM
     config = LlamaConfig.from_pretrained(args.model_name_or_path)
@@ -450,13 +490,24 @@ def wrap_lora(model, r):
 
 def build_dataset(args, tokenizer):
     from src.arguments import CompressionArguments
-    from src.data.dialogue.data import DialogueDataset
-    from src.data.dialogue.collator import DataCollatorForDialogue_LLAMA
     os.environ["DIALOG_MIRROR"] = args.dialog_mirror
     comp_args = CompressionArguments(attn_type="merge_recur",
                                      num_comp_tokens=N_TOK,
                                      add_comp_token=True,
                                      relative_embedding=args.relative_embedding)
+    if args.host == "qwen3":
+        from src.data.dialogue.qwen3_data import (
+            Qwen3DialogueDataset, Qwen3DialogueCollator)
+        dialog = Qwen3DialogueDataset(tokenizer, mirror=args.dialog_mirror)
+        collator = Qwen3DialogueCollator(
+            dialog=dialog, tokenizer=tokenizer, comp_args=comp_args,
+            comp_token=tokenizer.comp_token_id,
+            sum_token=tokenizer.sum_token_id,
+            pad_token=tokenizer.pad_token_id,
+            label_pad_token_id=-100)
+        return dialog, collator
+    from src.data.dialogue.data import DialogueDataset
+    from src.data.dialogue.collator import DataCollatorForDialogue_LLAMA
     dialog = DialogueDataset(tokenizer, comp_token=tokenizer.comp_token_id,
                              online=True, add_comp_token=True,
                              clean_split=True)
@@ -589,8 +640,13 @@ def run_forward(model, batch, device, grad_enabled):
     # res_all buffers and raises.  Autocast remains for the legacy fp16
     # resize host (its fp16 base path requires the mixed-mode forward).
     _official = bool(getattr(model, "_official_host", False))
+    # Autocast dtype follows the backbone weight dtype (fp16 Llama /
+    # bf16 Qwen3); fp32 hosts (official) skip autocast entirely.
+    _dt = next(model.parameters()).dtype
+    _acast_dt = _dt if _dt in (torch.float16, torch.bfloat16) \
+        else torch.float16
     with ctx:
-        with torch.autocast(device_type="cuda", dtype=torch.float16,
+        with torch.autocast(device_type="cuda", dtype=_acast_dt,
                             enabled=(device.type == "cuda" and not _official)):
             return model(input_ids=batch["input_ids"].to(device),
                          attention_mask=batch["attention_mask"].to(device),
@@ -1019,8 +1075,9 @@ def main():
         model = wrap_lora(model, args.lora_r)
         # The PEFT wrap can replace the CausalLM wrapper; re-assert the
         # comp/sum token registration on the wrapped object.
-        model.update_comp_token([32000 + k for k in range(N_TOK)],
-                                [32000 + N_TOK + k for k in range(N_TOK)])
+        model.update_comp_token(
+            [tokenizer.comp_token_id[k] for k in range(N_TOK)],
+            [tokenizer.sum_token_id[k] for k in range(N_TOK)])
     use_rpbe = args.arm in ("ours", "gamma_task_only")
     if use_rpbe:
         attach_gamma(model, hidden=args.gamma_hidden)
@@ -1047,10 +1104,19 @@ def main():
 
     adapter = maps = builder = utter_embed = window = None
     if use_rpbe:
+        # GQA hosts (qwen3) lift the memory from the KV heads (8) with
+        # the config's explicit head_dim (128); the Llama host uses all
+        # attention heads (32, head_dim = hidden / heads).
+        if args.host == "qwen3":
+            n_heads = cfg.num_key_value_heads
+            head_dim = getattr(cfg, "head_dim",
+                               cfg.hidden_size // cfg.num_attention_heads)
+        else:
+            n_heads = cfg.num_attention_heads
+            head_dim = cfg.hidden_size // cfg.num_attention_heads
         adapter = CCMHostAdapter(model, n_layers=cfg.num_hidden_layers,
-                                 n_heads=cfg.num_attention_heads,
-                                 head_dim=cfg.hidden_size
-                                 // cfg.num_attention_heads,
+                                 n_heads=n_heads,
+                                 head_dim=head_dim,
                                  z_dim=args.z_dim, seed=args.rpbe_seed)
         # Review round 8: FOUR independent 32-dim sketch branches (the
         # single 64-dim sketch had too much collision variance for the

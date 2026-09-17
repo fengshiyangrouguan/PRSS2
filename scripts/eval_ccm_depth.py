@@ -52,12 +52,17 @@ def bucket_of(dialog):
 def build_eval_dataset(args, tokenizer, pooled, online, comp_type):
     """Official DialogueDataset under the requested protocol."""
     from src.arguments import CompressionArguments
-    from src.data.dialogue.data import DialogueDataset
     comp_args = CompressionArguments(attn_type="merge_recur",
                                      num_comp_tokens=tc.N_TOK,
                                      add_comp_token=True,
                                      relative_embedding=args.relative_embedding,
                                      comp_type=comp_type)
+    if getattr(args, "host", "llama") == "qwen3":
+        from src.data.dialogue.qwen3_data import Qwen3DialogueDataset
+        dialog = Qwen3DialogueDataset(
+            tokenizer, mirror=args.dialog_mirror)
+        return dialog, comp_args
+    from src.data.dialogue.data import DialogueDataset
     dialog = DialogueDataset(tokenizer, comp_token=tokenizer.comp_token_id,
                              online=online, add_comp_token=True,
                              clean_split=not pooled)
@@ -65,8 +70,18 @@ def build_eval_dataset(args, tokenizer, pooled, online, comp_type):
 
 
 def build_collator(dialog, tokenizer, comp_args, comp_type, sum_recur):
-    from src.data.dialogue.collator import DataCollatorForDialogue_LLAMA
     comp_args.comp_type = comp_type
+    if getattr(tokenizer, "_qwen3_host", False):
+        from src.data.dialogue.qwen3_data import Qwen3DialogueCollator
+        return Qwen3DialogueCollator(
+            dialog=dialog, tokenizer=tokenizer, comp_args=comp_args,
+            comp_token=tokenizer.comp_token_id,
+            sum_token=tokenizer.sum_token_id,
+            pad_token=tokenizer.pad_token_id,
+            label_pad_token_id=-100,
+            online=comp_type == "online",
+            neg_control=comp_type == "neg_control")
+    from src.data.dialogue.collator import DataCollatorForDialogue_LLAMA
     return DataCollatorForDialogue_LLAMA(
         dialog=dialog, tokenizer=tokenizer, comp_args=comp_args,
         comp_token=tokenizer.comp_token_id, sum_token=tokenizer.sum_token_id,
@@ -75,10 +90,10 @@ def build_collator(dialog, tokenizer, comp_args, comp_type, sum_recur):
 
 
 def eval_split(model, collator, dialogs, device, limit, name,
-               use_ccm=True):
+               use_ccm=True, eos_id=2):
     """One condition over bucketed dialogues -> per-bucket NLL.
 
-    use_ccm=False forwards the raw LLaMA path (no attention_mask_comp
+    use_ccm=False forwards the raw backbone path (no attention_mask_comp
     kwarg); the uncompressed constructions carry no comp tokens so the
     plain forward is exact."""
     per_bucket = {}
@@ -100,7 +115,8 @@ def eval_split(model, collator, dialogs, device, limit, name,
                     out = model(
                         input_ids=batch["input_ids"].to(device),
                         attention_mask=batch["attention_mask"].to(device))
-                s, n = eval_ce_shifted_noeos(out, batch["labels"], device)
+                s, n = eval_ce_shifted_noeos(out, batch["labels"], device,
+                                             eos_id=eos_id)
                 total += float(s.detach())
                 n_tok += n
         nll = total / max(n_tok, 1)
@@ -115,8 +131,9 @@ def load_ccm_arm(args, device, ckpt):
     tokenizer = tc.build_tokenizer(args)
     model = tc.build_model(args, device)
     model = tc.wrap_lora(model, args.lora_r)
-    model.update_comp_token([32000 + k for k in range(tc.N_TOK)],
-                            [32000 + tc.N_TOK + k for k in range(tc.N_TOK)])
+    model.update_comp_token(
+        [tokenizer.comp_token_id[k] for k in range(tc.N_TOK)],
+        [tokenizer.sum_token_id[k] for k in range(tc.N_TOK)])
     tc.attach_gamma(model, hidden=args.gamma_hidden)
     dummy = torch.optim.AdamW(
         [p for p in model.parameters() if p.requires_grad], lr=1e-3)
@@ -126,16 +143,18 @@ def load_ccm_arm(args, device, ckpt):
     return tokenizer, model
 
 
-def eval_ce_shifted_noeos(out, labels, device):
+def eval_ce_shifted_noeos(out, labels, device, eos_id=2):
     """Official _loglikelihood_clm semantics: shifted CE that ignores
     padding (-100) AND the EOS token (review fix 2026-09-15: the paper
     protocol excludes EOS; the training CE includes it, which had been
-    lowering every eval number by 0.6-0.9 PPL)."""
+    lowering every eval number by 0.6-0.9 PPL).
+
+    eos_id: 2 for Llama, 151645 (<|im_end|>) for Qwen3."""
     logits = out.logits
     labs = labels.to(device)
     shift_logits = logits[..., :-1, :].contiguous()
     shift_labels = labs[..., 1:].contiguous()
-    shift_labels = shift_labels.masked_fill(shift_labels == 2, -100)
+    shift_labels = shift_labels.masked_fill(shift_labels == eos_id, -100)
     n_valid = int((shift_labels != -100).sum())
     loss = torch.nn.functional.cross_entropy(
         shift_logits.view(-1, shift_logits.shape[-1]),
@@ -205,7 +224,7 @@ TIME_STEPS = [1, 2, 4, 8, 13]
 
 
 def eval_truncated(model, collator, dialogs, device, limit, name,
-                   use_ccm=True):
+                   use_ccm=True, eos_id=2):
     """Official truncation protocol: every test dialogue with
     len >= t is truncated to dialog[:t] and the CE is scored on the
     t-th turn only (sample_dialog predicts dialog[-1]).  The sample set
@@ -230,7 +249,8 @@ def eval_truncated(model, collator, dialogs, device, limit, name,
                     out = model(
                         input_ids=batch["input_ids"].to(device),
                         attention_mask=batch["attention_mask"].to(device))
-                s, n = eval_ce_shifted_noeos(out, batch["labels"], device)
+                s, n = eval_ce_shifted_noeos(out, batch["labels"], device,
+                                             eos_id=eos_id)
                 total += float(s.detach())
                 n_tok += n
         nll = total / max(n_tok, 1)
@@ -252,6 +272,7 @@ def main():
                     default="/root/autodl-tmp/llama-7b-hf")
     ap.add_argument("--dialog-mirror",
                     default="/root/autodl-tmp/dailydialog_mirror/ijcnlp_dailydialog")
+    ap.add_argument("--host", default="llama", choices=["llama", "qwen3"])
     ap.add_argument("--gpu", type=int, default=0)
     ap.add_argument("--limit", type=int, default=0)
     ap.add_argument("--pooled", action="store_true",
@@ -271,9 +292,12 @@ def main():
     args = types.SimpleNamespace(
         arm="ours", model_name_or_path=a.model_name_or_path,
         dialog_mirror=a.dialog_mirror, relative_embedding="skip",
-        lora_r=8, z_dim=128, rpbe_seed=0, sketch_dim=64, gamma_hidden=64)
+        lora_r=8, z_dim=128, rpbe_seed=0, sketch_dim=64, gamma_hidden=64,
+        host=a.host, official_host=False, foundation="",
+        official_adapter="")
 
     tokenizer = tc.build_tokenizer(args)
+    eos_id = int(tokenizer.eos_token_id)
     results = {}
 
     if a.mode == "ccm":
@@ -282,8 +306,12 @@ def main():
             args, tokenizer, a.pooled, online=True, comp_type="online")
         collator = build_collator(dialog, tokenizer, comp_args,
                                   comp_type="online", sum_recur=True)
-        eval_dialogs = (dialog.valset["dialog"] if a.pooled
-                        else dialog.testset["dialog"])
+        if args.host == "qwen3":
+            eval_dialogs = [d["dialog"] for d in (
+                dialog.valset if a.pooled else dialog.testset)]
+        else:
+            eval_dialogs = (dialog.valset["dialog"] if a.pooled
+                            else dialog.testset["dialog"])
         for name, ckpt in ([("ours", a.ours_ckpt),
                             ("taskonly", a.taskonly_ckpt)]):
             if not ckpt:
@@ -297,10 +325,12 @@ def main():
                 results[name] = eval_truncated(model, collator,
                                                eval_dialogs, device,
                                                a.limit, name,
-                                               use_ccm=True)
+                                               use_ccm=True,
+                                               eos_id=eos_id)
             else:
                 results[name] = eval_split(model, collator, eval_dialogs,
-                                           device, a.limit, name)
+                                           device, a.limit, name,
+                                           eos_id=eos_id)
             del model
             torch.cuda.empty_cache()
         with open(a.out, "w") as f:
@@ -314,11 +344,21 @@ def main():
     elif a.lora_ckpt:
         _, model = load_ccm_arm(args, device, a.lora_ckpt)
     else:
-        from transformers.models.llama.modeling_llama import LlamaForCausalLM
-        model = LlamaForCausalLM.from_pretrained(
-            a.model_name_or_path, torch_dtype=torch.float16).to(device)
-        model.eval()
-        print("ref arms use RAW pretrained LLaMA", flush=True)
+        if a.host == "qwen3":
+            from transformers.models.qwen3.modeling_qwen3 import \
+                Qwen3ForCausalLM
+            model = Qwen3ForCausalLM.from_pretrained(
+                a.model_name_or_path,
+                torch_dtype=torch.bfloat16).to(device)
+            model.eval()
+            print("ref arms use RAW pretrained Qwen3", flush=True)
+        else:
+            from transformers.models.llama.modeling_llama import \
+                LlamaForCausalLM
+            model = LlamaForCausalLM.from_pretrained(
+                a.model_name_or_path, torch_dtype=torch.float16).to(device)
+            model.eval()
+            print("ref arms use RAW pretrained LLaMA", flush=True)
 
     # full_ctx: online=False dataset (no comp token injection) ->
     # _concat_dialog is pure concatenation; CE on the last turn only.
@@ -326,14 +366,21 @@ def main():
         args, tokenizer, a.pooled, online=False, comp_type="online")
     collator_nc = build_collator(dialog_nc, tokenizer, comp_args_nc,
                                  comp_type="online", sum_recur=False)
-    eval_dialogs = (dialog_nc.valset["dialog"] if a.pooled
-                    else dialog_nc.testset["dialog"])
+    if args.host == "qwen3":
+        # Qwen3DialogueDataset stores plain lists ({"dialog": ...} items)
+        eval_dialogs = [d["dialog"] for d in (
+            dialog_nc.valset if a.pooled else dialog_nc.testset)]
+    else:
+        eval_dialogs = (dialog_nc.valset["dialog"] if a.pooled
+                        else dialog_nc.testset["dialog"])
     results["full_ctx"] = (eval_truncated(model, collator_nc, eval_dialogs,
                                           device, a.limit, "full_ctx",
-                                          use_ccm=False) if a.truncate
+                                          use_ccm=False,
+                                          eos_id=eos_id) if a.truncate
                            else eval_split(model, collator_nc,
                                            eval_dialogs, device, a.limit,
-                                           "full_ctx", use_ccm=False))
+                                           "full_ctx", use_ccm=False,
+                                           eos_id=eos_id))
 
     # no_ctx: neg_control -> context = dialog[-2] only.
     dialog_nx, comp_args_nx = build_eval_dataset(
@@ -342,10 +389,11 @@ def main():
                                  comp_type="neg_control", sum_recur=True)
     results["no_ctx"] = (eval_truncated(model, collator_nx, eval_dialogs,
                                         device, a.limit, "no_ctx",
-                                        use_ccm=False) if a.truncate
+                                        use_ccm=False,
+                                        eos_id=eos_id) if a.truncate
                          else eval_split(model, collator_nx, eval_dialogs,
                                          device, a.limit, "no_ctx",
-                                         use_ccm=False))
+                                         use_ccm=False, eos_id=eos_id))
 
     with open(a.out, "w") as f:
         json.dump(results, f, indent=2)

@@ -88,11 +88,17 @@ class Qwen3DialogueDataset:
     """
 
     def __init__(self, tokenizer, mirror, max_len_turn=128,
-                 max_len_total=400, pooled=False):
+                 max_len_total=None, pooled=False):
         self.tokenizer = tokenizer
         dataset = _read_mirror(mirror)
+        # official DialogueDataset thresholds: train 400, val/test 600
+        if max_len_total is None:
+            max_len_total = {"train": 400, "validation": 600,
+                             "test": 600}
         self._splits = {}
         for split in ("train", "validation", "test"):
+            thr = (max_len_total[split] if isinstance(max_len_total, dict)
+                   else max_len_total)
             items = []
             for d, a in zip(dataset[split]["dialog"], dataset[split]["act"]):
                 dialog = [_preprocess(t) for t in d]
@@ -102,7 +108,7 @@ class Qwen3DialogueDataset:
                     continue
                 if any(len(t) > max_len_turn for t in tok):
                     continue
-                if sum(len(t) for t in tok) > max_len_total:
+                if sum(len(t) for t in tok) > thr:
                     continue
                 items.append({"dialog": tok, "act": a, "orig": dialog,
                               "split": split,

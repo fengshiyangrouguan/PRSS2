@@ -65,29 +65,40 @@ def main():
     tokenizer = tc.build_tokenizer(args)
     eos_id = int(tokenizer.eos_token_id)
 
-    # Exact training build chain (same as load_ccm_arm on the qwen3 host)
-    model = tc.build_model(args, device)
+    # Official-host build chain (train_ccm_merge semantics): the COMP/SUM
+    # input rows live in a trainable SeparatedEmbedding, the lm_head
+    # keeps the base vocab, no resize.
+    from transformers.models.qwen3.configuration_qwen3 import Qwen3Config
+    from src.arch.ccm_qwen3 import Qwen3ForCausalLM_CCM
+    from src.utils import SeparatedEmbedding
+    config = Qwen3Config.from_pretrained(args.model_name_or_path)
+    config.comp_relative_embedding = "skip"
+    model = Qwen3ForCausalLM_CCM.from_pretrained(
+        args.model_name_or_path, config=config,
+        torch_dtype=torch.bfloat16).to(device)
+    model.model.embed_tokens = SeparatedEmbedding(
+        model.model.embed_tokens, 2 * tc.N_TOK)
+    model.update_comp_token(
+        [config.vocab_size + k for k in range(tc.N_TOK)],
+        [config.vocab_size + tc.N_TOK + k for k in range(tc.N_TOK)])
     model = tc.wrap_lora(model, args.lora_r)
     model.update_comp_token(
         [tokenizer.comp_token_id[k] for k in range(tc.N_TOK)],
         [tokenizer.sum_token_id[k] for k in range(tc.N_TOK)])
+    # trainable set = LoRA + comp rows (same as train_ccm_merge)
+    for _p in model.parameters():
+        _p.requires_grad_(False)
+    for _n, _p in model.named_parameters():
+        if "lora_" in _n:
+            _p.requires_grad_(True)
+    model.base_model.model.model.embed_tokens.comp_embeddings.weight \
+        .requires_grad_(True)
     if not a.no_gamma:
         tc.attach_gamma(model, hidden=args.gamma_hidden)
     dummy = torch.optim.AdamW(
         [p for p in model.parameters() if p.requires_grad], lr=1e-3)
     if a.ckpt != "INIT":
-        payload = tc.load_trainable(a.ckpt, model, dummy, device)
-        if "new_token_rows" in payload:
-            n = 2 * tc.N_TOK
-            model.get_input_embeddings().weight[-n:] = \
-                payload["new_token_rows"]["input_embed_rows"].to(device)
-            model.lm_head.weight[-n:] = \
-                payload["new_token_rows"]["lm_head_rows"].to(device)
-            print("[eval] new_token_rows restored", flush=True)
-        else:
-            raise RuntimeError(
-                "checkpoint predates new_token_rows save; exact model "
-                "reconstruction impossible")
+        tc.load_trainable(a.ckpt, model, dummy, device)
         print("[eval] checkpoint loaded: {}".format(a.ckpt), flush=True)
     else:
         print("[eval] INIT: random trainable init kept", flush=True)

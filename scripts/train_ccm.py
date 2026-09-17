@@ -162,7 +162,9 @@ def parse_args():
                         "window's dialogue count), so batch>1 changes only "
                         "numerical reorder inside the kernels, not the "
                         "objective.  RPBE arms currently require 1 "
-                        "(fail-fast).")
+                        "(fail-fast).  The STRICT official merge training "
+                        "lives in scripts/train_ccm_merge.py (user ruling "
+                        "2026-09-17), not here.")
     p.add_argument("--model-name-or-path", required=True)
     p.add_argument("--dialog-mirror", required=True,
                    help="DIALOG_MIRROR: ijcnlp_dailydialog layout dir")
@@ -2089,7 +2091,8 @@ def main():
             fire = (args.merge_cadence == "window-matched"
                     and merge_eff_cuts >= args.kf_min_cuts) \
                 or (args.merge_cadence == "official"
-                    and len(pending) >= args.grad_accum)
+                    and sum(int(b["input_ids"].shape[0])
+                            for b, _sid in pending) >= args.grad_accum)
             if fire:
                 optimizer.zero_grad(set_to_none=True)
                 task_sum = 0.0

@@ -288,7 +288,10 @@ class Qwen3CCMAttention(nn.Module):
                 query_states.dtype)
         attn_output = torch.matmul(attn_weights, value_states_r)
         attn_output = attn_output.transpose(1, 2)
-        attn_output = attn_output.reshape(bsz, q_len, self.hidden_size)
+        # Qwen3 delta: heads * head_dim (4096) != hidden_size (2560);
+        # o_proj down-projects to the residual width.
+        attn_output = attn_output.reshape(
+            bsz, q_len, self.num_heads * self.head_dim)
 
         attn_output = self.o_proj(attn_output, comp_mask=comp_mask)
 
@@ -535,8 +538,7 @@ class Qwen3CCMModel(Qwen3PreTrainedModel):
         output_hidden_states = (output_hidden_states
                                 if output_hidden_states is not None
                                 else self.config.output_hidden_states)
-        use_cache = use_cache if use_cache is not None \
-            else self.config.use_cache
+        use_cache = use_cache if use_cache is not None else False  # v1
         if use_cache:
             raise NotImplementedError(
                 "ccm_qwen3 v1 is full-sequence only (use_cache=False)")
@@ -691,6 +693,77 @@ class Qwen3ForCausalLM_CCM(Qwen3PreTrainedModel):
 
     def set_output_embeddings(self, new_embeddings):
         self.lm_head = new_embeddings
+
+    def prepare_inputs_for_generation(
+        self,
+        input_ids,
+        past_key_values=None,
+        attention_mask=None,
+        attention_mask_comp=None,
+        inputs_embeds=None,
+        pos_id_offset=None,
+        first_time=False,
+        **kwargs,
+    ):
+        """Interface stub for peft_custom compatibility.
+
+        (generation itself raises in the model forward: v1 is
+        full-sequence only).  Kept verbatim from the Llama host so the
+        vendored PeftModel wrapper constructs cleanly."""
+        first_time_with_compression = first_time and pos_id_offset is not None
+
+        comp_mask = sum_mask = None
+        if self.comp_token is not None:
+            comp_mask = get_comp_mask(input_ids, self.comp_token).to(
+                input_ids.device)
+            comp_mask_all = comp_mask
+            if self.sum_token is not None:
+                sum_mask = get_comp_mask(input_ids, self.sum_token).to(
+                    input_ids.device)
+                comp_mask_all = comp_mask + sum_mask
+
+        input_len = input_ids.shape[1]
+        position_ids = kwargs.get("position_ids", None)
+        if attention_mask is not None and position_ids is None:
+            if self.comp_relative_embedding == "base":
+                position_ids = attention_mask.long().cumsum(-1) - 1
+                position_ids.masked_fill_(attention_mask == 0, 1)
+            else:
+                position_ids = update_position_ids(
+                    comp_mask_all,
+                    self.comp_token,
+                    attention_mask[:, -input_len:],
+                    type_=self.comp_relative_embedding)
+            if pos_id_offset is not None:
+                position_ids += pos_id_offset
+
+        if past_key_values and not first_time_with_compression:
+            input_ids = input_ids[:, -1:]
+            position_ids = position_ids[:, -1:]
+
+        if inputs_embeds is not None and past_key_values is None:
+            model_inputs = {"inputs_embeds": inputs_embeds}
+        else:
+            model_inputs = {"input_ids": input_ids}
+
+        model_inputs.update({
+            "position_ids": position_ids,
+            "past_key_values": past_key_values,
+            "use_cache": kwargs.get("use_cache"),
+            "attention_mask": attention_mask,
+            "attention_mask_comp": attention_mask_comp,
+            "pos_id_offset": pos_id_offset,
+        })
+        return model_inputs
+
+    @staticmethod
+    def _reorder_cache(past_key_values, beam_idx):
+        reordered_past = ()
+        for layer_past in past_key_values:
+            reordered_past += (tuple(
+                past_state.index_select(0, beam_idx) for past_state
+                in layer_past),)
+        return reordered_past
 
     def forward(
         self,

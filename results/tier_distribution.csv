@@ -1,0 +1,10 @@
+arm,checkpoint_absolute_step,n_demos,n_0cycle,n_1cycle,n_2cycle,n_3cycle,sum_tier,weighted_success_pct,strict_success,overshot
+avg (MemoryVLA host),best.pt (18k),20,10,6,4,0,14,23.3,0,0
+avg (MemoryVLA host),best.pt rerun,20,10,6,4,0,14,23.3,0,0
+ours (RPBE),8000,20,14,4,1,1,9,15.0,0,1
+ours (RPBE),10000,20,13,2,5,0,12,20.0,0,0
+ours (RPBE),13000,20,11,6,3,0,12,20.0,0,0
+ours (RPBE),15000,20,12,3,5,0,13,21.7,0,0
+ours (RPBE),17000,20,12,3,3,2,15,25.0,1,1
+ours (RPBE),19000,20,12,3,4,1,14,23.3,0,1
+ours (RPBE),21000,20,13,3,4,0,11,18.3,0,0

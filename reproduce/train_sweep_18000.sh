@@ -34,7 +34,7 @@ mkdir -p "$OUT/$RUN"
   --max-steps 18000 --batch-size 4 --grad-accum 4 \
   --lr 1e-5 --gamma-lr 2e-5 --sched const --warmup-steps 0 \
   --mem-length 16 --repeated-diffusion-steps 4 --future-action-window-size 15 \
-  --eval-every 500 --checkpoint-every 1000 --log-every 50 \
+  --eval-every 1000 --checkpoint-every 1000 --log-every 50 \
   --snapshot-steps 12000,15000 --no-fullstate 1 \
   --rpbe-mode project --kappa 0.02 --proj-tau 3e-4 \
   --proj-iters 400 --proj-iters-max 1600 \

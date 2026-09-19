@@ -32,4 +32,10 @@ for tag in snapshot_12000 snapshot_15000 checkpoint; do
   echo "--- done $tag ---" >> "$E/rollout_full.log"
 done
 echo "wrote $E/rollout_full.log"
-grep -E "===|tier_dist" "$E/rollout_full.log"   # summary on screen only
+
+# req 3: per-demo table -- how many times EACH demo completed the 3-cycle task,
+# one column per checkpoint.
+python "$(dirname "$0")/tier_table.py" "$E/rollout_full.log" "$E"
+
+# req 2: train loss + val loss, one row per 1000 steps
+python "$(dirname "$0")/extract_curves.py" "$D/train.log" "$E/curves.csv"

@@ -31,3 +31,31 @@ else
   git diff --stat c05e4fb "$REF" -- $PATHS | tail -20
   exit 1
 fi
+
+# ---- deployed-file level check -------------------------------------------
+# The 5 files that were actually on the training box, md5'd there and compared
+# against local HEAD c05e4fb during the run (server had: 38751ce7 / 5f50ad9c /
+# f826bcf1 / 17fed5d0 / c05e25f2 -- and they matched).  Those recorded values
+# are the CRLF form, because the box got the Windows working-tree copy over
+# sftp.  To be independent of line endings this check strips CR before hashing,
+# so it gives the canonical LF values below and works on either platform.
+echo
+echo "deployed-file check (CR-stripped, so line endings do not matter):"
+declare -A WANT=(
+  [src/rpbe_embodied/loss.py]=9a8cdde57a7f0d7d1353bada37683e8c
+  [src/rpbe_embodied/boundary.py]=5f50ad9cf0d5a030641360d3ee76c011
+  [src/rpbe_embodied/resume.py]=f826bcf1566d66b9f2b4c13cdcb9c8c5
+  [src/rpbe_embodied/test_projection.py]=45760bbd5f167da28c0b608782cf3134
+  [third_party/memoryvla/train_libero_mem_rpbe.py]=c05e25f20f4dddded7aac1acec0539b7
+)
+bad=0
+for f in "${!WANT[@]}"; do
+  got=$(git show "c05e4fb:$f" | tr -d '' | md5sum | cut -d' ' -f1)
+  if [ "$got" = "${WANT[$f]}" ]; then
+    echo "  ok   $f"
+  else
+    echo "  BAD  $f  got=$got want=${WANT[$f]}"
+    bad=1
+  fi
+done
+[ "$bad" = 0 ] && echo "RESULT: all 5 deployed files verified against the frozen record."   || { echo "RESULT: deployed-file MISMATCH"; exit 1; }

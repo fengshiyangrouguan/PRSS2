@@ -212,3 +212,89 @@ per-demo lines), the `tier_dist` per checkpoint, and
 comparable at all.
 
 
+
+## 10. The four things asked for, and where each one is answered
+
+### (1) Is this the same code that produced the 3-cycle successes?
+
+Yes —— and it is verified at two levels, not argued:
+
+| level | check | value |
+|---|---|---|
+| whole code tree | `git ls-tree` over `third_party/memoryvla` + `src/rpbe_embodied` + `scripts/tiered_eval.py`, 138 files | `634c18f53b59099f5b0c09af2b29c639cc34f94ea5c6031f352beebb98b03926` |
+| **the 5 files that were on the box** | md5, recorded during the run and compared server-vs-local at `c05e4fb` | see below |
+
+```
+9a8cdde57a7f0d7d1353bada37683e8c  src/rpbe_embodied/loss.py
+5f50ad9cf0d5a030641360d3ee76c011  src/rpbe_embodied/boundary.py
+f826bcf1566d66b9f2b4c13cdcb9c8c5  src/rpbe_embodied/resume.py
+45760bbd5f167da28c0b608782cf3134  src/rpbe_embodied/test_projection.py
+c05e25f20f4dddded7aac1acec0539b7  third_party/memoryvla/train_libero_mem_rpbe.py
+```
+
+`bash reproduce/check_code_identity.sh` checks both and fails loudly otherwise.
+
+**Footnote, because it looks like a discrepancy and is not one.** The md5s
+recorded *in the run log* are the CRLF form (`38751ce7…`, `17fed5d0…`) because
+the box received the Windows working-tree copy over sftp; the values above are
+the same content with `\r` stripped. Feeding the `c05e4fb` blob through
+`sed 's/$/\r/'` reproduces the recorded numbers exactly, and
+`git diff c05e4fb HEAD` over these files is empty. The check script strips CR
+so it gives the same answer on either platform.
+
+### (2) Training loss and val, every 1000 steps —— the file
+
+`train_sweep_18000.sh` now runs `--eval-every 1000`, and after evaluation
+`extract_curves.py` writes **`eval_<run>/curves.csv`**:
+
+```
+step,train_loss,val_loss,n_train_points
+1000,0.0xxxxx,0.0xxxxx,20
+...
+```
+
+`train_loss` is the mean of the training losses logged inside that 1000-step
+block (20 samples at `--log-every 50`); `val_loss` is the `[eval @ opt N] val
+action loss` at that step, blank when a step has no eval. Standalone use:
+`python reproduce/extract_curves.py <train.log> curves.csv`.
+
+### (3) Per-demo cycle count at each of the three checkpoints
+
+`eval_sweep_18000.sh` runs `tier_table.py` over the **unfiltered** eval log and
+writes, per run:
+
+- **`tier_by_demo.csv`** —— `demo, snapshot_12000, snapshot_15000, checkpoint`,
+  each cell = how many times that demo completed the 3-cycle task (0-3).
+- **`tier_summary.csv`** —— per checkpoint: `n_0/n_1/n_2/n_3`, `>=1`, `>=2`,
+  `strict`, `sum_tier`, `weighted_success_pct`.
+
+`tier_table.py` exits with an error if it finds no per-demo lines, i.e. if the
+log was filtered —— the failure mode that destroyed the Stage8 evidence.
+
+### (4) Where the data is —— and how to get it
+
+**None of it is in git** (fetch it with `bash reproduce/fetch_data.sh`):
+
+| artifact | source | size |
+|---|---|---|
+| **T3 task data** = `KITCHEN_SCENE1_3_lift_the_bowl_and_place_it_back_on_the_plate_3_times_demo.hdf5` | HF dataset **`libero-mem/LIBERO-Mem`**, file at `/datasets/libero-mem/LIBERO-Mem/resolve/main/…` | 18.4 GB |
+| `metainfo.json` | same repo | 0.7 GB |
+| base model `step-295000-epoch-40-loss=0.2200.pt` | HF **`openvla/openvla-7b-prismatic`** | 30 GB |
+| Llama-2-7b-hf | HF **`NousResearch/Llama-2-7b-hf`** | 13.5 GB |
+| the simulator env | `github.com/libero-mem/libero-mem` | small |
+
+So "T3" is the **3-times task** (`KITCHEN_SCENE1_3`), which is the task every
+number in `results/` was measured on.
+
+**One caveat you cannot download away.** The trainer's `--data-root` points at
+`libero-mem-no-noops`, a build of the file above with no-op transitions
+removed (~9% of frames). That filter script was never committed. Two options:
+
+- re-derive it (start from `scripts/probe_libero_mem_hdf5.py`); **for a
+  multi-seed comparison it only has to be fixed across your seeds —— it does
+  not have to match ours**, because every seed eats the same dataset; or
+- skip it and point `--data-root` at the raw directory —— then say so
+  explicitly, because that is a different dataset build from ours.
+
+Disk budget: 30 + 13.5 + 18.4 + 0.7 ≈ 63 GB of inputs, plus ~9.3 GB per run.
+Budget **200 GB+**.

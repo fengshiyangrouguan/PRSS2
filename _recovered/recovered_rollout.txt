@@ -1,0 +1,68 @@
+weighted_success=0.0% (sum_tier=0/57)  tier3_reached=0  strict_success=0  >=1cycle=0  >=2cycle=0  overshot_demos=0
+weighted_success=0.0% (sum_tier=0/60)  tier3_reached=0  strict_success=0  >=1cycle=0  >=2cycle=0  overshot_demos=0
+weighted_success=1.8% (sum_tier=1/57)  tier3_reached=0  strict_success=0  >=1cycle=1  >=2cycle=0  overshot_demos=0
+weighted_success=10.0% (sum_tier=3/30)  full3/3=0  >=1cycle=3  >=2cycle=0
+weighted_success=10.5% (sum_tier=6/57)  tier3_reached=0  strict_success=0  >=1cycle=6  >=2cycle=0  overshot_demos=0
+weighted_success=10.5% (sum_tier=6/57)  tier3_reached=1  strict_success=0  >=1cycle=3  >=2cycle=2  overshot_demos=1
+weighted_success=10.5% (sum_tier=6/57)  tier3_reached=1  strict_success=1  >=1cycle=3  >=2cycle=2  overshot_demos=0
+weighted_success=10.5% (sum_tier=6/57)  tier3_reached=1  strict_success=1  >=1cycle=4  >=2cycle=1  overshot_demos=0
+weighted_success=11.7% (sum_tier=7/60)  tier3_reached=0  strict_success=0  >=1cycle=5  >=2cycle=2  overshot_demos=0
+weighted_success=11.7% (sum_tier=7/60)  tier3_reached=0  strict_success=0  >=1cycle=6  >=2cycle=1  overshot_demos=0
+weighted_success=11.7% (sum_tier=7/60)  tier3_reached=1  strict_success=1  >=1cycle=5  >=2cycle=1  overshot_demos=0
+weighted_success=11.7% (sum_tier=7/60)  tier3_reached=2  strict_success=0  >=1cycle=3  >=2cycle=2  overshot_demos=2
+weighted_success=12.3% (sum_tier=7/57)  tier3_reached=0  strict_success=0  >=1cycle=4  >=2cycle=3  overshot_demos=0
+weighted_success=12.3% (sum_tier=7/57)  tier3_reached=0  strict_success=0  >=1cycle=6  >=2cycle=1  overshot_demos=0
+weighted_success=12.3% (sum_tier=7/57)  tier3_reached=0  strict_success=0  >=1cycle=7  >=2cycle=0  overshot_demos=0
+weighted_success=12.3% (sum_tier=7/57)  tier3_reached=2  strict_success=1  >=1cycle=3  >=2cycle=2  overshot_demos=1
+weighted_success=12.3% tier3_reached=1 strict_success=0
+weighted_success=13.3% (sum_tier=8/60)  tier3_reached=0  strict_success=0  >=1cycle=6  >=2cycle=2  overshot_demos=0
+weighted_success=13.3% (sum_tier=8/60)  tier3_reached=1  strict_success=1  >=1cycle=4  >=2cycle=3  overshot_demos=0
+weighted_success=14.0% tier3_reached=1
+weighted_success=14.0% tier3_reached=1 strict_success=0
+weighted_success=15.0% (sum_tier=9/60)
+weighted_success=15.0% (sum_tier=9/60)  full3/3=1  >=1cycle=7  >=2cycle=1
+weighted_success=15.0% (sum_tier=9/60)  tier3_reached=1  strict_success=0  >=1cycle=6  >=2cycle=2  overshot_demos=1
+weighted_success=15.0% (sum_tier=9/60) full3/3=1 >=1cycle=7 >=2cycle=1
+weighted_success=15.0% ... full3/3=1
+weighted_success=15.8% (sum_tier=9/57)  tier3_reached=0  strict_success=0  >=1cycle=7  >=2cycle=2  overshot_demos=0
+weighted_success=16.7% (sum_tier=10/60)  tier3_reached=0  strict_success=0  >=1cycle=6  >=2cycle=4  overshot_demos=0
+weighted_success=16.7% (sum_tier=5/30)  full3/3=0  >=1cycle=4  >=2cycle=1
+weighted_success=18.3% (sum_tier=11/60)  tier3_reached=0  strict_success=0  >=1cycle=7  >=2cycle=4  overshot_demos=0
+weighted_success=19.3% tier3_reached=1
+weighted_success=19.3% tier3_reached=1 strict_success=0
+weighted_success=20.0% (sum_tier=12/60)  tier3_reached=0  strict_success=0  >=1cycle=7  >=2cycle=5  overshot_demos=0
+weighted_success=20.0% (sum_tier=12/60)  tier3_reached=0  strict_success=0  >=1cycle=9  >=2cycle=3  overshot_demos=0
+weighted_success=20.0% (sum_tier=6/30)  full3/3=1  >=1cycle=4  >=2cycle=1
+weighted_success=21.7% (sum_tier=13/60)  tier3_reached=0  strict_success=0  >=1cycle=8  >=2cycle=5  overshot_demos=0
+weighted_success=21.7% (sum_tier=13/60)  tier3_reached=0  strict_success=0  >=1cycle=9  >=2cycle=4  overshot_demos=0
+weighted_success=21.7% ...   ← this is snapshot_1000
+weighted_success=23.3% (sum_tier=14/60)  tier3_reached=0  strict_success=0  >=1cycle=10  >=2cycle=4  overshot_demos=0
+weighted_success=23.3% (sum_tier=14/60)  tier3_reached=1  strict_success=0  >=1cycle=8  >=2cycle=5  overshot_demos=1
+weighted_success=23.3% (sum_tier=14/60)  tier3_reached=1  strict_success=0  >=1cycle=9  >=2cycle=4  overshot_demos=1
+weighted_success=24.6% (sum_tier=14/57)  tier3_reached=2  strict_success=0  >=1cycle=8  >=2cycle=4  overshot_demos=2
+weighted_success=25.0% (sum_tier=15/60)  tier3_reached=2  strict_success=1  >=1cycle=8  >=2cycle=5  overshot_demos=1
+weighted_success=3.3% (sum_tier=2/60)  tier3_reached=0  strict_success=0
+weighted_success=3.3% (sum_tier=2/60)  tier3_reached=0  strict_success=0  >=1cycle=2  >=2cycle=0  overshot_demos=0
+weighted_success=3.5% (sum_tier=2/57)  tier3_reached=0  strict_success=0  >=1cycle=1  >=2cycle=1  overshot_demos=0
+weighted_success=3.5% (sum_tier=2/57)  tier3_reached=0  strict_success=0  >=1cycle=2  >=2cycle=0  overshot_demos=0
+weighted_success=3.5% tier3_reached=0
+weighted_success=3.5% tier3_reached=0 strict_success=0
+weighted_success=5.3% (sum_tier=3/57)  tier3_reached=0  strict_success=0  >=1cycle=2  >=2cycle=1  overshot_demos=0
+weighted_success=5.3% (sum_tier=3/57)  tier3_reached=0  strict_success=0  >=1cycle=3  >=2cycle=0  overshot_demos=0
+weighted_success=5.3% (sum_tier=3/57)  tier3_reached=1  strict_success=0  >=1cycle=1  >=2cycle=1  overshot_demos=1
+weighted_success=6.7% (sum_tier=2/30)  tier3_reached=0  strict_success=0  >=1cycle=2  >=2cycle=0  overshot_demos=0
+weighted_success=6.7% (sum_tier=4/60)  full3/3=0  >=1cycle=3  >=2cycle=1
+weighted_success=6.7% (sum_tier=4/60)  tier3_reached=0  strict_success=0  >=1cycle=4  >=2cycle=0  overshot_demos=0
+weighted_success=6.7% ... full3/3=0
+weighted_success=7.0% (sum_tier=4/57)  tier3_reached=0  strict_success=0  >=1cycle=3  >=2cycle=1  overshot_demos=0
+weighted_success=7.0% (sum_tier=4/57)  tier3_reached=0  strict_success=0  >=1cycle=4  >=2cycle=0  overshot_demos=0
+weighted_success=7.0% (sum_tier=4/57)  tier3_reached=1  strict_success=1  >=1cycle=2  >=2cycle=1  overshot_demos=0
+weighted_success=7.0% (sum_tier=4/57) tier3_reached=0 strict_success=0 >=1cycle=3 >=2cycle=1 overshot_demos=0
+weighted_success=7.0% tier3_reached=1
+weighted_success=7.0% tier3_reached=1 strict_success=1
+weighted_success=8.3% (sum_tier=5/60)  tier3_reached=0  strict_success=0  >=1cycle=4  >=2cycle=1  overshot_demos=0
+weighted_success=8.8% (sum_tier=5/57)  tier3_reached=0  strict_success=0  >=1cycle=4  >=2cycle=1  overshot_demos=0
+weighted_success=8.8% (sum_tier=5/57)  tier3_reached=1  strict_success=1  >=1cycle=3  >=2cycle=1  overshot_demos=0
+weighted_success=8.8% (sum_tier=5/57) tier3_reached=0 strict_success=0 >=1cycle=4 >=2cycle=1 overshot_demos=0
+weighted_success=8.8% (sum_tier=5/57) tier3_reached=0 strict_success=0 >=1cycle=4 >=2cycle=1 overshot_demos=0` + TIERED_DONE
+weighted_success=8.8% tier3_reached=0 strict_success=0

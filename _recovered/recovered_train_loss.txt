@@ -1,0 +1,367 @@
+opt 10/120 (micro 40) | loss 0.7806 | ep_since 0 censored 0 window_cuts 0 | 0.3 min
+opt 10/120 (micro 40) | loss 0.7807 | ep_since 0 censored 0 window_cuts 0 | 0.3 min
+opt 10/15000 (micro 40) | loss 1.0152 | 0.3 min
+opt 10/20 (micro 20) | loss 1.0025 | 0.1 min
+opt 10/25 (micro 40) | loss 0.0521 | 0.3 min
+opt 10/40 (micro 20) | loss 0.0364 | ep_since 0 censored 0 window_cuts 0 | 0.2 min
+opt 10/40 (micro 20) | loss 1.0025 | 0.2 min
+opt 10/4000 (micro 40) | loss 0.0407 | 0.3 min
+opt 10/4000 (micro 40) | loss 0.0409 | ep_since 0 censored 0 window_cuts 0 | 0.3 min
+opt 10/4000 (micro 40) | loss 0.0578 | ep_since 0 censored 0 window_cuts 0 | 0.4 min
+opt 10/60 (micro 20) | loss 1.0025 | 0.2 min
+opt 10/60 (micro 20) | loss 1.0025 | ep_since 0 censored 0 window_cuts - | 0.2 min
+opt 100/120 (micro 400) | loss 0.8011 | ep_since 0 censored 10 window_cuts 0 | 2.8 min
+opt 100/1200 (micro 400) | loss 0.7072 | 2.4 min
+opt 100/1200 (micro 400) | loss 0.7780 | ep_since 0 censored 10 window_cuts 248 | 10.9 min
+opt 100/2500 (micro 400) | loss 0.7844 | 3.6 min
+opt 100/4000 (micro 400) | loss 0.1073 | 3.1 min
+opt 100/4000 (micro 400) | loss 0.1110 | ep_since 0 censored 10 window_cuts 0 | 3.3 min
+opt 100/8000 (micro 400) | loss 0.8010 | ep_since 0 censored 10 window_cuts 252 | 2.8 min
+opt 100/8000 (micro 400) | loss 0.8011 | ep_since 0 censored 10 window_cuts - | 3.0 min
+opt 1000/15000 (micro 4000) | loss 0.1079 | ep_since 0 censored 122 window_cuts 263 | 33.0 min
+opt 1000/15000 (micro 4000) | loss 0.1130 | ep_since 0 censored 122 window_cuts - | 32.9 min
+opt 1000/4000 (micro 4000) | loss 0.0440 | ep_since 0 censored 110 window_cuts 0 | 35.8 min
+opt 1010/4000 (micro 4040) | loss 0.0462 | ep_since 0 censored 112 window_cuts 0 | 37.1 min
+opt 1020/4000 (micro 4080) | loss 0.0346 | ep_since 0 censored 114 window_cuts 0 | 37.4 min
+opt 1050/4000 (micro 4200) | loss 0.0677 | 53.9 min
+opt 1050/8000 (micro 4200) | loss 0.0464 | ep_since 0 censored 128 window_cuts 0 | 39.5 min
+opt 1050/8000 (micro 4200) | loss 0.3685 | ep_since 0 censored 128 window_cuts 0 | 33.6 min
+opt 1060/4000 (micro 4240) | loss 0.0720 | 54.3 min
+opt 110/120 (micro 440) | loss 0.7792 | ep_since 0 censored 12 window_cuts 0 | 3.1 min
+opt 1100/15000 (micro 4400) | loss 0.0225 | ep_since 0 censored 134 window_cuts 732 | 39.9 min
+opt 1100/8000 (micro 4400) | loss 0.0119 | ep_since 0 censored 134 window_cuts - | 39.4 min
+opt 1100/8000 (micro 4400) | loss 0.2357 | ep_since 0 censored 134 window_cuts - | 32.9 min
+opt 1140/2500 (micro 4560) | loss 0.1315 | 36.1 min
+opt 1150/1200 (micro 4600) | loss 0.3173 | 31.6 min
+opt 1150/15000 (micro 4600) | loss 0.0641 | ep_since 0 censored 140 window_cuts - | 40.1 min
+opt 1160/2500 (micro 4640) | loss 0.1082 | 36.7 min
+opt 1180/2500 (micro 4720) | loss 0.0970 | 37.2 min
+opt 120/120 (micro 480) | loss 0.7773 | ep_since 0 censored 14 window_cuts 0 | 3.4 min
+opt 120/2500 (micro 480) | loss 0.6005 | 4.3 min
+opt 1200/1200 (micro 4800) | loss 0.1473 | 32.9 min
+opt 1200/15000 (micro 4800) | loss 0.0448 | ep_since 0 censored 146 window_cuts 253 | 41.1 min
+opt 1200/2500 (micro 4800) | loss 0.0748 | 37.8 min
+opt 1220/2500 (micro 4880) | loss 0.1173 | 38.4 min
+opt 1240/4000 (micro 4960) | loss 0.1252 | ep_since 0 censored 138 window_cuts 0 | 45.1 min
+opt 1250/15000 (micro 5000) | loss 0.0410 | ep_since 0 censored 152 window_cuts - | 40.3 min
+opt 1250/8000 (micro 5000) | loss 0.6054 | ep_since 0 censored 152 window_cuts - | 41.0 min
+opt 1310/4000 (micro 5240) | loss 0.0535 | 45.3 min
+opt 140/2500 (micro 560) | loss 0.5165 | 5.0 min
+opt 14350/20000 (micro 57400) | loss 0.0424 | ep_since 0 censored 42 window_cuts 232 | 15.3 min
+opt 14350/20000 (micro 57400) | loss 0.0426 | ep_since 0 censored 42 window_cuts - | 15.1 min
+opt 1450/15000 (micro 5800) | loss 0.0267 | ep_since 0 censored 176 window_cuts 0 | 52.5 min
+opt 14550/20000 (micro 58200) | loss 0.0373 | ep_since 0 censored 66 window_cuts - | 23.1 min
+opt 14550/20000 (micro 58200) | loss 0.0381 | ep_since 0 censored 66 window_cuts 242 | 23.5 min
+opt 1460/40000 (micro 2920) | loss 0.0858 | ep_since 0 censored 80 window_cuts 0 | 25.9 min
+opt 14670/40000 (micro 29340) | loss 0.0651 | 250.5 min
+opt 15/20 (micro 30) | loss 0.9932 | 0.3 min
+opt 15/25 (micro 30) | loss 0.9931 | 0.2 min
+opt 15/25 (micro 60) | loss 0.0719 | 0.6 min
+opt 15/40 (micro 30) | loss 0.9931 | 0.2 min
+opt 15/60 (micro 30) | loss 0.9931 | 0.2 min
+opt 150/1200 (micro 600) | loss 0.6513 | 3.6 min
+opt 150/1200 (micro 600) | loss 0.7822 | ep_since 0 censored 18 window_cuts 268 | 17.5 min
+opt 150/40000 (micro 300) | loss 0.6219 | ep_since 0 censored 8 window_cuts 0 | 2.5 min
+opt 150/40000 (micro 300) | loss 0.6234 | 2.4 min
+opt 150/8000 (micro 600) | loss 0.8536 | ep_since 0 censored 18 window_cuts - | 4.1 min
+opt 150/8000 (micro 600) | loss 0.8537 | ep_since 0 censored 18 window_cuts 268 | 4.2 min
+opt 1500/8000 (micro 6000) | loss 0.0513 | ep_since 0 censored 182 window_cuts 753 | 56.1 min
+opt 15000/15000 (micro 60000) | loss 0.0365 | ep_since 0 censored 1832 window_cuts - | 492.7 min
+opt 15000/15000 (micro 60000) | loss 0.0381 | ep_since 0 censored 1832 window_cuts 0 | 507.0 min
+opt 15000/15000 (micro 60000) | loss 0.0609 | ep_since 0 censored 854 window_cuts 0 | 232.9 min
+opt 15000/15000 (micro 60000) | loss 0.0854 | 191.8 min
+opt 1505/1540 (micro 3010) | loss 0.1152 | 2.0 min
+opt 1510/1540 (micro 3020) | loss 0.0935 | 2.1 min
+opt 1515/1540 (micro 3030) | loss 0.1546 | 2.2 min
+opt 1520/1540 (micro 3040) | loss 0.1229 | 2.2 min
+opt 1530/40000 (micro 3060) | loss 0.1263 | 25.8 min
+opt 15400/20000 (micro 61600) | loss 0.0231 | ep_since 0 censored 170 window_cuts 245 | 58.0 min
+opt 15450/20000 (micro 61800) | loss 0.0277 | ep_since 0 censored 176 window_cuts - | 58.8 min
+opt 160/2500 (micro 640) | loss 0.3264 | 5.7 min
+opt 160/40000 (micro 320) | loss 0.4708 | 2.6 min
+opt 160/40000 (micro 320) | loss 0.4732 | ep_since 0 censored 8 window_cuts 0 | 2.7 min
+opt 1600/15000 (micro 6400) | loss 0.0249 | ep_since 0 censored 194 window_cuts 268 | 54.4 min
+opt 1600/40000 (micro 3200) | loss 0.1327 | 22.9 min
+opt 1600/8000 (micro 6400) | loss 0.0170 | ep_since 0 censored 194 window_cuts - | 57.3 min
+opt 1660/4000 (micro 6640) | loss 0.1326 | ep_since 0 censored 184 window_cuts 0 | 60.2 min
+opt 1670/4000 (micro 6680) | loss 0.0324 | ep_since 0 censored 184 window_cuts 0 | 60.5 min
+opt 16700/20000 (micro 66800) | loss 0.0305 | ep_since 0 censored 328 window_cuts 0 | 101.5 min
+opt 16750/20000 (micro 67000) | loss 0.0578 | ep_since 0 censored 334 window_cuts - | 102.0 min
+opt 1680/4000 (micro 6720) | loss 0.1147 | ep_since 0 censored 186 window_cuts 0 | 60.9 min
+opt 1690/4000 (micro 6760) | loss 0.1329 | ep_since 0 censored 188 window_cuts 0 | 61.3 min
+opt 170/40000 (micro 340) | loss 0.4121 | 2.4 min
+opt 170/40000 (micro 340) | loss 0.4197 | 2.7 min
+opt 1700/15000 (micro 6800) | loss 0.0427 | ep_since 0 censored 206 window_cuts - | 54.7 min
+opt 1700/4000 (micro 6800) | loss 0.0726 | ep_since 0 censored 188 window_cuts 0 | 61.6 min
+opt 1710/4000 (micro 6840) | loss 0.0237 | 75.8 min
+opt 17100/20000 (micro 68400) | loss 0.0420 | ep_since 0 censored 378 window_cuts 232 | 114.6 min
+opt 1720/4000 (micro 6880) | loss 0.0916 | 76.1 min
+opt 1730/4000 (micro 6920) | loss 0.1875 | 76.5 min
+opt 17650/20000 (micro 70600) | loss 0.0828 | ep_since 0 censored 324 window_cuts 0 | 97.6 min
+opt 17700/20000 (micro 70800) | loss 0.0532 | 92.3 min
+opt 17750/20000 (micro 71000) | loss 0.0797 | 94.1 min
+opt 17800/20000 (micro 71200) | loss 0.2108 | 95.9 min
+opt 17850/20000 (micro 71400) | loss 0.1365 | 97.7 min
+opt 1800/8000 (micro 7200) | loss 0.1473 | ep_since 0 censored 218 window_cuts 240 | 58.2 min
+opt 1850/8000 (micro 7400) | loss 0.0194 | ep_since 0 censored 226 window_cuts 247 | 69.6 min
+opt 1950/8000 (micro 7800) | loss 0.0616 | ep_since 0 censored 238 window_cuts - | 70.3 min
+opt 1950/8000 (micro 7800) | loss 0.6011 | ep_since 0 censored 238 window_cuts 678 | 65.5 min
+opt 19890/40000 (micro 39780) | loss 0.0543 | ep_since 0 censored 1104 window_cuts 0 | 355.0 min
+opt 20/120 (micro 80) | loss 0.7803 | ep_since 0 censored 2 window_cuts 0 | 0.6 min
+opt 20/15000 (micro 80) | loss 1.0162 | 0.6 min
+opt 20/20 (micro 40) | loss 1.0139 | 0.3 min
+opt 20/25 (micro 40) | loss 1.0139 | 0.3 min
+opt 20/25 (micro 80) | loss 0.0583 | 0.7 min
+opt 20/2500 (micro 80) | loss 1.0165 | 0.9 min
+opt 20/40 (micro 40) | loss 0.1143 | ep_since 0 censored 0 window_cuts 0 | 0.3 min
+opt 20/40 (micro 40) | loss 1.0139 | 0.3 min
+opt 20/4000 (micro 80) | loss 0.1461 | 0.6 min
+opt 20/4000 (micro 80) | loss 0.1678 | 0.6 min
+opt 20/4000 (micro 80) | loss 0.1679 | ep_since 0 censored 2 window_cuts 0 | 0.7 min
+opt 20/40000 (micro 40) | loss 1.0139 | 0.3 min
+opt 20/5000 (micro 80) | loss 0.1456 | ep_since 0 censored 2 window_cuts 0 | 0.7 min
+opt 20/60 (micro 40) | loss 1.0139 | 0.3 min
+opt 20/60 (micro 40) | loss 1.0139 | ep_since 0 censored 0 window_cuts - | 0.3 min
+opt 200/1200 (micro 800) | loss 0.6883 | 4.8 min
+opt 200/15000 (micro 800) | loss 0.0265 | ep_since 0 censored 24 window_cuts 0 | 6.8 min
+opt 200/15000 (micro 800) | loss 0.0278 | ep_since 0 censored 24 window_cuts - | 6.4 min
+opt 200/4000 (micro 800) | loss 0.0293 | ep_since 0 censored 20 window_cuts 0 | 6.9 min
+opt 200/4000 (micro 800) | loss 0.0308 | 6.6 min
+opt 200/800 (micro 800) | loss 0.7744 | ep_since 0 censored 24 window_cuts 0 | 5.5 min
+opt 200/800 (micro 800) | loss 0.7744 | ep_since 0 censored 24 window_cuts 0 | 5.6 min
+opt 2000/2500 (micro 8000) | loss 0.0894 | 60.6 min
+opt 2000/8000 (micro 8000) | loss 0.1408 | ep_since 0 censored 244 window_cuts - | 64.0 min
+opt 20000/20000 (micro 80000) | loss 0.0963 | ep_since 0 censored 732 window_cuts 487 | 210.3 min
+opt 20000/20000 (micro 80000) | loss 0.0972 | ep_since 0 censored 732 window_cuts - | 208.2 min
+opt 2020/2500 (micro 8080) | loss 0.1323 | 61.2 min
+opt 2050/15000 (micro 8200) | loss 0.0781 | ep_since 0 censored 250 window_cuts 248 | 70.4 min
+opt 2050/20000 (micro 8200) | loss 0.0858 | ep_since 0 censored 250 window_cuts 0 | 68.1 min
+opt 2050/8000 (micro 8200) | loss 0.0716 | ep_since 0 censored 250 window_cuts 248 | 78.1 min
+opt 20770/40000 (micro 41540) | loss 0.0584 | 354.9 min
+opt 2100/20000 (micro 8400) | loss 0.0393 | 66.1 min
+opt 2100/20000 (micro 8400) | loss 0.0416 | ep_since 0 censored 256 window_cuts 0 | 69.7 min
+opt 2140/15000 (micro 8560) | loss 0.0755 | 63.1 min
+opt 2150/15000 (micro 8600) | loss 0.0199 | ep_since 0 censored 262 window_cuts - | 70.2 min
+opt 2150/20000 (micro 8600) | loss 0.0265 | 67.6 min
+opt 2150/8000 (micro 8600) | loss 0.0145 | ep_since 0 censored 262 window_cuts - | 78.6 min
+opt 2200/20000 (micro 8800) | loss 0.0544 | 69.1 min
+opt 2250/20000 (micro 9000) | loss 0.1058 | 70.5 min
+opt 2250/8000 (micro 9000) | loss 0.0565 | ep_since 0 censored 274 window_cuts 220 | 90.8 min
+opt 23260/40000 (micro 46520) | loss 0.0282 | 396.9 min
+opt 2360/4000 (micro 9440) | loss 0.1211 | 81.8 min
+opt 2400/15000 (micro 9600) | loss 0.0425 | ep_since 0 censored 292 window_cuts 542 | 82.2 min
+opt 2480/2500 (micro 9920) | loss 0.0894 | 74.4 min
+opt 25/25 (micro 100) | loss 0.0745 | 1.1 min
+opt 250/1200 (micro 1000) | loss 0.4438 | 6.0 min
+opt 250/15000 (micro 1000) | loss 0.0199 | ep_since 0 censored 30 window_cuts - | 8.4 min
+opt 250/8000 (micro 1000) | loss 0.0129 | ep_since 0 censored 30 window_cuts 753 | 9.4 min
+opt 2500/15000 (micro 10000) | loss 0.0591 | ep_since 0 censored 304 window_cuts - | 81.7 min
+opt 2500/2500 (micro 10000) | loss 0.1006 | 75.0 min
+opt 2500/8000 (micro 10000) | loss 0.0543 | ep_since 0 censored 304 window_cuts 0 | 108.0 min
+opt 2540/15000 (micro 10160) | loss 0.0560 | ep_since 0 censored 282 window_cuts 0 | 93.6 min
+opt 2550/8000 (micro 10200) | loss 0.1304 | ep_since 0 censored 310 window_cuts - | 80.9 min
+opt 2580/4000 (micro 10320) | loss 0.1617 | ep_since 0 censored 286 window_cuts 0 | 94.1 min
+opt 2590/4000 (micro 10360) | loss 0.0260 | ep_since 0 censored 286 window_cuts 0 | 94.4 min
+opt 2600/4000 (micro 10400) | loss 0.0824 | ep_since 0 censored 288 window_cuts 0 | 94.8 min
+opt 2600/8000 (micro 10400) | loss 0.0323 | ep_since 1 censored 318 window_cuts - | 107.6 min
+opt 2610/4000 (micro 10440) | loss 0.0374 | ep_since 0 censored 288 window_cuts 0 | 95.1 min
+opt 2620/4000 (micro 10480) | loss 0.0628 | ep_since 0 censored 290 window_cuts 0 | 95.5 min
+opt 2630/4000 (micro 10520) | loss 0.0267 | ep_since 0 censored 290 window_cuts 0 | 95.8 min
+opt 2650/8000 (micro 10600) | loss 0.1034 | ep_since 0 censored 324 window_cuts 517 | 89.3 min
+opt 27330/40000 (micro 54660) | loss 0.0218 | 462.9 min
+opt 2750/8000 (micro 11000) | loss 0.1075 | ep_since 0 censored 334 window_cuts - | 81.7 min
+opt 2750/8000 (micro 11000) | loss 0.1104 | ep_since 0 censored 334 window_cuts 764 | 83.9 min
+opt 2800/8000 (micro 11200) | loss 0.1392 | ep_since 0 censored 340 window_cuts - | 83.3 min
+opt 2800/8000 (micro 11200) | loss 0.1532 | ep_since 0 censored 340 window_cuts 467 | 85.4 min
+opt 2850/4000 (micro 11400) | loss 0.0583 | 114.2 min
+opt 2850/8000 (micro 11400) | loss 0.4860 | ep_since 0 censored 346 window_cuts - | 84.8 min
+opt 2860/4000 (micro 11440) | loss 0.0404 | 114.6 min
+opt 2870/4000 (micro 11480) | loss 0.1650 | 114.9 min
+opt 2880/4000 (micro 11520) | loss 0.1500 | 115.2 min
+opt 2890/4000 (micro 11560) | loss 0.0422 | 115.5 min
+opt 2920/15000 (micro 11680) | loss 0.0485 | 89.8 min
+opt 2940/15000 (micro 11760) | loss 0.0958 | ep_since 0 censored 326 window_cuts 0 | 107.5 min
+opt 2950/15000 (micro 11800) | loss 0.0189 | ep_since 0 censored 360 window_cuts 0 | 101.1 min
+opt 2950/8000 (micro 11800) | loss 0.0847 | ep_since 0 censored 360 window_cuts - | 92.9 min
+opt 29730/40000 (micro 59460) | loss 0.1286 | 502.2 min
+opt 30/120 (micro 120) | loss 0.7831 | ep_since 0 censored 2 window_cuts 0 | 0.8 min
+opt 30/15000 (micro 120) | loss 0.9868 | 0.9 min
+opt 30/40 (micro 120) | loss 0.0907 | 0.4 min
+opt 30/40 (micro 60) | loss 0.0752 | ep_since 0 censored 0 window_cuts 0 | 0.6 min
+opt 30/40 (micro 60) | loss 0.0761 | ep_since 0 censored 0 window_cuts 0 | 0.6 min
+opt 30/4000 (micro 120) | loss 0.1084 | 1.0 min
+opt 30/40000 (micro 60) | loss 1.0411 | 0.4 min
+opt 30/5000 (micro 120) | loss 0.0768 | 0.9 min
+opt 30/5000 (micro 120) | loss 0.0788 | ep_since 0 censored 2 window_cuts 0 | 1.0 min
+opt 30/60 (micro 60) | loss 1.0411 | ep_since 0 censored 0 window_cuts - | 0.4 min
+opt 300/1200 (micro 1200) | loss 0.4207 | 7.2 min
+opt 300/20000 (micro 1200) | loss 0.1898 | ep_since 0 censored 36 window_cuts 0 | 9.8 min
+opt 300/20000 (micro 1200) | loss 0.1925 | 9.3 min
+opt 300/4000 (micro 1200) | loss 0.1140 | 10.1 min
+opt 300/4000 (micro 1200) | loss 0.1184 | ep_since 0 censored 32 window_cuts 0 | 10.6 min
+opt 300/8000 (micro 1200) | loss 0.1240 | ep_since 0 censored 36 window_cuts - | 10.9 min
+opt 300/8000 (micro 1200) | loss 0.8432 | ep_since 0 censored 36 window_cuts - | 8.8 min
+opt 3000/8000 (micro 12000) | loss 0.0768 | ep_since 0 censored 366 window_cuts - | 94.3 min
+opt 3030/4000 (micro 12120) | loss 0.1485 | ep_since 0 censored 336 window_cuts 0 | 111.8 min
+opt 3050/15000 (micro 12200) | loss 0.0694 | ep_since 0 censored 372 window_cuts - | 100.4 min
+opt 3140/4000 (micro 12560) | loss 0.1554 | ep_since 0 censored 348 window_cuts 0 | 113.2 min
+opt 3150/4000 (micro 12600) | loss 0.0466 | ep_since 0 censored 348 window_cuts 0 | 113.5 min
+opt 3160/4000 (micro 12640) | loss 0.0671 | ep_since 0 censored 350 window_cuts 0 | 113.8 min
+opt 3170/4000 (micro 12680) | loss 0.0320 | ep_since 0 censored 350 window_cuts 0 | 114.1 min
+opt 3200/4000 (micro 12800) | loss 0.0416 | 112.2 min
+opt 3200/8000 (micro 12800) | loss 0.3691 | ep_since 1 censored 392 window_cuts 906 | 106.2 min
+opt 3220/4000 (micro 12880) | loss 0.0598 | ep_since 0 censored 356 window_cuts 0 | 115.8 min
+opt 3230/4000 (micro 12920) | loss 0.1708 | ep_since 0 censored 358 window_cuts 0 | 116.3 min
+opt 3350/15000 (micro 13400) | loss 0.0744 | ep_since 0 censored 408 window_cuts - | 110.2 min
+opt 340/4000 (micro 1360) | loss 0.0904 | ep_since 0 censored 36 window_cuts 0 | 12.1 min
+opt 35/40 (micro 140) | loss 0.0722 | 0.7 min
+opt 35/80 (micro 70) | loss 1.0247 | ep_since 0 censored 2 window_cuts 0 | 0.6 min
+opt 350/1200 (micro 1400) | loss 0.6952 | 8.5 min
+opt 350/20000 (micro 1400) | loss 0.0892 | 10.9 min
+opt 350/20000 (micro 1400) | loss 0.0968 | ep_since 0 censored 42 window_cuts 0 | 11.4 min
+opt 360/4000 (micro 1440) | loss 0.0371 | 12.1 min
+opt 3600/8000 (micro 14400) | loss 0.1193 | ep_since 0 censored 438 window_cuts - | 114.1 min
+opt 3600/8000 (micro 14400) | loss 0.1213 | ep_since 0 censored 438 window_cuts 723 | 118.6 min
+opt 3650/8000 (micro 14600) | loss 0.5208 | ep_since 0 censored 444 window_cuts 475 | 120.0 min
+opt 3800/8000 (micro 15200) | loss 0.0886 | ep_since 0 censored 464 window_cuts - | 127.9 min
+opt 3840/4000 (micro 15360) | loss 0.0563 | 148.0 min
+opt 3850/15000 (micro 15400) | loss 0.0610 | ep_since 0 censored 470 window_cuts 721 | 131.3 min
+opt 3850/4000 (micro 15400) | loss 0.0712 | 148.3 min
+opt 3860/4000 (micro 15440) | loss 0.0507 | 148.7 min
+opt 3870/4000 (micro 15480) | loss 0.0299 | 149.0 min
+opt 3880/4000 (micro 15520) | loss 0.0563 | 149.3 min
+opt 3880/5000 (micro 15520) | loss 0.0582 | ep_since 0 censored 430 window_cuts 0 | 141.5 min
+opt 3890/4000 (micro 15560) | loss 0.0240 | 149.7 min
+opt 40/120 (micro 160) | loss 0.7171 | ep_since 0 censored 4 window_cuts 0 | 1.1 min
+opt 40/15000 (micro 160) | loss 1.0105 | ep_since 0 censored 4 window_cuts 0 | 1.3 min
+opt 40/15000 (micro 160) | loss 1.0106 | 1.2 min
+opt 40/2500 (micro 160) | loss 1.0122 | 1.6 min
+opt 40/40 (micro 160) | loss 0.0629 | 0.8 min
+opt 40/40 (micro 80) | loss 0.1077 | ep_since 0 censored 2 window_cuts 232 | 0.8 min
+opt 40/40000 (micro 80) | loss 1.0096 | 0.6 min
+opt 40/5000 (micro 160) | loss 0.1861 | 1.2 min
+opt 40/60 (micro 80) | loss 1.0096 | ep_since 0 censored 2 window_cuts - | 0.6 min
+opt 40/80 (micro 80) | loss 0.0801 | ep_since 0 censored 2 window_cuts 215 | 1.4 min
+opt 40/80 (micro 80) | loss 0.0812 | ep_since 0 censored 2 window_cuts 215 | 1.4 min
+opt 40/80 (micro 80) | loss 1.0098 | ep_since 0 censored 2 window_cuts 0 | 0.6 min
+opt 400/1200 (micro 1600) | loss 0.2505 | 9.7 min
+opt 400/20000 (micro 1600) | loss 0.0483 | 12.4 min
+opt 400/20000 (micro 1600) | loss 0.0515 | ep_since 0 censored 48 window_cuts 0 | 13.0 min
+opt 400/800 (micro 1600) | loss 0.4561 | ep_since 0 censored 48 window_cuts 0 | 11.1 min
+opt 4000/15000 (micro 16000) | loss 0.0168 | ep_since 0 censored 488 window_cuts 0 | 136.2 min
+opt 4000/15000 (micro 16000) | loss 0.0174 | ep_since 0 censored 488 window_cuts - | 131.5 min
+opt 4000/4000 (micro 16000) | loss 0.0714 | 153.3 min
+opt 4000/4000 (micro 16000) | loss 0.0721 | ep_since 0 censored 444 window_cuts 0 | 141.2 min
+opt 4150/15000 (micro 16600) | loss 0.0768 | ep_since 0 censored 506 window_cuts - | 137.4 min
+opt 4150/20000 (micro 16600) | loss 0.1064 | ep_since 0 censored 506 window_cuts 0 | 136.9 min
+opt 4200/20000 (micro 16800) | loss 0.0520 | ep_since 0 censored 512 window_cuts 0 | 138.5 min
+opt 4200/8000 (micro 16800) | loss 0.1157 | ep_since 0 censored 512 window_cuts 0 | 138.1 min
+opt 4210/5000 (micro 16840) | loss 0.1055 | 141.8 min
+opt 4250/20000 (micro 17000) | loss 0.0598 | ep_since 0 censored 518 window_cuts 0 | 140.0 min
+opt 4400/5000 (micro 17600) | loss 0.0876 | ep_since 0 censored 488 window_cuts 0 | 164.8 min
+opt 4400/8000 (micro 17600) | loss 0.0736 | ep_since 0 censored 538 window_cuts - | 153.0 min
+opt 4400/8000 (micro 17600) | loss 0.0766 | ep_since 0 censored 538 window_cuts 218 | 153.9 min
+opt 4450/20000 (micro 17800) | loss 0.0393 | 137.7 min
+opt 45/80 (micro 90) | loss 0.9733 | ep_since 0 censored 2 window_cuts 0 | 0.7 min
+opt 450/1200 (micro 1800) | loss 0.8114 | 11.3 min
+opt 450/20000 (micro 1800) | loss 0.0523 | ep_since 0 censored 54 window_cuts 0 | 14.6 min
+opt 450/20000 (micro 1800) | loss 0.0543 | 13.9 min
+opt 450/40000 (micro 900) | loss 0.1375 | 6.3 min
+opt 4500/20000 (micro 18000) | loss 0.1084 | 139.2 min
+opt 4540/15000 (micro 18160) | loss 0.0663 | ep_since 0 censored 504 window_cuts 0 | 163.6 min
+opt 4540/5000 (micro 18160) | loss 0.0611 | ep_since 0 censored 504 window_cuts 0 | 171.0 min
+opt 4550/20000 (micro 18200) | loss 0.0708 | 140.7 min
+opt 4550/5000 (micro 18200) | loss 0.0639 | ep_since 0 censored 504 window_cuts 0 | 171.4 min
+opt 4700/15000 (micro 18800) | loss 0.0392 | ep_since 0 censored 574 window_cuts 779 | 160.8 min
+opt 4800/15000 (micro 19200) | loss 0.0575 | ep_since 0 censored 586 window_cuts 242 | 164.1 min
+opt 4810/5000 (micro 19240) | loss 0.0482 | 165.4 min
+opt 4850/15000 (micro 19400) | loss 0.1002 | ep_since 0 censored 592 window_cuts - | 160.1 min
+opt 4850/8000 (micro 19400) | loss 0.4149 | ep_since 0 censored 592 window_cuts - | 172.6 min
+opt 4880/15000 (micro 19520) | loss 0.0945 | 158.5 min
+opt 4950/5000 (micro 19800) | loss 0.0355 | 171.0 min
+opt 4960/5000 (micro 19840) | loss 0.1231 | 171.5 min
+opt 5/20 (micro 10) | loss 1.0209 | 0.1 min
+opt 5/25 (micro 20) | loss 0.0588 | 0.2 min
+opt 5/40 (micro 10) | loss 1.0209 | 0.1 min
+opt 5/60 (micro 10) | loss 1.0209 | 0.1 min
+opt 50/120 (micro 200) | loss 0.8031 | ep_since 0 censored 6 window_cuts 0 | 1.4 min
+opt 50/1200 (micro 200) | loss 0.7679 | 1.2 min
+opt 50/1200 (micro 200) | loss 0.8029 | ep_since 0 censored 6 window_cuts 741 | 4.7 min
+opt 50/1200 (micro 200) | loss 0.8029 | ep_since 0 censored 6 window_cuts 741 | 5.2 min
+opt 50/1200 (micro 200) | loss 0.8029 | ep_since 0 censored 6 window_cuts 741 | 6.1 min
+opt 50/1500 (micro 200) | loss 0.1159 | ep_since 0 censored 6 window_cuts 741 | 1.6 min
+opt 50/15000 (micro 200) | loss 0.9904 | ep_since 0 censored 4 window_cuts 0 | 1.7 min
+opt 50/40000 (micro 100) | loss 0.9596 | 0.7 min
+opt 50/60 (micro 100) | loss 0.9596 | ep_since 0 censored 2 window_cuts - | 0.8 min
+opt 50/80 (micro 100) | loss 0.9597 | ep_since 0 censored 2 window_cuts 0 | 0.8 min
+opt 500/8000 (micro 2000) | loss 0.3101 | ep_since 0 censored 60 window_cuts - | 15.6 min
+opt 5000/15000 (micro 20000) | loss 0.0513 | ep_since 0 censored 610 window_cuts - | 164.9 min
+opt 5000/8000 (micro 20000) | loss 0.0824 | ep_since 0 censored 610 window_cuts 286 | 178.9 min
+opt 5100/8000 (micro 20400) | loss 0.2302 | ep_since 0 censored 10 window_cuts - | 3.8 min
+opt 5100/8000 (micro 20400) | loss 0.2864 | ep_since 0 censored 10 window_cuts 252 | 3.9 min
+opt 5150/8000 (micro 20600) | loss 0.0848 | ep_since 0 censored 628 window_cuts - | 193.8 min
+opt 5250/8000 (micro 21000) | loss 0.0762 | ep_since 0 censored 30 window_cuts - | 13.8 min
+opt 5250/8000 (micro 21000) | loss 0.0787 | ep_since 0 censored 30 window_cuts 753 | 12.6 min
+opt 5270/15000 (micro 21080) | loss 0.0583 | ep_since 0 censored 586 window_cuts 0 | 188.9 min
+opt 5280/15000 (micro 21120) | loss 0.0642 | 172.2 min
+opt 5450/8000 (micro 21800) | loss 0.4242 | ep_since 0 censored 664 window_cuts 0 | 199.7 min
+opt 55/80 (micro 110) | loss 0.9747 | ep_since 0 censored 2 window_cuts 0 | 0.9 min
+opt 550/15000 (micro 2200) | loss 0.1328 | 15.8 min
+opt 550/40000 (micro 1100) | loss 0.1379 | 7.9 min
+opt 550/8000 (micro 2200) | loss 0.3461 | ep_since 0 censored 66 window_cuts - | 16.9 min
+opt 560/15000 (micro 2240) | loss 0.1441 | 16.1 min
+opt 5750/8000 (micro 23000) | loss 0.1535 | ep_since 0 censored 702 window_cuts 695 | 226.8 min
+opt 60/120 (micro 240) | loss 0.7696 | ep_since 0 censored 6 window_cuts 0 | 1.7 min
+opt 60/2500 (micro 240) | loss 0.9863 | 2.2 min
+opt 60/40000 (micro 120) | loss 0.9697 | 0.8 min
+opt 60/60 (micro 120) | loss 0.9697 | ep_since 0 censored 2 window_cuts - | 0.9 min
+opt 60/60 (micro 120) | loss 0.9698 | ep_since 0 censored 2 window_cuts - | 0.9 min
+opt 60/80 (micro 120) | loss 0.9701 | ep_since 0 censored 2 window_cuts 0 | 1.0 min
+opt 600/15000 (micro 2400) | loss 0.1001 | ep_since 0 censored 72 window_cuts 0 | 19.3 min
+opt 600/800 (micro 2400) | loss 0.8036 | ep_since 0 censored 72 window_cuts 0 | 16.8 min
+opt 6250/8000 (micro 25000) | loss 0.6527 | ep_since 0 censored 152 window_cuts - | 64.2 min
+opt 630/40000 (micro 1260) | loss 0.1517 | ep_since 0 censored 34 window_cuts 0 | 11.0 min
+opt 6300/20000 (micro 25200) | loss 0.0288 | ep_since 0 censored 770 window_cuts 0 | 207.3 min
+opt 6350/20000 (micro 25400) | loss 0.0530 | ep_since 0 censored 776 window_cuts 0 | 208.8 min
+opt 6400/20000 (micro 25600) | loss 0.0414 | ep_since 0 censored 782 window_cuts 0 | 210.4 min
+opt 6400/8000 (micro 25600) | loss 0.0816 | ep_since 0 censored 170 window_cuts 245 | 64.2 min
+opt 65/80 (micro 130) | loss 1.0015 | ep_since 0 censored 2 window_cuts 0 | 1.0 min
+opt 650/15000 (micro 2600) | loss 0.0173 | ep_since 0 censored 78 window_cuts - | 20.9 min
+opt 6500/8000 (micro 26000) | loss 0.0848 | ep_since 0 censored 182 window_cuts - | 88.7 min
+opt 6550/8000 (micro 26200) | loss 0.3385 | ep_since 0 censored 188 window_cuts - | 93.4 min
+opt 660/40000 (micro 1320) | loss 0.2625 | 11.0 min
+opt 6600/8000 (micro 26400) | loss 0.0723 | ep_since 0 censored 194 window_cuts - | 98.5 min
+opt 6750/20000 (micro 27000) | loss 0.0420 | 207.8 min
+opt 6800/20000 (micro 27200) | loss 0.0390 | 209.3 min
+opt 6800/8000 (micro 27200) | loss 0.0834 | ep_since 0 censored 218 window_cuts 240 | 89.5 min
+opt 6850/20000 (micro 27400) | loss 0.0597 | 210.8 min
+opt 690/15000 (micro 2760) | loss 0.1978 | ep_since 0 censored 76 window_cuts 0 | 25.0 min
+opt 6900/8000 (micro 27600) | loss 0.5405 | ep_since 0 censored 232 window_cuts 0 | 95.6 min
+opt 70/120 (micro 280) | loss 0.7944 | ep_since 0 censored 8 window_cuts 0 | 2.0 min
+opt 70/80 (micro 140) | loss 0.9543 | ep_since 0 censored 4 window_cuts 0 | 1.1 min
+opt 700/15000 (micro 2800) | loss 0.0937 | ep_since 0 censored 84 window_cuts 476 | 24.1 min
+opt 700/8000 (micro 2800) | loss 0.2933 | ep_since 0 censored 84 window_cuts 476 | 22.8 min
+opt 7040/15000 (micro 28160) | loss 0.0336 | 228.5 min
+opt 710/40000 (micro 1420) | loss 0.1479 | ep_since 0 censored 38 window_cuts 0 | 12.3 min
+opt 740/40000 (micro 1480) | loss 0.1087 | 12.3 min
+opt 750/15000 (micro 3000) | loss 0.0248 | ep_since 0 censored 92 window_cuts 452 | 27.3 min
+opt 750/15000 (micro 3000) | loss 0.0250 | ep_since 0 censored 92 window_cuts - | 26.3 min
+opt 750/15000 (micro 3000) | loss 0.0264 | ep_since 0 censored 92 window_cuts - | 24.3 min
+opt 750/8000 (micro 3000) | loss 0.2130 | ep_since 0 censored 92 window_cuts 452 | 24.2 min
+opt 7860/15000 (micro 31440) | loss 0.1354 | 253.4 min
+opt 80/120 (micro 320) | loss 0.7649 | ep_since 0 censored 8 window_cuts 0 | 2.2 min
+opt 80/2500 (micro 320) | loss 0.9409 | 2.9 min
+opt 800/800 (micro 3200) | loss 0.5273 | ep_since 0 censored 96 window_cuts 0 | 22.4 min
+opt 8050/15000 (micro 32200) | loss 0.0808 | ep_since 0 censored 6 window_cuts 0 | 1.7 min
+opt 8200/15000 (micro 32800) | loss 0.0194 | ep_since 0 censored 24 window_cuts 0 | 6.4 min
+opt 8230/15000 (micro 32920) | loss 0.0347 | 265.9 min
+opt 8470/15000 (micro 33880) | loss 0.0698 | 273.6 min
+opt 8500/20000 (micro 34000) | loss 0.1140 | ep_since 0 censored 1036 window_cuts 0 | 279.4 min
+opt 860/4000 (micro 3440) | loss 0.1061 | 47.4 min
+opt 870/4000 (micro 3480) | loss 0.0646 | 47.7 min
+opt 880/4000 (micro 3520) | loss 0.1609 | 48.0 min
+opt 90/120 (micro 360) | loss 0.7903 | ep_since 0 censored 10 window_cuts 0 | 2.5 min
+opt 900/8000 (micro 3600) | loss 0.1978 | ep_since 0 censored 110 window_cuts 701 | 29.0 min
+opt 9050/15000 (micro 36200) | loss 0.0572 | 1.5 min
+opt 9050/20000 (micro 36200) | loss 0.0249 | 280.2 min
+opt 9250/15000 (micro 37000) | loss 0.0324 | 7.4 min

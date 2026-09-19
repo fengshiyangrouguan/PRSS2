@@ -1,0 +1,65 @@
+
+=== 63764db6-b98c-4463-b1d5-11905e2409cf.jsonl:6309 ===
+可以，这正是审阅建议的 tiered 加权成功率的思路。我来定义一个**加权成功率**指标并算出现有结果： ``` weighted_success = Σ(tier_i) / (3 × n_demos) ``` 即 tier 1/3 贡献 1 分、2/3 贡献 2 分、3/3 贡献 3 分，除以满分 3×n。平滑反映渐进进步，不硬切。 先用现有 20-demo 结果算给你看：
+
+=== 63764db6-b98c-4463-b1d5-11905e2409cf.jsonl:6331 ===
+len(rows) wsum=sum(r["tier"] for r in rows) weighted=wsum/(3.0*max(1,n)) full=sum(1 for r in rows if r["tier"]==3) ge1=sum(1 for r in rows if r["tier"]>=1) ge2=sum(1 for r in rows if r["tier"]>=2) print("arm=%s exec=%d n=%d tier_dist=%s final_success=%d"%(arm,args.exec,n,dist,nf),flush=True) print("weighted_success=%.1f%% (sum_tier=%d/%.0f) full3/3=%d >=1cycle=%d >=2cycle=%d"% (weighted*100, wsum, 3.0*n, full, ge1, ge2),flush=True) print("TIERED_DONE",flush=True)''' assert old in s s=s.replace(old,new) open(p,'w',encoding='utf-8').write(s) import ast; ast.parse(s); print('tiered_eval updated with wei
+
+=== 63764db6-b98c-4463-b1d5-11905e2409cf.jsonl:6335 ===
+部署更新版 tiered_eval 到服务器，同时回答你的问题。 ## 加权成功率指标定义（已加入评估器） ``` weighted_success = Σ(tier_i) / (3 × n_demos) ``` tier 1/3 记 1 分、2/3 记 2 分、3/3 记 3 分（你描述的"1/3 算一次、3/3 算三次、权重递增"正是这个）。分母 3×n 是满分。这样部分成功也计入，能平滑反映训练进步，不会把 2/3 和 0/3 混为一谈。 **现有 stage2 结果套用该指标：** | 臂 | weighted_success | 3/3 完整 | ≥1 循环 | ≥2 循环 | |---|---|---|---|---| | **avg** | **11.7%** (7/60) | 0 | 6 | 1 | | **gamma
+
+=== 63764db6-b98c-4463-b1d5-11905e2409cf.jsonl:6340 ===
+已部署并 push（`372ed54`）。 ## 加权成功率指标已定为正式评估标准 公式：`weighted_success = Σ(tier)/(3×n)`，tier 值本身作分数（1/3→1 分…3/3→3 分），平滑反映部分成功。 **当前 stage2 基线**（20 训练 demo，w8 官方状态机）： - **avg: 11.7%**（Σ=7/60） - **gamma-rpbe: 20.0%**（Σ=12/60，含 2 个完整 3/3） gamma-rpbe 显著领先，方法提升有真实行为证据。 ## 下一步选项 用这个加权指标做标尺，接下来可以： 1. **启动加权 loss 的 stage3**（从 stage2 best init，lr 低，3-5k 步）—— 我已在 `6d00f8e` 
+
+=== 63764db6-b98c-4463-b1d5-11905e2409cf.jsonl:6340 ===
+3→3 分），平滑反映部分成功。 **当前 stage2 基线**（20 训练 demo，w8 官方状态机）： - **avg: 11.7%**（Σ=7/60） - **gamma-rpbe: 20.0%**（Σ=12/60，含 2 个完整 3/3） gamma-rpbe 显著领先，方法提升有真实行为证据。 ## 下一步选项 用这个加权指标做标尺，接下来可以： 1. **启动加权 loss 的 stage3**（从 stage2 best init，lr 低，3-5k 步）—— 我已在 `6d00f8e` 写好 per-dim 加权 + action_mask，专攻 xy/z。跑完看 weighted_success 是否从 20% 提升。 2. 或先用当前 stage2 结果 + 加权指标跑一轮更细的分析（哪些 demo 卡在 1/3→2/3，是否特定失败模式）。 你说哪个方向（或都做）？训练不动等你定。
+
+=== 63764db6-b98c-4463-b1d5-11905e2409cf.jsonl:6455 ===
+est init | | 1 | gamma-rpbe-s42-stage3-wloss | opt 20/4000 | 同上 | 两 run 都从各自 stage2 best init-from-weights，用**加权 loss**（x/y=1.5, z=2.0, rotation=0.5, gripper=1.0 + action_mask 排除 padded 帧），lr=5e-6，4000 步。gamma 起步时 window 已开始闭合（censored 递增）。 stage3 完成后用加权成功率指标（tiered_eval）对比 stage2 → 验证 xy/z 加权是否把 weighted_success 从 gamma 20% 推高。 全程约需 ~2-3h。继续盯，跑完自动评估。
+
+=== 63764db6-b98c-4463-b1d5-11905e2409cf.jsonl:6468 ===
+a-rpbe-s3-wloss** | opt 340/4000 | 0.090 | gamma 边界正常触发 | 刚起步（~12 min），还没到首个 eval（eval-every 1000）。加权 loss 下 train loss 与 stage2 同阶段可比（avg ~0.037 vs stage2 同期 ~0.04），说明**加权 loss 没有破坏整体收敛尺度**（审阅要求的归一化正确）。 还需 ~1.5h 到 4000。首个 eval 在 opt 1000（~30 min 后）会给出 val，看加权 loss 是否让 val 有变化。跑完我用 tiered_eval 对比 weighted_success。继续盯。
+
+=== 63764db6-b98c-4463-b1d5-11905e2409cf.jsonl:6494 ===
+["tier"] for r in rows) 96 weighted=wsum/(3.0*max(1,n)) 97 full=sum(1 for r in rows if r["tier"]==3) 98 ge1=sum(1 for r in rows if r["tier"]>=1) 99 ge2=sum(1 for r in rows if r["tier"]>=2) 100 print("arm=%s exec=%d n=%d tier_dist=%s final_success=%d"%(arm,args.exec,n,dist,nf),flush=True) 101 print("weighted_success=%.1f%% (sum_tier=%d/%.0f) full3/3=%d >=1cycle=%d >=2cycle=%d"% 102 (weighted*100, wsum, 3.0*n, full, ge1, ge2),flush=True) 103 print("TIERED_DONE",flush=True)
+
+=== 63764db6-b98c-4463-b1d5-11905e2409cf.jsonl:6502 ===
+1240/4000 | **0.1133** | **观察**：两臂 val 几乎一致（0.1125 vs 0.1133），但比 stage2 同期**起点更高**（stage2 在 init-from stage1 best 后，opt 1000 时 val ~0.0861）。这是因为 stage3 从 stage2 best init + 加权 loss，加权 loss 的绝对值尺度不同——**不能直接跨 stage 比 val 数值**，只能比 stage3 内部 trend（当前都在降）和最终 tiered_success。 真正有意义的是跑完后用 tiered_eval 测 **weighted_success**（gamma stage2 是 20%，看 stage3 加权 loss 后能否提升）。 还需 ~1.5h 到 4000。继续盯。无异常。
+
+=== 63764db6-b98c-4463-b1d5-11905e2409cf.jsonl:6519 ===
+进度 | val 轨迹 | |---|---|---| | **avg** | opt 2360/4000 | 0.1125@1k → 0.1125@2k（平台）| | **gamma-rpbe** | opt ~2300/4000 | 0.1133@1k → **0.1130@2k**（微降）| **观察**： - gamma 加权 loss 下 val 微降（0.1133→0.1130），avg 持平 0.1125 - 这个阶段起始是从 stage2 best init，val 起点高是加权 loss 尺度差异，**跨 stage val 不可直接比** - 关键看跑完后 tiered weighted_success 两 run 都健康，gamma registry 持续释放。再 ~1h 到 4000 完成，届时跑 tiered_eval 对比 weighted_success（gamma stage2 是 20%）。继续等。
+
+=== 63764db6-b98c-4463-b1d5-11905e2409cf.jsonl:6519 ===
+| **gamma-rpbe** | opt ~2300/4000 | 0.1133@1k → **0.1130@2k**（微降）| **观察**： - gamma 加权 loss 下 val 微降（0.1133→0.1130），avg 持平 0.1125 - 这个阶段起始是从 stage2 best init，val 起点高是加权 loss 尺度差异，**跨 stage val 不可直接比** - 关键看跑完后 tiered weighted_success 两 run 都健康，gamma registry 持续释放。再 ~1h 到 4000 完成，届时跑 tiered_eval 对比 weighted_success（gamma stage2 是 20%）。继续等。
+
+=== 63764db6-b98c-4463-b1d5-11905e2409cf.jsonl:6532 ===
+---|---| | **avg** | opt 3200/4000 | 0.1125 → 0.1125 → **0.1118@3k** | | **gamma-rpbe** | opt 3030/4000 | 0.1133 → **0.1130** → 0.1130@3k | 两 run 都快跑完。avg 微降（0.1118），gamma 平台在 0.1130。gamma 在 stage3 加权 loss 下 val 平台于 0.1130——比 stage2 终点（0.0859）高，但那是加权 loss 尺度差异，不能直接比。 跑完（~25 min）后用 tiered_eval 测 **weighted_success** 才是关键对比（gamma stage2 是 20%）。等它完成。
+
+=== 63764db6-b98c-4463-b1d5-11905e2409cf.jsonl:6563 ===
+两个 stage3 都跑完了（SMOKE_DONE），GPU 全空。现在用 tiered_eval 测两臂 stage3 best 的 weighted_success，对比 stage2 基线（avg 11.7%, gamma 20%）。先确认 best.pt。
+
+=== 63764db6-b98c-4463-b1d5-11905e2409cf.jsonl:6584 ===
+sleep 60; cd /tmp/rpbe_ssh && python ssh_run.py "ps aux | grep tiered_eval | grep -v grep | wc -l; echo '=== per-demo tier so far ==='; grep -aE '\[demo_|weighted_success' /root/autodl-tmp/outputs/avg_s42_stage3_wloss/tiered20.log 2>&1 | tail -6; echo '---gamma---'; grep -aE '\[demo_|weighted_success' /root/autodl-tmp/outputs/gamma-rpbe_s42_stage3_wloss/tiered20.log 2>&1 | tail -6" 2>&1 | grep -v CryptographyDeprecation | grep -v "'class'"
+
+=== 63764db6-b98c-4463-b1d5-11905e2409cf.jsonl:6587 ===
+/3），但 gamma demo_1 这次是 1/3 而非 stage2 的 3/3——加权 loss 阶段可能需要观察完整 20 demo 后综合判断。等全部完成再对比。 等等——proc 4 但前面 tiered_eval 之前那次是 2（主+子各一个进程？）。实际上 nohup 启动的 python 有主进程，proc 计数可能含 grep 自身。tiered eval 每个进程会 fork 子进程处理 DataLoader？不，tiered_eval 没 DataLoader。proc 4 = 2 主进程 + 2 个是什么？可能 ps aux grep 计数包含了什么。不管，等它出 weighted_success。 让我等够时间让它完成。tiered 20 demo × 370 帧 × 每帧 predict + env.step，之前 stage2 tiered 也跑了挺久。继续等。
+
+=== 63764db6-b98c-4463-b1d5-11905e2409cf.jsonl:6588 ===
+还在跑（已 5 demo）。stage3 早期 gamma demo_1=1/3（stage2 时 3/3）——但单 demo 有随机性，等完整 20 demo + weighted_success 再下结论。继续等。
+
+=== 63764db6-b98c-4463-b1d5-11905e2409cf.jsonl:6589 ===
+tmp/rpbe_ssh && python ssh_run.py "ps aux | grep tiered_eval | grep -v grep | wc -l; echo '=== demos done ==='; grep -acE '\[demo_' /root/autodl-tmp/outputs/avg_s42_stage3_wloss/tiered20.log /root/autodl-tmp/outputs/gamma-rpbe_s42_stage3_wloss/tiered20.log; echo '=== weighted so far ==='; grep -aE 'weighted_success|full3' /root/autodl-tmp/outputs/avg_s42_stage3_wloss/tiered20.log /root/autodl-tmp/outputs/gamma-rpbe_s42_stage3_wloss/tiered20.log 2>&1 | tail -4" 2>&1 | grep -v CryptographyDeprecation | grep -v "'class'"
+
+=== 63764db6-b98c-4463-b1d5-11905e2409cf.jsonl:6594 ===
+ "class": algorithms.Blowfish, === STDOUT === 0 1 ==== TIERED EVAL ==== arm=avg exec=8 n=20 tier_dist={0: 13, 1: 6, 2: 0, 3: 1} final_success=1 weighted_success=15.0% (sum_tier=9/60) full3/3=1 >=1cycle=7 >=2cycle=1 TIERED_DONE ---gamma--- ==== TIERED EVAL ==== arm=gamma-rpbe exec=8 n=20 tier_dist={0: 17, 1: 2, 2: 1, 3: 0} final_success=0 weighted_success=6.7% (sum_tier=4/60) full3/3=0 >=1cycle=3 >=2cycle=1 TIERED_DONE
+
+=== 63764db6-b98c-4463-b1d5-11905e2409cf.jsonl:6594 ===
+== 0 1 ==== TIERED EVAL ==== arm=avg exec=8 n=20 tier_dist={0: 13, 1: 6, 2: 0, 3: 1} final_success=1 weighted_success=15.0% (sum_tier=9/60) full3/3=1 >=1cycle=7 >=2cycle=1 TIERED_DONE ---gamma--- ==== TIERED EVAL ==== arm=gamma-rpbe exec=8 n=20 tier_dist={0: 17, 1: 2, 2: 1, 3: 0} final_success=0 weighted_success=6.7% (sum_tier=4/60) full3/3=0 >=1cycle=3 >=2cycle=1 TIERED_DONE
+
+=== 63764db6-b98c-4463-b1d5-11905e2409cf.jsonl:6597 ===
+Traceback (most recent call last):
+  File "D:\RPBE_vla_fix\_recovered\scan_rollout.py", line 53, in <module>
+    main()
+  File "D:\RPBE_vla_fix\_recovered\scan_rollout.py", line 50, in main
+    print(re.sub(r"\s+", " ", s[a:b]))
+UnicodeEncodeError: 'gbk' codec can't encode character '\u2705' in position 184: illegal multibyte sequence

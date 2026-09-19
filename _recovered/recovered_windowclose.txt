@@ -1,0 +1,41 @@
+[window close] J=...`). I can plot J vs step, and compare to the s8f (frozen γ) run where J also logged. That's a real comparison: same d
+[window close] J=35.6647 cuts=247 episodes=1 censored=4
+[window close] J=35.6839 cuts=247 episodes=1 censored=4
+[window close] J=36.9690 cuts=257 episodes=1 censored=2
+[window close] J=37.5260 cuts=247 episodes=1 censored=326
+[window close] J=37.73 cuts=232 episodes=1 censored=2` → window close with rebuild path works.
+[window close] J=37.7301 cuts=232 episodes=1 censored=2
+[window close] J=37.7330 J_gap=None J_p95=None cuts=223 episodes=1 rebuild_inputs=223 censored=4
+[window close] J=37.9949 cuts=284 episodes=1 censored=350
+[window close] J=38.0088 cuts=257 episodes=1 censored=2
+[window close] J=38.0321 J_gap=None J_p95=None cuts=218 episodes=1 rebuild_inputs=218 censored=14
+[window close] J=38.2649 cuts=312 episodes=1 censored=6
+[window close] J=39.235 J_gap=8.76 J_p95=30.68 cuts=447 episodes=2 rebuild_inputs=447` → **multi-episode window close works, rebuild_inpu
+[window close] J=39.2350 J_gap=8.76372581322175 J_p95=30.683498259869197 cuts=447 episodes=2 rebuild_inputs=447 censored=4
+[window close] J=39.2866 J_gap=8.806548998887028 J_p95=30.71811256494209 cuts=447 episodes=2 rebuild_inputs=447 censored=4
+[window close] J=39.29 J_gap=8.81 J_p95=30.72 cuts=447 episodes=2 rebuild_inputs=447` → multi-episode close + rebuild, J_real > null p95.
+[window close] J=39.4185 J_gap=None J_p95=None cuts=232 episodes=1 rebuild_inputs=232 censored=2
+[window close] J=39.4717 J_gap=None J_p95=None cuts=246 episodes=1 rebuild_inputs=246 censored=12
+[window close] J=39.6321 J_gap=None J_p95=None cuts=232 episodes=1 rebuild_inputs=232 censored=2
+[window close] J=40.1888 J_gap=None J_p95=None cuts=252 episodes=1 rebuild_inputs=252 censored=10
+[window close] J=41.0832 J_gap=None J_p95=None cuts=267 episodes=1 rebuild_inputs=267 censored=8
+[window close] J=41.3251 J_gap=None J_p95=None cuts=975 episodes=4 rebuild_inputs=975 censored=72
+[window close] J=41.4478 J_gap=None J_p95=None cuts=286 episodes=1 rebuild_inputs=286 censored=6
+[window close] J=41.5465 J_gap=None J_p95=None cuts=943 episodes=4 rebuild_inputs=943 censored=80
+[window close] J=42.1249 J_gap=13.190158151910172 J_p95=29.10689363435298 cuts=1008 episodes=4 rebuild_inputs=1008 censored=8
+[window close] J=42.2636 J_gap=None J_p95=None cuts=976 episodes=4 rebuild_inputs=976 censored=88
+[window close] J=44.1909 J_gap=None J_p95=None cuts=950 episodes=4 rebuild_inputs=950 censored=16
+[window close] J=44.4705 J_gap=None J_p95=None cuts=1008 episodes=4 rebuild_inputs=1008 censored=8
+[window close] J=44.5217 J_gap=None J_p95=None cuts=1008 episodes=4 rebuild_inputs=1008 censored=8
+[window close] J=44.5221 J_gap=None J_p95=None cuts=1008 episodes=4 rebuild_inputs=1008 censored=8
+[window close] J=44.5355 ...
+[window close] J=44.5355 ... cuts=1008 episodes=4 rebuild_inputs=1008 censored=8
+[window close] J=44.5355 ... cuts=1008 episodes=4 rebuild_inputs=1008` — so yes, window closed.
+[window close] J=44.5355 ... cuts=1008 episodes=4` at the tail, but NO `[comp-audit]` or `[interv]` lines after it. And the proc list is
+[window close] J=44.5355 ... episodes=4`), followed by `[gamma audit] alpha=1.0 |U|=13.07 residual=0.0020`.
+[window close] J=44.5355 ...` (first window, pv=2→3 boundary)
+[window close] J=44.5355 ...`). And `comp_zpw = getattr(window,
+[window close] J=44.5355 J_gap=None J_p95=None cuts=1008 episodes=4 rebuild_inputs=1008 censored=8
+[window close] J=45.9385 J_gap=None J_p95=None cuts=990 episodes=4 rebuild_inputs=990 censored=336
+[window close] J={j:.4f}
+[window close] J={j:.4f} J_gap={diag.get('J_gap')}

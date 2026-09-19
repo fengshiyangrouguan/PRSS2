@@ -1,7 +1,7 @@
 # Reproducing the Stage8 run (the one that produced the 25.0% peak)
 
 Short answer: **the code clones and runs; the run cannot be resumed, and a bit-exact
-exact rerun needs work you cannot skip.** This file says exactly which parts
+rerun needs work you cannot skip.** This file says exactly which parts
 you get from the clone, which you must supply yourself, and which are gone.
 
 ## 1. What you get from the clone
@@ -40,9 +40,10 @@ There is no second copy.
 
 | artifact | where it comes from |
 |---|---|
-| base VLA checkpoint `step-295000-epoch-40-loss=0.2200.pt` | the MemoryVLA / OpenVLA-7B prismatic release. **We did not record the exact URL** —— get it from the MemoryVLA release page |
-| `Llama-2-7b-hf` | Meta's Llama-2 release (the trainer reads `LLAMA2_LOCAL_PATH`) |
-| LIBERO-Mem task suite + `libero-mem-code` (the env) | the LIBERO-Mem release. Not vendored here |
+| base VLA checkpoint `step-295000-epoch-40-loss=0.2200.pt` | HF `openvla/openvla-7b-prismatic` —— see `reproduce/fetch_data.sh` |
+| `Llama-2-7b-hf` | HF `NousResearch/Llama-2-7b-hf` (the trainer reads `LLAMA2_LOCAL_PATH`) |
+| LIBERO-Mem task suite | HF dataset `libero-mem/LIBERO-Mem` —— see §10 (4) |
+| the simulator env | `github.com/libero-mem/libero-mem` |
 | `libero-mem-no-noops` | **derived**: LIBERO-Mem with no-op transitions removed (~9% of frames). The filter script was never committed. `scripts/probe_libero_mem_hdf5.py` is the starting point for re-deriving it; the criterion was "drop transitions where the robot neither moves nor toggles the gripper" |
 | a **host** | either retrain Stage5-avg (§4) or supply your own |
 

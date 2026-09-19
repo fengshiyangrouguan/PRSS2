@@ -31,6 +31,44 @@ Three facts you need before you touch anything:
    `GammaMerger` (0.57M params) on top of a frozen host, with a feasibility
    projection on the update. It **starts from a host checkpoint**.
 
+
+### Terminology —— "base" and "host" are two different things
+
+The trainer takes two independent checkpoints. Conflating them is the single
+most common confusion, so read this twice:
+
+| flag | what it is | has task ability? | required? |
+|---|---|---|---|
+| `--pretrained-checkpoint` | **the BASE** —— OpenVLA-7B prismatic (`step-295000-epoch-40-loss=0.2200.pt`). Loaded through `load_vla()`; it *builds the architecture* (vision encoder + LLM + DiT head) and initialises its weights. | **no** —— a general robot policy, never trained on LIBERO-Mem | **yes, always** |
+| `--init-from-weights` | **the HOST** —— a MemoryVLA checkpoint that was already trained on LIBERO-Mem. Copies `ck["model"]` on top of the base at opt 0, with a fresh optimizer/scheduler/RNG. | **yes** —— ours scored 23.3% | no (default `""`) |
+
+So:
+
+- **The base is not the host.** The base is the architecture init; the host is
+  a *product of training* that the base was the input to.
+- **The thing Γ fine-tunes on top of is the HOST, not the base.**
+- **Both of our Stage8 stages used the same base** and differed only in
+  `--init-from-weights`: stage 1 used the host, stage 2 used stage 1's
+  checkpoint.
+
+**Why you cannot just use the base.** `--train-scope gamma-only` freezes the
+action head and the memory modules and trains only Γ (0.57M params, a memory
+*merge* operator). If the frozen parts never learned the task, there is no task
+ability to preserve and Γ cannot create any —— every rollout is ~0. The base
+alone therefore answers a different question, and a much harder one.
+
+**The good historical result was itself produced by training from the base** ——
+as a chain: `base → Stage1 → … → Stage5` → the 23.3% checkpoint *is* the host.
+"Our run from scratch scored well" and "you need a host" are the same statement
+seen from two ends.
+
+**What counts as a usable host:** same architecture as `load_vla()` builds
+(prismatic dinosiglip + llama2-7b-pure + DiT-L, matching `mem_length` /
+`retrieval_layers` / `fusion_type` / `per_token_size`), trained on LIBERO-Mem
+T3, with **rollout > 0**, and shipped with the `dataset_statistics.json` that
+matches its `--data-root`/`--task-filter`. Record its hash and its baseline
+`weighted_success` —— every number you report is relative to it.
+
 ---
 
 ## Phase 1 — GATE: confirm you are running the frozen code

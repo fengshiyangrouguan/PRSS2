@@ -1,0 +1,17 @@
+## Execution Result (Turn {turn}/{max_turns})
+
+Score: {score:.4f}
+Exit code: {exit_code}
+Duration: {duration_s:.1f}s
+
+### stdout
+{stdout}
+
+### stderr
+{stderr}
+
+{eval_feedback_section}
+
+Analyze the results carefully. If the score is below 0.5 or there are errors/timeouts,
+you MUST iterate — identify the root cause and fix it. Do NOT signal completion
+unless the solution is genuinely working.

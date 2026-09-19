@@ -1,0 +1,18 @@
+## Execution Result (Turn 1/5)
+
+Score: 1.0000
+Exit code: 0
+Duration: 2.5s
+
+### stdout
+All tests passed
+Done
+
+### stderr
+(empty)
+
+
+
+Analyze the results carefully. If the score is below 0.5 or there are errors/timeouts,
+you MUST iterate — identify the root cause and fix it. Do NOT signal completion
+unless the solution is genuinely working.

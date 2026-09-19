@@ -1,0 +1,114 @@
+{
+  "archive_index": {
+    "best_candidate_id": "gen0_seed",
+    "best_mean_score": 0.5,
+    "candidates": [
+      {
+        "candidate_id": "gen0_seed",
+        "depth": 1,
+        "iteration": 0,
+        "mean_score": 0.5,
+        "num_children": 1,
+        "parent_id": null,
+        "pass_at_1": 1.0,
+        "per_task_scores": {
+          "task_a": 0.5,
+          "task_b": 0.5
+        },
+        "temperature_used": 0.7,
+        "total_tokens": 20
+      },
+      {
+        "candidate_id": "gen1_b0_k0",
+        "depth": 2,
+        "iteration": 1,
+        "mean_score": 0.5,
+        "num_children": 1,
+        "parent_id": "gen0_seed",
+        "pass_at_1": 1.0,
+        "per_task_scores": {
+          "task_a": 0.5,
+          "task_b": 0.5
+        },
+        "temperature_used": 0.7,
+        "total_tokens": 17
+      },
+      {
+        "candidate_id": "gen2_b0_k0",
+        "depth": 3,
+        "iteration": 2,
+        "mean_score": 0.5,
+        "num_children": 0,
+        "parent_id": "gen1_b0_k0",
+        "pass_at_1": 1.0,
+        "per_task_scores": {
+          "task_a": 0.5,
+          "task_b": 0.5
+        },
+        "temperature_used": 0.9,
+        "total_tokens": 17
+      }
+    ],
+    "per_task_best": {
+      "task_a": {
+        "candidate_id": "gen0_seed",
+        "score": 0.5
+      },
+      "task_b": {
+        "candidate_id": "gen0_seed",
+        "score": 0.5
+      }
+    },
+    "size": 3
+  },
+  "candidate_summaries": {
+    "gen0_seed": {
+      "candidate_id": "gen0_seed",
+      "created_at": "<normalized>",
+      "depth": 1,
+      "iteration": 0,
+      "mean_score": 0.5,
+      "num_children": 0,
+      "parent_id": null,
+      "pass_at_1": 1.0,
+      "per_task_scores": {
+        "task_a": 0.5,
+        "task_b": 0.5
+      },
+      "temperature_used": 0.7,
+      "total_tokens": 20
+    },
+    "gen1_b0_k0": {
+      "candidate_id": "gen1_b0_k0",
+      "created_at": "<normalized>",
+      "depth": 2,
+      "iteration": 1,
+      "mean_score": 0.5,
+      "num_children": 0,
+      "parent_id": "gen0_seed",
+      "pass_at_1": 1.0,
+      "per_task_scores": {
+        "task_a": 0.5,
+        "task_b": 0.5
+      },
+      "temperature_used": 0.7,
+      "total_tokens": 17
+    },
+    "gen2_b0_k0": {
+      "candidate_id": "gen2_b0_k0",
+      "created_at": "<normalized>",
+      "depth": 3,
+      "iteration": 2,
+      "mean_score": 0.5,
+      "num_children": 0,
+      "parent_id": "gen1_b0_k0",
+      "pass_at_1": 1.0,
+      "per_task_scores": {
+        "task_a": 0.5,
+        "task_b": 0.5
+      },
+      "temperature_used": 0.9,
+      "total_tokens": 17
+    }
+  }
+}

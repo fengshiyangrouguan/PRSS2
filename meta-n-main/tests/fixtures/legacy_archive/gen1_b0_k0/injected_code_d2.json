@@ -1,0 +1,1 @@
+{"pre_process": "# legacy layer\nx = 1", "code_library": {"robust_zscore": "def robust_zscore(v):\n    return v"}, "code_library_bash": {}, "rationale": "legacy archive fixture (frozen pre-v2-field format)", "source_depth": 2}

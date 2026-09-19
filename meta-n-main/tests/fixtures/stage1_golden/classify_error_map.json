@@ -1,0 +1,16 @@
+{
+  "constraint_violation": "Constraint violation",
+  "dependency_error": "Dependency error",
+  "empty_io": "Unknown error",
+  "environment_fault": "Environment fault",
+  "format_parse_error": "Format/parse error",
+  "indexing_error": "Indexing error",
+  "long_output": "Runtime error",
+  "numeric_instability": "Numeric instability",
+  "runtime_error": "Runtime error",
+  "success_full": "Unknown error",
+  "syntax_error": "Syntax error",
+  "timeout": "Timeout",
+  "turn_starvation": "Turn starvation",
+  "with_eval_feedback": "Unknown error"
+}

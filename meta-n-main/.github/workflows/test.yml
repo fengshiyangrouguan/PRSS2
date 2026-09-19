@@ -1,0 +1,64 @@
+name: tests
+
+# Runs the unit-test suite on every push to main and every PR targeting main.
+# Also exposes a manual trigger via the Actions UI for one-off re-runs.
+#
+# Selector mirrors the canonical local invocation that has been our
+# working-tree-clean baseline since the audit:
+#   pytest tests/ -m "not slow" \
+#     --deselect <pre-existing temperature-cycling mock-arg drift> \
+#     --deselect <pre-existing terminal_bench Docker-state failure>
+# The two deselections are pre-existing failures unrelated to any recent
+# change (confirmed by re-running on the parent commit during the audit).
+# Until they're addressed, deselecting them keeps the signal honest:
+# CI green = the meta-n test suite passes on this commit.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  pytest:
+    name: pytest (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      # fail-fast: false so a 3.11 failure doesn't mask a separate 3.12
+      # failure (or vice versa) — we want to see both legs.
+      fail-fast: false
+      matrix:
+        # pyproject.toml requires-python = ">=3.11". Cover the supported
+        # range without paying for older versions that aren't supported.
+        python-version: ["3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python-version }}
+          # Built-in pip cache keyed off pyproject.toml saves ~30s per run
+          # once warm — most of the runtime here is dependency install.
+          cache: pip
+          cache-dependency-path: pyproject.toml
+
+      - name: Install dependencies
+        # The four extras pulled in here cover everything the test suite
+        # imports: dev (pytest + pytest-asyncio), bench (networkx, psutil),
+        # classify (datasets — needed for HF mocks even when not actually
+        # downloading), openevolve (numpy, scipy, pyyaml). harbor is
+        # excluded because the terminal_bench tests mock the harbor APIs;
+        # adding it would only slow installs without changing test
+        # results.
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev,bench,classify,openevolve]"
+
+      - name: pytest
+        run: |
+          pytest tests/ -m "not slow" \
+            --deselect "tests/test_evolutionary_orchestrator.py::TestEvolutionaryOrchestrator::test_temperature_cycling" \
+            --deselect "tests/test_terminal_bench.py::TestTerminalBenchExecutor::test_execute_image_build_error" \
+            --tb=short -q

@@ -1,0 +1,23 @@
+{
+  "_doc": "Synthetic 2-task CO-Bench-shaped fixture for the builtin-parity Checkpoint A test (plan §12.1). Each task drives the BuiltinBackend through a fake native solver returning the given solution + outer-token usage; the scorer returns the given score/raw_score. This is install-free: no real CO-Bench data, no Docker, no subprocess.",
+  "tasks": [
+    {
+      "task_id": "cobench-knapsack",
+      "description": "Author a solve() for a small knapsack instance.",
+      "solution": "def solve(**kwargs):\n    return {'value': 42}\n",
+      "score": 0.85,
+      "raw_score": 42.0,
+      "outer_prompt_tokens": 1200,
+      "outer_completion_tokens": 300
+    },
+    {
+      "task_id": "cobench-tsp",
+      "description": "Author a solve() for a small TSP instance.",
+      "solution": "def solve(**kwargs):\n    return {'tour': [0, 1, 2]}\n",
+      "score": 0.60,
+      "raw_score": 17.5,
+      "outer_prompt_tokens": 900,
+      "outer_completion_tokens": 250
+    }
+  ]
+}

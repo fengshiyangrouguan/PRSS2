@@ -1,0 +1,17 @@
+[
+  {
+    "task_id": "toy_001",
+    "description": "Create a file called /tmp/hello.txt containing exactly the text 'Hello, World!'",
+    "verification_script": "test \"$(cat /tmp/hello.txt)\" = 'Hello, World!'"
+  },
+  {
+    "task_id": "toy_002",
+    "description": "Compute 6 * 7 and write only the result to /tmp/answer.txt",
+    "verification_script": "test \"$(cat /tmp/answer.txt | tr -d '\\n')\" = '42'"
+  },
+  {
+    "task_id": "toy_003",
+    "description": "Create a directory /tmp/testdir with three empty files: a.txt, b.txt, c.txt",
+    "verification_script": "test -f /tmp/testdir/a.txt && test -f /tmp/testdir/b.txt && test -f /tmp/testdir/c.txt"
+  }
+]

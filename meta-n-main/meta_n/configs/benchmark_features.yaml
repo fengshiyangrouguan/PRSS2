@@ -1,0 +1,60 @@
+# Benchmark-feature config, LOADED BY DEFAULT by meta_n.main. It turns on meta-n's
+# metacognition stack without changing code defaults. Precedence: explicit CLI flag >
+# this file's per-benchmark block > this file's 'defaults' block > code default.
+# Applies only to --benchmark runs; custom --tasks runs always keep bare code defaults.
+# Per-key opt-out: every boolean set here has a --no-<flag> CLI form (e.g.
+# --no-consolidate) that beats this file (explicit CLI always wins).
+# Reproduce the bare pre-metacognition behavior with:  --benchmark-config none
+# (baseline/control runs must pass it; --use-archive is required — a non-archive
+# run is refused at startup — so the single-draw control invocation is
+# exactly:  --use-archive --benchmark-config none --max-iterations 0).
+#
+# Only default-OFF boolean flags and a few ints are settable here; ablation flags
+# (no_code_library / no_inspiration / no_outer_context) and probes (seed_code_library,
+# paired_eval, repropagation) are intentionally NOT set on (repropagation is mutually
+# exclusive with consolidate; paired_eval is inert off-azure).
+# Two gate-fed keys are likewise intentionally NOT set anywhere in this file,
+# because `consolidate: true` (defaults below) gives every bred child a focus
+# task, which SKIPS the quality gate — their only entry point:
+#   * within_layer_refine — consumed only in the gate-FAIL branch; under
+#     consolidate the gate never runs, so the refine hook could never fire.
+#     Enable it only in a gated non-consolidate profile (gate_tasks > 0).
+#   * eval_repeats_gate_topup — tops up reused GATE traces only, and only at
+#     eval_repeats R>1 (at R=1 it trips its own startup warning); under
+#     consolidate no gate trace exists and the consolidation inherit map is
+#     precomputed-frozen, so the top-up can never fire — dead even where
+#     eval_repeats: 3 is set below. It rides WITH eval_repeats: set it only in
+#     a custom config with eval_repeats > 1 AND consolidate off; operators
+#     raising --eval-repeats on a gated run must also pass
+#     --eval-repeats-gate-topup themselves.
+#   * elite_rotation — consulted only inside the n>=2 reserved-elite block of
+#     parent selection (rotates fully at beam_width >= 3); at the default
+#     --beam-width 1 it is never read. Pair it with beam_width: 2+ in a custom
+#     profile (costs ~beam_width x the per-generation solves).
+# Invariant (pinned by test_bundled_yaml_yields_no_noop_notes_on_any_benchmark):
+# this shipped file must never trigger an F229 no-op warning about a key it set.
+defaults:            # applied to EVERY benchmark
+  use_archive: true            # metacognition IS the evolutionary path
+  consolidate: true            # per-task oracle (>= single chain by construction)
+  regression_guard: true       # never ship below the best-of-R base floor (the ">= best-of-N" guarantee)
+  regression_guard_repeats: 3  # base-floor resample budget
+  # NOTE: --protect-floor is a NUMERIC per-task gate-veto threshold (float), not a
+  # boolean — do NOT set it here. regression_guard already provides the archive-level
+  # floor. protect_floor (like every gate knob: gate_tasks / gate_margin / gate_repeats)
+  # acts inside the quality gate, and consolidate mode SKIPS the gate (every
+  # consolidation child solves one focus task; the rest are inherit-frozen), so under
+  # this file's `consolidate: true` a per-benchmark protect_floor is a silent no-op.
+  # A strict gate veto for a specific bench needs BOTH keys in that bench's block,
+  # e.g. {consolidate: false, protect_floor: 0.05}.
+  within_task_recursion: true  # genuine within-task depth
+  focus_current_headroom: true
+  symmetric_trace_sampling: true
+co_bench: {}                   # code channel stays demoted (adapter default) — do NOT force-live
+swe_bench_verified: {regression_guard_repeats: 1}  # Docker family: keep the seed-draw floor/clamp, skip the 2 extra full-bench resample passes (3x500 gen0 cost)
+terminal_bench: {regression_guard_repeats: 1}      # same: 3x113 container passes at gen0 is not an accepted default budget
+alphaevolve_math: {foster_adoption: true}   # live-helper families: nudge adoption of the code channel
+symbolic_regression: {foster_adoption: true}
+algotune: {foster_adoption: true}
+arc_agi_2: {foster_adoption: true}
+symptom2disease: {eval_repeats: 3}          # noisy classification: denoise selection
+lawbench_charge: {eval_repeats: 3}

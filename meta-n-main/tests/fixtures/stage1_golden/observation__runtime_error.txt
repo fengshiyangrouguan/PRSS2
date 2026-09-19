@@ -1,0 +1,17 @@
+## Execution Result (Turn 2/5)
+
+Score: 0.0000
+Exit code: 1
+Duration: 0.8s
+
+### stdout
+(empty)
+
+### stderr
+RuntimeError: solver returned an invalid result
+
+
+
+Analyze the results carefully. If the score is below 0.5 or there are errors/timeouts,
+you MUST iterate — identify the root cause and fix it. Do NOT signal completion
+unless the solution is genuinely working.

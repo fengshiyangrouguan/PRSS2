@@ -1,0 +1,21 @@
+{
+  "_doc": "Self-consistency round-trip baseline for the builtin-parity test (plan §12.1). NOT a recording of an actual Layer1Solver/legacy-path run — these values are hand-authored to EQUAL the synthetic input fixture (cobench_2task.json), so the test asserts BuiltinBackend passes its scores through unchanged AND records the (outer_prompt, outer_completion, inner=0) tuple with token_basis='outer'. To make a true cross-path golden later, record this from an actual --base-solver builtin co_bench run and note the provenance. Keyed by task_id.",
+  "runs": {
+    "cobench-knapsack": {
+      "score": 0.85,
+      "raw_score": 42.0,
+      "outer_prompt": 1200,
+      "outer_completion": 300,
+      "inner": 0,
+      "token_basis": "outer"
+    },
+    "cobench-tsp": {
+      "score": 0.60,
+      "raw_score": 17.5,
+      "outer_prompt": 900,
+      "outer_completion": 250,
+      "inner": 0,
+      "token_basis": "outer"
+    }
+  }
+}

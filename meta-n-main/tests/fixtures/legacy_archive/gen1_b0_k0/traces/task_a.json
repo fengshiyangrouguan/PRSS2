@@ -1,0 +1,1 @@
+{"task_id": "task_a", "depth": 2, "success": true, "score": 0.62, "script": "def solve(**kwargs):\n    return {}", "error_summary": "", "reasoning": "", "eval_feedback": ""}

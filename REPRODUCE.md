@@ -161,3 +161,54 @@ Consequences, which any multi-seed design has to decide about:
   **same structure** as the recorded run —— two stages, one warm start —— or
   the comparison is between different training procedures.
 
+## 9. The multi-seed sweep we settled on (single segment, 18000 steps)
+
+The two-stage mess in §8 is avoided entirely by running **one uninterrupted
+segment to 18000 steps** and evaluating the rollout at **12000 / 15000 /
+18000**.
+
+```bash
+# 1. check the code is the frozen one
+bash reproduce/check_code_identity.sh
+
+# 2. train: one process per GPU, two GPUs by default
+HOST=/path/to/host.pt SEEDS="42 7 123" ARMS="gamma-rpbe" GPUS="0 1" \
+  bash reproduce/sweep_launch.sh
+
+# 3. AFTER all training finishes, evaluate each run
+RUN=gamma-rpbe_seed42_18k  bash reproduce/eval_sweep_18000.sh
+RUN=gamma-rpbe_seed7_18k   bash reproduce/eval_sweep_18000.sh
+...
+```
+
+What each script pins:
+
+| script | pins |
+|---|---|
+| `train_sweep_18000.sh` | `--max-steps 18000 --snapshot-steps 12000,15000 --no-fullstate 1`, `--train-scope gamma-only`, `kappa=0.02`, `tau=3e-4`, `--seed $SEED`, host via `$HOST` |
+| `eval_sweep_18000.sh` | the three checkpoints, 20 demos, `exec=8`, `maxsteps=370`, seed 42, **full unfiltered stdout** |
+| `sweep_launch.sh` | arm × seed product, at most `len($GPUS)` concurrent |
+
+### Two traps this design sidesteps, and one it must respect
+
+1. **`dataset_statistics.json` only exists after training finishes.** The
+   trainer writes it at completion, and `tiered_eval.py` reads it from the
+   checkpoint's own directory —— so evaluating a mid-run snapshot fails with
+   `FileNotFoundError`. This bit us in Stage8 and the workaround was to
+   hand-copy the file from another run. Hence: **train first, evaluate after**,
+   or pre-place the file.
+2. **Do not pipe the eval through a summary `grep`.** Keep
+   `[demo_N] tier=X/3 ...`. Losing it cost us every per-demo identity in
+   Stage8.
+3. **Budget.** ~1.56 s/step → 18000 steps ≈ **7.8 h per run**; **~9.3 GB
+   per run** (2 snapshots + best + latest + checkpoint, no fullstate). Three
+   seeds × 3 checkpoints of eval ≈ 18 min of GPU per run on top.
+
+### What to record per seed, so this doesn't repeat
+
+Per run, keep at least: `train.log`, the val curve, `rollout_full.log` (with
+per-demo lines), the `tier_dist` per checkpoint, and
+`check_code_identity.sh`'s output. The last one is what proves the seeds are
+comparable at all.
+
+

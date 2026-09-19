@@ -1,0 +1,336 @@
+You are a higher-order meta-layer (depth 4) in a recursive self-improving system called Meta^n.
+
+## Your Role
+Previous layers have already made tactical fixes — dependency handling, constraint checks, format corrections. Your job is NOT to patch individual errors. Lower layers already do that.
+
+Instead, you should:
+1. Identify SYSTEMIC patterns across task categories
+2. Understand WHY previous layers' fixes helped some tasks but hurt others
+3. Make STRUCTURAL improvements: task classification, solver strategy selection, algorithm implementations
+4. Consider CONDITIONING or BYPASSING previous layers' changes for task types where they cause regressions
+5. Provide reusable algorithm implementations (via solver_lib) that the solver can call directly
+
+## System Context
+Current depth: 4
+Tasks attempted: 1
+Current mean score: 0.794  ← PRIMARY OBJECTIVE: raise the MEAN CONTINUOUS SCORE (not just the pass count)
+Score spread (1 tasks): [0.0-0.3]x0  [0.3-0.7]x0  [0.7-1.0]x1
+pass@1 (binary success rate): 100.0%
+
+## DEEPEN — keep improving ONLY task 'flow_shop_scheduling'
+The layer BELOW already worked 'flow_shop_scheduling'; its current solution is the starting point, NOT a blank slate. Reason about what that layer produced and improve 'flow_shop_scheduling' FURTHER — do NOT discard or restart it. Every OTHER task is FROZEN and will NOT be re-solved; spend NO effort on them.
+## Opportunity — lowest-scoring tasks (most absolute room)
+All tasks are at the best-known score; these have the most room toward a perfect 1.0:
+
+| task | now | room->1.0 |
+|------|-----|----------|
+| flow_shop_scheduling | 0.794 | 0.206 |
+
+## Performance Summary & Analysis
+## Task Category Performance
+
+- **scheduling** (1 tasks): 1/1 pass, mean=0.79, key issue: -
+
+## Previous Layer Effectiveness
+
+Previous layer rationale: "## Diagnosis
+The indexing error (list index out of range) occurs in the NEH heuristic's sequence insertion loop and/or makespan evaluation when n >= 5 (e.g. tai100_5.txt through tai500_20.txt), stemmi..."
+
+Tasks that IMPROVED (1):
+  flow_shop_scheduling: 0.000 → 0.794 (+0.794)
+Tasks unchanged: 0
+Net effect: +0.794 mean score change (over 1 shared tasks)
+
+## Representative Traces (1 of 1)
+
+--- Task: flow_shop_scheduling [SUCCESS score=0.794] ---
+Script:
+```python
+def solve(**kwargs):
+    n = kwargs['n']
+    m = kwargs['m']
+    matrix = kwargs['matrix']
+    # Compute total processing time for each job (sum across all machines)
+    totals = [sum(row) for row in matrix]
+    # Sort jobs by total time ascending (shortest total processing time first heuristic)
+    order = sorted(range(n), key=lambda i: totals[i])
+    return {'job_sequence': [i + 1 for i in order]}
+```
+Stdout:
+score=0.7944
+raw_score=0.7944
+Eval feedback:
+...0']
+tai100_20.txt -> Scores: ['0.791', '0.760', '0.791', '0.767', '0.769']
+tai100_5.txt -> Scores: ['0.859', '0.865', '0.870', '0.855', '0.860']
+tai200_10.txt -> Scores: ['0.856', '0.871', '0.830', '0.840', '0.900']
+tai200_20.txt -> Scores: ['0.813', '0.817', '0.805', '0.818', '0.800']
+tai20_10.txt -> Scores: ['0.785', '0.703', '0.769', '0.691', '0.734']
+tai20_20.txt -> Scores: ['0.672', '0.641', '0.726', '0.707', '0.696']
+tai20_5.txt -> Scores: ['0.823', '0.773', '0.793', '0.761', '0.837']
+tai500_20.txt -> Scores: ['0.865', '0.845', '0.858', '0.858', '0.856']
+tai50_10.txt -> Scores: ['0.778', '0.772', '0.743', '0.715', '0.742']
+tai50_20.txt -> Scores: ['0.711', '0.695', '0.687', '0.696', '0.760']
+tai50_5.txt -> Scores: ['0.863', '0.844', '0.833', '0.861', '0.834']
+Avg Dev Score: 0.7944
+
+
+## Inspiration from Archive (best solutions from other candidates for tasks you failed)
+--- Task: flow_shop_scheduling [BEST score=0.807] (from another candidate) ---
+Script:
+```python
+import time
+import itertools
+
+def solve(**kwargs):
+    n = kwargs['n']
+    m = kwargs['m']
+    matrix = kwargs['matrix']
+    if n == 0:
+        return {'job_sequence': []}
+    start_time = time.time()
+    best_makespan = float('inf')
+    best_seq = None
+    for perm in itertools.permutations(range(n)):
+        elapsed = time.time() - start_time
+        if elapsed > 9.0:  # safety margin
+            break
+        ms = compute_makespan(perm, matrix)
+        if ms < best_makespan:
+            best_makespan = ms
+            best_seq = perm
+    if best_seq is None:
+        best_seq = tuple(range(n))  # fallback
+    return {'job_sequence': [j + 1 for j in best_seq]}
+
+def compute_makespan(order, matrix):
+    n = len(order)
+    m = len(matrix[0])
+    C = [[0] * m for _ in range(n)]
+    for j in range(m):
+        for i in range(n):
+            job = order[i]
+            if i == 0 and j == 0:
+                C[i][j] = matrix[job][j]
+            elif i == 0:
+                C[i][j] = C[i][j - 1] + matrix[job][j]
+            elif j == 0:
+                C[i][j] = C[i - 1][j] + matrix[job][j]
+            else:
+                C[i][j] = max(C[i - 1][j], C[i][j - 1]) + matrix[job][j]
+    return C[n - 1][m - 1]
+```
+
+
+## Previously Injected Code (layers below you)
+--- Depth 2 ---
+pre_process:
+```python
+if task.task_id == "flow_shop_scheduling":
+    additional_context = """You are solving the m-machine flow-shop scheduling problem (n jobs, m machines). The optimal makespan is NP-hard for m>2, so use Johnson's rule as a fast heuristic (optimal for m=2). Implement a Johnson's heuristic or NEH insertion heuristic in the solver; only fall back to the provided DP for n<=12. Never use lists vs tuples in comparisons. Return {'job_sequence': list_of_job_indices_0based}. The returned sequence must be a valid permutation (all jobs 0..n-1 exactly once)."""
+else:
+    additional_context = ""
+```
+solver_lib:johnson_heuristic:
+```python
+def johnson_heuristic(n: int, m: int, matrix: list) -> list:
+    """Johnson's heuristic for m-machine flow shop (approximation algorithm).
+
+    Args:
+        n: number of jobs
+        m: number of machines
+        matrix: n x m list of processing times (matrix[i][j] = time of job i on machine j)
+
+    Returns:
+        list of job indices (0-based) in the order to process them.
+    """
+    import math
+    # For m==2 use optimal Johnson's rule
+    if m == 2:
+        times = [(matrix[i][0] + matrix[i][1], matrix[i][1] - matrix[i][0]) for i in range(n)]
+        jobs = list(range(n))
+        jobs.sort(key=lambda i: (times[i][0], -times[i][1]) if times[i][1] < 0 else (times[i][0], math.inf))
+        return jobs
+    # For m>2 use NEH heuristic (insertion heuristic, fast and strong)
+    else:
+        # Start with longest processing time order
+        p = [sum(row) for row in matrix]
+        jobs = list(range(n))
+        jobs.sort(key=p.__getitem__, reverse=True)
+        # NEH insertion
+        for i in range(1, n):
+            best_pos = i
+            best_makespan = float('inf')
+            for pos in range(i + 1):
+                # insert job jobs[i] at position pos
+                seq = jobs[:pos] + [jobs[i]] + jobs[pos:i]
+                # compute makespan of this seq (simple O(n*m) simulation)
+                comp = [0.0] * m
+                for job_idx in seq:
+                    for mm in range(m):
+                        comp[mm] = max(comp[mm], comp[mm - 1] if mm > 0 else 0) + matrix[job_idx][mm]
+                if comp[-1] < best_makespan:
+                    best_makespan = comp[-1]
+                    best_pos = pos
+            # move job to best_pos
+            jobs.pop(i)
+            jobs.insert(best_pos, jobs[i])  # jobs[i] was the one we moved
+        return jobs
+```
+Rationale: The runtime error stems from the DP transition comparing a mutable list (new_comp) directly against a tuple (from dp) using <; this is invalid in Python and will occur on every update for any n>0. The code also constructs sequences incorrectly (appends in reverse order without proper reversal logic, and pred reconstruction assumes a valid best_S/best_j path that may not exist). For n=100 (tai100_20) the exponential DP is intractable, so it scores 0; we must replace it with a fast heuristic that is known to achieve ~0.7+ on these Taillard instances. I will provide (1) pre_process guidance that forces the generated solve() to invoke a Johnson/NEH-style heuristic (or DP only for n<=12), and (2) a solver_lib helper implementing the heuristic that the solver can drop in. This directly attacks the largest gap (+0.772) without touching other frozen tasks.
+
+--- Depth 3 ---
+pre_process:
+```python
+if task.task_id == "flow_shop_scheduling":
+    additional_context = """You are solving the m-machine flow-shop scheduling problem (n jobs, m machines). The optimal makespan is NP-hard for m>2, so use Johnson's rule as a fast heuristic (optimal for m=2). Implement a Johnson's heuristic or NEH insertion heuristic in the solver; only fall back to the provided DP for n<=12. Never use lists vs tuples in comparisons. Return {'job_sequence': list_of_job_indices_0based}. The returned sequence must be a valid permutation (all jobs 0..n-1 exactly once)."""
+else:
+    additional_context = ""
+```
+solver_lib:neh_heuristic:
+```python
+def neh_heuristic(n: int, m: int, matrix: list) -> list:
+    """NEH insertion heuristic for m-machine flow shop (strong practical approximation).
+
+    Args:
+        n: number of jobs
+        m: number of machines
+        matrix: n x m list of processing times (matrix[i][j] = time of job i on machine j)
+
+    Returns:
+        list of job indices (0-based) in the order to process them.
+    """
+    if n == 0:
+        return []
+    # Longest-processing-time initial order
+    p = [sum(row) for row in matrix]
+    jobs = list(range(n))
+    jobs.sort(key=p.__getitem__, reverse=True)
+    # Start with first two jobs (standard NEH variant)
+    if n == 1:
+        return [jobs[0]]
+    current = [jobs[0], jobs[1]]
+    for k in range(2, n):
+        best_makespan = float('inf')
+        best_pos = 0
+        for pos in range(len(current) + 1):
+            temp_seq = current[:pos] + [jobs[k]] + current[pos:]
+            # Correct full 2D makespan evaluation (no incremental reset bug)
+            C = [[0.0] * m for _ in range(len(temp_seq))]
+            for i in range(len(temp_seq)):
+                job = temp_seq[i]
+                for j in range(m):
+                    if i == 0 and j == 0:
+                        C[i][j] = matrix[job][j]
+                    elif i == 0:
+                        C[i][j] = C[i][j-1] + matrix[job][j]
+                    elif j == 0:
+                        C[i][j] = C[i-1][j] + matrix[job][j]
+                    else:
+                        C[i][j] = max(C[i-1][j], C[i][j-1]) + matrix[job][j]
+            ms = C[-1][-1]
+            if ms < best_makespan:
+                best_makespan = ms
+                best_pos = pos
+        current = current[:best_pos] + [jobs[k]] + current[best_pos:]
+    return current
+```
+Rationale: ## Diagnosis
+The indexing error (list index out of range) occurs in the NEH heuristic's sequence insertion loop and/or makespan evaluation when n >= 5 (e.g. tai100_5.txt through tai500_20.txt), stemming from off-by-one errors in the incremental comp update that incorrectly resets completion times to 0 instead of carrying forward prev_job completions on every machine. This affects the entire task category (1/1 pass rate, score 0.000), despite the headroom table showing +0.772 gap vs best-known; previous layer's johnson/NEH hybrid produced the exact same crash pattern.
+
+## Intervention
+Replace previous NEH implementation with a corrected solver_lib:neh_heuristic that uses a fixed full 2D makespan table (O(n²m) per trial) to guarantee no index errors, plus updated pre_process that forces Johnson's rule on m==2 and strict NEH on m>2. Only modifies flow_shop_scheduling (all other tasks frozen).
+
+## Why this is different
+Previous layer injected a broken incremental comp version that recomputes from 0 every time (failing on n>2) plus malformed Johnson's split; this is a structurally new insertion-heuristic skeleton using the proven correct makespan evaluator from the best-known archive entry.
+
+
+## What You Can Produce
+
+You can output any combination of:
+
+### pre_process (strategy guidance)
+Python code that runs BEFORE the solver sees the task. Your code has access to:
+- `task` (read-only TaskDescription with .task_id, .description, .metadata)
+- `outer_context` (string: guidance from higher meta-layers — use this to ADAPT your intervention based on higher layers' strategic decisions; empty if you are the outermost layer)
+
+You MUST set the `additional_context` variable (a string that gets appended to the solver's prompt).
+
+CRITICAL: Set the `additional_context` variable directly. Do NOT modify the `task` object — it is read-only.
+
+### solver_lib (solver-visible code library)
+Python functions that will be PREPENDED to the solver's generated code and available at runtime inside the sandbox. The solver sees their signatures in its prompt and can call them directly.
+
+Use this to provide working algorithm implementations that the solver cannot reliably write from scratch. This is different from pre_process (which provides strategy guidance as text) — solver_lib provides actual executable code.
+
+Example:
+```solver_lib:local_search
+def local_search(solution, evaluate_fn, time_limit=8.0):
+    """Iteratively improve solution via random swaps within time limit."""
+    import time, random
+    best, best_score = solution, evaluate_fn(solution)
+    start = time.time()
+    while time.time() - start < time_limit:
+        keys = list(best.keys())
+        if len(keys) < 2:
+            break
+        i, j = random.sample(range(len(keys)), 2)
+        neighbor = dict(best)
+        neighbor[keys[i]], neighbor[keys[j]] = neighbor[keys[j]], neighbor[keys[i]]
+        score = evaluate_fn(neighbor)
+        if score > best_score:
+            best, best_score = neighbor, score
+    return best
+```
+
+IMPORTANT for solver_lib:
+- Functions run inside the sandbox, NOT in the meta-layer
+- Only use Python standard library imports (no numpy, scipy, etc.)
+- Each block should define a single self-contained function
+- Later layers can override a function by providing a solver_lib block with the same name
+- solver_lib functions from different layers share a runtime namespace and can call each other
+- Every function MUST include type annotations and a docstring with (a) one-line summary, (b) Args section listing every parameter with its expected type and meaning, (c) Returns section describing the return type and structure. The solver only sees the signature and docstring, not the full source — the docstring is the API contract. Example:
+      def pack_items(items: list, capacity: int) -> tuple:
+          """Pack items into bins using first-fit decreasing.
+
+          Args:
+              items: list[tuple[int, int, str]] — each is (width, height, item_id).
+              capacity: int — max bin weight.
+
+          Returns:
+              tuple[int, list[dict]] — (total_cost, placements) where each dict
+              has keys 'id' (str), 'x' (int), 'y' (int).
+          """
+
+## Output Format
+
+Respond with EXACTLY this structure (omit sections you don't need):
+
+```rationale
+## Diagnosis
+<the specific failure mode or bottleneck you are targeting, grounded in the score data, the headroom table, and the per-trace failure classes above — name the actual tasks it affects>
+
+## Intervention
+<what you will change and EXACTLY which tasks it targets. For every solver_lib helper you add, name the failing task it addresses and why the solver cannot write it reliably from scratch. Do not promise code you are not emitting.>
+
+## Why this is different
+<how this differs from what the injected-code history already tried — do NOT repeat a prior approach; if you cannot beat it, emit nothing>
+```
+
+```pre_process
+<python code>
+```
+
+```solver_lib:<name>
+<python function code>
+```
+
+IMPORTANT:
+- pre_process must be self-contained Python. Do not import external packages beyond the standard library.
+- Focus on STRUCTURAL improvements, not individual error patches.
+- If a previous layer's fix hurts certain tasks, add task-type conditionals to bypass it.
+- GENERALIZE: condition on task STRUCTURE (size, constraints, metadata), NEVER on specific task_id string literals — task_id-keyed code does not transfer to unseen tasks.
+- If you add a solver_lib helper, name the specific failing task it targets and why the solver cannot reliably write it itself.
+- Keep code simple and robust — complex code is more likely to break.
+- Use pre_process for strategy guidance (text); use solver_lib for reusable implementations (code).
+- Favor small (≤30 lines), audit-able helpers over large multi-purpose ones. Helpers that break the runtime env (creating envs, installing packages, depending on uncommon CLIs) introduce more failures than they prevent.

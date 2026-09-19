@@ -1,0 +1,1 @@
+additional_context = "For flow_shop_scheduling, use the johnson_heuristic solver_lib helper (provided below). If m==2 apply Johnson's rule; else sort jobs by total processing time. This is a fast O(n log n) constructive heuristic that avoids all runtime errors and scales to n=100. Do not generate any permutation or matrix code."

@@ -1,0 +1,792 @@
+You are a higher-order meta-layer (depth 3) in a recursive self-improving system called Meta^n.
+
+## Your Role
+Previous layers have already made tactical fixes — dependency handling, constraint checks, format corrections. Your job is NOT to patch individual errors. Lower layers already do that.
+
+Instead, you should:
+1. Identify SYSTEMIC patterns across task categories
+2. Understand WHY previous layers' fixes helped some tasks but hurt others
+3. Make STRUCTURAL improvements: task classification, solver strategy selection, algorithm implementations
+4. Consider CONDITIONING or BYPASSING previous layers' changes for task types where they cause regressions
+5. Provide reusable algorithm implementations (via solver_lib) that the solver can call directly
+
+## System Context
+Current depth: 3
+Tasks attempted: 6
+Current mean score: 0.839  ← PRIMARY OBJECTIVE: raise the MEAN CONTINUOUS SCORE (not just the pass count)
+Score spread (6 tasks): [0.0-0.3]x0  [0.3-0.7]x1  [0.7-1.0]x5
+pass@1 (binary success rate): 100.0%
+
+## DEEPEN — keep improving ONLY task 'assignment_problem'
+The layer BELOW already worked 'assignment_problem'; its current solution is the starting point, NOT a blank slate. Reason about what that layer produced and improve 'assignment_problem' FURTHER — do NOT discard or restart it. Every OTHER task is FROZEN and will NOT be re-solved; spend NO effort on them.
+## Opportunity — lowest-scoring tasks (most absolute room)
+All tasks are at the best-known score; these have the most room toward a perfect 1.0:
+
+| task | now | room->1.0 |
+|------|-----|----------|
+| capacitated_warehouse_location | 0.694 | 0.306 |
+| assortment_problem | 0.701 | 0.299 |
+| assignment_problem | 0.721 | 0.279 |
+| bin_packing___one_dimensional | 0.954 | 0.046 |
+| aircraft_landing | 0.978 | 0.022 |
+| common_due_date_scheduling | 0.985 | 0.015 |
+
+## Performance Summary & Analysis
+## Task Category Performance
+
+- **assignment/location** (2 tasks): 2/2 pass, mean=0.71, key issue: -
+- **packing/cutting** (2 tasks): 2/2 pass, mean=0.83, key issue: -
+- **scheduling** (2 tasks): 2/2 pass, mean=0.98, key issue: -
+
+## Previous Layer Effectiveness
+
+Previous layer rationale: "The assignment solver currently gets perfect scores on n=100 and n=400 but times out on n=700 and n=3000 because pure-Python Hungarian is O(n^3). Since pass@1 is already 100% but continuous score is o..."
+
+Tasks that IMPROVED (6):
+  assignment_problem: 0.500 → 0.721 (+0.221)
+  assortment_problem: 0.569 → 0.701 (+0.131)
+  aircraft_landing: 0.863 → 0.978 (+0.115)
+  bin_packing___one_dimensional: 0.848 → 0.954 (+0.106)
+  common_due_date_scheduling: 0.926 → 0.985 (+0.060)
+  ... and 1 more
+Tasks unchanged: 0
+Net effect: +0.112 mean score change (over 6 shared tasks)
+
+## Representative Traces (2 of 6)
+
+--- Task: assignment_problem [SUCCESS score=0.721] ---
+Script:
+```python
+def solve(**kwargs):
+    """
+    Solves an instance of the Assignment Problem.
+
+    Input kwargs:
+      - n: int
+      - cost_matrix: 2D array-like with shape (n, n)
+
+    Returns:
+      dict with:
+        - "total_cost": minimal/feasible total assignment cost
+        - "assignment": list of 1-indexed (item, agent) tuples
+    """
+    import time
+
+    n = int(kwargs.get("n"))
+    cost_matrix = kwargs.get("cost_matrix")
+
+    if n <= 0:
+        return {"total_cost": 0, "assignment": []}
+
+    def _clean_total(x):
+        try:
+            return x.item()
+        except Exception:
+            return x
+
+    # Exact Hungarian algorithm for small/medium dense instances.
+    def hungarian(cm, n):
+        INF = float("inf")
+        u = [0] * (n + 1)
+        v = [0] * (n + 1)
+        p = [0] * (n + 1)
+        way = [0] * (n + 1)
+
+        for i in range(1, n + 1):
+            p[0] = i
+            j0 = 0
+            minv = [INF] * (n + 1)
+            used = [False] * (n + 1)
+
+            while True:
+                used[j0] = True
+                i0 = p[j0]
+                row = cm[i0 - 1]
+                delta = INF
+                j1 = 0
+
+                ui0 = u[i0]
+                for j in range(1, n + 1):
+                    if not used[j]:
+                        cur = row[j - 1] - ui0 - v[j]
+                        if cur < minv[j]:
+                            minv[j] = cur
+                            way[j] = j0
+                        if minv[j] < delta:
+                            delta = minv[j]
+                            j1 = j
+
+                for j in range(0, n + 1):
+                    if used[j]:
+                        u[p[j]] += delta
+                        v[j] -= delta
+                    else:
+                        minv[j] -= delta
+
+                j0 = j1
+                if p[j0] == 0:
+                    break
+
+            while True:
+                j1 = way[j0]
+                p[j0] = p[j1]
+                j0 = j1
+                if j0 == 0:
+                    break
+
+        row_to_col = [0] * (n + 1)
+        for j in range(1, n + 1):
+            if p[j] != 0:
+                row_to_col[p[j]] = j
+
+        assignment = []
+        total = 0
+        for i in range(1, n + 1):
+            j = row_to_col[i]
+            assignment.append((i, j))
+            total += cm[i - 1][j - 1]
+
+        return _clean_total(total), assignment
+
+    # Fast feasible heuristic for large instances.
+    def greedy_assignment(cm, n, time_limit=8.5):
+        start = time.time()
+        deadline = start + time_limit
+
+        # Estimate row urgency by best-second-best gap.
+        row_info = []
+        for i in range(n):
+            row = cm[i]
+            best = None
+            second = None
+            bestj = -1
+
+            for j in range(n):
+                val = row[j]
+                if best is None or val < best:
+                    second = best
+                    best = val
+                    bestj = j
+                elif second is None or val < second:
+                    second = val
+
+            if second is None:
+                gap = 0
+            else:
+                gap = second - best
+            row_info.append((-gap, best, i, bestj))
+
+            if time.time() > deadline:
+                break
+
+        if len(row_info) < n:
+            # Fallback if even preprocessing is too slow.
+            used = [False] * n
+            col_for_row = [-1] * n
+            for i in range(n):
+                row = cm[i]
+                bestj = -1
+                best = None
+                for j in range(n):
+                    if not used[j]:
+                        val = row[j]
+                        if best is None or val < best:
+                            best = val
+                            bestj = j
+                if bestj < 0:
+                    for j in range(n):
+                        if not used[j]:
+                            bestj = j
+                            break
+                used[bestj] = True
+                col_for_row[i] = bestj
+            assignment = [(i + 1, col_for_row[i] + 1) for i in range(n)]
+            total = sum(cm[i][col_for_row[i]] for i in range(n))
+            return _clean_total(total), assignment
+
+        row_info.sort()
+        used = [False] * n
+        col_for_row = [-1] * n
+
+        for _, _, i, preferred in row_info:
+            if preferred >= 0 and not used[preferred]:
+                col_for_row[i] = preferred
+                used[preferred] = True
+                continue
+
+            row = cm[i]
+            bestj = -1
+            best = None
+            for j in range(n):
+                if not used[j]:
+                    val = row[j]
+                    if best is None or val < best:
+                        best = val
+                        bestj = j
+
+            if bestj < 0:
+                for j in range(n):
+                    if not used[j]:
+                        bestj = j
+                        break
+
+            col_for_row[i] = bestj
+            used[bestj] = True
+
+        # Limited 2-swap local improvement.
+        # This is deliberately conservative to avoid timeouts.
+        improved = True
+        passes = 0
+        while improved and passes < 2 and time.time() < deadline:
+            improved = False
+            passes += 1
+            for a in range(n):
+                if time.time() >= deadline:
+                    break
+                ca = col_for_row[a]
+                rowa = cm[a]
+                olda = rowa[ca]
+                for b in range(a + 1, n):
+                    cb = col_for_row[b]
+                    rowb = cm[b]
+                    old = olda + rowb[cb]
+                    new = rowa[cb] + rowb[ca]
+                    if new < old:
+                        col_for_row[a], col_for_row[b] = cb, ca
+                        improved = True
+                        ca = cb
+                        olda = rowa[ca]
+
+        assignment = [(i + 1, col_for_row[i] + 1) for i in range(n)]
+        total = sum(cm[i][col_for_row[i]] for i in range(n))
+        return _clean_total(total), assignment
+
+    # Threshold chosen to keep pure-Python exact method safely under the hard wall-clock limit.
+    if n <= 400:
+        total_cost, assignment = hungarian(cost_matrix, n)
+    else:
+        total_cost, assignment = greedy_assignment(cost_matrix, n, time_limit=8.5)
+
+    return {"total_cost": total_cost, "assignment": assignment}
+```
+Stdout:
+score=0.7206
+raw_score=0.7206
+Eval feedback:
+assign100.txt -> Scores: ['1.000']
+assign400.txt -> Scores: ['1.000']
+assign700.txt -> Scores: ['0.874']
+assignp3000.txt -> Scores: ['0.008']
+Avg Dev Score: 0.7206
+
+--- Task: common_due_date_scheduling [SUCCESS score=0.985] ---
+Script:
+```python
+def solve(**kwargs):
+    """
+    Heuristic solver for the restricted single-machine common due date scheduling
+    problem. Returns a valid 1-based permutation of the jobs.
+    """
+    import time
+    import random
+
+    jobs = kwargs.get('jobs', [])
+    h = kwargs.get('h', 0.6)
+    n = len(jobs)
+
+    if n <= 1:
+        return {'schedule': list(range(1, n + 1))}
+
+    start_time = time.time()
+    deadline = start_time + 9.15
+
+    ps = [j[0] for j in jobs]
+    aa = [j[1] for j in jobs]
+    bb = [j[2] for j in jobs]
+
+    total_p = sum(ps)
+    d = int(total_p * h)
+
+    def penalty(order):
+        t = 0
+        val = 0
+        for idx in order:
+            t += ps[idx]
+            if t < d:
+                val += aa[idx] * (d - t)
+            elif t > d:
+                val += bb[idx] * (t - d)
+        return val
+
+    all_idx = list(range(n))
+
+    def make_v_shape(early_jobs):
+        early_set = set(early_jobs)
+        early = list(early_set)
+        tardy = [i for i in all_idx if i not in early_set]
+
+        early.sort(
+            key=lambda i: (ps[i] / (aa[i] if aa[i] else 1e-9), ps[i]),
+            reverse=True
+        )
+        tardy.sort(
+            key=lambda i: (ps[i] / (bb[i] if bb[i] else 1e-9), -bb[i])
+        )
+        return early + tardy
+
+    candidates = []
+
+    candidates.append(all_idx[:])
+    candidates.append(sorted(all_idx, key=lambda i: ps[i]))
+    candidates.append(sorted(all_idx, key=lambda i: ps[i], reverse=True))
+    candidates.append(sorted(all_idx, key=lambda i: ps[i] / (bb[i] if bb[i] else 1e-9)))
+    candidates.append(sorted(all_idx, key=lambda i: ps[i] / (aa[i] if aa[i] else 1e-9), reverse=True))
+    candidates.append(sorted(all_idx, key=lambda i: ps[i] / (aa[i] + bb[i] + 1e-9)))
+
+    selection_orders = [
+        sorted(all_idx, key=lambda i: (bb[i] / (aa[i] + 1e-9), -ps[i]), reverse=True),
+        sorted(all_idx, key=lambda i: ((bb[i] + 1) / (aa[i] + 1), -ps[i]), reverse=True),
+        sorted(all_idx, key=lambda i: (bb[i] - aa[i], -ps[i]), reverse=True),
+        sorted(all_idx, key=lambda i: (bb[i] * ps[i], -aa[i]), reverse=True),
+        sorted(all_idx, key=lambda i: (aa[i] / (bb[i] + 1e-9), ps[i])),
+        sorted(all_idx, key=lambda i: ps[i], reverse=True),
+    ]
+
+    for order in selection_orders:
+        load = 0
+        early = []
+        for i in order:
+            if load + ps[i] <= d:
+                early.append(i)
+                load += ps[i]
+        candidates.append(make_v_shape(early))
+
+        load = 0
+        early = []
+        for i in order:
+            if load + ps[i] <= d or load < d * 0.92:
+                early.append(i)
+                load += ps[i]
+            if load >= d:
+                break
+        candidates.append(make_v_shape(early))
+
+    if n <= 170 and time.time() < deadline:
+        add_order = sorted(all_idx, key=lambda i: ps[i] * (aa[i] + bb[i]), reverse=True)
+        seq = []
+        complete = True
+
+        for job in add_order:
+            if time.time() > deadline:
+                complete = False
+                break
+
+            best_seq = None
+            best_val = None
+
+            for pos in range(len(seq) + 1):
+                trial = seq[:pos] + [job] + seq[pos:]
+                val = penalty(trial)
+
+                if best_val is None or val < best_val:
+                    best_val = val
+                    best_seq = trial
+
+            seq = best_seq
+
+        if complete and len(seq) == n:
+            candidates.append(seq)
+
+    best = None
+    best_val = None
+    seen = set()
+
+    for cand in candidates:
+        if len(cand) != n:
+            continue
+
+        key = tuple(cand)
+        if key in seen:
+            continue
+
+        seen.add(key)
+        val = penalty(cand)
+
+        if best_val is None or val < best_val:
+            best_val = val
+            best = cand[:]
+
+    if best is None:
+        best = all_idx[:]
+        best_val = penalty(best)
+
+    def adjacent_improve(seq, val):
+        passes = 0
+        improved = True
+
+        while improved and passes < 25 and time.time() < deadline:
+            improved = False
+            passes += 1
+
+            for i in range(n - 1):
+                if time.time() > deadline:
+                    break
+
+                seq[i], seq[i + 1] = seq[i + 1], seq[i]
+                new_val = penalty(seq)
+
+                if new_val < val:
+                    val = new_val
+                    improved = True
+                else:
+                    seq[i], seq[i + 1] = seq[i + 1], seq[i]
+
+        return seq, val
+
+    best, best_val = adjacent_improve(best, best_val)
+
+    loops = 0
+    while time.time() < deadline and loops < 4:
+        loops += 1
+        improved = False
+
+        t = 0
+        cross = 0
+        for k, idx in enumerate(best):
+            t += ps[idx]
+            if t >= d:
+                cross = k
+                break
+
+        for i in range(n):
+            if time.time() > deadline:
+                break
+
+            job = best[i]
+            base = best[:i] + best[i + 1:]
+
+            if n <= 90:
+                positions = range(n)
+            else:
+                positions_set = {
+                    0, n - 1,
+                    i, max(0, i - 1), min(n - 1, i + 1),
+                    cross, max(0, cross - 1), min(n - 1, cross + 1)
+                }
+
+                for off in (2, 3, 5, 8, 13, 21):
+                    positions_set.add(max(0, i - off))
+                    positions_set.add(min(n - 1, i + off))
+                    positions_set.add(max(0, cross - off))
+                    positions_set.add(min(n - 1, cross + off))
+
+                positions = sorted(positions_set)
+
+            local_best_pos = i
+            local_best_val = best_val
+
+            for pos in positions:
+                if pos == i:
+                    continue
+
+                trial = base[:pos] + [job] + base[pos:]
+                val = penalty(trial)
+
+                if val < local_best_val:
+                    local_best_val = val
+                    local_best_pos = pos
+
+            if local_best_val < best_val:
+                best = base[:local_best_pos] + [job] + base[local_best_pos:]
+                best_val = local_best_val
+                improved = True
+
+        if not improved:
+            break
+
+        best, best_val = adjacent_improve(best, best_val)
+
+    rnd = random.Random(1234567)
+    attempts = 0
+
+    while time.time() < deadline and attempts < 20 and n <= 250:
+        attempts += 1
+        seq = best[:]
+
+        for _ in range(max(1, n // 25)):
+            i = rnd.randrange(n)
+            j = rnd.randrange(n)
+            seq[i], seq[j] = seq[j], seq[i]
+
+        val = penalty(seq)
+        seq, val = adjacent_improve(seq, val)
+
+        if val < best_val:
+            best = seq
+            best_val = val
+
+    return {'schedule': [i + 1 for i in best]}
+```
+Stdout:
+score=0.9853
+raw_score=0.9853
+Eval feedback:
+sch10.txt -> Scores: ['0.947', '0.981', '1.000']
+sch100.txt -> Scores: ['0.983', '0.978', '0.996']
+sch1000.txt -> Scores: ['0.974', '0.980', '0.999']
+sch20.txt -> Scores: ['1.010', '0.971', '1.003']
+sch200.txt -> Scores: ['0.994', '0.970', '0.978']
+sch50.txt -> Scores: ['1.000', '1.000', '0.989']
+sch500.txt -> Scores: ['0.971', '0.974', '0.995']
+Avg Dev Score: 0.9853
+
+
+## Previously Injected Code (layers below you)
+--- Depth 2 ---
+pre_process:
+```python
+additional_context = """
+For assignment_problem, do not use pure-Python Hungarian for all sizes: it times out on large dense cases.
+Use exact Hungarian only for small/medium n where it can finish comfortably, and for large n switch to a fast feasible heuristic.
+
+Recommended structure:
+- Parse n and cost_matrix as before.
+- If n <= about 450 or 500, Hungarian is OK.
+- If n is larger, call fast_greedy_assignment(cost_matrix, n, time_limit=8.5).
+- Return {'total_cost': total_cost, 'assignment': assignment}.
+A valid complete assignment with heuristic cost is much better than timing out.
+The assignment list should contain 1-based (row, column) pairs and total_cost should be the summed selected costs.
+"""
+```
+solver_lib:fast_greedy_assignment:
+```python
+def fast_greedy_assignment(cost_matrix: list, n: int = None, time_limit: float = 8.5) -> tuple:
+    """Construct a fast feasible assignment for large dense assignment instances.
+
+    Args:
+        cost_matrix: list[list[number]] — square n by n cost matrix, or an object with row indexing.
+        n: int — problem dimension; if None, uses len(cost_matrix).
+        time_limit: float — approximate seconds available for construction and local improvement.
+
+    Returns:
+        tuple[float, list[tuple[int, int]]] — (total_cost, assignment), where assignment is
+        a list of 1-based (row, column) pairs assigning every row to exactly one distinct column.
+    """
+    import time
+
+    start = time.time()
+    deadline = start + max(0.1, float(time_limit))
+    if n is None:
+        n = len(cost_matrix)
+    n = int(n)
+
+    if n <= 0:
+        return 0, []
+
+    def get_row(i):
+        row = cost_matrix[i]
+        try:
+            return row.tolist()
+        except AttributeError:
+            return row
+
+    # For each row, find best and second-best columns.  Rows with high regret are assigned first.
+    row_info = []
+    for i in range(n):
+        row = get_row(i)
+        best_c = 0
+        best_v = row[0]
+        second_v = None
+        for j in range(1, n):
+            v = row[j]
+            if v < best_v:
+                second_v = best_v
+                best_v = v
+                best_c = j
+            elif second_v is None or v < second_v:
+                second_v = v
+        if second_v is None:
+            second_v = best_v
+        row_info.append((second_v - best_v, best_v, i, best_c))
+
+    row_info.sort(reverse=True)
+
+    free_cols = list(range(n))
+    assigned_col = [-1] * n
+    total = 0
+
+    # Greedy regret assignment: each difficult row gets its cheapest remaining column.
+    for _, __, i, pref in row_info:
+        if time.time() > deadline:
+            break
+        row = get_row(i)
+        best_pos = 0
+        best_j = free_cols[0]
+        best_v = row[best_j]
+
+        # Fast path if preferred column is still free.
+        # Linear membership would be too costly, so scan once anyway.
+        for pos, j in enumerate(free_cols):
+            v = row[j]
+            if v < best_v:
+                best_v = v
+                best_j = j
+                best_pos = pos
+
+        assigned_col[i] = best_j
+        total += best_v
+        last = free_cols.pop()
+        if best_pos < len(free_cols):
+            free_cols[best_pos] = last
+
+    # If time expired mid-construction, finish arbitrarily but validly.
+    if free_cols:
+        k = 0
+        for i in range(n):
+            if assigned_col[i] < 0:
+                j = free_cols[k]
+                assigned_col[i] = j
+                total += get_row(i)[j]
+                k += 1
+
+    # Time-limited 2-row swap improvement.  This is cheap and often improves greedy collisions.
+    # Try rows with largest selected costs first.
+    if time.time() < deadline:
+        rows = list(range(n))
+        try:
+            rows.sort(key=lambda i: get_row(i)[assigned_col[i]], reverse=True)
+        except Exception:
+            pass
+
+        max_outer = n if n <= 1200 else min(n, 700)
+        max_inner = n if n <= 1200 else min(n, 900)
+
+        improved = True
+        passes = 0
+        while improved and passes < 2 and time.time() < deadline:
+            improved = False
+            passes += 1
+            for ai in range(max_outer):
+                if time.time() >= deadline:
+                    break
+                i = rows[ai]
+                ci = assigned_col[i]
+                row_i = get_row(i)
+                old_i = row_i[ci]
+                for bj in range(ai + 1, min(len(rows), ai + 1 + max_inner)):
+                    k = rows[bj]
+                    ck = assigned_col[k]
+                    if ci == ck:
+                        continue
+                    row_k = get_row(k)
+                    old = old_i + row_k[ck]
+                    new = row_i[ck] + row_k[ci]
+                    if new < old:
+                        assigned_col[i], assigned_col[k] = ck, ci
+                        total += new - old
+                        improved = True
+                        break
+                if improved:
+                    break
+
+    assignment = [(i + 1, assigned_col[i] + 1) for i in range(n)]
+    try:
+        total = total.item()
+    except AttributeError:
+        pass
+    return total, assignment
+```
+Rationale: The assignment solver currently gets perfect scores on n=100 and n=400 but times out on n=700 and n=3000 because pure-Python Hungarian is O(n^3). Since pass@1 is already 100% but continuous score is only 0.5 due the two timeouts, the safest improvement is not to attempt exact optimization for large dense instances. Instead, keep Hungarian for small/medium cases where it finishes, and switch to a fast O(n^2)-style feasible-assignment heuristic for large n. A valid but suboptimal solution should score above a timeout/zero and raise the mean.
+
+The helper below builds a complete assignment quickly by ordering rows by regret between their two cheapest columns, assigning each row to its cheapest still-free column, then doing a small time-limited pairwise swap improvement. It is intended specifically for the large assignment_problem instances where exact Hungarian times out.
+
+
+## What You Can Produce
+
+You can output any combination of:
+
+### pre_process (strategy guidance)
+Python code that runs BEFORE the solver sees the task. Your code has access to:
+- `task` (read-only TaskDescription with .task_id, .description, .metadata)
+- `outer_context` (string: guidance from higher meta-layers — use this to ADAPT your intervention based on higher layers' strategic decisions; empty if you are the outermost layer)
+
+You MUST set the `additional_context` variable (a string that gets appended to the solver's prompt).
+
+CRITICAL: Set the `additional_context` variable directly. Do NOT modify the `task` object — it is read-only.
+
+### solver_lib (solver-visible code library)
+Python functions that will be PREPENDED to the solver's generated code and available at runtime inside the sandbox. The solver sees their signatures in its prompt and can call them directly.
+
+Use this to provide working algorithm implementations that the solver cannot reliably write from scratch. This is different from pre_process (which provides strategy guidance as text) — solver_lib provides actual executable code.
+
+Example:
+```solver_lib:local_search
+def local_search(solution, evaluate_fn, time_limit=8.0):
+    """Iteratively improve solution via random swaps within time limit."""
+    import time, random
+    best, best_score = solution, evaluate_fn(solution)
+    start = time.time()
+    while time.time() - start < time_limit:
+        keys = list(best.keys())
+        if len(keys) < 2:
+            break
+        i, j = random.sample(range(len(keys)), 2)
+        neighbor = dict(best)
+        neighbor[keys[i]], neighbor[keys[j]] = neighbor[keys[j]], neighbor[keys[i]]
+        score = evaluate_fn(neighbor)
+        if score > best_score:
+            best, best_score = neighbor, score
+    return best
+```
+
+IMPORTANT for solver_lib:
+- Functions run inside the sandbox, NOT in the meta-layer
+- Only use Python standard library imports (no numpy, scipy, etc.)
+- Each block should define a single self-contained function
+- Later layers can override a function by providing a solver_lib block with the same name
+- solver_lib functions from different layers share a runtime namespace and can call each other
+- Every function MUST include type annotations and a docstring with (a) one-line summary, (b) Args section listing every parameter with its expected type and meaning, (c) Returns section describing the return type and structure. The solver only sees the signature and docstring, not the full source — the docstring is the API contract. Example:
+      def pack_items(items: list, capacity: int) -> tuple:
+          """Pack items into bins using first-fit decreasing.
+
+          Args:
+              items: list[tuple[int, int, str]] — each is (width, height, item_id).
+              capacity: int — max bin weight.
+
+          Returns:
+              tuple[int, list[dict]] — (total_cost, placements) where each dict
+              has keys 'id' (str), 'x' (int), 'y' (int).
+          """
+
+## Output Format
+
+Respond with EXACTLY this structure (omit sections you don't need):
+
+```rationale
+## Diagnosis
+<the specific failure mode or bottleneck you are targeting, grounded in the score data, the headroom table, and the per-trace failure classes above — name the actual tasks it affects>
+
+## Intervention
+<what you will change and EXACTLY which tasks it targets. For every solver_lib helper you add, name the failing task it addresses and why the solver cannot write it reliably from scratch. Do not promise code you are not emitting.>
+
+## Why this is different
+<how this differs from what the injected-code history already tried — do NOT repeat a prior approach; if you cannot beat it, emit nothing>
+```
+
+```pre_process
+<python code>
+```
+
+```solver_lib:<name>
+<python function code>
+```
+
+IMPORTANT:
+- pre_process must be self-contained Python. Do not import external packages beyond the standard library.
+- Focus on STRUCTURAL improvements, not individual error patches.
+- If a previous layer's fix hurts certain tasks, add task-type conditionals to bypass it.
+- GENERALIZE: condition on task STRUCTURE (size, constraints, metadata), NEVER on specific task_id string literals — task_id-keyed code does not transfer to unseen tasks.
+- If you add a solver_lib helper, name the specific failing task it targets and why the solver cannot reliably write it itself.
+- Keep code simple and robust — complex code is more likely to break.
+- Use pre_process for strategy guidance (text); use solver_lib for reusable implementations (code).
+- Favor small (≤30 lines), audit-able helpers over large multi-purpose ones. Helpers that break the runtime env (creating envs, installing packages, depending on uncommon CLIs) introduce more failures than they prevent.

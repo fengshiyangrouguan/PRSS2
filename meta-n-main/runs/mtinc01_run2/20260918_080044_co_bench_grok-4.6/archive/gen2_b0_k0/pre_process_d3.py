@@ -1,0 +1,1 @@
+additional_context = "For this 1D bin-packing task, use the bin_pack_bfd solver_lib helper (Best-Fit Decreasing on descending-sized items). Call it exactly as shown in the helper signature and then format the output as {'num_bins': N, 'bins': [list of 1-based indices per bin]}. Do not implement packing logic yourself."

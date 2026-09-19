@@ -1,0 +1,38 @@
+mple, for 4 jobs, a valid return is:
+            {'job_sequence': [1, 3, 2, 4]}
+
+    Note: This is a placeholder implementation.
+    """
+    # Placeholder: simply return the identity permutation.
+    return {'job_sequence': list(range(1, kwargs['n'] + 1))}
+
+## Execution limits (HARD)
+- Each instance is evaluated in a separate process with a strict **10-second wall-clock limit**.
+- Exceeding it kills the process and that instance scores **0.0**.
+- The limit covers the ENTIRE runtime of one `solve(**instance_kwargs)` call: your parsing, every heuristic, every local-search loop, and every helper you call.
+- Plan for a safe margin: a timeout scores 0.0, which is strictly worse than simply returning an un-improved but valid answer. Bound any search with an explicit deadline well below 10 seconds and return the best solution found so far when it expires.
+- Do NOT reach for `signal`, `threading` or `sys` to implement that deadline -- they are unavailable (see below). Compare elapsed time with the `time` module instead.
+
+## Helper code restrictions (HARD)
+Any function you place in `code_library` is validated BEFORE it is made available, and a helper that fails validation is dropped silently -- callers then fail with `NameError`.
+- These modules may NOT be imported, at any level:
+  `builtins, ctypes, fcntl, gc, http, importlib, inspect, io, marshal, mmap, multiprocessing, nt, os, pathlib, pickle, posix, requests, resource, shutil, signal, socket, subprocess, sys, tempfile, threading, urllib, urllib3`
+- Plain arithmetic, `math`, `random`, `time`, `collections`, `heapq`, `itertools`, `functools`, `bisect` and the builtins are all fine.
+- Everything the helper needs must live inside the helper itself; do not rely on imports from the solver script or the surrounding process.
+- If you cannot implement a helper without a blocked module, write the logic directly in `solve()` instead of advertising a helper the solver would then fail to call.
+
+
+## Additional Context
+Use the NEH heuristic (provided in solver_lib as neh_heuristic) to generate the job_sequence instead of brute force or identity. Call neh_heuristic(matrix) and return its output directly. This will raise the makespan score toward 1.0.
+
+## Requirements
+- Output ONLY the complete solve() function in a fenced Python code block
+- The function must match the signature shown in the problem description
+- Use only the Python standard library (do NOT use numpy, scipy, or other external packages)
+- An `llm(prompt, *, temperature=0.3, max_tokens=512) -> str` helper is available at runtime for LLM reasoning when useful (e.g. classification, text understanding). For multiple calls, prefer `llm_batch(prompts: list[str], *, temperature=0.3, max_tokens=512) -> list[str]` which runs them concurrently. Both are optional — pure Python solutions are preferred for algorithmic tasks.
+- Focus on producing a correct, efficient solution
+- Do NOT include test code or if __name__ blocks
+
+```python
+<your solve function here>
+```

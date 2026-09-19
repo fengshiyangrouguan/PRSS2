@@ -1,0 +1,4 @@
+if task.task_id == "flow_shop_scheduling":
+    additional_context = """You are solving the m-machine flow-shop scheduling problem (n jobs, m machines). Optimal makespan is NP-hard for m>2. Use the provided solver_lib helpers exactly: Johnson's rule when m==2 (optimal); NEH insertion heuristic when m>2 (strong practical approximation). NEVER write your own heuristic. The solver must call johnson_heuristic or neh_heuristic from solver_lib. Return only {'job_sequence': list_of_job_indices_0based} where the list is a valid permutation of [0..n-1]. Never use lists vs tuples in comparisons. For large n use the fast O(n²m) evaluator inside the lib functions."""
+else:
+    additional_context = ""

@@ -1,0 +1,31 @@
+rationale
+## Diagnosis
+The batch_assignment (round-robin over job index in permutation) and the hybrid permutation both ignore dynamic machine loads, causing high variance (0.518-0.785) and poor makespan on instances with differing setup/processing ratios (e.g. hrs-50_1 avg ~0.54 vs hrs-50_2 ~0.70); this is the primary bottleneck given the 0.269 headroom to best-known, as static heuristics fail to reentrant bottleneck avoidance.
+## Intervention
+Add solver_lib:improved_batch_assignment (targets hybrid_reentrant_shop_scheduling; solver cannot reliably code online min-load list scheduling with processing times correctly in edge cases like varying n_machines or reentrancy). Use in pre_process (via improved_permutation helper already present) to override round-robin; chains with prior hybrid permutation guidance.
+## Why this is different
+Introduces dynamic load-aware list scheduling (new algorithm class vs. static sort refinement + small +0.006 net); bypasses round-robin component without task_id conditionals or prior helper tweaks.
+```pre_process
+additional_context = "Improve the batch_assignment by calling the improved_batch_assignment helper (provided in solver_lib) to assign each job (in hybrid_permutation order) to the machine with the current minimum load, using processing_times for load calculation (list scheduling heuristic). Keep the permutation as the hybrid setup*processing sort. Document the load-balanced assignment logic in the returned dict."
+```
+```solver_lib:improved_batch_assignment
+def improved_batch_assignment(n_jobs: int, n_machines: int, permutation: list[int], processing_times: list[float]) -> list[int]:
+    """Greedy list scheduling: assign jobs to machine with current min load.
+
+    Args:
+        n_jobs: int — number of jobs
+        n_machines: int — number of machines
+        permutation: list[int] — 1-based job order (from improved_permutation)
+        processing_times: list[float] — processing time per job
+
+    Returns:
+        list[int] — batch_assignment (1-based machine id for each job in order)
+    """
+    loads = [0.0] * n_machines
+    batch_assignment = []
+    for job_id in permutation:
+        machine = loads.index(min(loads))
+        batch_assignment.append(machine + 1)
+        loads[machine] += processing_times[job_id - 1]
+    return batch_assignment
+```

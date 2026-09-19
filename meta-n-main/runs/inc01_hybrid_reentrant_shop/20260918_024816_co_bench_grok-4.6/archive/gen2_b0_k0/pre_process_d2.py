@@ -1,0 +1,3 @@
+# Use the new least-loaded assignment helper when generating solver code for this task.
+# This replaces the weak round-robin batch logic with a simple, effective load-balancing heuristic.
+additional_context = "For hybrid_reentrant_shop_scheduling, improve batch_assignment by calling the least_loaded_assignment helper (min-heap on loads). This is a better dynamic load-balancing approach than fixed round-robin. Keep permutation simple (identity)."

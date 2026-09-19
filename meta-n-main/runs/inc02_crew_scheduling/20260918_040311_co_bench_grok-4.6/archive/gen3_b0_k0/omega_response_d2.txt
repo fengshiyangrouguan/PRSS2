@@ -1,0 +1,97 @@
+```rationale
+The failure pattern is that the provided solver logic (greedy sort-by-start + assign-to-compatible-crew-or-empty) sometimes leaves some tasks unassigned in the crews dict, producing total task count != N (validator error). This occurs because the best_crew fallback (to 0 when -1) can still produce wrong counts in edge cases where possible transitions are partial, duration checks interact badly with mixed empty/full crews, or task ids in arcs/tasks are not perfectly 0..N-1. The duty check later only filters invalid chains but does not retroactively fix missing assignments. 
+
+Highest-impact fix: keep the same high-level greedy structure (sort by start time, prefer empty crew then lowest-cost append) but move the assignment into a reusable helper (solver_lib) that explicitly tracks assigned tasks via a set, forces assignment of every task from task_list, falls back reliably to any empty crew (without relying on best_cost inf hacks), and returns empty crews if any chain exceeds time_limit. Add a final validation pass. This directly eliminates the count bug while preserving the original intent; generalize over task structure (N, arcs compatibility graph, start-ordered tasks) rather than hard-coding file names or constants.
+```
+
+```pre_process
+if "crew_scheduling" in task.task_id.lower():
+    additional_context = "Use the assignment helper from solver_lib to guarantee exactly N unique tasks are placed across crews and fix any count mismatches. Sort tasks by start time. Ensure every task gets a crew (empty or compatible append) and reject if any crew duty exceeds time_limit."
+else:
+    additional_context = ""
+```
+
+```solver_lib:fix_assignment
+def fix_assignment(N: int, tasks: dict, arcs: dict, K: int, time_limit: float) -> list:
+    """Greedy crew assignment helper for crew_scheduling.
+    Args:
+        N: total tasks (int).
+        tasks: dict of task_id -> (start, end) floats.
+        arcs: dict of (i,j) -> transition cost float.
+        K: number of crews (int).
+        time_limit: max duty time per crew (float).
+    Returns:
+        List of K lists, each inner list = task_ids assigned to that crew in start-order.
+        Empty list if any constraint violated (no full cover or duty overflow).
+    """
+    import copy
+    task_list = sorted(tasks.keys(), key=lambda t: tasks[t][0])
+    possible = {}
+    for i in task_list:
+        possible[i] = []
+        fi, _ = tasks[i]
+        for j in task_list:
+            if i == j:
+                continue
+            fj, _ = tasks[j]
+            if fj <= fi:
+                continue
+            if (i, j) in arcs:
+                possible[i].append((j, arcs[(i, j)]))
+    crews = [[] for _ in range(K)]
+    current_costs = [0.0] * K
+    crew_last = [None] * K
+    assigned = set()
+    for task in task_list:
+        if task in assigned:
+            continue
+        best_crew = -1
+        best_cost = float("inf")
+        for c in range(K):
+            if crew_last[c] is None:
+                if tasks[task][1] - tasks[task][0] > time_limit:
+                    continue
+                if best_crew == -1 or current_costs[c] < best_cost:
+                    best_crew = c
+                    best_cost = current_costs[c]
+                continue
+            last = crew_last[c]
+            can = False
+            cost = 0.0
+            for nxt, cst in possible.get(last, []):
+                if nxt == task:
+                    can = True
+                    cost = cst
+                    break
+            if can:
+                new_cost = current_costs[c] + cost
+                if new_cost < best_cost:
+                    best_crew = c
+                    best_cost = new_cost
+        if best_crew == -1:
+            best_crew = 0
+        crews[best_crew].append(task)
+        if crew_last[best_crew] is None:
+            crew_last[best_crew] = task
+            current_costs[best_crew] = 0.0
+        else:
+            can = False
+            cost = 0.0
+            for nxt, cst in possible.get(crew_last[best_crew], []):
+                if nxt == task:
+                    can = True
+                    cost = cst
+                    break
+            if can:
+                current_costs[best_crew] += cost
+        crew_last[best_crew] = task
+        assigned.add(task)
+    # final validation
+    total_assigned = sum(len(c) for c in crews)
+    if total_assigned != N:
+        return []
+    for c in range(K):
+        if not crews[c]:
+            continue
+        first = crews[c][0]
+        last = crews

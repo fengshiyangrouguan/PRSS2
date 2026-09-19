@@ -1,0 +1,15 @@
+{
+  "candidate_id": "gen1_b0_k0",
+  "parent_id": "gen0_seed",
+  "iteration": 1,
+  "depth": 2,
+  "mean_score": 0.7002202190793545,
+  "pass_at_1": 1.0,
+  "per_task_scores": {
+    "hybrid_reentrant_shop_scheduling": 0.7002202190793545
+  },
+  "num_children": 0,
+  "temperature_used": 0.7,
+  "total_tokens": 7265,
+  "created_at": "2026-09-18T04:37:18.975450"
+}

@@ -1,0 +1,9 @@
+{
+  "outer_calls": 9,
+  "outer_prompt_tokens": 27144,
+  "outer_completion_tokens": 126161,
+  "outer_cached_tokens": 13440,
+  "outer_cost_usd": 0.0,
+  "model": "deepseek-flash",
+  "backend": "openrouter"
+}

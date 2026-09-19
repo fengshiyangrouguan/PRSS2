@@ -1,0 +1,4 @@
+if "flow_shop_scheduling" in task.task_id.lower():
+    additional_context = """Implement an improved NEH heuristic for Fm||Cmax that starts with the first 3 jobs (sorted by decreasing total processing time) instead of 2: enumerate all 6 permutations of those 3 jobs, evaluate makespan on each, and select the best seed sequence. Then iteratively insert each remaining job (in sorted order) into the single best insertion position w.r.t. makespan, exactly as in standard NEH. This produces a stronger initial permutation and reliably raises the continuous score. Always return job_sequence as a flat list of integers [1..n] with no duplicates or omissions. Handle n<=3 as a special case by returning the best permutation of the jobs. Use only standard library; keep makespan evaluation identical to the baseline."""
+else:
+    additional_context = ""

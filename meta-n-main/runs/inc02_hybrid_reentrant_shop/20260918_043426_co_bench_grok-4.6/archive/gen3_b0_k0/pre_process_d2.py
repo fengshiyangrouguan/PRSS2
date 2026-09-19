@@ -1,0 +1,1 @@
+additional_context = "For hybrid reentrant shop scheduling, sort jobs for the permutation by a weighted key that combines setup time (higher priority) and processing time (lower). Use batch_assignment that balances machine loads by cumulative processing time rather than pure modulo. These heuristics address the reentrancy and setup constraints that the baseline ignores."

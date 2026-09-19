@@ -1,0 +1,9 @@
+{
+  "pre_process": "if \"crew_scheduling\" in task.task_id.lower():\n    additional_context = \"Use the assignment helper from solver_lib to guarantee exactly N unique tasks are placed across crews and fix any count mismatches. Sort tasks by start time. Ensure every task gets a crew (empty or compatible append) and reject if any crew duty exceeds time_limit.\"\nelse:\n    additional_context = \"\"",
+  "code_library": {},
+  "code_library_bash": {},
+  "rationale": "The failure pattern is that the provided solver logic (greedy sort-by-start + assign-to-compatible-crew-or-empty) sometimes leaves some tasks unassigned in the crews dict, producing total task count != N (validator error). This occurs because the best_crew fallback (to 0 when -1) can still produce wrong counts in edge cases where possible transitions are partial, duration checks interact badly with mixed empty/full crews, or task ids in arcs/tasks are not perfectly 0..N-1. The duty check later only filters invalid chains but does not retroactively fix missing assignments. \n\nHighest-impact fix: keep the same high-level greedy structure (sort by start time, prefer empty crew then lowest-cost append) but move the assignment into a reusable helper (solver_lib) that explicitly tracks assigned tasks via a set, forces assignment of every task from task_list, falls back reliably to any empty crew (without relying on best_cost inf hacks), and returns empty crews if any chain exceeds time_limit. Add a final validation pass. This directly eliminates the count bug while preserving the original intent; generalize over task structure (N, arcs compatibility graph, start-ordered tasks) rather than hard-coding file names or constants.",
+  "source_depth": 2,
+  "task_solution_map": {},
+  "sandbox_verified_names": []
+}

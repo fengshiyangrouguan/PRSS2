@@ -1,0 +1,1 @@
+Use the NEH heuristic but initialize the initial sequence with the top 5 jobs (by total processing time) instead of top 2. This reduces the number of insertions by roughly 60% while improving solution quality. Also use the attached makespan helper (which avoids redundant matrix copies) for speed. Keep all other logic identical.

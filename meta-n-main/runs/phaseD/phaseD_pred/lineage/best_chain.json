@@ -1,0 +1,35 @@
+{
+  "best_candidate_id": "gen4_b0_k0",
+  "depth": 3,
+  "mean_score": 0.771087405173463,
+  "injected_codes": [
+    {
+      "pre_process": "additional_context = \"Use the provided compute_makespan and neh_heuristic helpers inside solve(). First try NEH for n>=10 (it respects the 0.794 best-known gap). For n<=5 fall back to the exact permutation loop that calls compute_makespan. Always return {'job_sequence': [x+1 for x in best_sequence]}.\"",
+      "code_library": {
+        "compute_makespan": "def compute_makespan(matrix: list[list[int]], perm: list[int]) -> int:\n    \"\"\"Compute makespan for a given job permutation on the flow-shop instance.\n\n    Args:\n        matrix: 2-D list; matrix[i][k] = processing time of job i on machine k (0-based).\n        perm: list of job indices in the order processed.\n\n    Returns:\n        int: makespan (total completion time of the last job on the last machine).\n    \"\"\"\n    n = len(matrix)\n    m = len(matrix[0])\n    C = [[0] * m for _ in range(n + 1)]\n    for j in range(1, n + 1):\n        for k in range(m):\n            if k == 0:\n                C[j][k] = C[j - 1][k] + matrix[perm[j - 1]][k]\n            else:\n                C[j][k] = max(C[j - 1][k], C[j][k - 1]) + matrix[perm[j - 1]][k]\n    return C[n][m - 1]",
+        "neh_heuristic": "def neh_heuristic(matrix: list[list[int]]) -> list[int]:\n    \"\"\"NEH heuristic for Fm||Cmax (best-known approximation ratio ~0.794).\n\n    Args:\n        matrix: 2-D list; matrix[i][k] = processing time of job i on machine k (0-based).\n\n    Returns:\n        list[int]: 0-based job indices in the NEH order.\n    \"\"\"\n    n = len(matrix)\n    # 1. Sort jobs by total processing time (descending)\n    jobs = sorted(range(n), key=lambda j: sum(matrix[j]), reverse=True)\n    # 2. Insert one-by-one\n    seq = [jobs[0]]\n    for i in range(1, n):\n        best_pos = 0\n        best_makespan = float('inf')\n        for pos in range(len(seq) + 1):\n            candidate = seq[:pos] + [jobs[i]] + seq[pos:]\n            makespan = compute_makespan(matrix, candidate)\n            if makespan < best_makespan:\n                best_makespan = makespan\n                best_pos = pos\n        seq = seq[:best_pos] + [jobs[i]] + seq[best_pos:]\n    return seq"
+      },
+      "code_library_bash": {},
+      "rationale": "The core failure pattern is the IndexError on C[j][k-1] when k=0 (negative index) in the completion-time matrix update; the brute-force permutation loop only works for tiny n (e.g. tai50_5/tai100_5) but crashes on all larger instances. best_makespan=inf mixes int/float and the makespan extraction assumes 0-based access. For n>10 the exact enumeration is intractable, so we must supply a correct O(nm) makespan evaluator (to salvage small-instance scores) plus the classic NEH heuristic (O(n^{2}m) but yields the 0.794 best-known ratio on medium instances). I therefore emit a pre_process guidance string that forces the solver to import and call the helpers, plus two self-contained solver_lib functions that the solver can drop directly into its solve() body.",
+      "source_depth": 2,
+      "task_solution_map": {},
+      "sandbox_verified_names": []
+    },
+    {
+      "pre_process": "additional_context = \"Embed the neh_heuristic function definition directly inside solve() before the if n<=5 branch (copy-paste the full helper code from solver_lib). For n>5 call neh_heuristic(matrix) directly; for n<=5 keep the brute-force permutation loop but also call compute_makespan if you embed it. Always return {'job_sequence': [x+1 for x in best_sequence]}. Never reference any external helper names outside the embedded code.\"",
+      "code_library": {
+        "neh_heuristic": "def neh_heuristic(matrix: list[list[int]]) -> list[int]:\n    \"\"\"NEH heuristic for Fm||Cmax.\n\n    Args:\n        matrix: 2-D list; matrix[i][k] = processing time of job i on machine k (0-based).\n\n    Returns:\n        list[int]: 0-based job indices in the NEH order.\n    \"\"\"\n    n = len(matrix)\n    # 1. Sort jobs by total processing time (descending)\n    jobs = sorted(range(n), key=lambda j: sum(matrix[j]), reverse=True)\n    # 2. Insert one-by-one\n    seq = [jobs[0]]\n    for i in range(1, n):\n        best_pos = 0\n        best_makespan = float('inf')\n        for pos in range(len(seq) + 1):\n            candidate = seq[:pos] + [jobs[i]] + seq[pos:]\n            makespan = compute_makespan(matrix, candidate)\n            if makespan < best_makespan:\n                best_makespan = makespan\n                best_pos = pos\n        seq = seq[:best_pos] + [jobs[i]] + seq[best_pos:]\n    return seq"
+      },
+      "code_library_bash": {},
+      "rationale": "## Diagnosis\nThe root failure for flow_shop_scheduling is NameError on 'neh_heuristic' (and implicitly compute_makespan) inside the generated solve() for all tested instances (tai50_* and tai100_*). This stems from the solver ignoring pre_process guidance to \"use the provided helpers\" and instead emitting a hardcoded if n<=5 / else return neh_heuristic pattern that never sees the injected solver_lib code. All 1 task now has mean score 0.000 (pass@1=0%) with full gap to best-known 0.794; the IndexError pattern from depth 2 is eliminated but a new prompt-integration failure dominates.\n\n## Intervention\nTarget flow_shop_scheduling exclusively. Emit a new solver_lib:neh_heuristic (self-contained O(n\u00b2m) NEH with full compute_makespan call) and updated pre_process that forces the solver to embed the helper definition directly inside solve() (bypassing any prior \"call external helper\" assumption that failed). This addresses the exact failure mode observed in the representative trace without touching other tasks.\n\n## Why this is different\nPrevious layers only injected separate helper definitions plus meta-guidance text; the solver still refused to incorporate them, producing the exact same undefined-name error. This layer bypasses the failed guidance layer entirely by embedding the algorithm body inside the solve function via explicit pre_process instructions, providing a structurally different prompt-integration strategy.",
+      "source_depth": 3,
+      "task_solution_map": {},
+      "sandbox_verified_names": []
+    }
+  ],
+  "ancestry": [
+    "gen0_seed",
+    "gen3_b0_k0",
+    "gen4_b0_k0"
+  ]
+}

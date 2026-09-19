@@ -1,0 +1,10 @@
+{
+  "oracle_mean_score": 0.11411928258301773,
+  "num_contributing_chains": 1,
+  "per_task_best_sources": {
+    "job_shop_scheduling": {
+      "score": 0.11411928258301773,
+      "candidate_id": "gen0_seed"
+    }
+  }
+}

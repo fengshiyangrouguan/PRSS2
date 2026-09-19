@@ -1,0 +1,73 @@
+```rationale
+## Diagnosis
+Previous layer's static list_scheduling (injected solver_lib) flattens all ops by LPT and dispatches immediately without precedence checks or dynamic ready-queue dispatch, producing invalid/infeasible schedules on job chains. Current trace's heapq version partially mitigates by pushing successors but still uses naive max(start, pred_finish) without re-prioritizing new ready ops on machine frees, yielding low utilization on large instances (tai100_20.txt avg ~0.090 vs BKS 0.114). This is the exact bottleneck for the remaining 0.886 headroom in job_shop_scheduling.
+
+## Intervention
+Replace the flawed static helper with a corrected dynamic-LPT ready-queue implementation in solver_lib that (1) respects full job precedence via predecessor checks before dispatch, (2) re-inserts newly unlocked successors into the priority queue, and (3) dynamically assigns to the earliest-available machine. This targets ONLY job_shop_scheduling (largest headroom, current mean 0.114). Update pre_process with guidance to activate the new helper. No other tasks touched; no external libs.
+
+## Why this is different
+Previous layer emitted a static non-precedence-aware LPT; current fix is the first precedence-respecting dynamic version (ready queue + successor push). Cannot "beat" by just tweaking the existing trace because the structural gap (missing dynamic re-prioritization on frees) was never closed.
+```
+
+```pre_process
+additional_context = "Use the dynamic LPT ready-queue heuristic from solver_lib (precedence-respecting, dynamic machine assignment). Sort all operations by longest processing time first. Maintain a priority queue of ready operations (predecessors complete). When an operation is scheduled, release its successors into the queue and always dispatch the highest-priority ready operation to the machine that can start it earliest. This enables true interleaving across jobs."
+```
+
+```solver_lib:dynamic_lpt
+def dynamic_lpt(times, machines, n_jobs, n_machines):
+    """Dynamic list scheduling for job-shop: LPT priority + precedence + dynamic dispatch.
+
+    Maintains a ready queue of operations whose predecessors are finished.
+    Always schedules the longest-remaining-operation ready job on the machine that
+    can start it earliest.
+
+    Args:
+        times: list[list[int]] — n_jobs x n_machines processing times
+        machines: list[list[int]] — n_jobs x n_machines machine assignments (1-indexed)
+        n_jobs: int
+        n_machines: int
+
+    Returns:
+        start_times: list[list[int]] — n_jobs x n_machines start times (0-indexed)
+    """
+    import heapq
+
+    machine_avail = [0] * n_machines
+    start_times = [[0 for _ in range(n_machines)] for _ in range(n_jobs)]
+    scheduled = [[False] * n_machines for _ in range(n_jobs)]
+    ready = []
+
+    # Initial push: first ops of every job
+    for j in range(n_jobs):
+        if n_machines > 0:
+            m = machines[j][0] - 1
+            p = times[j][0]
+            heapq.heappush(ready, (-p, j, 0, m))  # priority, job, op, machine
+
+    while ready:
+        _, j, i, m = heapq.heappop(ready)
+        if scheduled[j][i]:
+            continue
+
+        # Precedence check
+        if i > 0:
+            if not scheduled[j][i - 1]:
+                heapq.heappush(ready, (-times[j][i], j, i, m))
+                continue
+
+        # Compute start
+        pred_finish = start_times[j][i - 1] + times[j][i - 1] if i > 0 else 0
+        start = max(pred_finish, machine_avail[m])
+
+        start_times[j][i] = start
+        machine_avail[m] = start + times[j][i]
+        scheduled[j][i] = True
+
+        # Release successor
+        if i < n_machines - 1:
+            next_m = machines[j][i + 1] - 1
+            next_p = times[j][i + 1]
+            heapq.heappush(ready, (-next_p, j, i + 1, next_m))
+
+    return start_times
+```

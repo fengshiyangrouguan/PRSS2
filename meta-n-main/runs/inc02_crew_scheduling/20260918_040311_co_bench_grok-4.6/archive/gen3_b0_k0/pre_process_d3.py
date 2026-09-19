@@ -1,0 +1,1 @@
+additional_context = "After the solver generates crews, always call solver_lib.force_full_assignment to guarantee exactly N unique tasks are placed across crews and fix any count mismatches. Sort tasks by start time. Ensure every task gets a crew (empty or compatible append) and reject if any crew duty exceeds time_limit."

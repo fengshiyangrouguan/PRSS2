@@ -1,0 +1,27 @@
+{
+  "size": 1,
+  "best_mean_score": 0.0,
+  "best_candidate_id": "gen0_seed",
+  "per_task_best": {
+    "affine_transform_2d": {
+      "score": 0.0,
+      "candidate_id": "gen0_seed"
+    }
+  },
+  "candidates": [
+    {
+      "candidate_id": "gen0_seed",
+      "parent_id": null,
+      "iteration": 0,
+      "depth": 1,
+      "mean_score": 0.0,
+      "pass_at_1": 0.0,
+      "num_children": 1,
+      "temperature_used": 0.7,
+      "total_tokens": 3344,
+      "per_task_scores": {
+        "affine_transform_2d": 0.0
+      }
+    }
+  ]
+}

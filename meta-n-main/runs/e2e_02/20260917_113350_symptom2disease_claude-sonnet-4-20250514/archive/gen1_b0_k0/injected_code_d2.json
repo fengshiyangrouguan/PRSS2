@@ -1,0 +1,11 @@
+{
+  "pre_process": "def pre_process(task, solution):\n    return solution",
+  "code_library": {
+    "mock_helper": "def mock_helper(x):\n    return x"
+  },
+  "code_library_bash": {},
+  "rationale": "mock layer at depth 2: keep the contract, change nothing observable.",
+  "source_depth": 2,
+  "task_solution_map": {},
+  "sandbox_verified_names": []
+}

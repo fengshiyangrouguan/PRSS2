@@ -1,0 +1,15 @@
+{
+  "candidate_id": "gen4_b0_k0",
+  "parent_id": "gen2_b0_k0",
+  "iteration": 4,
+  "depth": 4,
+  "mean_score": 0.7953454716949414,
+  "pass_at_1": 1.0,
+  "per_task_scores": {
+    "flow_shop_scheduling": 0.7953454716949414
+  },
+  "num_children": 0,
+  "temperature_used": 0.7,
+  "total_tokens": 9352,
+  "created_at": "2026-09-18T02:33:08.153119"
+}

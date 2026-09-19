@@ -1,0 +1,9 @@
+{
+  "pre_process": "additional_context = \"\"\"Upgrade the solver to the best-known heuristic for flow_shop_scheduling (O(n log n), works for all n):\nExtract per-job first and last processing times: p1 = matrix[i][0], pm = matrix[i][m-1].\nSplit jobs into group1 (p1 <= pm) and group2 (p1 > pm).\nSort group1 ascending by p1, group2 descending by pm.\nReturn concatenated job_sequence (0-based indices +1).\nThis beats brute force on large tai* instances; use only this logic, ignore permutations entirely.\"\"\"",
+  "code_library": {},
+  "code_library_bash": {},
+  "rationale": "Current brute-force only handles n<=8 (40320 perms feasible), else randomizes \u2014 drags avg to 0.795 on tai* instances with larger n. Best-known (0.829) is a O(n log n) job-grouping heuristic that separates \"early\" vs \"late\" machine processing times, sorts within groups, and concatenates; it exploits flow-shop makespan structure without exhaustive search. I will embed this exact heuristic into the solver prompt via additional_context so the layer below upgrades its permutation skeleton to the proven method. No solver_lib needed (heuristics are simple to embed, and we avoid code duplication across layers). This targets the exact gap while staying generalizable (depends only on task metadata: n, m, matrix shape).",
+  "source_depth": 2,
+  "task_solution_map": {},
+  "sandbox_verified_names": []
+}

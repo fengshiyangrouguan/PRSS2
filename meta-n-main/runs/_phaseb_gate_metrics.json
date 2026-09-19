@@ -1,0 +1,9 @@
+{
+  "steps": 300,
+  "wall_s": 116.54822897911072,
+  "api_delta": 0,
+  "gamma_moved": true,
+  "final_J_task": 0.9911821864893026,
+  "final_vmax": 0.0,
+  "final_n_active": 0
+}

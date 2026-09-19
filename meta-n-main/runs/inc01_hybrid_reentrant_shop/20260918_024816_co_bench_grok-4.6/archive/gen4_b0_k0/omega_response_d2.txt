@@ -1,0 +1,37 @@
+```rationale
+The current solver relies on an identity permutation (arbitrary job ordering) and cyclic round-robin machine assignment. This is a weak baseline that ignores load balancing and machine utilization patterns critical for reentrant shop scheduling (where jobs revisit machines, amplifying the impact of poor assignments on makespan or other continuous metrics). From the eval traces, scores dip below 0.95 on several instances (e.g., hrs-50_1.txt at 0.912, hrs-50_175.txt at 0.985), indicating suboptimal machine utilization rather than permutation issues. The opportunity table confirms 0.031 room to 1.0, driven by these assignment failures. A simple list-scheduling heuristic (greedy assignment by current machine load) will balance utilization better without complexity, directly targeting the dominant failure mode while remaining deterministic, auditable, and compatible with reentrant constraints. No branching on task_id; generalized to n_jobs/n_machines structure. This prepends via solver_lib so the lower solver can adopt it immediately.
+```
+
+```pre_process
+additional_context = "Prioritize machine load balancing in your assignment heuristic because reentrant jobs revisit machines multiple times; poor balance directly degrades makespan and continuous scores on instances like hrs-50 variants. Use the improved_heuristic from solver_lib to generate permutation and batch_assignment. Keep output structure identical to baseline but call the helper for assignment."
+```
+
+```solver_lib:improved_heuristic
+def improved_heuristic(n_jobs: int, n_machines: int) -> dict:
+    """Improved list-scheduling heuristic for hybrid reentrant shop scheduling.
+
+    Args:
+        n_jobs: int — number of jobs to schedule
+        n_machines: int — number of machines in the shop
+
+    Returns:
+        dict — must contain exactly:
+            'permutation': list[int] — job order (1-based indices)
+            'batch_assignment': list[int] — machine id (1-based) for each job
+    """
+    import random
+    # Maintain a reasonable permutation order (could be randomized or sorted if metadata available)
+    permutation = list(range(1, n_jobs + 1))
+    # Greedy assignment: always assign next job to the currently least-loaded machine
+    # This balances load and reduces makespan impact for reentrant visits
+    batch_assignment = []
+    loads = [0] * n_machines
+    for _ in range(n_jobs):
+        machine = loads.index(min(loads))
+        batch_assignment.append(machine + 1)
+        loads[machine] += 1
+    return {
+        'permutation': permutation,
+        'batch_assignment': batch_assignment
+    }
+```

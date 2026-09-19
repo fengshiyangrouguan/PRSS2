@@ -1,0 +1,47 @@
+```rationale
+## Diagnosis
+The NEH3 insertion loop (O(n^3 m) makespan evals) times out on all large instances (tai200_* and tai500_*, n=200/500) regardless of seed or m, as the 5-run limit rejects any partial output; this is the dominant failure mode dragging mean score to 0.772 (good on tai20/50 but zero contribution from large). The m==2 Johnson's branch was attempted but not reliably triggered in emitted code, and the archive best (0.794) on large instances comes from the simple total-time sort heuristic that runs in O(n log n) and avoids timeout.
+## Intervention
+Target exclusively flow_shop_scheduling. Update pre_process with n-based branching: n<=20 keep NEH3 insertion, m==2 force Johnson's rule (optimal), else use simple total-time sort (bypasses all insertion cost and thus all timeouts). Add solver_lib:johnsons (same reusable impl) and solver_lib:simple_sort (new, targets large-n timeout failure where solver cannot reliably emit O(n log n) sort from scratch). This is a different structural change from prior layers: size-conditioned heuristic dispatch instead of fixed NEH3 + optional Johnson's.
+## Why this is different
+Prior layers emitted unconditional NEH3 description (with m==2 optional Johnson's); this adds explicit n-threshold dispatch to skip the costly loop entirely on large instances (different regression mode: timeout vs score), matching the archive simple-sort performance on those cases without re-emitting full insertion code.
+```
+
+```pre_process
+def pre_process(task, outer_context):
+    n = task.metadata.get("n", 0)
+    m = task.metadata.get("m", 0)
+    if m == 2:
+        additional_context = """When m == 2 invoke Johnson's rule (group jobs by a_j < b_j or a_j > b_j, sort group1 ascending on a, group2 descending on b, concatenate; for n <= 1 return identity). For all other m implement the 3-seed NEH insertion heuristic exactly as described previously: sort jobs by total processing time, enumerate all 6 permutations of the first 3 as seed, pick the best makespan seed, then iteratively insert each remaining job (sorted order) into the single best position by evaluating makespan on each of the O(n) positions. Always return job_sequence as flat list [1..n]. Handle n <= 3 by full enumeration. Use only standard library; keeps makespan evaluator identical to baseline."""
+    elif n <= 20:
+        additional_context = """For small n (<=20) use the 3-seed NEH insertion heuristic: sort jobs by total processing time descending, enumerate all 6 permutations of first 3, pick best makespan seed, then iteratively insert each remaining job (in sorted order) into the single best position w.r.t. makespan. Handle n<=3 as special case by full permutation. Always return job_sequence as flat list of integers [1..n] with no duplicates or omissions. Use only standard library; keep makespan evaluation identical to baseline."""
+    else:
+        additional_context = """For large n (>20) and m>2 use simple heuristic: sort jobs by total processing time descending (O(n log n)). This avoids O(n^3 m) timeout on tai200/500 instances while matching or beating prior NEH3 on those. Always return job_sequence as flat list of integers [1..n] with no duplicates or omissions. Use only standard library."""
+    return additional_context
+```
+
+```solver_lib:johnsons
+def johnsons(jobs: list, matrix: list) -> list:
+    """Apply Johnson's rule for F2||Cmax (optimal when m==2).
+    Args:
+        jobs: list[int] — 0-based job indices (size n).
+        matrix: list[list[int]] — n rows, each [a_j, b_j] processing times on the two machines.
+    Returns:
+        list[int] — sequence of 0-based job indices in optimal order for Cmax.
+    """
+    if len(jobs) <= 1:
+        return jobs
+    a = [matrix[j][0] for j in jobs]
+    b = [matrix[j][1] for j in jobs]
+    group1 = [j for j in jobs if a[j] < b[j]]
+    group2 = [j for j in jobs if a[j] > b[j]]
+    group1.sort(key=lambda j: a[j])
+    group2.sort(key=lambda j: b[j], reverse=True)
+    return group1 + group2
+```
+
+```solver_lib:simple_sort
+def simple_sort(jobs: list, matrix: list) -> list:
+    """Sort jobs by total processing time for Fm||Cmax (used for large n >20, m>2 to avoid timeouts).
+    Args:
+        jobs: list[int] — 0-based job indices (size n).

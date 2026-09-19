@@ -1,0 +1,518 @@
+You are a higher-order meta-layer (depth 3) in a recursive self-improving system called Meta^n.
+
+## Your Role
+Previous layers have already made tactical fixes — dependency handling, constraint checks, format corrections. Your job is NOT to patch individual errors. Lower layers already do that.
+
+Instead, you should:
+1. Identify SYSTEMIC patterns across task categories
+2. Understand WHY previous layers' fixes helped some tasks but hurt others
+3. Make STRUCTURAL improvements: task classification, solver strategy selection, algorithm implementations
+4. Consider CONDITIONING or BYPASSING previous layers' changes for task types where they cause regressions
+5. Provide reusable algorithm implementations (via solver_lib) that the solver can call directly
+
+## System Context
+Current depth: 3
+Tasks attempted: 6
+Current mean score: 0.828  ← PRIMARY OBJECTIVE: raise the MEAN CONTINUOUS SCORE (not just the pass count)
+Score spread (6 tasks): [0.0-0.3]x0  [0.3-0.7]x2  [0.7-1.0]x4
+pass@1 (binary success rate): 100.0%
+
+## DEEPEN — keep improving ONLY task 'assortment_problem'
+The layer BELOW already worked 'assortment_problem'; its current solution is the starting point, NOT a blank slate. Reason about what that layer produced and improve 'assortment_problem' FURTHER — do NOT discard or restart it. Every OTHER task is FROZEN and will NOT be re-solved; spend NO effort on them.
+## Opportunity — lowest-scoring tasks (most absolute room)
+All tasks are at the best-known score; these have the most room toward a perfect 1.0:
+
+| task | now | room->1.0 |
+|------|-----|----------|
+| assignment_problem | 0.693 | 0.307 |
+| capacitated_warehouse_location | 0.693 | 0.307 |
+| assortment_problem | 0.706 | 0.294 |
+| bin_packing___one_dimensional | 0.938 | 0.062 |
+| aircraft_landing | 0.953 | 0.047 |
+| common_due_date_scheduling | 0.985 | 0.015 |
+
+## Performance Summary & Analysis
+## Task Category Performance
+
+- **assignment/location** (1 tasks): 1/1 pass, mean=0.69, key issue: -
+- **scheduling** (2 tasks): 2/2 pass, mean=0.97, key issue: -
+
+## Previous Layer Effectiveness
+
+Previous layer rationale: "The only unfrozen target is assortment_problem, with modest but real headroom. The likely scoring pattern is continuous objective quality, so the solver should avoid merely returning any feasible asso..."
+
+Tasks that IMPROVED (1):
+  capacitated_warehouse_location: 0.662 → 0.693 (+0.032)
+Tasks unchanged: 2
+Net effect: +0.012 mean score change (over 3 shared tasks)
+
+## Representative Traces (1 of 3)
+
+--- Task: common_due_date_scheduling [SUCCESS score=0.985] ---
+Script:
+```python
+def solve(**kwargs):
+    import time
+    import math
+    import random
+
+    start_time = time.time()
+    deadline = start_time + 8.7
+
+    jobs = kwargs.get("jobs", [])
+    h = kwargs.get("h", 0.6)
+    n = len(jobs)
+
+    if n == 0:
+        return {"schedule": []}
+
+    p = [int(x[0]) for x in jobs]
+    a = [int(x[1]) for x in jobs]
+    b = [int(x[2]) for x in jobs]
+    total_p = sum(p)
+    d = int(math.floor(total_p * h))
+
+    def penalty_job(j, c):
+        if c < d:
+            return a[j] * (d - c)
+        if c > d:
+            return b[j] * (c - d)
+        return 0
+
+    def eval_order(order):
+        t = 0
+        val = 0
+        for j in order:
+            t += p[j]
+            if t < d:
+                val += a[j] * (d - t)
+            elif t > d:
+                val += b[j] * (t - d)
+        return val
+
+    # Exact dynamic programming for small instances.
+    if n <= 17:
+        m = 1 << n
+        inf = 10**30
+        dp = [inf] * m
+        parent = [-1] * m
+        prevmask = [-1] * m
+        sump = [0] * m
+        dp[0] = 0
+
+        for mask in range(1, m):
+            lb = mask & -mask
+            j = lb.bit_length() - 1
+            sump[mask] = sump[mask ^ lb] + p[j]
+
+        for mask in range(m):
+            base = dp[mask]
+            if base >= inf:
+                continue
+            t0 = sump[mask]
+            rem = ((m - 1) ^ mask)
+            while rem:
+                lb = rem & -rem
+                j = lb.bit_length() - 1
+                nm = mask | lb
+                c = t0 + p[j]
+                val = base + penalty_job(j, c)
+                if val < dp[nm]:
+                    dp[nm] = val
+                    parent[nm] = j
+                    prevmask[nm] = mask
+                rem ^= lb
+
+            if mask % 4096 == 0 and time.time() > deadline:
+                break
+
+        full = m - 1
+        if parent[full] != -1:
+            order = []
+            mask = full
+            while mask:
+                j = parent[mask]
+                order.append(j)
+                mask = prevmask[mask]
+            order.reverse()
+            return {"schedule": [x + 1 for x in order]}
+
+    def make_partition_order(key_func, reverse=True, fill_factor=1.0, allow_cross=False):
+        idx = list(range(n))
+        idx.sort(key=key_func, reverse=reverse)
+
+        cap = int(d * fill_factor)
+        early = []
+        tardy = []
+        used = 0
+
+        for j in idx:
+            if used + p[j] <= cap or (allow_cross and not early and used < cap):
+                early.append(j)
+                used += p[j]
+            else:
+                tardy.append(j)
+
+        # Early part: reverse Smith rule for maximizing weighted completion.
+        early.sort(key=lambda j: p[j] / (a[j] if a[j] > 0 else 1e-9), reverse=True)
+        # Tardy part: Smith rule for minimizing weighted completion.
+        tardy.sort(key=lambda j: p[j] / (b[j] if b[j] > 0 else 1e-9))
+        return early + tardy
+
+    candidates = []
+
+    base = list(range(n))
+    candidates.append(base[:])
+    candidates.append(sorted(base, key=lambda j: p[j]))
+    candidates.append(sorted(base, key=lambda j: p[j] / (b[j] if b[j] else 1e-9)))
+    candidates.append(sorted(base, key=lambda j: p[j] / (a[j] if a[j] else 1e-9), reverse=True))
+    candidates.append(sorted(base, key=lambda j: b[j] / (a[j] + b[j] + 1e-9), reverse=True))
+    candidates.append(sorted(base, key=lambda j: (b[j] - a[j]), reverse=True))
+
+    key_funcs = [
+        lambda j: b[j] / (a[j] + 1e-9),
+        lambda j: b[j] / (a[j] + b[j] + 1e-9),
+        lambda j: b[j] * p[j],
+        lambda j: b[j] - a[j],
+        lambda j: b[j],
+        lambda j: b[j] / (p[j] + 1e-9),
+    ]
+
+    for ff in (0.85, 0.95, 1.0, 1.05, 1.15):
+        for kf in key_funcs:
+            candidates.append(make_partition_order(kf, True, ff, False))
+            if len(candidates) < 60:
+                candidates.append(make_partition_order(kf, True, ff, True))
+
+    best_order = None
+    best_val = 10**40
+
+    for cand in candidates:
+        if time.time() > deadline:
+            break
+        val = eval_order(cand)
+        if val < best_val:
+            best_val = val
+            best_order = cand[:]
+
+    if best_order is None:
+        best_order = list(range(n))
+        best_val = eval_order(best_order)
+
+    def adjacent_descent(order, val):
+        improved = True
+        passes = 0
+        while improved and time.time() < deadline and passes < 50:
+            improved = False
+            passes += 1
+            t = 0
+            i = 0
+            while i < n - 1:
+                if time.time() > deadline:
+                    break
+                x = order[i]
+                y = order[i + 1]
+                c1 = t + p[x]
+                c2 = c1 + p[y]
+                old = penalty_job(x, c1) + penalty_job(y, c2)
+
+                nc1 = t + p[y]
+                nc2 = nc1 + p[x]
+                new = penalty_job(y, nc1) + penalty_job(x, nc2)
+
+                if new < old:
+                    order[i], order[i + 1] = order[i + 1], order[i]
+                    val += new - old
+                    improved = True
+                    # Prefix time after two jobs is unchanged.
+                    t += p[x] + p[y]
+                    i += 2
+                else:
+                    t += p[x]
+                    i += 1
+        return order, val
+
+    # Improve promising deterministic candidates.
+    for cand in candidates[:40]:
+        if time.time() > deadline:
+            break
+        val = eval_order(cand)
+        cand, val = adjacent_descent(cand[:], val)
+        if val < best_val:
+            best_val = val
+            best_order = cand[:]
+
+    # Randomized perturbation + adjacent descent for remaining time.
+    rng = random.Random(1234567 + n + total_p)
+    while time.time() < deadline:
+        cur = best_order[:]
+
+        # Light perturbation: random removals and insertions.
+        moves = 1 + min(12, n // 20)
+        for _ in range(moves):
+            if n <= 1:
+                break
+            i = rng.randrange(n)
+            job = cur.pop(i)
+            j = rng.randrange(n)
+            cur.insert(j, job)
+
+        val = eval_order(cur)
+        cur, val = adjacent_descent(cur, val)
+
+        if val < best_val:
+            best_val = val
+            best_order = cur[:]
+
+    return {"schedule": [j + 1 for j in best_order]}
+```
+Stdout:
+score=0.9855
+raw_score=0.9855
+Eval feedback:
+sch10.txt -> Scores: ['0.947', '0.981', '1.000']
+sch100.txt -> Scores: ['0.986', '0.985', '1.000']
+sch1000.txt -> Scores: ['0.967', '0.975', '0.998']
+sch20.txt -> Scores: ['1.012', '0.971', '1.006']
+sch200.txt -> Scores: ['0.994', '0.963', '0.975']
+sch50.txt -> Scores: ['1.013', '1.007', '0.994']
+sch500.txt -> Scores: ['0.964', '0.965', '0.993']
+Avg Dev Score: 0.9855
+
+
+## Previously Injected Code (layers below you)
+--- Depth 2 ---
+pre_process:
+```python
+# Provide targeted guidance only when the task description structurally looks like
+# an assortment/revenue choice optimization problem. Do not modify the task object.
+desc = (getattr(task, "description", "") or "").lower()
+meta = str(getattr(task, "metadata", "") or "").lower()
+text = desc + " " + meta
+
+if ("assortment" in text) or ("multinomial" in text) or ("logit" in text) or ("no-purchase" in text) or ("no purchase" in text):
+    additional_context = """
+For assortment-style revenue problems, optimize the expected objective, not just feasibility.
+If the model is multinomial-logit/MNL with revenues r_i, preference weights v_i, and no-purchase
+weight v0, the expected revenue of offered set S is:
+
+    R(S) = sum_{i in S} v_i*r_i / (v0 + sum_{i in S} v_i)
+
+Do NOT simply sort by revenue or by preference weight: high-attraction low-revenue products can
+cannibalize better items. Use the provided helper `mnl_assortment(...)` when the input resembles
+an MNL assortment problem. It handles optional cardinality limits and returns 1-based product
+indices plus the expected revenue. If the benchmark has additional constraints, use the helper's
+selected set as a high-quality starting point, then run small add/drop/swap local search while
+recomputing the true objective and preserving feasibility.
+"""
+else:
+    additional_context = ""
+```
+solver_lib:mnl_assortment:
+```python
+def mnl_assortment(products: list, no_purchase_weight: float = 1.0, max_items: int | None = None,
+                   revenue_key: str = "revenue", weight_key: str = "weight") -> dict:
+    """Compute a high-quality MNL revenue-maximizing assortment.
+
+    Args:
+        products: list — products in original order. Each product may be a dict with revenue and
+            preference/attraction weight fields, a tuple/list like (revenue, weight), or a numeric
+            revenue value. Recognized dict alternatives include revenue/profit/price and
+            weight/preference/attraction/value/v.
+        no_purchase_weight: float — outside-option/no-purchase preference weight v0.
+        max_items: int | None — optional maximum number of offered products. If None, no cardinality
+            cap is applied.
+        revenue_key: str — preferred dict key for revenue if present.
+        weight_key: str — preferred dict key for MNL preference weight if present.
+
+    Returns:
+        dict — {'selected': list[int], 'expected_revenue': float}, where selected contains 1-based
+        product indices in ascending order.
+    """
+    def fields(p):
+        if isinstance(p, dict):
+            r = None
+            for k in (revenue_key, "revenue", "profit", "price", "margin", "r"):
+                if k in p:
+                    r = p[k]
+                    break
+            if r is None:
+                r = 0.0
+            v = None
+            for k in (weight_key, "weight", "preference", "attraction", "value", "utility", "v"):
+                if k in p:
+                    v = p[k]
+                    break
+            if v is None:
+                v = 1.0
+            return float(r), float(v)
+        if isinstance(p, (tuple, list)):
+            if len(p) >= 2:
+                return float(p[0]), float(p[1])
+            if len(p) == 1:
+                return float(p[0]), 1.0
+        return float(p), 1.0
+
+    items = []
+    for idx, p in enumerate(products, 1):
+        r, v = fields(p)
+        if v > 0.0 and r > 0.0:
+            items.append((idx, r, v))
+
+    if not items:
+        return {"selected": [], "expected_revenue": 0.0}
+
+    if max_items is not None:
+        try:
+            max_items = int(max_items)
+        except Exception:
+            max_items = None
+    if max_items is not None and max_items <= 0:
+        return {"selected": [], "expected_revenue": 0.0}
+
+    v0 = float(no_purchase_weight)
+    if v0 < 0.0:
+        v0 = 0.0
+
+    def eval_set(sel):
+        num = 0.0
+        den = v0
+        for _, r, v in sel:
+            num += r * v
+            den += v
+        return num / den if den > 0.0 else 0.0
+
+    def best_for_threshold(R):
+        cand = []
+        for it in items:
+            _, r, v = it
+            gain = v * (r - R)
+            if gain > 1e-12:
+                cand.append((gain, it))
+        cand.sort(reverse=True, key=lambda x: x[0])
+        if max_items is not None:
+            cand = cand[:max_items]
+        return [it for _, it in cand]
+
+    # Parametric fixed-point iteration. For MNL, the optimal set consists of items
+    # with positive contribution relative to the optimal revenue; with a cardinality
+    # cap, keep the largest positive contributions.
+    R = 0.0
+    best_sel = []
+    best_R = 0.0
+    for _ in range(80):
+        sel = best_for_threshold(R)
+        new_R = eval_set(sel)
+        if new_R > best_R + 1e-12:
+            best_R = new_R
+            best_sel = sel
+        if abs(new_R - R) <= 1e-11 * (1.0 + abs(R)):
+            break
+        R = new_R
+
+    # Safety pass over revenue thresholds catches edge cases/ties and is cheap.
+    thresholds = sorted(set([0.0] + [r for _, r, _ in items]))
+    for R0 in thresholds:
+        sel = best_for_threshold(R0 - 1e-12)
+        val = eval_set(sel)
+        if val > best_R + 1e-12:
+            best_R = val
+            best_sel = sel
+
+    selected = sorted(idx for idx, _, _ in best_sel)
+    return {"selected": selected, "expected_revenue": float(best_R)}
+```
+Rationale: The only unfrozen target is assortment_problem, with modest but real headroom. The likely scoring pattern is continuous objective quality, so the solver should avoid merely returning any feasible assortment and instead optimize expected revenue. Many assortment benchmarks use multinomial-logit/no-purchase choice models, where the expected revenue of an offered set S is sum(v_i*r_i)/(v0+sum(v_i)). A robust improvement is to give the solver a small exact/near-exact helper for MNL assortments, especially with optional cardinality limits. This addresses a common weakness: solvers often use revenue sorting or value sorting, which is suboptimal because low-revenue high-attraction products can cannibalize demand.
+
+The helper below is intentionally generic: it does not branch on task_id and accepts products as dicts, tuples, or raw revenues. It implements the fixed-point / parametric characterization: for a candidate revenue R, products with positive v_i*(r_i-R) are beneficial; with a cardinality cap, keep the top positive contributions. This yields strong solutions quickly, and the solver can still wrap it with local add/drop/swap search if the instance has extra constraints.
+
+
+## What You Can Produce
+
+You can output any combination of:
+
+### pre_process (strategy guidance)
+Python code that runs BEFORE the solver sees the task. Your code has access to:
+- `task` (read-only TaskDescription with .task_id, .description, .metadata)
+- `outer_context` (string: guidance from higher meta-layers — use this to ADAPT your intervention based on higher layers' strategic decisions; empty if you are the outermost layer)
+
+You MUST set the `additional_context` variable (a string that gets appended to the solver's prompt).
+
+CRITICAL: Set the `additional_context` variable directly. Do NOT modify the `task` object — it is read-only.
+
+### solver_lib (solver-visible code library)
+Python functions that will be PREPENDED to the solver's generated code and available at runtime inside the sandbox. The solver sees their signatures in its prompt and can call them directly.
+
+Use this to provide working algorithm implementations that the solver cannot reliably write from scratch. This is different from pre_process (which provides strategy guidance as text) — solver_lib provides actual executable code.
+
+Example:
+```solver_lib:local_search
+def local_search(solution, evaluate_fn, time_limit=8.0):
+    """Iteratively improve solution via random swaps within time limit."""
+    import time, random
+    best, best_score = solution, evaluate_fn(solution)
+    start = time.time()
+    while time.time() - start < time_limit:
+        keys = list(best.keys())
+        if len(keys) < 2:
+            break
+        i, j = random.sample(range(len(keys)), 2)
+        neighbor = dict(best)
+        neighbor[keys[i]], neighbor[keys[j]] = neighbor[keys[j]], neighbor[keys[i]]
+        score = evaluate_fn(neighbor)
+        if score > best_score:
+            best, best_score = neighbor, score
+    return best
+```
+
+IMPORTANT for solver_lib:
+- Functions run inside the sandbox, NOT in the meta-layer
+- Only use Python standard library imports (no numpy, scipy, etc.)
+- Each block should define a single self-contained function
+- Later layers can override a function by providing a solver_lib block with the same name
+- solver_lib functions from different layers share a runtime namespace and can call each other
+- Every function MUST include type annotations and a docstring with (a) one-line summary, (b) Args section listing every parameter with its expected type and meaning, (c) Returns section describing the return type and structure. The solver only sees the signature and docstring, not the full source — the docstring is the API contract. Example:
+      def pack_items(items: list, capacity: int) -> tuple:
+          """Pack items into bins using first-fit decreasing.
+
+          Args:
+              items: list[tuple[int, int, str]] — each is (width, height, item_id).
+              capacity: int — max bin weight.
+
+          Returns:
+              tuple[int, list[dict]] — (total_cost, placements) where each dict
+              has keys 'id' (str), 'x' (int), 'y' (int).
+          """
+
+## Output Format
+
+Respond with EXACTLY this structure (omit sections you don't need):
+
+```rationale
+## Diagnosis
+<the specific failure mode or bottleneck you are targeting, grounded in the score data, the headroom table, and the per-trace failure classes above — name the actual tasks it affects>
+
+## Intervention
+<what you will change and EXACTLY which tasks it targets. For every solver_lib helper you add, name the failing task it addresses and why the solver cannot write it reliably from scratch. Do not promise code you are not emitting.>
+
+## Why this is different
+<how this differs from what the injected-code history already tried — do NOT repeat a prior approach; if you cannot beat it, emit nothing>
+```
+
+```pre_process
+<python code>
+```
+
+```solver_lib:<name>
+<python function code>
+```
+
+IMPORTANT:
+- pre_process must be self-contained Python. Do not import external packages beyond the standard library.
+- Focus on STRUCTURAL improvements, not individual error patches.
+- If a previous layer's fix hurts certain tasks, add task-type conditionals to bypass it.
+- GENERALIZE: condition on task STRUCTURE (size, constraints, metadata), NEVER on specific task_id string literals — task_id-keyed code does not transfer to unseen tasks.
+- If you add a solver_lib helper, name the specific failing task it targets and why the solver cannot reliably write it itself.
+- Keep code simple and robust — complex code is more likely to break.
+- Use pre_process for strategy guidance (text); use solver_lib for reusable implementations (code).
+- Favor small (≤30 lines), audit-able helpers over large multi-purpose ones. Helpers that break the runtime env (creating envs, installing packages, depending on uncommon CLIs) introduce more failures than they prevent.

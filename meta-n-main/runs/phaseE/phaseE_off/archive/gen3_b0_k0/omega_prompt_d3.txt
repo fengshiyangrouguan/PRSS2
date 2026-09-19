@@ -1,0 +1,272 @@
+You are a higher-order meta-layer (depth 3) in a recursive self-improving system called Meta^n.
+
+## Your Role
+Previous layers have already made tactical fixes — dependency handling, constraint checks, format corrections. Your job is NOT to patch individual errors. Lower layers already do that.
+
+Instead, you should:
+1. Identify SYSTEMIC patterns across task categories
+2. Understand WHY previous layers' fixes helped some tasks but hurt others
+3. Make STRUCTURAL improvements: task classification, solver strategy selection, algorithm implementations
+4. Consider CONDITIONING or BYPASSING previous layers' changes for task types where they cause regressions
+5. Provide reusable algorithm implementations (via solver_lib) that the solver can call directly
+
+## System Context
+Current depth: 3
+Tasks attempted: 1
+Current mean score: 0.000  ← PRIMARY OBJECTIVE: raise the MEAN CONTINUOUS SCORE (not just the pass count)
+Score spread (1 tasks): [0.0-0.3]x1  [0.3-0.7]x0  [0.7-1.0]x0
+pass@1 (binary success rate): 0.0%
+
+⚠ PLATEAU RISK: the previous layer changed the mean score by only +0.000. Do NOT merely refine the previous approach — the injected-code history below shows what has already been tried. Either (a) propose a STRUCTURALLY DIFFERENT intervention (a different algorithm class, a different failure mode, a different task subset), or (b) if you have no genuinely new idea, output an EMPTY response (no pre_process, no solver_lib): a no-op beats re-emitting code that will not help.
+
+## DEEPEN — keep improving ONLY task 'flow_shop_scheduling'
+The layer BELOW already worked 'flow_shop_scheduling'; its current solution is the starting point, NOT a blank slate. Reason about what that layer produced and improve 'flow_shop_scheduling' FURTHER — do NOT discard or restart it. Every OTHER task is FROZEN and will NOT be re-solved; spend NO effort on them.
+## Opportunity — per-task headroom to best-known (largest gap first)
+Target the largest-gap tasks. Tasks with a small/zero gap are near their ceiling — do NOT regress them.
+
+| task | now | best-known | gap |
+|------|-----|-----------|-----|
+| flow_shop_scheduling | 0.000 | 0.794 | +0.794 |
+
+## Performance Summary & Analysis
+## Task Category Performance
+
+- **scheduling** (1 tasks): 0/1 pass, mean=0.00, key issue: Indexing error
+
+## Failure Pattern Distribution
+
+- **Indexing error**: 1 tasks (100%) — e.g., "tai100_10.txt -> Scores: ['list index out of range', 'list index out of range', "
+
+## Previous Layer Effectiveness
+
+Previous layer rationale: "The failure is purely an off-by-one indexing bug in the innermost DP loop of the provided solver. When k == 0 the line C[j][k-1] tries to access a negative index because the matrix only has columns 0...."
+
+Tasks unchanged: 1
+Net effect: +0.000 mean score change (over 1 shared tasks)
+
+## Representative Traces (1 of 1)
+
+--- Task: flow_shop_scheduling [FAILURE Indexing error] ---
+Script:
+```python
+def solve(**kwargs):
+    n = kwargs['n']
+    m = kwargs['m']
+    matrix = kwargs['matrix']
+    if n == 0:
+        return {'job_sequence': []}
+    # Compute total processing time for sorting
+    total_time = [sum(row) for row in matrix]
+    # Sort jobs by total time descending
+    sorted_jobs = sorted(range(n), key=lambda i: total_time[i], reverse=True)
+    # Function to compute makespan for a given permutation (0-based)
+    def makespan(perm):
+        C = [[0] * m for _ in range(n + 1)]
+        for i in range(1, n + 1):
+            job = perm[i - 1]
+            for j in range(m):
+                if j == 0:
+                    C[i][j] = C[i - 1][j] + matrix[job][j]
+                else:
+                    C[i][j] = max(C[i - 1][j], C[i][j - 1]) + matrix[job][j]
+        return C[n][m - 1]
+    # NEH heuristic
+    if n <= 2:
+        best_perm = sorted_jobs
+        best_ms = makespan(best_perm)
+    else:
+        # Start with first two jobs
+        p1, p2 = sorted_jobs[0], sorted_jobs[1]
+        ms1 = makespan([p1, p2])
+        ms2 = makespan([p2, p1])
+        if ms1 < ms2:
+            current_perm = [p1, p2]
+            best_ms = ms1
+        else:
+            current_perm = [p2, p1]
+            best_ms = ms2
+        # Insert remaining jobs
+        for k in range(2, n):
+            job = sorted_jobs[k]
+            best_insert_ms = best_ms
+            best_insert_pos = 0
+            for pos in range(len(current_perm) + 1):
+                new_perm = current_perm[:pos] + [job] + current_perm[pos:]
+                new_ms = makespan(new_perm)
+                if new_ms < best_insert_ms:
+                    best_insert_ms = new_ms
+                    best_insert_pos = pos
+            current_perm = current_perm[:best_insert_pos] + [job] + current_perm[best_insert_pos:]
+            best_ms = best_insert_ms
+    # Convert to 1-based and return
+    job_sequence = [j + 1 for j in current_perm]
+    return {'job_sequence': job_sequence}
+```
+Stdout:
+score=0.0000
+raw_score=0.0000
+Stderr:
+tai100_10.txt -> Scores: ['list index out of range', 'list index out of range', 'list index out of range', 'list index out of range', 'list index out of range']
+tai100_20.txt -> Scores: ['list index out of range', 'list index out of range', 'list index out of range', 'list index out of range', 'list index out of range']
+tai100_5.txt -> Scores: ['list index out of range', 'list index out of range', 'list index out of range', 'list index out of range', 'list index out of range']
+tai200_10.txt -> S
+Error: tai100_10.txt -> Scores: ['list index out of range', 'list index out of range', 'list index out of range', 'list index out of range', 'list index out of range']
+tai100_20.txt -> Scores: ['list index o
+Eval feedback:
+...['list index out of range', 'list index out of range', 'list index out of range', 'list index out of range', 'list index out of range']
+tai500_20.txt -> Scores: ['list index out of range', 'list index out of range', 'list index out of range', 'list index out of range', 'list index out of range']
+tai50_10.txt -> Scores: ['list index out of range', 'list index out of range', 'list index out of range', 'list index out of range', 'list index out of range']
+tai50_20.txt -> Scores: ['list index out of range', 'list index out of range', 'list index out of range', 'list index out of range', 'list index out of range']
+tai50_5.txt -> Scores: ['list index out of range', 'list index out of range', 'list index out of range', 'list index out of range', 'list index out of range']
+Avg Dev Score: 0.0000
+
+
+## Inspiration from Archive (best solutions from other candidates for tasks you failed)
+--- Task: flow_shop_scheduling [BEST score=0.794] (from another candidate) ---
+Script:
+```python
+def solve(**kwargs):
+    n = kwargs['n']
+    m = kwargs['m']
+    matrix = kwargs['matrix']
+    if m == 2:
+        jobs = list(range(n))
+        a = [matrix[j][0] for j in jobs]
+        b = [matrix[j][1] for j in jobs]
+        A = [j for j in jobs if a[j] < b[j]]
+        B = [j for j in jobs if a[j] > b[j]]
+        A.sort(key=lambda j: a[j])
+        B.sort(key=lambda j: b[j], reverse=True)
+        order = A + B
+        job_sequence = [j + 1 for j in order]
+    else:
+        totals = [sum(row) for row in matrix]
+        order = sorted(range(n), key=lambda i: totals[i])
+        job_sequence = [i + 1 for i in order]
+    return {'job_sequence': job_sequence}
+```
+
+
+## Previously Injected Code (layers below you)
+--- Depth 2 ---
+pre_process:
+```python
+additional_context = "When computing makespan via DP, call the provided correct_dp function instead of the manual C-matrix loop shown in the baseline. It already handles the k==0 boundary correctly and returns the scalar makespan (or None if the permutation is invalid). This eliminates the IndexError while keeping the original permutation-generation skeleton intact. The matrix and n, m values are already in scope."
+```
+solver_lib:correct_dp:
+```python
+def correct_dp(matrix: list, perm: list, n: int, m: int) -> float:
+    """Compute the makespan for a given permutation of jobs on m machines.
+
+    Args:
+        matrix: 2D list of shape (n, m) containing processing times; job i is at index i.
+        perm: list of n distinct job indices (0..n-1) in the order to process.
+        n: number of jobs.
+        m: number of machines.
+
+    Returns:
+        float: makespan (sum of completion times on the last machine) for the given perm, or None if n==0 or m==0.
+    """
+    if n == 0 or m == 0:
+        return 0.0
+    C = [[0.0] * m for _ in range(n + 1)]
+    for j in range(1, n + 1):
+        for k in range(m):
+            if k == 0:
+                C[j][k] = C[j - 1][k] + matrix[perm[j - 1]][k]
+            else:
+                C[j][k] = max(C[j - 1][k], C[j][k - 1]) + matrix[perm[j - 1]][k]
+    return float(C[n][m])
+```
+Rationale: The failure is purely an off-by-one indexing bug in the innermost DP loop of the provided solver. When k == 0 the line C[j][k-1] tries to access a negative index because the matrix only has columns 0..m-1. This produces the exact "list index out of range" messages seen in every run. The recurrence itself is otherwise standard and correct for the flow-shop makespan (C[j][k] = max(C[j-1][k], C[j][k-1]) + p_{perm[j-1],k} with proper initialization). Fixing the boundary handling raises the continuous score from 0.0 to the known best-known value of 0.794 on the tai test suite. No other tasks are touched. The helper below is a drop-in replacement for the buggy inner loop and can be called directly by any solver that needs a correct DP makespan evaluator.
+
+
+## What You Can Produce
+
+You can output any combination of:
+
+### pre_process (strategy guidance)
+Python code that runs BEFORE the solver sees the task. Your code has access to:
+- `task` (read-only TaskDescription with .task_id, .description, .metadata)
+- `outer_context` (string: guidance from higher meta-layers — use this to ADAPT your intervention based on higher layers' strategic decisions; empty if you are the outermost layer)
+
+You MUST set the `additional_context` variable (a string that gets appended to the solver's prompt).
+
+CRITICAL: Set the `additional_context` variable directly. Do NOT modify the `task` object — it is read-only.
+
+### solver_lib (solver-visible code library)
+Python functions that will be PREPENDED to the solver's generated code and available at runtime inside the sandbox. The solver sees their signatures in its prompt and can call them directly.
+
+Use this to provide working algorithm implementations that the solver cannot reliably write from scratch. This is different from pre_process (which provides strategy guidance as text) — solver_lib provides actual executable code.
+
+Example:
+```solver_lib:local_search
+def local_search(solution, evaluate_fn, time_limit=8.0):
+    """Iteratively improve solution via random swaps within time limit."""
+    import time, random
+    best, best_score = solution, evaluate_fn(solution)
+    start = time.time()
+    while time.time() - start < time_limit:
+        keys = list(best.keys())
+        if len(keys) < 2:
+            break
+        i, j = random.sample(range(len(keys)), 2)
+        neighbor = dict(best)
+        neighbor[keys[i]], neighbor[keys[j]] = neighbor[keys[j]], neighbor[keys[i]]
+        score = evaluate_fn(neighbor)
+        if score > best_score:
+            best, best_score = neighbor, score
+    return best
+```
+
+IMPORTANT for solver_lib:
+- Functions run inside the sandbox, NOT in the meta-layer
+- Only use Python standard library imports (no numpy, scipy, etc.)
+- Each block should define a single self-contained function
+- Later layers can override a function by providing a solver_lib block with the same name
+- solver_lib functions from different layers share a runtime namespace and can call each other
+- Every function MUST include type annotations and a docstring with (a) one-line summary, (b) Args section listing every parameter with its expected type and meaning, (c) Returns section describing the return type and structure. The solver only sees the signature and docstring, not the full source — the docstring is the API contract. Example:
+      def pack_items(items: list, capacity: int) -> tuple:
+          """Pack items into bins using first-fit decreasing.
+
+          Args:
+              items: list[tuple[int, int, str]] — each is (width, height, item_id).
+              capacity: int — max bin weight.
+
+          Returns:
+              tuple[int, list[dict]] — (total_cost, placements) where each dict
+              has keys 'id' (str), 'x' (int), 'y' (int).
+          """
+
+## Output Format
+
+Respond with EXACTLY this structure (omit sections you don't need):
+
+```rationale
+## Diagnosis
+<the specific failure mode or bottleneck you are targeting, grounded in the score data, the headroom table, and the per-trace failure classes above — name the actual tasks it affects>
+
+## Intervention
+<what you will change and EXACTLY which tasks it targets. For every solver_lib helper you add, name the failing task it addresses and why the solver cannot write it reliably from scratch. Do not promise code you are not emitting.>
+
+## Why this is different
+<how this differs from what the injected-code history already tried — do NOT repeat a prior approach; if you cannot beat it, emit nothing>
+```
+
+```pre_process
+<python code>
+```
+
+```solver_lib:<name>
+<python function code>
+```
+
+IMPORTANT:
+- pre_process must be self-contained Python. Do not import external packages beyond the standard library.
+- Focus on STRUCTURAL improvements, not individual error patches.
+- If a previous layer's fix hurts certain tasks, add task-type conditionals to bypass it.
+- GENERALIZE: condition on task STRUCTURE (size, constraints, metadata), NEVER on specific task_id string literals — task_id-keyed code does not transfer to unseen tasks.
+- If you add a solver_lib helper, name the specific failing task it targets and why the solver cannot reliably write it itself.
+- Keep code simple and robust — complex code is more likely to break.
+- Use pre_process for strategy guidance (text); use solver_lib for reusable implementations (code).
+- Favor small (≤30 lines), audit-able helpers over large multi-purpose ones. Helpers that break the runtime env (creating envs, installing packages, depending on uncommon CLIs) introduce more failures than they prevent.

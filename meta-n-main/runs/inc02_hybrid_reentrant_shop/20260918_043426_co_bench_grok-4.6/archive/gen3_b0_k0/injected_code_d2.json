@@ -1,0 +1,12 @@
+{
+  "pre_process": "additional_context = \"For hybrid reentrant shop scheduling, sort jobs for the permutation by a weighted key that combines setup time (higher priority) and processing time (lower). Use batch_assignment that balances machine loads by cumulative processing time rather than pure modulo. These heuristics address the reentrancy and setup constraints that the baseline ignores.\"",
+  "code_library": {
+    "weighted_permutation": "def weighted_permutation(jobs: list, setup_times: list, processing_times: list) -> list:\n    \"\"\"Return job permutation sorted by weighted key (setup dominant, processing secondary).\n\n    Args:\n        jobs: list of job indices (0..n_jobs-1)\n        setup_times: list of setup times for each job\n        processing_times: list of total processing times for each job\n\n    Returns:\n        list of job indices in optimal order for the solver\n    \"\"\"\n    def key(i):\n        return setup_times[i] * 10 + processing_times[i] / 100\n    return sorted(range(len(jobs)), key=key, reverse=True)",
+    "batch_assignment": "def batch_assignment(n_jobs: int, n_machines: int, processing_times: list) -> list:\n    \"\"\"Return batch_assignment that balances cumulative machine loads.\n\n    Args:\n        n_jobs: number of jobs\n        n_machines: number of machines\n        processing_times: list of total processing times per job\n\n    Returns:\n        list of machine ids (1-based) for each job\n    \"\"\"\n    machine_loads = [0.0] * n_machines\n    assignment = [0] * n_jobs\n    for i in range(n_jobs):\n        machine = min(range(n_machines), key=lambda m: machine_loads[m])\n        assignment[i] = machine + 1\n        machine_loads[machine] += processing_times[i]\n    return assignment"
+  },
+  "code_library_bash": {},
+  "rationale": "The current round-robin batch_assignment ignores setup/processing asymmetries and machine-specific loads, while the permutation sorts purely by setup (ignoring processing times and reentrancy constraints). This explains the wide score spread (0.529-0.771) and the 0.275 gap to best-known. Highest-impact fix is a solver_lib helper that computes a weighted key (setup+processing) for permutation + a simple load-balancing batch re-assignment; generalize via metadata (n_jobs, n_machines) rather than task_id literals. Keep helpers small, self-contained, and pure-Python so the sandbox solver can call them reliably.",
+  "source_depth": 2,
+  "task_solution_map": {},
+  "sandbox_verified_names": []
+}

@@ -1,0 +1,525 @@
+You are one layer in a recursive self-improving system called Meta^n.
+
+## Your Role
+Given the execution traces and context of the system below you, produce code that improves its performance — specifically, that raises the MEAN CONTINUOUS SCORE across tasks. Treat a higher score as the goal even on tasks that already "pass": most tasks here are scored on a 0.0–1.0 continuum, not pass/fail. You do NOT solve tasks directly — you write code that helps the solver below you perform better.
+
+## System Context
+Current depth: 2
+Tasks attempted: 6
+Current mean score: 0.169  ← PRIMARY OBJECTIVE: raise the MEAN CONTINUOUS SCORE (not just the pass count)
+Score spread (6 tasks): [0.0-0.3]x5  [0.3-0.7]x1  [0.7-1.0]x0
+pass@1 (binary success rate): 66.7%
+
+## DEEPEN — keep improving ONLY task 'assortment_problem'
+The layer BELOW already worked 'assortment_problem'; its current solution is the starting point, NOT a blank slate. Reason about what that layer produced and improve 'assortment_problem' FURTHER — do NOT discard or restart it. Every OTHER task is FROZEN and will NOT be re-solved; spend NO effort on them.
+## Opportunity — per-task headroom to best-known (largest gap first)
+Target the largest-gap tasks. Tasks with a small/zero gap are near their ceiling — do NOT regress them.
+
+| task | now | best-known | gap |
+|------|-----|-----------|-----|
+| bin_packing___one_dimensional | 0.000 | 0.930 | +0.930 |
+| common_due_date_scheduling | 0.139 | 0.434 | +0.295 |
+| aircraft_landing | 0.077 | 0.102 | +0.026 |
+| assignment_problem | 0.000 | 0.000 | +0.000 |
+| assortment_problem | 0.140 | 0.140 | +0.000 |
+| capacitated_warehouse_location | 0.658 | 0.658 | +0.000 |
+
+## Execution Traces (sampled: 2 failures, 4 successes)
+--- Task: assignment_problem [FAILURE Indexing error] ---
+Script:
+```python
+def solve(**kwargs):
+    import math
+    n = kwargs['n']
+    cost_matrix = kwargs['cost_matrix']
+    INF = float('inf')
+    N = 1 << n
+    pop = [0] * N
+    for i in range(1, N):
+        pop[i] = pop[i >> 1] + (i & 1)
+    dp = [INF] * N
+    dp[0] = 0
+    for mask in range(N):
+        k = pop[mask]
+        if k == n:
+            continue
+        for j in range(n):
+            if (mask & (1 << j)) == 0:
+                new_mask = mask | (1 << j)
+                dp[new_mask] = min(dp[new_mask], dp[mask] + cost_matrix[k][j])
+    min_cost = dp[N - 1]
+    mask = N - 1
+    assignment = []
+    for k in range(n - 1, -1, -1):
+        for j in range(n):
+            if (mask & (1 << j)) == 0:
+                continue
+            new_mask = mask ^ (1 << j)
+            if dp[new_mask] + cost_matrix[k][j] == dp[mask]:
+                assignment.append((k + 1, j + 1))
+                mask = new_mask
+                break
+    assignment.reverse()
+    return {"total_cost": min_cost, "assignment": assignment}
+```
+Stdout:
+score=0.0000
+raw_score=0.0000
+Stderr:
+assign100.txt -> Scores: ["cannot fit 'int' into an index-sized integer"]
+assign400.txt -> Scores: ["cannot fit 'int' into an index-sized integer"]
+assign700.txt -> Scores: ["cannot fit 'int' into an index-sized integer"]
+assignp3000.txt -> Scores: ["cannot fit 'int' into an index-sized integer"]
+Avg Dev Score: 0.0000
+Error: assign100.txt -> Scores: ["cannot fit 'int' into an index-sized integer"]
+assign400.txt -> Scores: ["cannot fit 'int' into an index-sized integer"]
+assign700.txt -> Scores: ["cannot fit 'int' into an 
+Eval feedback:
+assign100.txt -> Scores: ["cannot fit 'int' into an index-sized integer"]
+assign400.txt -> Scores: ["cannot fit 'int' into an index-sized integer"]
+assign700.txt -> Scores: ["cannot fit 'int' into an index-sized integer"]
+assignp3000.txt -> Scores: ["cannot fit 'int' into an index-sized integer"]
+Avg Dev Score: 0.0000
+
+--- Task: bin_packing___one_dimensional [FAILURE Runtime error] ---
+Script:
+```python
+def solve(**kwargs):
+    """
+    Solve the one-dimensional bin packing problem for a single test case.
+
+    Input kwargs (for a single test case):
+      - id:           The problem identifier (string)
+      - bin_capacity: The capacity of each bin (int)
+      - num_items:    The number of items (int)
+      - items:        A list of item sizes (list of ints)
+      - **kwargs:     Other unused keyword arguments
+
+    Evaluation metric:
+      - The solution is scored by the total number of bins used.
+      - If the solution is invalid (e.g., items are missing or duplicated, or bin capacity is exceeded),
+        a penalty of 1,000,000 is added.
+
+    Returns:
+      A dictionary with:
+        - 'num_bins': An integer, the number of bins used.
+        - 'bins': A list of lists, where each inner list contains the 1-based indices of items assigned to that bin.
+
+    Note: This is a placeholder implementation.
+    """
+    bin_capacity = kwargs['bin_capacity']
+    items = kwargs['items']
+    n = len(items)
+    # Create list of (size, 1-based index) and sort by size descending
+    indexed_items = [(items[i], i + 1) for i in range(n)]
+    indexed_items.sort(reverse=True, key=lambda x: x[0])
+    bins = []
+    for size, idx in indexed_items:
+        placed = False
+        for bin_load in bins:
+            if sum(bin_load) + size <= bin_capacity:
+                bin_load.append(idx)
+                placed = True
+                break
+        if not placed:
+            bins.append([idx])
+    num_bins = len(bins)
+    return {
+        'num_bins': num_bins,
+        'bins': bins
+    }
+```
+Stdout:
+score=0.0000
+raw_score=0.0000
+Stderr:
+binpack1.txt -> Scores: ['0.000', '0.000', '0.000', '0.000', '0.000']
+binpack2.txt -> Scores: ['0.000', '0.000', '0.000', '0.000', '0.000']
+binpack3.txt -> Scores: ['0.000', '0.000', '0.000', '0.000', '0.000']
+binpack4.txt -> Scores: ['0.000', '0.000', '0.000', '0.000', '0.000']
+binpack5.txt -> Scores: ['0.000', '0.000', '0.000', '0.000', '0.000']
+binpack6.txt -> Scores: ['0.000', '0.000', '0.000', '0.000', '0.000']
+binpack7.txt -> Scores: ['0.000', '0.000', '0.000', '0.000', '0.000']
+binpack8.t
+Error: binpack1.txt -> Scores: ['0.000', '0.000', '0.000', '0.000', '0.000']
+binpack2.txt -> Scores: ['0.000', '0.000', '0.000', '0.000', '0.000']
+binpack3.txt -> Scores: ['0.000', '0.000', '0.000', '0.000',
+Eval feedback:
+binpack1.txt -> Scores: ['0.000', '0.000', '0.000', '0.000', '0.000']
+binpack2.txt -> Scores: ['0.000', '0.000', '0.000', '0.000', '0.000']
+binpack3.txt -> Scores: ['0.000', '0.000', '0.000', '0.000', '0.000']
+binpack4.txt -> Scores: ['0.000', '0.000', '0.000', '0.000', '0.000']
+binpack5.txt -> Scores: ['0.000', '0.000', '0.000', '0.000', '0.000']
+binpack6.txt -> Scores: ['0.000', '0.000', '0.000', '0.000', '0.000']
+binpack7.txt -> Scores: ['0.000', '0.000', '0.000', '0.000', '0.000']
+binpack8.txt -> Scores: ['0.000', '0.000', '0.000', '0.000', '0.000']
+Avg Dev Score: 0.0000
+
+--- Task: aircraft_landing [SUCCESS score=0.077] ---
+Script:
+```python
+def solve(**kwargs):
+    """
+    Problem:
+        Given an instance of the Aircraft Landing Scheduling Problem, schedule the landing time for each plane and assign a runway so that:
+          - Each landing time is within its allowed time window.
+          - Each plane is assigned to one runway (from the available runways).
+          - For any two planes assigned to the same runway, if plane i lands at or before plane j, then the landing times must be separated by at least
+            the specified separation time (provided in the input data).
+          - The overall penalty is minimized. For each plane, if its landing time is earlier than its target time, a penalty
+            is incurred proportional to the earliness; if later than its target time, a penalty proportional to the lateness is incurred.
+          - If any constraint is violated, the solution receives no score.
+
+    Input kwargs:
+        num_planes  : (int) Number of planes.
+        num_runways : (int) Number of runways.
+        freeze_time : (float) Freeze time (unused in scheduling decisions).
+        planes      : (list of dict) Each dictionary contains:
+                        - "appearance"    : float, time the plane appears.
+                        - "earliest"      : float, earliest landing time.
+                        - "target"        : float, target landing time.
+                        - "latest"        : float, latest landing time.
+                        - "penalty_early" : float, penalty per unit time landing early.
+                        - "penalty_late"  : float, penalty per unit time landing late.
+        separation  : (list of lists) separation[i][j] is the required gap after plane i lands before plane j can land
+                      when they are assigned to the same runway.
+
+    Returns:
+        A dictionary named "schedule" mapping each plane id (1-indexed) to a dictionary with its scheduled landing time
+        and assigned runway, e.g., { plane_id: {"landing_time": float, "runway": int}, ... }.
+    """
+    schedule = {}
+    num_runways = kwargs["num_runways"]
+    planes = kwargs["planes"]
+    for i, plane in enumerate(planes, start=1):
+        schedule[i] = {"landing_time": plane["target"], "runway": (i % num_runways) + 1}
+    return {"schedule": schedule}
+```
+Stdout:
+score=0.0769
+raw_score=0.0769
+Eval feedback:
+...ed gap: 8.0).']
+airland5.txt -> Scores: ['Separation violation on runway 1: Plane 1 lands at 155.0 and Plane 13 at 161.0 (required gap: 15.0).', 'Separation violation on runway 2: Plane 1 lands at 155.0 and Plane 13 at 161.0 (required gap: 15.0).']
+airland6.txt -> Scores: ['Separation violation on runway 1: Plane 2 lands at 79.0 and Plane 4 at 204.0 (required gap: 200.0).']
+airland7.txt -> Scores: ['1.000']
+airland8.txt -> Scores: ['Separation violation on runway 1: Plane 12 lands at 126.0 and Plane 9 at 132.0 (required gap: 8.0).']
+airland9.txt -> Scores: ['Separation violation on runway 1: Plane 3 lands at 1378.0 and Plane 8 at 1401.0 (required gap: 68.0).', 'Separation violation on runway 2: Plane 5 lands at 1618.0 and Plane 13 at 1724.0 (required gap: 113.0).']
+Avg Dev Score: 0.0769
+
+--- Task: assortment_problem [SUCCESS score=0.140] ---
+Script:
+```python
+def solve(**kwargs):
+    m = kwargs['m']
+    stocks = kwargs['stocks']
+    pieces = kwargs['pieces']
+    if not stocks or not pieces or m == 0:
+        return {"objective": 0.0, "placements": {1: {"stock_type": 1, "placements": []}}}
+    stock_type = 1
+    placements = {}
+    current_instance_id = 1
+    total_used = 0.0
+    total_stock_area = 0.0
+    s_l = stocks[0]['length']
+    s_w = stocks[0]['width']
+    for i in range(m):
+        piece = pieces[i]
+        min_count = piece['min']
+        if min_count == 0:
+            continue
+        p_l0 = piece['length']
+        p_w0 = piece['width']
+        # Try orientation 0
+        if p_l0 <= s_l and p_w0 <= s_w:
+            orient = 0
+            pl = p_l0
+            pw = p_w0
+        # Try orientation 1
+        elif p_w0 <= s_l and p_l0 <= s_w:
+            orient = 1
+            pl = p_w0
+            pw = p_l0
+        else:
+            continue  # cannot fit this piece type
+        num_stocks = min_count
+        for _ in range(num_stocks):
+            placements[current_instance_id] = {
+                "stock_type": stock_type,
+                "placements": [{
+                    "piece": i + 1,
+                    "x": 0.0,
+                    "y": 0.0,
+                    "orientation": orient
+                }]
+            }
+            total_used += pl * pw
+            total_stock_area += s_l * s_w
+            current_instance_id += 1
+    if current_instance_id == 1:
+        objective = 0.0
+    else:
+        objective = (total_stock_area - total_used) / total_stock_area
+    return {
+        "objective": objective,
+        "placements": placements
+    }
+```
+Stdout:
+score=0.1399
+raw_score=0.1399
+Eval feedback:
+assort1.txt -> Scores: ['0.102']
+assort10.txt -> Scores: ['0.166']
+assort4.txt -> Scores: ['0.083']
+assort7.txt -> Scores: ['0.208']
+Avg Dev Score: 0.1399
+
+--- Task: capacitated_warehouse_location [SUCCESS score=0.658] ---
+Script:
+```python
+def solve(**kwargs):
+    m = kwargs["m"]
+    n = kwargs["n"]
+    warehouses = kwargs["warehouses"]
+    customers = kwargs["customers"]
+    # Check total capacity feasibility
+    total_capacity = sum(w['capacity'] for w in warehouses)
+    total_demand = sum(c['demand'] for c in customers)
+    if total_capacity < total_demand:
+        return {
+            "total_cost": float('inf'),
+            "warehouse_open": [0] * m,
+            "assignments": [[0.0] * m for _ in range(n)]
+        }
+    # Greedy assignment: for each customer, assign to lowest cost warehouse with remaining capacity
+    assignments = [[0.0] * m for _ in range(n)]
+    remaining_capacity = [w['capacity'] for w in warehouses]
+    for i in range(n):
+        demand = customers[i]['demand']
+        costs = customers[i]['costs']
+        for _ in range(m):
+            min_cost_idx = -1
+            min_cost = float('inf')
+            for j in range(m):
+                if remaining_capacity[j] > 0 and costs[j] < min_cost:
+                    min_cost = costs[j]
+                    min_cost_idx = j
+            if min_cost_idx == -1:
+                break
+            assign = min(demand, remaining_capacity[min_cost_idx])
+            assignments[i][min_cost_idx] = assign
+            remaining_capacity[min_cost_idx] -= assign
+            demand -= assign
+            if demand <= 0:
+                break
+    # Compute used warehouses
+    used = [sum(assignments[i][j] for i in range(n)) for j in range(m)]
+    warehouse_open = [1 if u > 0 else 0 for u in used]
+    # Compute total_cost
+    fixed_cost = sum(warehouses[j]['fixed_cost'] for j in range(m) if used[j] > 0)
+    assignment_cost = 0.0
+    for i in range(n):
+        for j in range(m):
+            assignment_cost += assignments[i][j] * customers[i]['costs'][j]
+    total_cost = fixed_cost + assignment_cost
+    return {
+        "total_cost": total_cost,
+        "warehouse_open": warehouse_open,
+        "assignments": assignments
+    }
+```
+Stdout:
+score=0.6576
+raw_score=0.6576
+Eval feedback:
+cap101.txt -> Scores: ['0.957']
+cap112.txt -> Scores: ['0.715']
+cap123.txt -> Scores: ['0.604']
+cap134.txt -> Scores: ['0.502']
+cap41.txt -> Scores: ['0.972']
+cap62.txt -> Scores: ['0.954']
+cap73.txt -> Scores: ['0.918']
+cap84.txt -> Scores: ['0.826']
+cap91.txt -> Scores: ['0.957']
+capa-12000.txt -> Scores: ['0.098']
+capb-5000.txt -> Scores: ['0.182']
+capc-7250.txt -> Scores: ['0.206']
+Avg Dev Score: 0.6576
+
+--- Task: common_due_date_scheduling [SUCCESS score=0.139] ---
+Script:
+```python
+import itertools
+import sys
+
+def solve(**kwargs):
+    """
+    Solves the restricted single‐machine common due date scheduling problem.
+
+    The problem:
+       Given a list of jobs where each job is represented as a tuple (p, a, b):
+         • p: processing time
+         • a: earliness penalty coefficient
+         • b: tardiness penalty coefficient
+       and an optional parameter h (default 0.6), the common due date is computed as:
+             d = floor(sum(p) * h)
+       A schedule (i.e., a permutation of job indices in 1‐based numbering) is produced.
+       When processing the jobs in that order, the penalty is computed by:
+         • Adding a × (d − C) if a job’s completion time C is less than d,
+         • Adding b × (C − d) if C is greater than d,
+         • No penalty if C equals d.
+       The objective is to minimize the total penalty.
+
+    Input kwargs:
+         - 'jobs' (List[Tuple[int, int, int]]): a list of tuples where each tuple represents a job with:
+              • p (int): processing time,
+              • a (int): earliness penalty coefficient,
+              • b (int): tardiness penalty coefficient.
+         - Optional: 'h' (float): the factor used to compute the common due date (default is 0.6).
+
+    Evaluation Metric:
+         The computed schedule is evaluated by accumulating processing times and applying
+         the appropriate earliness/tardiness penalties with respect to the common due date.
+
+    Returns:
+         A dictionary with key 'schedule' whose value is a list of integers representing
+         a valid permutation of job indices (1-based).
+    """
+    jobs = kwargs.get('jobs', [])
+    n = len(jobs)
+    if n == 0:
+        return {'schedule': []}
+    h = kwargs.get('h', 0.6)
+    P = sum(p for p, a, b in jobs)
+    d = int(P * h)
+    best_penalty = sys.maxsize
+    best_perm = None
+    for perm in itertools.permutations(range(n)):
+        C = 0
+        penalty = 0
+        for idx in perm:
+            p, a, b = jobs[idx]
+            C += p
+            if C < d:
+                penalty += a * (d - C)
+            elif C > d:
+                penalty += b * (C - d)
+        if penalty < best_penalty:
+            best_penalty = penalty
+            best_perm = perm
+    return {'schedule': [i + 1 for i in best_perm]}
+```
+Stdout:
+score=0.1394
+raw_score=0.1394
+Eval feedback:
+sch10.txt -> Scores: ['0.947', '0.981', '1.000']
+sch100.txt -> Scores: ['Timeout (10s)', 'Timeout (10s)', 'Timeout (10s)']
+sch1000.txt -> Scores: ['Timeout (10s)', 'Timeout (10s)', 'Timeout (10s)']
+sch20.txt -> Scores: ['Timeout (10s)', 'Timeout (10s)', 'Timeout (10s)']
+sch200.txt -> Scores: ['Timeout (10s)', 'Timeout (10s)', 'Timeout (10s)']
+sch50.txt -> Scores: ['Timeout (10s)', 'Timeout (10s)', 'Timeout (10s)']
+sch500.txt -> Scores: ['Timeout (10s)', 'Timeout (10s)', 'Timeout (10s)']
+Avg Dev Score: 0.1394
+
+## Baseline Comparison
+
+Tasks unchanged: 6
+Net effect: +0.000 mean score change
+
+## Previously Injected Code (layers below you)
+(none — you are the first meta-layer)
+
+## What You Can Produce
+
+You can output any combination of:
+
+### pre_process (strategy guidance)
+Python code that runs BEFORE the solver sees the task. Your code has access to:
+- `task` (read-only TaskDescription with .task_id, .description, .metadata)
+- `outer_context` (string: guidance from higher meta-layers — use this to ADAPT your intervention based on higher layers' strategic decisions; empty if you are the outermost layer)
+
+You MUST set the `additional_context` variable (a string that gets appended to the solver's prompt).
+
+CRITICAL: Set the `additional_context` variable directly. Do NOT modify the `task` object — it is read-only.
+
+Example:
+```pre_process
+# Adapt tactics based on higher layer's strategy (if any)
+if "greedy" in outer_context.lower():
+    additional_context = "Implement greedy assignment: sort by cost, assign iteratively."
+elif "file" in task.description.lower():
+    additional_context = "Remember to use proper quoting for file paths with spaces."
+else:
+    additional_context = ""
+```
+
+### solver_lib (solver-visible code library)
+Python functions that will be PREPENDED to the solver's generated code and available at runtime inside the sandbox. The solver sees their signatures in its prompt and can call them directly.
+
+Use this to provide working algorithm implementations that the solver cannot reliably write from scratch. This is different from pre_process (which provides strategy guidance as text) — solver_lib provides actual executable code.
+
+Example:
+```solver_lib:local_search
+def local_search(solution, evaluate_fn, time_limit=8.0):
+    """Iteratively improve solution via random swaps within time limit."""
+    import time, random
+    best, best_score = solution, evaluate_fn(solution)
+    start = time.time()
+    while time.time() - start < time_limit:
+        keys = list(best.keys())
+        if len(keys) < 2:
+            break
+        i, j = random.sample(range(len(keys)), 2)
+        neighbor = dict(best)
+        neighbor[keys[i]], neighbor[keys[j]] = neighbor[keys[j]], neighbor[keys[i]]
+        score = evaluate_fn(neighbor)
+        if score > best_score:
+            best, best_score = neighbor, score
+    return best
+```
+
+IMPORTANT for solver_lib:
+- Functions run inside the sandbox, NOT in the meta-layer
+- Only use Python standard library imports (no numpy, scipy, etc.)
+- Each block should define a single self-contained function
+- Later layers can override a function by providing a solver_lib block with the same name
+- solver_lib functions from different layers share a runtime namespace and can call each other
+- Every function MUST include type annotations and a docstring with (a) one-line summary, (b) Args section listing every parameter with its expected type and meaning, (c) Returns section describing the return type and structure. The solver only sees the signature and docstring, not the full source — the docstring is the API contract. Example:
+      def pack_items(items: list, capacity: int) -> tuple:
+          """Pack items into bins using first-fit decreasing.
+
+          Args:
+              items: list[tuple[int, int, str]] — each is (width, height, item_id).
+              capacity: int — max bin weight.
+
+          Returns:
+              tuple[int, list[dict]] — (total_cost, placements) where each dict
+              has keys 'id' (str), 'x' (int), 'y' (int).
+          """
+
+## Output Format
+
+Respond with EXACTLY this structure (omit sections you don't need):
+
+```rationale
+<your reasoning about what patterns you see and what improvements to make>
+```
+
+```pre_process
+<python code>
+```
+
+```solver_lib:<name>
+<python function code>
+```
+
+IMPORTANT:
+- pre_process must be self-contained Python. Do not import external packages beyond the standard library.
+- Focus on the highest-impact improvement based on the failure patterns you observe.
+- Be specific about what failure patterns you're addressing.
+- GENERALIZE: condition your intervention on task STRUCTURE (problem size, presence of hard constraints, metadata fields) — NEVER branch on specific task_id string literals. Code that keys off task_id values cannot transfer to unseen tasks and is wasted effort.
+- If you add a solver_lib helper, it must target a specific failing task: name that task in your rationale and explain why the solver cannot write it reliably itself.
+- Keep code simple and robust — complex code is more likely to break.
+- Favor small (≤30 lines), audit-able helpers over large multi-purpose ones. Helpers that break the runtime env (creating envs, installing packages, depending on uncommon CLIs) introduce more failures than they prevent.

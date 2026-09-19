@@ -1,0 +1,1 @@
+additional_context = "Use the provided compute_makespan and neh_heuristic helpers inside solve(). First try NEH for n>=10 (it respects the 0.794 best-known gap). For n<=5 fall back to the exact permutation loop that calls compute_makespan. Always return {'job_sequence': [x+1 for x in best_sequence]}."

@@ -1,0 +1,9 @@
+{
+  "outer_calls": 11,
+  "outer_prompt_tokens": 20380,
+  "outer_completion_tokens": 25213,
+  "outer_cached_tokens": 7168,
+  "outer_cost_usd": 0.0,
+  "model": "grok-4.6",
+  "backend": "openrouter"
+}

@@ -1,0 +1,310 @@
+You are a higher-order meta-layer (depth 3) in a recursive self-improving system called Meta^n.
+
+## Your Role
+Previous layers have already made tactical fixes — dependency handling, constraint checks, format corrections. Your job is NOT to patch individual errors. Lower layers already do that.
+
+Instead, you should:
+1. Identify SYSTEMIC patterns across task categories
+2. Understand WHY previous layers' fixes helped some tasks but hurt others
+3. Make STRUCTURAL improvements: task classification, solver strategy selection, algorithm implementations
+4. Consider CONDITIONING or BYPASSING previous layers' changes for task types where they cause regressions
+5. Provide reusable algorithm implementations (via solver_lib) that the solver can call directly
+
+## System Context
+Current depth: 3
+Tasks attempted: 1
+Current mean score: 0.000  ← PRIMARY OBJECTIVE: raise the MEAN CONTINUOUS SCORE (not just the pass count)
+Score spread (1 tasks): [0.0-0.3]x1  [0.3-0.7]x0  [0.7-1.0]x0
+pass@1 (binary success rate): 0.0%
+
+⚠ PLATEAU RISK: the previous layer changed the mean score by only +0.000. Do NOT merely refine the previous approach — the injected-code history below shows what has already been tried. Either (a) propose a STRUCTURALLY DIFFERENT intervention (a different algorithm class, a different failure mode, a different task subset), or (b) if you have no genuinely new idea, output an EMPTY response (no pre_process, no solver_lib): a no-op beats re-emitting code that will not help.
+
+## DEEPEN — keep improving ONLY task 'flow_shop_scheduling'
+The layer BELOW already worked 'flow_shop_scheduling'; its current solution is the starting point, NOT a blank slate. Reason about what that layer produced and improve 'flow_shop_scheduling' FURTHER — do NOT discard or restart it. Every OTHER task is FROZEN and will NOT be re-solved; spend NO effort on them.
+## Opportunity — per-task headroom to best-known (largest gap first)
+Target the largest-gap tasks. Tasks with a small/zero gap are near their ceiling — do NOT regress them.
+
+| task | now | best-known | gap |
+|------|-----|-----------|-----|
+| flow_shop_scheduling | 0.000 | 0.772 | +0.772 |
+
+## Performance Summary & Analysis
+## Task Category Performance
+
+- **scheduling** (1 tasks): 0/1 pass, mean=0.00, key issue: Indexing error
+
+## Failure Pattern Distribution
+
+- **Indexing error**: 1 tasks (100%) — e.g., "tai100_10.txt -> Scores: ['list index out of range', 'list index out of range', "
+
+## Previous Layer Effectiveness
+
+Previous layer rationale: "The runtime error stems from the DP transition comparing a mutable list (new_comp) directly against a tuple (from dp) using <; this is invalid in Python and will occur on every update for any n>0. The..."
+
+Tasks unchanged: 1
+Net effect: +0.000 mean score change (over 1 shared tasks)
+
+## Representative Traces (1 of 1)
+
+--- Task: flow_shop_scheduling [FAILURE Indexing error] ---
+Script:
+```python
+def solve(**kwargs):
+    n = kwargs['n']
+    m = kwargs['m']
+    matrix = kwargs['matrix']
+    # Compute total processing time for each job
+    totals = [sum(row) for row in matrix]
+    # Sort jobs by total time descending
+    jobs = list(range(n))
+    jobs.sort(key=lambda j: totals[j], reverse=True)
+    # NEH heuristic
+    def compute_makespan(seq):
+        C = [[0] * m for _ in range(n)]
+        for j in range(m):
+            for i in range(n):
+                p = matrix[seq[i]][j]
+                if i == 0 and j == 0:
+                    C[i][j] = p
+                elif i == 0:
+                    C[i][j] = C[i][j-1] + p
+                elif j == 0:
+                    C[i][j] = C[i-1][j] + p
+                else:
+                    C[i][j] = max(C[i-1][j], C[i][j-1]) + p
+        return C[n-1][m-1]
+    # Start with first two jobs
+    seq = jobs[:2]
+    for j in jobs[2:]:
+        best_makespan = float('inf')
+        best_pos = 0
+        for pos in range(len(seq) + 1):
+            temp_seq = seq[:pos] + [j] + seq[pos:]
+            ms = compute_makespan(temp_seq)
+            if ms < best_makespan:
+                best_makespan = ms
+                best_pos = pos
+        seq = seq[:best_pos] + [j] + seq[best_pos:]
+    return {'job_sequence': [x + 1 for x in seq]}
+```
+Stdout:
+score=0.0000
+raw_score=0.0000
+Stderr:
+tai100_10.txt -> Scores: ['list index out of range', 'list index out of range', 'list index out of range', 'list index out of range', 'list index out of range']
+tai100_20.txt -> Scores: ['list index out of range', 'list index out of range', 'list index out of range', 'list index out of range', 'list index out of range']
+tai100_5.txt -> Scores: ['list index out of range', 'list index out of range', 'list index out of range', 'list index out of range', 'list index out of range']
+tai200_10.txt -> S
+Error: tai100_10.txt -> Scores: ['list index out of range', 'list index out of range', 'list index out of range', 'list index out of range', 'list index out of range']
+tai100_20.txt -> Scores: ['list index o
+Eval feedback:
+...['list index out of range', 'list index out of range', 'list index out of range', 'list index out of range', 'list index out of range']
+tai500_20.txt -> Scores: ['list index out of range', 'list index out of range', 'list index out of range', 'list index out of range', 'list index out of range']
+tai50_10.txt -> Scores: ['list index out of range', 'list index out of range', 'list index out of range', 'list index out of range', 'list index out of range']
+tai50_20.txt -> Scores: ['list index out of range', 'list index out of range', 'list index out of range', 'list index out of range', 'list index out of range']
+tai50_5.txt -> Scores: ['list index out of range', 'list index out of range', 'list index out of range', 'list index out of range', 'list index out of range']
+Avg Dev Score: 0.0000
+
+
+## Inspiration from Archive (best solutions from other candidates for tasks you failed)
+--- Task: flow_shop_scheduling [BEST score=0.772] (from another candidate) ---
+Script:
+```python
+def solve(**kwargs):
+    n = kwargs['n']
+    m = kwargs['m']
+    matrix = kwargs['matrix']
+    if n == 0:
+        return {'job_sequence': []}
+    def compute_makespan(seq, matrix):
+        n = len(seq)
+        m = len(matrix[0])
+        C = [[0] * m for _ in range(n)]
+        for i in range(n):
+            job = seq[i]
+            for j in range(m):
+                if i == 0 and j == 0:
+                    C[i][j] = matrix[job][j]
+                elif i == 0:
+                    C[i][j] = C[i][j-1] + matrix[job][j]
+                elif j == 0:
+                    C[i][j] = C[i-1][j] + matrix[job][j]
+                else:
+                    C[i][j] = max(C[i-1][j], C[i][j-1]) + matrix[job][j]
+        return C[-1][-1]
+    if m == 2:
+        jobs = list(range(n))
+        p1 = [matrix[j][0] for j in jobs]
+        p2 = [matrix[j][1] for j in jobs]
+        group1 = [j for j in jobs if p1[j] < p2[j]]
+        group2 = [j for j in jobs if p1[j] > p2[j]]
+        group1.sort(key=lambda j: p1[j])
+        group2.sort(key=lambda j: p2[j])
+        sequence = group1 + group2
+        return {'job_sequence': [j+1 for j in sequence]}
+    else:
+        totals = [sum(row) for row in matrix]
+        jobs = list(range(n))
+        jobs.sort(key=lambda j: totals[j], reverse=True)
+        current = [jobs[0]]
+        for k in range(1, n):
+            best_makespan = float('inf')
+            best_pos = 0
+            for pos in range(len(current) + 1):
+                temp_seq = current[:pos] + [jobs[k]] + current[pos:]
+                ms = compute_makespan(temp_seq, matrix)
+                if ms < best_makespan:
+                    best_makespan = ms
+                    best_pos = pos
+            current = current[:best_pos] + [jobs[k]] + current[best_pos:]
+        return {'job_sequence': [j+1 for j in current]}
+```
+
+
+## Previously Injected Code (layers below you)
+--- Depth 2 ---
+pre_process:
+```python
+if task.task_id == "flow_shop_scheduling":
+    additional_context = """You are solving the m-machine flow-shop scheduling problem (n jobs, m machines). The optimal makespan is NP-hard for m>2, so use Johnson's rule as a fast heuristic (optimal for m=2). Implement a Johnson's heuristic or NEH insertion heuristic in the solver; only fall back to the provided DP for n<=12. Never use lists vs tuples in comparisons. Return {'job_sequence': list_of_job_indices_0based}. The returned sequence must be a valid permutation (all jobs 0..n-1 exactly once)."""
+else:
+    additional_context = ""
+```
+solver_lib:johnson_heuristic:
+```python
+def johnson_heuristic(n: int, m: int, matrix: list) -> list:
+    """Johnson's heuristic for m-machine flow shop (approximation algorithm).
+
+    Args:
+        n: number of jobs
+        m: number of machines
+        matrix: n x m list of processing times (matrix[i][j] = time of job i on machine j)
+
+    Returns:
+        list of job indices (0-based) in the order to process them.
+    """
+    import math
+    # For m==2 use optimal Johnson's rule
+    if m == 2:
+        times = [(matrix[i][0] + matrix[i][1], matrix[i][1] - matrix[i][0]) for i in range(n)]
+        jobs = list(range(n))
+        jobs.sort(key=lambda i: (times[i][0], -times[i][1]) if times[i][1] < 0 else (times[i][0], math.inf))
+        return jobs
+    # For m>2 use NEH heuristic (insertion heuristic, fast and strong)
+    else:
+        # Start with longest processing time order
+        p = [sum(row) for row in matrix]
+        jobs = list(range(n))
+        jobs.sort(key=p.__getitem__, reverse=True)
+        # NEH insertion
+        for i in range(1, n):
+            best_pos = i
+            best_makespan = float('inf')
+            for pos in range(i + 1):
+                # insert job jobs[i] at position pos
+                seq = jobs[:pos] + [jobs[i]] + jobs[pos:i]
+                # compute makespan of this seq (simple O(n*m) simulation)
+                comp = [0.0] * m
+                for job_idx in seq:
+                    for mm in range(m):
+                        comp[mm] = max(comp[mm], comp[mm - 1] if mm > 0 else 0) + matrix[job_idx][mm]
+                if comp[-1] < best_makespan:
+                    best_makespan = comp[-1]
+                    best_pos = pos
+            # move job to best_pos
+            jobs.pop(i)
+            jobs.insert(best_pos, jobs[i])  # jobs[i] was the one we moved
+        return jobs
+```
+Rationale: The runtime error stems from the DP transition comparing a mutable list (new_comp) directly against a tuple (from dp) using <; this is invalid in Python and will occur on every update for any n>0. The code also constructs sequences incorrectly (appends in reverse order without proper reversal logic, and pred reconstruction assumes a valid best_S/best_j path that may not exist). For n=100 (tai100_20) the exponential DP is intractable, so it scores 0; we must replace it with a fast heuristic that is known to achieve ~0.7+ on these Taillard instances. I will provide (1) pre_process guidance that forces the generated solve() to invoke a Johnson/NEH-style heuristic (or DP only for n<=12), and (2) a solver_lib helper implementing the heuristic that the solver can drop in. This directly attacks the largest gap (+0.772) without touching other frozen tasks.
+
+
+## What You Can Produce
+
+You can output any combination of:
+
+### pre_process (strategy guidance)
+Python code that runs BEFORE the solver sees the task. Your code has access to:
+- `task` (read-only TaskDescription with .task_id, .description, .metadata)
+- `outer_context` (string: guidance from higher meta-layers — use this to ADAPT your intervention based on higher layers' strategic decisions; empty if you are the outermost layer)
+
+You MUST set the `additional_context` variable (a string that gets appended to the solver's prompt).
+
+CRITICAL: Set the `additional_context` variable directly. Do NOT modify the `task` object — it is read-only.
+
+### solver_lib (solver-visible code library)
+Python functions that will be PREPENDED to the solver's generated code and available at runtime inside the sandbox. The solver sees their signatures in its prompt and can call them directly.
+
+Use this to provide working algorithm implementations that the solver cannot reliably write from scratch. This is different from pre_process (which provides strategy guidance as text) — solver_lib provides actual executable code.
+
+Example:
+```solver_lib:local_search
+def local_search(solution, evaluate_fn, time_limit=8.0):
+    """Iteratively improve solution via random swaps within time limit."""
+    import time, random
+    best, best_score = solution, evaluate_fn(solution)
+    start = time.time()
+    while time.time() - start < time_limit:
+        keys = list(best.keys())
+        if len(keys) < 2:
+            break
+        i, j = random.sample(range(len(keys)), 2)
+        neighbor = dict(best)
+        neighbor[keys[i]], neighbor[keys[j]] = neighbor[keys[j]], neighbor[keys[i]]
+        score = evaluate_fn(neighbor)
+        if score > best_score:
+            best, best_score = neighbor, score
+    return best
+```
+
+IMPORTANT for solver_lib:
+- Functions run inside the sandbox, NOT in the meta-layer
+- Only use Python standard library imports (no numpy, scipy, etc.)
+- Each block should define a single self-contained function
+- Later layers can override a function by providing a solver_lib block with the same name
+- solver_lib functions from different layers share a runtime namespace and can call each other
+- Every function MUST include type annotations and a docstring with (a) one-line summary, (b) Args section listing every parameter with its expected type and meaning, (c) Returns section describing the return type and structure. The solver only sees the signature and docstring, not the full source — the docstring is the API contract. Example:
+      def pack_items(items: list, capacity: int) -> tuple:
+          """Pack items into bins using first-fit decreasing.
+
+          Args:
+              items: list[tuple[int, int, str]] — each is (width, height, item_id).
+              capacity: int — max bin weight.
+
+          Returns:
+              tuple[int, list[dict]] — (total_cost, placements) where each dict
+              has keys 'id' (str), 'x' (int), 'y' (int).
+          """
+
+## Output Format
+
+Respond with EXACTLY this structure (omit sections you don't need):
+
+```rationale
+## Diagnosis
+<the specific failure mode or bottleneck you are targeting, grounded in the score data, the headroom table, and the per-trace failure classes above — name the actual tasks it affects>
+
+## Intervention
+<what you will change and EXACTLY which tasks it targets. For every solver_lib helper you add, name the failing task it addresses and why the solver cannot write it reliably from scratch. Do not promise code you are not emitting.>
+
+## Why this is different
+<how this differs from what the injected-code history already tried — do NOT repeat a prior approach; if you cannot beat it, emit nothing>
+```
+
+```pre_process
+<python code>
+```
+
+```solver_lib:<name>
+<python function code>
+```
+
+IMPORTANT:
+- pre_process must be self-contained Python. Do not import external packages beyond the standard library.
+- Focus on STRUCTURAL improvements, not individual error patches.
+- If a previous layer's fix hurts certain tasks, add task-type conditionals to bypass it.
+- GENERALIZE: condition on task STRUCTURE (size, constraints, metadata), NEVER on specific task_id string literals — task_id-keyed code does not transfer to unseen tasks.
+- If you add a solver_lib helper, name the specific failing task it targets and why the solver cannot reliably write it itself.
+- Keep code simple and robust — complex code is more likely to break.
+- Use pre_process for strategy guidance (text); use solver_lib for reusable implementations (code).
+- Favor small (≤30 lines), audit-able helpers over large multi-purpose ones. Helpers that break the runtime env (creating envs, installing packages, depending on uncommon CLIs) introduce more failures than they prevent.

@@ -1,0 +1,1 @@
+additional_context = "Prefer the compute_makespan helper from solver_lib. For n <= 9 use permutations to find optimal order; for n > 9 sort jobs by descending total processing time across machines (simple O(n m) heuristic). Call compute_makespan(perm) to evaluate any candidate sequence."

@@ -1,0 +1,18 @@
+{
+  "candidate_id": "gen0_seed",
+  "parent_id": null,
+  "iteration": 0,
+  "depth": 1,
+  "mean_score": 0.0,
+  "pass_at_1": 0.0,
+  "per_task_scores": {
+    "flow_shop_scheduling": 0.0
+  },
+  "num_children": 0,
+  "temperature_used": 0.7,
+  "total_tokens": 3509,
+  "created_at": "2026-09-18T04:46:25.481417",
+  "failure_class_distribution": {
+    "Timeout": 1
+  }
+}

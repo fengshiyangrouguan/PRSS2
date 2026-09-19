@@ -1,0 +1,40 @@
+CONTROL / BARE-PRE-METACOGNITION CONFIGURATION -- NOT Official parity
+=====================================================================
+
+This run passed `--benchmark-config none`, which the bundled
+meta_n/configs/benchmark_features.yaml documents (line 7) as the flag that
+"Reproduce[s] the bare pre-metacognition behavior", and (lines 8-10) as the
+invocation required for baseline/control runs.
+
+Resolved config this run recorded in its own config.json:
+
+    consolidate              = False
+    regression_guard         = False
+    within_task_recursion    = False
+    focus_current_headroom   = False
+    symmetric_trace_sampling = False
+
+Because `consolidate` was OFF, every bred child was left WITHOUT a focus task,
+so evolutionary_orchestrator.py:1290
+
+    if self.config.gate_tasks > 0 and not focus_task:
+
+let the official quality gate RUN. The gate then rejected every child (each
+child solver raised `IndexError: list index out of range`), the archive stayed
+at size 1, and eligible_lineages stayed 0.
+
+=> The 0-lineage result here is an ARTIFACT OF RUNNING THE CONTROL PATH.
+   It must NOT be used to diagnose SRI / RPBE, and it is not evidence about
+   Meta^n's recursion, about the model, or about the method.
+
+Official parity, same model and same task, with the official config (no
+`--benchmark-config` flag at all):
+
+    runs/canary_parity/20260918_002348_co_bench_grok-4.6
+      archive_size      1 -> 5
+      eligible_lineages = 2
+      seed 0.7953 -> gen1_b0_k0 (d2) 0.8292 -> gen3/gen4_b0_k0 (d3)
+      child.injected_codes[:-1] == parent.injected_codes      (inheritance)
+      depth-3: pre_process layers=[2,3], ran=True             (context accum)
+
+See TASKBOOK_v4.2.md section 0.8 and section 10.

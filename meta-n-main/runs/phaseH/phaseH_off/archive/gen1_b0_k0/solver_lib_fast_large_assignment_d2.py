@@ -1,0 +1,160 @@
+def fast_large_assignment(cost_matrix: list, n: int, time_limit: float = 8.5) -> dict:
+    """Construct a fast feasible assignment for large square assignment instances.
+
+    Args:
+        cost_matrix: list — square n x n matrix-like object of numeric assignment costs.
+        n: int — number of rows and columns.
+        time_limit: float — approximate maximum runtime in seconds for this heuristic.
+
+    Returns:
+        dict — {"total_cost": numeric total assignment cost,
+        "assignment": list[tuple[int, int]]} where assignment contains 1-indexed
+        (row, column) pairs and is a complete one-to-one assignment.
+    """
+    import time
+    import heapq
+    import random
+
+    start = time.time()
+    deadline = start + max(0.1, float(time_limit))
+
+    if n <= 0:
+        return {"total_cost": 0, "assignment": []}
+
+    try:
+        cm = cost_matrix.tolist()
+    except AttributeError:
+        cm = cost_matrix
+
+    # Candidate width: enough to get good choices, small enough for n=3000.
+    if n <= 800:
+        k = 48
+    elif n <= 1800:
+        k = 32
+    else:
+        k = 20
+    if k > n:
+        k = n
+
+    row_cands = []
+    row_order_data = []
+
+    # Build per-row top-k candidates and regret score.
+    for i in range(n):
+        row = cm[i]
+        if k < n:
+            cands = heapq.nsmallest(k, range(n), key=row.__getitem__)
+        else:
+            cands = sorted(range(n), key=row.__getitem__)
+        row_cands.append(cands)
+
+        best = row[cands[0]]
+        second = row[cands[1]] if len(cands) > 1 else best
+        regret = second - best
+        row_order_data.append((-regret, best, i))
+
+    # Rows with high regret should choose early.
+    row_order_data.sort()
+    row_order = [x[2] for x in row_order_data]
+
+    assigned_col = [-1] * n
+    used = [False] * n
+    unused_count = n
+
+    for i in row_order:
+        if time.time() >= deadline:
+            break
+        chosen = -1
+        row = cm[i]
+
+        for j in row_cands[i]:
+            if not used[j]:
+                chosen = j
+                break
+
+        if chosen < 0:
+            best_j = -1
+            best_c = None
+            # Full scan fallback only when top-k exhausted.
+            for j in range(n):
+                if not used[j]:
+                    c = row[j]
+                    if best_c is None or c < best_c:
+                        best_c = c
+                        best_j = j
+            chosen = best_j
+
+        if chosen >= 0:
+            assigned_col[i] = chosen
+            used[chosen] = True
+            unused_count -= 1
+
+    # If time expired mid-construction, finish deterministically and cheaply.
+    if unused_count:
+        unused_cols = [j for j in range(n) if not used[j]]
+        ptr = 0
+        for i in range(n):
+            if assigned_col[i] < 0:
+                # Choose best among a small prefix of remaining columns to avoid bad arbitrary matches.
+                row = cm[i]
+                best_pos = ptr
+                best_c = row[unused_cols[ptr]]
+                end = min(len(unused_cols), ptr + 64)
+                for pos in range(ptr + 1, end):
+                    c = row[unused_cols[pos]]
+                    if c < best_c:
+                        best_c = c
+                        best_pos = pos
+                unused_cols[ptr], unused_cols[best_pos] = unused_cols[best_pos], unused_cols[ptr]
+                assigned_col[i] = unused_cols[ptr]
+                ptr += 1
+
+    # Lightweight pair-swap local improvement. Exact delta is cheap.
+    def try_pair_swap(i: int, r: int) -> bool:
+        ji = assigned_col[i]
+        jr = assigned_col[r]
+        if ji == jr:
+            return False
+        old = cm[i][ji] + cm[r][jr]
+        new = cm[i][jr] + cm[r][ji]
+        if new < old:
+            assigned_col[i], assigned_col[r] = jr, ji
+            return True
+        return False
+
+    # Deterministic improvement over adjacent/high-conflict rows, then random samples.
+    passes = 0
+    while time.time() < deadline and passes < 2:
+        improved = False
+        passes += 1
+
+        limit = n - 1
+        for pos in range(limit):
+            if time.time() >= deadline:
+                break
+            i = row_order[pos]
+            r = row_order[pos + 1]
+            if try_pair_swap(i, r):
+                improved = True
+
+        if not improved:
+            break
+
+    rng = random.Random(1234567 + n)
+    attempts = 0
+    max_attempts = 20000 if n <= 1000 else 35000
+    while time.time() < deadline and attempts < max_attempts:
+        attempts += 1
+        i = rng.randrange(n)
+        r = rng.randrange(n)
+        if i != r:
+            try_pair_swap(i, r)
+
+    total = 0
+    assignment = []
+    for i in range(n):
+        j = assigned_col[i]
+        assignment.append((i + 1, j + 1))
+        total += cm[i][j]
+
+    return {"total_cost": total, "assignment": assignment}

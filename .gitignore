@@ -8,15 +8,7 @@ __pycache__/
 .mypy_cache/
 .ipynb_checkpoints/
 
-# run artifacts (large; keep the SMALL trained checkpoints + manifests only)
-meta-n-main/runs/*/
-!meta-n-main/runs/*.pt
-!meta-n-main/runs/*.jsonl
-!meta-n-main/runs/*.json
-!meta-n-main/runs/*.md
-!meta-n-main/runs/*.txt
-
-# local scratch
+# local scratch (not evidence)
 _fuse_test/
 pilot_01/
 *.log

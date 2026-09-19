@@ -1,0 +1,11 @@
+```rationale
+The failure is a clear runtime indexing error ('list index out of range') on every test case. The root cause is in the C matrix construction loop: C is sized as (n+1) rows by m columns (indices 0..n and 0..m-1), but the final makespan line accesses C[n][m] instead of C[n][m-1]. This is a classic off-by-one in 2D array indexing for the last machine. The permutation loop itself is correct for the standard flow-shop formulation (matrix rows = jobs, columns = machines). No other structural issues (e.g., duplicate jobs, negative times) are indicated by the trace. The largest gap (+0.794) is entirely due to this crash, so the highest-leverage intervention is a targeted pre_process hint that forces the lower solver to correct the index before re-running; this is simpler, more robust, and avoids introducing new dependencies or large helper functions that could themselves introduce runtime fragility.
+```
+
+```pre_process
+# Fix the known indexing bug that causes list index out of range on every test instance
+# (C matrix is (n+1) x m but final access used m instead of m-1)
+additional_context = "The provided solve function has a critical off-by-one error: after the inner loop, set makespan = C[n][m-1] (not C[n][m]). Also change best_makespan = float('inf') for type safety. Re-run the full permutation search with this correction on all .txt instances. This will eliminate the crash and produce valid sequences whose makespans can be evaluated."
+```
+
+```

@@ -1,0 +1,7 @@
+{
+  "chain_test_mean_score": 0.5794354490634149,
+  "chain_test_scores": {
+    "job_shop_scheduling": 0.5794354490634149
+  },
+  "candidate_id": "gen0_seed"
+}

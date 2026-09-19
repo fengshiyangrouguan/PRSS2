@@ -1,0 +1,1 @@
+additional_context = "The solver code assumes matrix[perm[j-1]][k] and computes C[n][m]. Replace those with the compute_makespan helper below to match the (m, n) matrix shape from the benchmark files and avoid index errors. Then run the permutation loop as written but use makespan = compute_makespan(perm, matrix, n, m). This will produce valid scores on all instances."

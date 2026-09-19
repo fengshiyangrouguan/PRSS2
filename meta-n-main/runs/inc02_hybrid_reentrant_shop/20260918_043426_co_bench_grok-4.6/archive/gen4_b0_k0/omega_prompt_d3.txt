@@ -1,0 +1,217 @@
+You are a higher-order meta-layer (depth 3) in a recursive self-improving system called Meta^n.
+
+## Your Role
+Previous layers have already made tactical fixes — dependency handling, constraint checks, format corrections. Your job is NOT to patch individual errors. Lower layers already do that.
+
+Instead, you should:
+1. Identify SYSTEMIC patterns across task categories
+2. Understand WHY previous layers' fixes helped some tasks but hurt others
+3. Make STRUCTURAL improvements: task classification, solver strategy selection, algorithm implementations
+4. Consider CONDITIONING or BYPASSING previous layers' changes for task types where they cause regressions
+5. Provide reusable algorithm implementations (via solver_lib) that the solver can call directly
+
+## System Context
+Current depth: 3
+Tasks attempted: 1
+Current mean score: 0.700  ← PRIMARY OBJECTIVE: raise the MEAN CONTINUOUS SCORE (not just the pass count)
+Score spread (1 tasks): [0.0-0.3]x0  [0.3-0.7]x0  [0.7-1.0]x1
+pass@1 (binary success rate): 100.0%
+
+⚠ PLATEAU RISK: the previous layer changed the mean score by only +0.006. Do NOT merely refine the previous approach — the injected-code history below shows what has already been tried. Either (a) propose a STRUCTURALLY DIFFERENT intervention (a different algorithm class, a different failure mode, a different task subset), or (b) if you have no genuinely new idea, output an EMPTY response (no pre_process, no solver_lib): a no-op beats re-emitting code that will not help.
+
+## DEEPEN — keep improving ONLY task 'hybrid_reentrant_shop_scheduling'
+The layer BELOW already worked 'hybrid_reentrant_shop_scheduling'; its current solution is the starting point, NOT a blank slate. Reason about what that layer produced and improve 'hybrid_reentrant_shop_scheduling' FURTHER — do NOT discard or restart it. Every OTHER task is FROZEN and will NOT be re-solved; spend NO effort on them.
+## Opportunity — per-task headroom to best-known (largest gap first)
+Target the largest-gap tasks. Tasks with a small/zero gap are near their ceiling — do NOT regress them.
+
+| task | now | best-known | gap |
+|------|-----|-----------|-----|
+| hybrid_reentrant_shop_scheduling | 0.700 | 0.969 | +0.268 |
+
+## Performance Summary & Analysis
+## Task Category Performance
+
+- **scheduling** (1 tasks): 1/1 pass, mean=0.70, key issue: -
+
+## Previous Layer Effectiveness
+
+Previous layer rationale: "The solver's current permutation (sorted solely by setup_times descending) and round-robin batch_assignment ignore processing_times, which strongly influence shop makespan and reentrancy conflicts (hi..."
+
+Tasks unchanged: 1
+Net effect: +0.006 mean score change (over 1 shared tasks)
+
+## Representative Traces (1 of 1)
+
+--- Task: hybrid_reentrant_shop_scheduling [SUCCESS score=0.700] ---
+Script:
+```python
+def solve(**kwargs):
+    """
+    Hybrid Reentrant Shop Scheduling heuristic.
+    permutation: jobs sorted descending by setup_times[i] * processing_times[i] (hybrid priority for high-setup/high-proc jobs to reduce makespan).
+    batch_assignment: round-robin assignment to n_machines (1-based).
+    """
+    n_jobs = kwargs['n_jobs']
+    n_machines = kwargs['n_machines']
+    setup_times = kwargs['setup_times']
+    processing_times = kwargs['processing_times']
+    
+    # Hybrid permutation: sort by product of setup and processing times (descending)
+    jobs = list(range(n_jobs))
+    jobs.sort(key=lambda i: setup_times[i] * processing_times[i], reverse=True)
+    permutation = [j + 1 for j in jobs]  # 1-based
+    
+    # Round-robin batch assignment to primary machines
+    batch_assignment = [(i % n_machines) + 1 for i in range(n_jobs)]
+    
+    return {
+        'permutation': permutation,
+        'batch_assignment': batch_assignment
+    }
+```
+Stdout:
+score=0.7002
+raw_score=0.7002
+Eval feedback:
+...0.580', '0.568', '0.598', '0.622', '0.586', '0.586', '0.562', '0.614', '0.619']
+hrs-50_1.txt -> Scores: ['0.545', '0.543', '0.527', '0.560', '0.520', '0.549', '0.545', '0.543', '0.541', '0.523']
+hrs-50_125.txt -> Scores: ['0.614', '0.605', '0.662', '0.558', '0.578', '0.599', '0.554', '0.609', '0.604', '0.590']
+hrs-50_15.txt -> Scores: ['0.638', '0.609', '0.648', '0.638', '0.645', '0.632', '0.622', '0.624', '0.647', '0.652']
+hrs-50_175.txt -> Scores: ['0.718', '0.656', '0.641', '0.680', '0.617', '0.706', '0.619', '0.608', '0.678', '0.661']
+hrs-50_2.txt -> Scores: ['0.663', '0.767', '0.785', '0.646', '0.705', '0.707', '0.688', '0.695', '0.686', '0.691']
+hrs-50_25.txt -> Scores: ['0.742', '0.751', '0.731', '0.767', '0.714', '0.706', '0.749', '0.756', '0.718', '0.715']
+Avg Dev Score: 0.7002
+
+
+## Inspiration from Archive (best solutions from other candidates for tasks you failed)
+--- Task: hybrid_reentrant_shop_scheduling [BEST score=0.969] (from another candidate) ---
+Script:
+```python
+def solve(**kwargs):
+    n_jobs = kwargs['n_jobs']
+    n_machines = kwargs['n_machines']
+    # Simple valid heuristic: natural permutation and round-robin batch assignment
+    permutation = list(range(1, n_jobs + 1))
+    batch_assignment = [(i % n_machines) + 1 for i in range(n_jobs)]
+    return {
+        'permutation': permutation,
+        'batch_assignment': batch_assignment
+    }
+```
+
+
+## Previously Injected Code (layers below you)
+--- Depth 2 ---
+pre_process:
+```python
+additional_context = "Improve the permutation by calling the improved_permutation helper (provided in solver_lib) to sort jobs using the hybrid key setup_times[i] * processing_times[i] (descending). This prioritizes jobs with both high setup and high processing to reduce makespan under reentrancy. Keep batch_assignment as round-robin but document the hybrid permutation logic in the returned dict."
+```
+solver_lib:improved_permutation:
+```python
+def improved_permutation(n_jobs: int, setup_times: list[float], processing_times: list[float]) -> list[int]:
+    """Return 1-based job permutation sorted by hybrid key (setup * processing descending).
+
+    Args:
+        n_jobs: int — number of jobs in the instance
+        setup_times: list[float] — setup time per job (scalar per job)
+        processing_times: list[float] — processing time per job
+
+    Returns:
+        list[int] — permutation of job numbers (1-based) sorted by setup*processing descending
+    """
+    def key(i):
+        return setup_times[i] * processing_times[i]
+    return [p + 1 for p in sorted(range(n_jobs), key=key, reverse=True)]
+```
+Rationale: The solver's current permutation (sorted solely by setup_times descending) and round-robin batch_assignment ignore processing_times, which strongly influence shop makespan and reentrancy conflicts (high-setup jobs should also be deprioritized if they have long processing to avoid machine bottlenecks). Failure patterns across instances show high variance (0.524–0.798) with lower scores on hrs-50_* where processing/setup ratios differ; the 0.694 avg reflects this gap. Largest headroom (+0.275) is here, so target by adding a hybrid key (setup * processing descending) in solver_lib — the lower layer cannot reliably derive this without explicit guidance and will continue using the naive sort. pre_process appends the exact strategy to the solver's prompt so it rewrites its own permutation using the helper while keeping batch_assignment; this is small, auditable, and generalizes to any n_jobs/n_machines without task_id branching.
+
+
+## What You Can Produce
+
+You can output any combination of:
+
+### pre_process (strategy guidance)
+Python code that runs BEFORE the solver sees the task. Your code has access to:
+- `task` (read-only TaskDescription with .task_id, .description, .metadata)
+- `outer_context` (string: guidance from higher meta-layers — use this to ADAPT your intervention based on higher layers' strategic decisions; empty if you are the outermost layer)
+
+You MUST set the `additional_context` variable (a string that gets appended to the solver's prompt).
+
+CRITICAL: Set the `additional_context` variable directly. Do NOT modify the `task` object — it is read-only.
+
+### solver_lib (solver-visible code library)
+Python functions that will be PREPENDED to the solver's generated code and available at runtime inside the sandbox. The solver sees their signatures in its prompt and can call them directly.
+
+Use this to provide working algorithm implementations that the solver cannot reliably write from scratch. This is different from pre_process (which provides strategy guidance as text) — solver_lib provides actual executable code.
+
+Example:
+```solver_lib:local_search
+def local_search(solution, evaluate_fn, time_limit=8.0):
+    """Iteratively improve solution via random swaps within time limit."""
+    import time, random
+    best, best_score = solution, evaluate_fn(solution)
+    start = time.time()
+    while time.time() - start < time_limit:
+        keys = list(best.keys())
+        if len(keys) < 2:
+            break
+        i, j = random.sample(range(len(keys)), 2)
+        neighbor = dict(best)
+        neighbor[keys[i]], neighbor[keys[j]] = neighbor[keys[j]], neighbor[keys[i]]
+        score = evaluate_fn(neighbor)
+        if score > best_score:
+            best, best_score = neighbor, score
+    return best
+```
+
+IMPORTANT for solver_lib:
+- Functions run inside the sandbox, NOT in the meta-layer
+- Only use Python standard library imports (no numpy, scipy, etc.)
+- Each block should define a single self-contained function
+- Later layers can override a function by providing a solver_lib block with the same name
+- solver_lib functions from different layers share a runtime namespace and can call each other
+- Every function MUST include type annotations and a docstring with (a) one-line summary, (b) Args section listing every parameter with its expected type and meaning, (c) Returns section describing the return type and structure. The solver only sees the signature and docstring, not the full source — the docstring is the API contract. Example:
+      def pack_items(items: list, capacity: int) -> tuple:
+          """Pack items into bins using first-fit decreasing.
+
+          Args:
+              items: list[tuple[int, int, str]] — each is (width, height, item_id).
+              capacity: int — max bin weight.
+
+          Returns:
+              tuple[int, list[dict]] — (total_cost, placements) where each dict
+              has keys 'id' (str), 'x' (int), 'y' (int).
+          """
+
+## Output Format
+
+Respond with EXACTLY this structure (omit sections you don't need):
+
+```rationale
+## Diagnosis
+<the specific failure mode or bottleneck you are targeting, grounded in the score data, the headroom table, and the per-trace failure classes above — name the actual tasks it affects>
+
+## Intervention
+<what you will change and EXACTLY which tasks it targets. For every solver_lib helper you add, name the failing task it addresses and why the solver cannot write it reliably from scratch. Do not promise code you are not emitting.>
+
+## Why this is different
+<how this differs from what the injected-code history already tried — do NOT repeat a prior approach; if you cannot beat it, emit nothing>
+```
+
+```pre_process
+<python code>
+```
+
+```solver_lib:<name>
+<python function code>
+```
+
+IMPORTANT:
+- pre_process must be self-contained Python. Do not import external packages beyond the standard library.
+- Focus on STRUCTURAL improvements, not individual error patches.
+- If a previous layer's fix hurts certain tasks, add task-type conditionals to bypass it.
+- GENERALIZE: condition on task STRUCTURE (size, constraints, metadata), NEVER on specific task_id string literals — task_id-keyed code does not transfer to unseen tasks.
+- If you add a solver_lib helper, name the specific failing task it targets and why the solver cannot reliably write it itself.
+- Keep code simple and robust — complex code is more likely to break.
+- Use pre_process for strategy guidance (text); use solver_lib for reusable implementations (code).
+- Favor small (≤30 lines), audit-able helpers over large multi-purpose ones. Helpers that break the runtime env (creating envs, installing packages, depending on uncommon CLIs) introduce more failures than they prevent.

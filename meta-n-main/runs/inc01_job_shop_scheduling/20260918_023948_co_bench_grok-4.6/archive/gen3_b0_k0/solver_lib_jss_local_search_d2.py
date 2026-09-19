@@ -1,0 +1,69 @@
+def jss_local_search(start_times, machines, times, n_jobs, n_machines, max_passes=5):
+    """Run a lightweight adjacent-swap local search on the JSSP solution.
+    Repeatedly selects any machine that has >=2 operations, picks two
+    consecutive operations in the current order, swaps their start times,
+    and accepts the swap only when the makespan strictly decreases.
+    Stops after max_passes or when no improving swap exists.
+
+    Args:
+        start_times: list[list[float]] — start time of each operation
+        machines: list[list[int]] — machine index for each operation
+        times: list[list[float]] — processing time for each operation
+        n_jobs: int
+        n_machines: int
+        max_passes: int — number of full passes over all machines
+
+    Returns:
+        tuple: (improved_start_times, final_makespan)
+    """
+    import copy
+    import random
+    current = copy.deepcopy(start_times)
+    best_makespan = float('inf')
+    for _ in range(max_passes):
+        improved = False
+        for mach in range(n_machines):
+            ops = [(j, m) for j in range(n_jobs)
+                   for m in range(n_machines) if machines[j][m] == mach]
+            if len(ops) < 2:
+                continue
+            ops.sort(key=lambda jm: current[jm[0]][jm[1]])
+            for i in range(len(ops) - 1):
+                j1, m1 = ops[i]
+                j2, m2 = ops[i + 1]
+                # compute old makespan
+                old_finish = [0.0] * n_machines
+                for j in range(n_jobs):
+                    for m in range(n_machines):
+                        mach_ = machines[j][m]
+                        if m > 0:
+                            old_finish[mach_] = max(old_finish[mach_],
+                                                    current[j][m - 1] + times[j][m - 1])
+                        old_finish[mach_] = max(old_finish[mach_],
+                                                current[j][m] + times[j][m])
+                old_makespan = max(old_finish)
+                # swap
+                s1, s2 = current[j1][m1], current[j2][m2]
+                current[j1][m1], current[j2][m2] = s2, s1
+                # compute new makespan
+                new_finish = [0.0] * n_machines
+                for j in range(n_jobs):
+                    for m in range(n_machines):
+                        mach_ = machines[j][m]
+                        if m > 0:
+                            new_finish[mach_] = max(new_finish[mach_],
+                                                    current[j][m - 1] + times[j][m - 1])
+                        new_finish[mach_] = max(new_finish[mach_],
+                                                current[j][m] + times[j][m])
+                new_makespan = max(new_finish)
+                delta = new_makespan - old_makespan
+                if delta < 0:
+                    improved = True
+                    best_makespan = new_makespan
+                    break  # accept first improving swap
+                else:
+                    # revert swap
+                    current[j1][m1], current[j2][m2] = s1, s2
+        if not improved:
+            break
+    return current, best_makespan

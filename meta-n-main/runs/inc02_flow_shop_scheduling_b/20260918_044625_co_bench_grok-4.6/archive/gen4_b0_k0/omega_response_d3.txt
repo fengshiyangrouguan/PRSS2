@@ -1,0 +1,40 @@
+```rationale
+## Diagnosis
+Indexing errors stem from boundary/index mishandling in makespan eval (C[][] access, n=0/m=0 edge cases, insertion loop when seq empty or n small) on Tai100+ instances (100% of failures). This blocks any permutation-based or insertion heuristic, keeping score at 0.000 despite 0.792 headroom.
+
+## Intervention
+Add solver_lib.compute_makespan (O(n m) reusable evaluator with full boundary handling) and pre_process guidance instructing hybrid solver (brute-force permutations via itertools for n<=9; total-processing-time sort heuristic for n>9). This directly targets the failing Tai instances that previously regressed to zero via index errors or timeouts; solver_lib is called directly from generated code.
+
+## Why this is different
+Unlike prior NEH injection (which still produced index errors on large Tai and did not reach the archive's 0.792 via simple sort), this structural change uses the proven minimal-heuristic class from the best candidate (permutations only for tiny n, total-time sort otherwise) plus a correct makespan primitive the solver cannot reliably implement itself.
+```
+
+```pre_process
+additional_context = "Prefer the compute_makespan helper from solver_lib. For n <= 9 use permutations to find optimal order; for n > 9 sort jobs by descending total processing time across machines (simple O(n m) heuristic). Call compute_makespan(perm) to evaluate any candidate sequence."
+```
+
+```solver_lib:compute_makespan
+def compute_makespan(matrix: list[list[float]], perm: list[int]) -> float:
+    """Compute makespan for a job permutation on m machines.
+
+    Args:
+        matrix: list[list[float]] — matrix[job][machine] = processing time of job on that machine (0-based).
+        perm: list[int] — 0-based job order.
+
+    Returns:
+        float — makespan value.
+    """
+    n = len(perm)
+    if n == 0:
+        return 0.0
+    m = len(matrix[0]) if matrix else 0
+    C = [[0.0] * m for _ in range(n)]
+    for i in range(n):
+        job = perm[i]
+        for j in range(m):
+            if i == 0:
+                C[i][j] = matrix[job][j] if j == 0 else C[i][j - 1] + matrix[job][j]
+            else:
+                C[i][j] = max(C[i - 1][j], C[i][j - 1]) + matrix[job][j]
+    return C[n - 1][m - 1]
+```

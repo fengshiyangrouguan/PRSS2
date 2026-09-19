@@ -1,0 +1,9 @@
+{
+  "pre_process": "additional_context = \"\"\"Embed the correct_greedy_crew_assignment helper directly into the solver code instead of importing it. Sort tasks by start time. Maintain an explicit list of current end-times for each of the K crews. For each task in order, scan the K crews and assign to the first one whose current end-time plus the task's duration fits within time_limit and that has a valid arc connection from the last task on that crew (or start a new crew if none). Append the task ID to that crew's list, update the crew's end-time, and track all assigned tasks. After processing all tasks, verify exactly N tasks were assigned; if any remain unplaced, return empty crews. Do not modify or call any external module \u2014 the helper code below must be copied verbatim into the solver's implementation.\"\"\"",
+  "code_library": {},
+  "code_library_bash": {},
+  "rationale": "",
+  "source_depth": 5,
+  "task_solution_map": {},
+  "sandbox_verified_names": []
+}

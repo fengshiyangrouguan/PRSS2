@@ -1,0 +1,1 @@
+additional_context = "Ignore any prior hybrid product key. Instead call the lpt_permutation helper from solver_lib to obtain a longest-processing-time (descending) 1-based permutation. Keep batch_assignment exactly as round-robin. The LPT heuristic prioritizes jobs with long processing times to reduce makespan under reentrancy; document this choice in the returned dict."

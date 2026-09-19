@@ -1,0 +1,52 @@
+{
+  "size": 1,
+  "best_mean_score": 0.7594723805244677,
+  "best_candidate_id": "gen0_seed",
+  "per_task_best": {
+    "aircraft_landing": {
+      "score": 0.9527004480588209,
+      "candidate_id": "gen0_seed"
+    },
+    "assignment_problem": {
+      "score": 0.5,
+      "candidate_id": "gen0_seed"
+    },
+    "assortment_problem": {
+      "score": 0.5876540734145644,
+      "candidate_id": "gen0_seed"
+    },
+    "bin_packing___one_dimensional": {
+      "score": 0.9380312331811949,
+      "candidate_id": "gen0_seed"
+    },
+    "capacitated_warehouse_location": {
+      "score": 0.6931798839533595,
+      "candidate_id": "gen0_seed"
+    },
+    "common_due_date_scheduling": {
+      "score": 0.9854934347305396,
+      "candidate_id": "gen0_seed"
+    }
+  },
+  "candidates": [
+    {
+      "candidate_id": "gen0_seed",
+      "parent_id": null,
+      "iteration": 0,
+      "depth": 1,
+      "mean_score": 0.7594723805244677,
+      "pass_at_1": 1.0,
+      "num_children": 0,
+      "temperature_used": 0.7,
+      "total_tokens": 22273,
+      "per_task_scores": {
+        "aircraft_landing": 0.9527004480588209,
+        "assignment_problem": 0.5,
+        "assortment_problem": 0.5310929171327017,
+        "bin_packing___one_dimensional": 0.9296111745469443,
+        "capacitated_warehouse_location": 0.6615180139102773,
+        "common_due_date_scheduling": 0.9819117294980623
+      }
+    }
+  ]
+}

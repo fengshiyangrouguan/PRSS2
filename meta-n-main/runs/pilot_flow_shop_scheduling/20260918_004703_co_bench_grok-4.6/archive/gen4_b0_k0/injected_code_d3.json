@@ -1,0 +1,9 @@
+{
+  "pre_process": "additional_context = \"CRITICAL: The injected solver_lib.compute_makespan helper MUST be used for EVERY makespan evaluation (NEH insertions, final output). NEVER implement or call any in-line compute_makespan function \u2014 always invoke solver_lib.compute_makespan(seq, matrix, n, m) instead. This is non-negotiable for correctness and to avoid timeouts on harder instances.\"",
+  "code_library": {},
+  "code_library_bash": {},
+  "rationale": "## Diagnosis\nThe core regression is in the solve skeleton's hardcoded compute_makespan (the buggy C[0][j] init and in-line recurrence), which was not replaced by calls to the injected solver_lib.compute_makespan despite the helper being present and correct. This produces invalid or suboptimal makespan values (especially on instances where m > n or large n/m like tai200_20/tai500_20 that already timeout), capping the continuous score at 0.730 and preventing further gains toward 1.0 on all flow_shop_scheduling test cases.\n\n## Intervention\nEnforce structural use of the existing solver_lib.compute_makespan helper in all makespan calls during NEH insertions (via pre_process guidance to the solver); do not add or override any new solver_lib functions. This targets flow_shop_scheduling exclusively, raising average makespan accuracy and sequence quality without touching outer heuristic logic or any other task.\n\n## Why this is different\nPrevious layer only injected the helper + rationale (keeping the outer solve skeleton unchanged), allowing the generated code to ignore the helper and retain the buggy in-line version; this layer makes a minimal structural conditioning change (pre_process) that forces the helper into the only failing component while preserving all prior gains.",
+  "source_depth": 3,
+  "task_solution_map": {},
+  "sandbox_verified_names": []
+}

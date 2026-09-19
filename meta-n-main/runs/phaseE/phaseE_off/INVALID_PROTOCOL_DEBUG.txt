@@ -1,0 +1,12 @@
+INVALID_PROTOCOL_DEBUG -- NOT AN EFFECT POINT
+=============================================
+This arm forked from a shared prefix whose boundary did NOT align with the
+first treatment-ACTIVE cut.  re-enters the checkpoint's iteration
+(evolutionary_orchestrator.py:788-796), so this run re-bred a second d2 child
+from the root instead of continuing from the shared d2, and UCB parent
+selection (all scores tied at 0.0000) then wandered across the root and d2
+candidates. Treatment therefore did not necessarily first act where intended.
+
+Arm B was deliberately NOT run. This pair enters no effect table.
+
+See PHASE_C_AUTOPSY_V1.md.

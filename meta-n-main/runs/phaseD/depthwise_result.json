@@ -1,0 +1,80 @@
+{
+  "task": "Flow shop scheduling",
+  "rows": [
+    {
+      "depth": 1,
+      "official_test": 0.0,
+      "predictive_test": 0.0,
+      "delta": 0.0,
+      "off_reached": true,
+      "pred_reached": true,
+      "official_dev": 0.7594723805244677,
+      "predictive_dev": 0.7594723805244677,
+      "official_cand": "gen0_seed",
+      "predictive_cand": "gen0_seed"
+    },
+    {
+      "depth": 2,
+      "official_test": 0.0,
+      "predictive_test": 0.0,
+      "delta": 0.0,
+      "off_reached": true,
+      "pred_reached": true,
+      "official_dev": 0.8171569235451934,
+      "predictive_dev": 0.8279488118336259,
+      "official_cand": "merge_oracle",
+      "predictive_cand": "gen2_b0_k0"
+    },
+    {
+      "depth": 3,
+      "official_test": 0.0,
+      "predictive_test": 0.0,
+      "delta": 0.0,
+      "off_reached": true,
+      "pred_reached": true,
+      "official_dev": 0.8171569235451934,
+      "predictive_dev": 0.8279488118336259,
+      "official_cand": "gen3_b0_k0",
+      "predictive_cand": "gen2_b0_k0"
+    },
+    {
+      "depth": 4,
+      "official_test": null,
+      "predictive_test": null,
+      "delta": null,
+      "off_reached": false,
+      "pred_reached": false,
+      "official_dev": 0.8171569235451934,
+      "predictive_dev": 0.8279488118336259,
+      "official_cand": "gen3_b0_k0",
+      "predictive_cand": "gen2_b0_k0"
+    },
+    {
+      "depth": 5,
+      "official_test": null,
+      "predictive_test": null,
+      "delta": null,
+      "off_reached": false,
+      "pred_reached": false,
+      "official_dev": 0.8171569235451934,
+      "predictive_dev": 0.8279488118336259,
+      "official_cand": "gen3_b0_k0",
+      "predictive_cand": "gen2_b0_k0"
+    },
+    {
+      "depth": 6,
+      "official_test": null,
+      "predictive_test": null,
+      "delta": null,
+      "off_reached": false,
+      "pred_reached": false,
+      "official_dev": 0.8171569235451934,
+      "predictive_dev": 0.8279488118336259,
+      "official_cand": "gen3_b0_k0",
+      "predictive_cand": "gen2_b0_k0"
+    }
+  ],
+  "arm_a_max_depth": 3,
+  "arm_b_max_depth": 3,
+  "d1_gate_pass": true
+}

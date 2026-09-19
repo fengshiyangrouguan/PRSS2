@@ -1,0 +1,96 @@
+```rationale
+The current assortment_problem solver (score 0.1399, matching best-known 0.140) is a naive per-piece stock allocator that never packs >1 piece per stock and ignores max counts/orientation choices beyond a single try. Eval feedback confirms per-instance variance (0.083–0.208), with clear waste on larger instances. Largest headroom is here (even though gap=0), so improve packing density via a helper that (a) groups pieces by stock_type, (b) uses first-fit-with-orientation per stock, (c) respects min/max counts, (d) prefers compact orientations. This targets the exact failure pattern (under-utilized area) without touching frozen tasks.
+```
+
+```pre_process
+additional_context = "Use the provided pack_stocks helper to implement a first-fit bin-packing routine that (1) respects each piece's min/max counts, (2) tries both orientations per stock_type, (3) greedily fills existing stocks of the same type before opening new ones, and (4) only opens the minimal number of stocks needed. This will reduce waste and raise objective on high-waste instances (e.g. those scoring <0.15)."
+```
+
+```solver_lib:pack_stocks
+def pack_stocks(stocks: list, pieces: list) -> dict:
+    """Improved stock packer using first-fit-with-orientation.
+    Args:
+        stocks: list of {'length': float, 'width': float, 'stock_type': int}
+        pieces: list of {'min': int, 'max': int, 'length': float, 'width': float, 'piece_idx': int}
+    Returns:
+        dict with 'objective' (0.0-1.0 waste reduction) and 'placements' dict keyed by instance_id.
+    """
+    import copy
+    placements = {}
+    current_id = 1
+    total_used_area = 0.0
+    total_stock_area = 0.0
+    # Group pieces by stock_type
+    from collections import defaultdict
+    pieces_by_type = defaultdict(list)
+    for p in pieces:
+        pieces_by_type[p['stock_type']].append(p)
+    # For each stock_type, create list of available stocks
+    available_stocks = []
+    for s in stocks:
+        total_stock_area += s['length'] * s['width']
+        available_stocks.append({
+            'length': s['length'],
+            'width': s['width'],
+            'used': 0.0,
+            'stock_type': s['stock_type'],
+            'placements': []
+        })
+    # Process each piece type
+    for st, plist in pieces_by_type.items():
+        remaining_min_max = [(p['min'], p['max'], p['length'], p['width'], p['piece_idx']) for p in plist]
+        # Sort by area desc
+        remaining_min_max.sort(key=lambda x: x[2]*x[3], reverse=True)
+        for min_c, max_c, pl, pw, pidx in remaining_min_max:
+            needed = min_c
+            while needed > 0:
+                placed_in_existing = False
+                for stock in available_stocks:
+                    if stock['stock_type'] != st:
+                        continue
+                    # Try orientation 0
+                    if pl <= stock['length'] - stock['used'] and pw <= stock['width']:
+                        stock['placements'].append({
+                            'piece': pidx + 1,
+                            'x': 0.0,
+                            'y': stock['used'],
+                            'orientation': 0
+                        })
+                        stock['used'] += pl * pw
+                        needed -= 1
+                        placed_in_existing = True
+                        break
+                    # Try orientation 1
+                    elif pw <= stock['length'] - stock['used'] and pl <= stock['width']:
+                        stock['placements'].append({
+                            'piece': pidx + 1,
+                            'x': 0.0,
+                            'y': stock['used'],
+                            'orientation': 1
+                        })
+                        stock['used'] += pw * pl
+                        needed -= 1
+                        placed_in_existing = True
+                        break
+                if not placed_in_existing:
+                    # Open new stock of same type
+                    new_stock = {
+                        'length': pl,  # dummy, will be replaced below
+                        'width': pw,
+                        'used': pl * pw,
+                        'stock_type': st,
+                        'placements': [{
+                            'piece': pidx + 1,
+                            'x': 0.0,
+                            'y': 0.0,
+                            'orientation': 0
+                        }]
+                    }
+                    available_stocks.append(new_stock)
+                    needed -= 1
+    # Build final placements and objective
+    for stock in available_stocks:
+        for plmt in stock['placements']:
+            placements[current_id] = {
+                "stock_type": stock['stock_type'],
+                "placements": [

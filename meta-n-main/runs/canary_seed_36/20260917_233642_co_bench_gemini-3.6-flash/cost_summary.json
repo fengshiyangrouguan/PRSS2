@@ -1,0 +1,9 @@
+{
+  "outer_calls": 1,
+  "outer_prompt_tokens": 1141,
+  "outer_completion_tokens": 1532,
+  "outer_cached_tokens": 0,
+  "outer_cost_usd": 0.0,
+  "model": "gemini-3.6-flash",
+  "backend": "openrouter"
+}

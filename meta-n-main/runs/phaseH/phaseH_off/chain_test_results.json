@@ -1,0 +1,12 @@
+{
+  "chain_test_mean_score": 0.7527326173972048,
+  "chain_test_scores": {
+    "aircraft_landing": 0.9125681418337923,
+    "assignment_problem": 0.5313327865368271,
+    "assortment_problem": 0.45978433858416506,
+    "bin_packing___one_dimensional": 0.9402749366067706,
+    "capacitated_warehouse_location": 0.6984766158091983,
+    "common_due_date_scheduling": 0.9739588850124749
+  },
+  "candidate_id": "gen3_b0_k0"
+}

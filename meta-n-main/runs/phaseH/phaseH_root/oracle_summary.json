@@ -1,0 +1,30 @@
+{
+  "oracle_mean_score": 0.7761765122230799,
+  "num_contributing_chains": 1,
+  "per_task_best_sources": {
+    "aircraft_landing": {
+      "score": 0.9527004480588209,
+      "candidate_id": "gen0_seed"
+    },
+    "assignment_problem": {
+      "score": 0.5,
+      "candidate_id": "gen0_seed"
+    },
+    "assortment_problem": {
+      "score": 0.5876540734145644,
+      "candidate_id": "gen0_seed"
+    },
+    "bin_packing___one_dimensional": {
+      "score": 0.9380312331811949,
+      "candidate_id": "gen0_seed"
+    },
+    "capacitated_warehouse_location": {
+      "score": 0.6931798839533595,
+      "candidate_id": "gen0_seed"
+    },
+    "common_due_date_scheduling": {
+      "score": 0.9854934347305396,
+      "candidate_id": "gen0_seed"
+    }
+  }
+}

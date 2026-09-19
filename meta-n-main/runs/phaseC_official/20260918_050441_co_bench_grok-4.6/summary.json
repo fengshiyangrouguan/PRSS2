@@ -1,0 +1,31 @@
+{
+  "archive_size": 5,
+  "total_iterations": 4,
+  "total_tokens": 50914,
+  "token_usage": {
+    "outer_total": 50914,
+    "outer_prompt": 18619,
+    "outer_completion": 32295,
+    "outer_calls": 11,
+    "inner_total": 0,
+    "inner_prompt": 0,
+    "inner_completion": 0,
+    "inner_calls": 0
+  },
+  "best_mean_score": 0.7715861982558935,
+  "best_candidate_id": "gen0_seed",
+  "oracle_mean_score": 0.8101160626539669,
+  "test_mean_score": 0.8133094259570882,
+  "chain_test_mean_score": 0.7697624942998641,
+  "per_task_best_scores": {
+    "flow_shop_scheduling": 0.8101160626539669
+  },
+  "convergence_history": [
+    0.7715861982558935,
+    0.7715861982558935,
+    0.7715861982558935,
+    0.7715861982558935,
+    0.7715861982558935
+  ],
+  "run_status": "completed"
+}

@@ -1,0 +1,9 @@
+{
+  "pre_process": "if n > 100:\n    additional_context = (\n        \"For large instances (n>100) prefer the fast O(n m) heuristic: \"\n        \"sort jobs by increasing p[0] (first-machine processing time). \"\n        \"Only fall back to the two-job NEH insertion loop when n<=100 or m==2.\"\n    )\nelse:\n    additional_context = \"\"",
+  "code_library": {},
+  "code_library_bash": {},
+  "rationale": "Observed failure patterns: The provided solver is strong on small instances (n<=50, tai*5/10/*.txt all >0.89) and hits the Johnson's-rule optimum on m=2 cases, but the NEH insertion loop (O(n^3 m) because each of ~n insertions tries ~n positions and each makespan costs O(n m)) produces 10 s timeouts on the two largest benchmarks (tai200_20.txt and tai500_20.txt). Those timeouts map to raw_score=0 (hence the 0.772 aggregate). The per-task headroom is therefore concentrated on larger instances. A simple, low-risk improvement is to add size-aware strategy guidance: for n>100 switch to a fast O(n m) baseline heuristic that is already known to be strong on Flow-Shop (sort by first-machine time) before falling back to the slower NEH only when n is modest. This requires only a tiny pre_process block that appends guidance to the solver's prompt and preserves the existing solver_lib-free contract.",
+  "source_depth": 2,
+  "task_solution_map": {},
+  "sandbox_verified_names": []
+}

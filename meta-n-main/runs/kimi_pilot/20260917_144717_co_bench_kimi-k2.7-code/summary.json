@@ -1,0 +1,12 @@
+{
+  "iteration": 0,
+  "archive_size": 1,
+  "best_mean_score": 0.0,
+  "oracle_mean_score": 0.0,
+  "best_candidate_id": "gen0_seed",
+  "per_task_best_scores": {
+    "bin_packing___one_dimensional": 0.0
+  },
+  "total_tokens": 0,
+  "elapsed_s": 104.39006352424622
+}

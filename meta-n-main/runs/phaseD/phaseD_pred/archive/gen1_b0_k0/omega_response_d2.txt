@@ -1,0 +1,58 @@
+```rationale
+The failure pattern is a clear indexing bug in the makespan DP inside the permutation loop: when k=0, C[j][k-1] attempts C[j][-1], which raises IndexError (visible in every stderr trace). The provided code also omits the required first-row and first-column boundary initializations that every correct Fm||Cmax DP must have. Brute-force enumeration will never reach 0.794 on its own because 20! is impossible and even 5! is borderline; the immediate highest-ROI fix is to inject the canonical O(nm) completion-time routine that every textbook Fm||Cmax solver uses. Once the indexing bug is eliminated the same permutation skeleton can at least be scored on the tiniest instances (tai50_5.txt etc.) and the mean will jump. All other tasks remain frozen; only flow_shop_scheduling is touched.
+```
+
+```solver_lib:flow_shop_dp
+def compute_makespan(sequence: list, matrix: list) -> float:
+    """Computes makespan for a given job permutation on Fm||Cmax using standard DP.
+
+    Args:
+        sequence: list of job indices (0-based) in processing order.
+        matrix: 2D list of processing times, matrix[j][k] = time of job j on machine k.
+
+    Returns:
+        makespan: the Cmax value (makespan) of the sequence.
+    """
+    n = len(sequence)
+    m = len(matrix[0])
+    C = [[0.0] * m for _ in range(n + 1)]
+    # First row (first job on all machines)
+    C[1][0] = matrix[sequence[0]][0]
+    for k in range(1, m):
+        C[1][k] = C[1][k - 1] + matrix[sequence[0]][k]
+    # First column (first machine for remaining jobs)
+    for j in range(2, n + 1):
+        C[j][0] = C[j - 1][0] + matrix[sequence[j - 1]][0]
+        # Remaining cells
+        for k in range(1, m):
+            C[j][k] = max(C[j - 1][k], C[j][k - 1]) + matrix[sequence[j - 1]][k]
+    return C[n][m - 1]
+```
+
+```solver_lib:solve
+def solve(**kwargs):
+    """Exact permutation solver for flow shop scheduling (Fm||Cmax) with fixed DP.
+
+    Args:
+        n: int — number of jobs.
+        m: int — number of machines.
+        matrix: list[list[float]] — processing time matrix (job x machine).
+
+    Returns:
+        dict: {'job_sequence': list of 1-based job indices in optimal order}
+    """
+    import itertools
+    from math import inf
+
+    matrix = kwargs['matrix']
+    best_makespan = inf
+    best_sequence = None
+
+    for perm in itertools.permutations(range(kwargs['n'])):
+        makespan = compute_makespan(perm, matrix)
+        if makespan < best_makespan:
+            best_makespan = makespan
+            best_sequence = perm
+
+    return {'job_sequence': [x + 1 for x in best_sequence]}
+```

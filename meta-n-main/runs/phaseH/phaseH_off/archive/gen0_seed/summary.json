@@ -1,0 +1,20 @@
+{
+  "candidate_id": "gen0_seed",
+  "parent_id": null,
+  "iteration": 0,
+  "depth": 1,
+  "mean_score": 0.7594723805244677,
+  "pass_at_1": 1.0,
+  "per_task_scores": {
+    "aircraft_landing": 0.9527004480588209,
+    "assignment_problem": 0.5,
+    "assortment_problem": 0.5310929171327017,
+    "bin_packing___one_dimensional": 0.9296111745469443,
+    "capacitated_warehouse_location": 0.6615180139102773,
+    "common_due_date_scheduling": 0.9819117294980623
+  },
+  "num_children": 0,
+  "temperature_used": 0.7,
+  "total_tokens": 22273,
+  "created_at": "2026-09-18T09:15:49.717712"
+}

@@ -1,0 +1,7 @@
+{
+  "chain_test_mean_score": 0.7699489291860747,
+  "chain_test_scores": {
+    "flow_shop_scheduling": 0.7699489291860747
+  },
+  "candidate_id": "gen4_b0_k0"
+}

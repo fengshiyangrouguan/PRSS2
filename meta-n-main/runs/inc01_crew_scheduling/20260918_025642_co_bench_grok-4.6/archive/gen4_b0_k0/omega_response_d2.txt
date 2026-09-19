@@ -1,0 +1,72 @@
+```rationale
+The root cause of the 0.000 score is that the greedy assignment loop (sorted by start time) contains multiple logical bugs: (1) the inner cost-selection logic uses an always-0 "added" value and an incorrect continue that skips valid first-crew assignments, (2) the fallback "start new crew" only triggers on the very first empty crew and never checks later crews, and (3) no global tracking of which tasks have been assigned, so some tasks are silently dropped before the final validity check. Consequently the returned crews never contain exactly N tasks. The fix is to replace the buggy assignment with a single, self-contained greedy routine that (a) sorts tasks by start time, (b) for each task scans all K crews to pick the one with minimal connection cost (or the first empty crew) while enforcing the time-window and arc constraints, (c) appends the task to that crew's list, and (d) finally validates that every task was placed. This routine is pure Python, uses only the supplied kwargs, and can be injected as a drop-in helper so the layer-below solver can call it instead of its current broken inline logic. No branching on task_id literals; the helper is structure-agnostic.
+```
+
+```pre_process
+additional_context = """Use the greedy_crew_assignment helper (provided via solver_lib) to perform the actual assignment. Sort tasks by start time. For each task, scan all crews: prefer the crew with lowest connection cost (or the first empty crew) that satisfies the time-window constraint and the arc cost. Append the task to the chosen crew and mark it assigned. After processing all tasks, verify that exactly N tasks were placed across all crews; if not, return the empty solution. Do not modify the helper code itself."""
+```
+
+```solver_lib:greedy_crew_assignment
+def greedy_crew_assignment(N: int, K: int, time_limit: float, tasks: dict, arcs: dict) -> dict:
+    """Greedy assignment of N tasks to K crews.
+
+    Args:
+        N: total number of tasks to cover
+        K: number of crews
+        time_limit: maximum duration any crew may cover
+        tasks: dict mapping task_id to [start_time, end_time] float pair
+        arcs: dict mapping (prev_task, next_task) -> connection_cost float
+
+    Returns:
+        {"crews": list of lists}, where each inner list is the ordered task_ids for one crew
+        (empty lists if any task could not be assigned)
+    """
+    import sys
+    # Sort tasks by start time
+    task_list = sorted(tasks.keys(), key=lambda t: tasks[t][0])
+    crews = [[] for _ in range(K)]
+    assigned = set()
+    for task in task_list:
+        if task in assigned:
+            continue
+        best_added = sys.float_info.max
+        best_crew = -1
+        best_prev = None
+        for c_idx in range(K):
+            crew = crews[c_idx]
+            if not crew:  # empty crew - start new
+                s, f = tasks[task]
+                if f - s > time_limit:
+                    continue
+                added = 0.0
+                if added < best_added:
+                    best_added = added
+                    best_crew = c_idx
+                    best_prev = None
+                continue
+            last = crew[-1]
+            if (last, task) not in arcs:
+                continue
+            cost = arcs[(last, task)]
+            last_f = tasks[last][1]
+            if last_f > tasks[task][0]:
+                continue
+            new_f = max(last_f, tasks[task][1])
+            if new_f - tasks[crew[0]][0] > time_limit:
+                continue
+            added = cost
+            if added < best_added:
+                best_added = added
+                best_crew = c_idx
+                best_prev = last
+        if best_crew != -1:
+            if best_prev is None:
+                crews[best_crew] = [task]
+            else:
+                crews[best_crew].append(task)
+            assigned.add(task)
+    # Validate coverage
+    if len(assigned) != N:
+        return {"crews": [[] for _ in range(K)]}
+    return {"crews": crews}
+```

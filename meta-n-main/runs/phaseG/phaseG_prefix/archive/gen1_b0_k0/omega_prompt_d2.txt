@@ -1,0 +1,1668 @@
+You are one layer in a recursive self-improving system called Meta^n.
+
+## Your Role
+Given the execution traces and context of the system below you, produce code that improves its performance — specifically, that raises the MEAN CONTINUOUS SCORE across tasks. Treat a higher score as the goal even on tasks that already "pass": most tasks here are scored on a 0.0–1.0 continuum, not pass/fail. You do NOT solve tasks directly — you write code that helps the solver below you perform better.
+
+## System Context
+Current depth: 2
+Tasks attempted: 6
+Current mean score: 0.727  ← PRIMARY OBJECTIVE: raise the MEAN CONTINUOUS SCORE (not just the pass count)
+Score spread (6 tasks): [0.0-0.3]x0  [0.3-0.7]x3  [0.7-1.0]x3
+pass@1 (binary success rate): 100.0%
+
+## DEEPEN — keep improving ONLY task 'assignment_problem'
+The layer BELOW already worked 'assignment_problem'; its current solution is the starting point, NOT a blank slate. Reason about what that layer produced and improve 'assignment_problem' FURTHER — do NOT discard or restart it. Every OTHER task is FROZEN and will NOT be re-solved; spend NO effort on them.
+## Opportunity — per-task headroom to best-known (largest gap first)
+Target the largest-gap tasks. Tasks with a small/zero gap are near their ceiling — do NOT regress them.
+
+| task | now | best-known | gap |
+|------|-----|-----------|-----|
+| assortment_problem | 0.569 | 0.701 | +0.131 |
+| aircraft_landing | 0.863 | 0.978 | +0.115 |
+| bin_packing___one_dimensional | 0.848 | 0.954 | +0.106 |
+| common_due_date_scheduling | 0.926 | 0.985 | +0.060 |
+| capacitated_warehouse_location | 0.655 | 0.694 | +0.040 |
+| assignment_problem | 0.500 | 0.500 | +0.000 |
+
+## Execution Traces (sampled: 0 failures, 6 successes)
+--- Task: aircraft_landing [SUCCESS score=0.863] ---
+Script:
+```python
+def solve(**kwargs):
+    import time
+    import math
+    import random
+
+    start_time = time.time()
+    deadline = start_time + 8.5
+
+    n = int(kwargs.get("num_planes", 0))
+    m = max(1, int(kwargs.get("num_runways", 1)))
+    planes = kwargs["planes"]
+    sep = kwargs["separation"]
+
+    E = [float(p["earliest"]) for p in planes]
+    T = [float(p["target"]) for p in planes]
+    L = [float(p["latest"]) for p in planes]
+    PE = [float(p["penalty_early"]) for p in planes]
+    PL = [float(p["penalty_late"]) for p in planes]
+
+    def eval_sequence(seq):
+        """Return (feasible, cost, times_for_seq) for a fixed runway order."""
+        k = len(seq)
+        if k == 0:
+            return True, 0.0, []
+
+        earliest = [0.0] * k
+        for a, p in enumerate(seq):
+            if a == 0:
+                val = E[p]
+            else:
+                prev = seq[a - 1]
+                val = max(E[p], earliest[a - 1] + float(sep[prev][p]))
+            if val > L[p] + 1e-9:
+                return False, 1e100, []
+            earliest[a] = val
+
+        latest = [0.0] * k
+        for a in range(k - 1, -1, -1):
+            p = seq[a]
+            if a == k - 1:
+                val = L[p]
+            else:
+                nxt = seq[a + 1]
+                val = min(L[p], latest[a + 1] - float(sep[p][nxt]))
+            if val + 1e-9 < earliest[a]:
+                return False, 1e100, []
+            latest[a] = val
+
+        times = [0.0] * k
+        cost = 0.0
+
+        # Backward target-clamping gives a good feasible timing for this fixed order.
+        upper = 1e100
+        for a in range(k - 1, -1, -1):
+            p = seq[a]
+            hi = min(latest[a], upper)
+            lo = earliest[a]
+            if T[p] < lo:
+                t = lo
+            elif T[p] > hi:
+                t = hi
+            else:
+                t = T[p]
+            times[a] = t
+            if t <= T[p]:
+                cost += (T[p] - t) * PE[p]
+            else:
+                cost += (t - T[p]) * PL[p]
+            if a > 0:
+                prev = seq[a - 1]
+                upper = t - float(sep[prev][p])
+
+        return True, cost, times
+
+    def eval_sequence_relaxed(seq):
+        """Always returns a forward feasible-as-possible timing and violation amount."""
+        k = len(seq)
+        times = [0.0] * k
+        violation = 0.0
+        cost = 0.0
+        for a, p in enumerate(seq):
+            if a == 0:
+                t = max(E[p], min(T[p], L[p]))
+            else:
+                prev = seq[a - 1]
+                t = max(E[p], times[a - 1] + float(sep[prev][p]))
+                if t < T[p]:
+                    t = min(T[p], L[p])
+            if t > L[p]:
+                violation += t - L[p]
+            times[a] = min(max(t, E[p]), max(L[p], t))
+            tt = times[a]
+            if tt <= T[p]:
+                cost += (T[p] - tt) * PE[p]
+            else:
+                cost += (tt - T[p]) * PL[p]
+        return violation, cost, times
+
+    def all_times(seqs):
+        out = {}
+        total_cost = 0.0
+        feasible = True
+        for r, seq in enumerate(seqs):
+            ok, c, ts = eval_sequence(seq)
+            if not ok:
+                feasible = False
+                _, c, ts = eval_sequence_relaxed(seq)
+            total_cost += c
+            for idx, p in enumerate(seq):
+                out[p] = (ts[idx], r)
+        return feasible, total_cost, out
+
+    # Several priority rules; keep the best complete feasible schedule.
+    orders = []
+    ids = list(range(n))
+    orders.append(sorted(ids, key=lambda i: (L[i], T[i], E[i])))
+    orders.append(sorted(ids, key=lambda i: (T[i], L[i], E[i])))
+    orders.append(sorted(ids, key=lambda i: (E[i], T[i], L[i])))
+    orders.append(sorted(ids, key=lambda i: ((L[i] - E[i]), T[i])))
+    orders.append(sorted(ids, key=lambda i: (T[i] - E[i], L[i])))
+
+    best_seqs = None
+    best_cost = 1e100
+    best_feasible = False
+
+    for order in orders:
+        if time.time() > deadline:
+            break
+
+        seqs = [[] for _ in range(m)]
+        feasible_build = True
+
+        for p in order:
+            if time.time() > deadline:
+                break
+
+            best_move = None
+            best_move_score = 1e100
+
+            total_len = sum(len(s) for s in seqs)
+
+            for r in range(m):
+                seq = seqs[r]
+                positions = range(len(seq) + 1)
+
+                # For very large instances, examine a smaller set of promising insertion points.
+                if total_len > 220 and len(seq) > 18:
+                    pos_set = {0, len(seq)}
+                    for a, q in enumerate(seq):
+                        if abs(T[q] - T[p]) <= 1000 or len(pos_set) < 12:
+                            pos_set.add(a)
+                            pos_set.add(a + 1)
+                    positions = sorted(pos_set)
+
+                for pos in positions:
+                    cand = seq[:pos] + [p] + seq[pos:]
+                    ok, c, _ = eval_sequence(cand)
+                    if ok:
+                        # Prefer low runway cost, and mildly prefer keeping time order close to target order.
+                        score = c + 0.0001 * abs(pos - len(seq) / 2.0)
+                        if score < best_move_score:
+                            best_move_score = score
+                            best_move = (r, pos, cand)
+
+            if best_move is not None:
+                r, pos, cand = best_move
+                seqs[r] = cand
+            else:
+                feasible_build = False
+                # Fallback: append to the runway with smallest relaxed violation.
+                br = 0
+                bscore = 1e100
+                bcand = None
+                for r in range(m):
+                    cand = seqs[r] + [p]
+                    v, c, _ = eval_sequence_relaxed(cand)
+                    score = v * 1e9 + c
+                    if score < bscore:
+                        bscore = score
+                        br = r
+                        bcand = cand
+                seqs[br] = bcand
+
+        ok, c, _ = all_times(seqs)
+        if ok and c < best_cost:
+            best_cost = c
+            best_seqs = [s[:] for s in seqs]
+            best_feasible = True
+        elif best_seqs is None:
+            best_seqs = [s[:] for s in seqs]
+
+    if best_seqs is None:
+        best_seqs = [[] for _ in range(m)]
+        for i in range(n):
+            best_seqs[i % m].append(i)
+
+    # Local improvement by single-plane relocation/insertion.
+    if best_feasible:
+        improved = True
+        while improved and time.time() < deadline:
+            improved = False
+            current_ok, current_cost, _ = all_times(best_seqs)
+            if not current_ok:
+                break
+
+            for r1 in range(m):
+                if time.time() > deadline:
+                    break
+                for pos1 in range(len(best_seqs[r1])):
+                    if time.time() > deadline:
+                        break
+
+                    p = best_seqs[r1][pos1]
+                    base_r1 = best_seqs[r1][:pos1] + best_seqs[r1][pos1 + 1:]
+
+                    for r2 in range(m):
+                        if time.time() > deadline:
+                            break
+
+                        maxpos = len(best_seqs[r2]) + 1
+                        for pos2 in range(maxpos):
+                            if r1 == r2:
+                                if pos2 == pos1 or pos2 == pos1 + 1:
+                                    continue
+                                temp = best_seqs[r1][:]
+                                temp.pop(pos1)
+                                ins = pos2
+                                if pos2 > pos1:
+                                    ins -= 1
+                                temp.insert(ins, p)
+                                cand_seqs = [s[:] for s in best_seqs]
+                                cand_seqs[r1] = temp
+                            else:
+                                cand_seqs = [s[:] for s in best_seqs]
+                                cand_seqs[r1] = base_r1[:]
+                                cand = best_seqs[r2][:]
+                                cand.insert(pos2, p)
+                                cand_seqs[r2] = cand
+
+                            ok, c, _ = all_times(cand_seqs)
+                            if ok and c + 1e-7 < current_cost:
+                                best_seqs = cand_seqs
+                                best_cost = c
+                                improved = True
+                                break
+                        if improved:
+                            break
+                    if improved:
+                        break
+                if improved:
+                    break
+
+    feasible, cost, times_map = all_times(best_seqs)
+
+    # If the constructed schedule is infeasible, use a conservative append-by-earliest fallback.
+    if not feasible:
+        seqs = [[] for _ in range(m)]
+        ready = [0.0] * m
+        last = [-1] * m
+        for p in sorted(range(n), key=lambda i: (E[i], L[i], T[i])):
+            br = 0
+            bt = 1e100
+            for r in range(m):
+                if last[r] == -1:
+                    t = E[p]
+                else:
+                    t = max(E[p], ready[r] + float(sep[last[r]][p]))
+                if t < bt:
+                    bt = t
+                    br = r
+            seqs[br].append(p)
+            ready[br] = bt
+            last[br] = p
+        feasible, cost, times_map = all_times(seqs)
+
+    schedule = {}
+    for i in range(n):
+        if i in times_map:
+            t, r = times_map[i]
+        else:
+            t, r = T[i], 0
+        if t < E[i]:
+            t = E[i]
+        if t > L[i] and feasible:
+            t = L[i]
+        schedule[i + 1] = {"landing_time": float(t), "runway": int(r + 1)}
+
+    return {"schedule": schedule}
+```
+Stdout:
+score=0.8627
+raw_score=0.8627
+Eval feedback:
+airland1.txt -> Scores: ['0.854']
+airland10.txt -> Scores: ['0.974', '0.655']
+airland11.txt -> Scores: ['1.216', '0.743']
+airland12.txt -> Scores: ['1.172', '1.000']
+airland13.txt -> Scores: ['Separation violation on runway 1: Plane 2 lands at 1298.0 and Plane 5 at 1346.0 (required gap: 113.0).', '0.549']
+airland2.txt -> Scores: ['1.000']
+airland3.txt -> Scores: ['1.000']
+airland4.txt -> Scores: ['0.762', '1.000']
+airland5.txt -> Scores: ['1.000', '0.730']
+airland6.txt -> Scores: ['0.512']
+airland7.txt -> Scores: ['1.000']
+airland8.txt -> Scores: ['1.000']
+airland9.txt -> Scores: ['1.089', '0.807']
+Avg Dev Score: 0.8627
+
+--- Task: assignment_problem [SUCCESS score=0.500] ---
+Script:
+```python
+def solve(**kwargs):
+    """
+    Solves an instance of the Assignment Problem using the Hungarian algorithm.
+    """
+    n = kwargs.get("n")
+    cost_matrix = kwargs.get("cost_matrix")
+
+    if n is None:
+        n = len(cost_matrix)
+
+    if n == 0:
+        return {"total_cost": 0, "assignment": []}
+
+    try:
+        a = cost_matrix.tolist()
+    except AttributeError:
+        a = [list(row) for row in cost_matrix]
+
+    # Hungarian algorithm for minimization, 1-indexed internally.
+    u = [0] * (n + 1)
+    v = [0] * (n + 1)
+    p = [0] * (n + 1)
+    way = [0] * (n + 1)
+
+    inf = float("inf")
+
+    for i in range(1, n + 1):
+        p[0] = i
+        j0 = 0
+        minv = [inf] * (n + 1)
+        used = [False] * (n + 1)
+
+        while True:
+            used[j0] = True
+            i0 = p[j0]
+            row = a[i0 - 1]
+
+            delta = inf
+            j1 = 0
+
+            for j in range(1, n + 1):
+                if not used[j]:
+                    cur = row[j - 1] - u[i0] - v[j]
+                    if cur < minv[j]:
+                        minv[j] = cur
+                        way[j] = j0
+                    if minv[j] < delta:
+                        delta = minv[j]
+                        j1 = j
+
+            for j in range(0, n + 1):
+                if used[j]:
+                    u[p[j]] += delta
+                    v[j] -= delta
+                else:
+                    minv[j] -= delta
+
+            j0 = j1
+            if p[j0] == 0:
+                break
+
+        while True:
+            j1 = way[j0]
+            p[j0] = p[j1]
+            j0 = j1
+            if j0 == 0:
+                break
+
+    item_to_agent = [0] * (n + 1)
+    for j in range(1, n + 1):
+        if p[j] != 0:
+            item_to_agent[p[j]] = j
+
+    assignment = []
+    total_cost = 0
+    for i in range(1, n + 1):
+        j = item_to_agent[i]
+        assignment.append((i, j))
+        total_cost += a[i - 1][j - 1]
+
+    try:
+        total_cost = total_cost.item()
+    except AttributeError:
+        pass
+
+    return {"total_cost": total_cost, "assignment": assignment}
+```
+Stdout:
+score=0.5000
+raw_score=0.5000
+Eval feedback:
+assign100.txt -> Scores: ['1.000']
+assign400.txt -> Scores: ['1.000']
+assign700.txt -> Scores: ['Timeout (10s)']
+assignp3000.txt -> Scores: ['Timeout (10s)']
+Avg Dev Score: 0.5000
+
+--- Task: assortment_problem [SUCCESS score=0.569] ---
+Script:
+```python
+def solve(**kwargs):
+    import time
+    import math
+    import random
+
+    start_time = time.time()
+    deadline = start_time + 8.5
+
+    stocks = kwargs.get("stocks", [])
+    pieces = kwargs.get("pieces", [])
+    m = kwargs.get("m", len(pieces))
+
+    if not stocks or not pieces:
+        return {"objective": 0.0, "placements": {}}
+
+    n_stocks = len(stocks)
+    stock_area = [float(s["length"]) * float(s["width"]) for s in stocks]
+
+    p_len = [float(p["length"]) for p in pieces]
+    p_wid = [float(p["width"]) for p in pieces]
+    p_area = [p_len[i] * p_wid[i] for i in range(m)]
+    p_min = [int(p.get("min", 0)) for p in pieces]
+    p_max = [int(p.get("max", p_min[i])) for i, p in enumerate(pieces)]
+
+    def fits_piece_stock(pi, si):
+        L = float(stocks[si]["length"])
+        W = float(stocks[si]["width"])
+        a = p_len[pi]
+        b = p_wid[pi]
+        return (a <= L + 1e-9 and b <= W + 1e-9) or (b <= L + 1e-9 and a <= W + 1e-9)
+
+    if sum(p_min) == 0:
+        return {"objective": 0.0, "placements": {}}
+
+    # Ensure each mandatory piece type can fit somewhere.
+    for i in range(m):
+        if p_min[i] > 0 and not any(fits_piece_stock(i, s) for s in range(n_stocks)):
+            return {"objective": 1.0, "placements": {}}
+
+    def orient_dims(pi, si, prefer_wide=False):
+        L = float(stocks[si]["length"])
+        W = float(stocks[si]["width"])
+        a = p_len[pi]
+        b = p_wid[pi]
+        opts = []
+        if a <= L + 1e-9 and b <= W + 1e-9:
+            opts.append((a, b, 0))
+        if b <= L + 1e-9 and a <= W + 1e-9:
+            opts.append((b, a, 1))
+        if not opts:
+            return None
+        if prefer_wide:
+            opts.sort(key=lambda t: (-t[0], t[1]))
+        else:
+            opts.sort(key=lambda t: (-t[1], t[0]))
+        return opts[0]
+
+    def pack_group(si, item_types):
+        """
+        Packs a list of piece type indices into stock type si using a simple shelf FFD heuristic.
+        Returns list of stock-instance placement lists, or None.
+        """
+        if not item_types:
+            return []
+
+        L = float(stocks[si]["length"])
+        W = float(stocks[si]["width"])
+
+        # Sort large/tall pieces first.
+        enriched = []
+        for pi in item_types:
+            od = orient_dims(pi, si)
+            if od is None:
+                return None
+            a, b, o = od
+            enriched.append((max(a, b), p_area[pi], pi))
+        enriched.sort(reverse=True)
+
+        bins = []
+
+        for _, __, pi in enriched:
+            if time.time() > deadline:
+                return None
+
+            placed = False
+
+            # Try both orientations where feasible, generally preferring the one that wastes less shelf height.
+            orientations = []
+            a = p_len[pi]
+            b = p_wid[pi]
+            if a <= L + 1e-9 and b <= W + 1e-9:
+                orientations.append((a, b, 0))
+            if b <= L + 1e-9 and a <= W + 1e-9:
+                orientations.append((b, a, 1))
+            orientations.sort(key=lambda t: (-t[1], -t[0]))
+
+            best_choice = None
+            # Existing shelves first.
+            for bi, stock_bin in enumerate(bins):
+                shelves = stock_bin["shelves"]
+                for sh_i, sh in enumerate(shelves):
+                    sy, sh_h, sx = sh
+                    for rw, rh, ori in orientations:
+                        if rh <= sh_h + 1e-9 and sx + rw <= L + 1e-9:
+                            waste_h = sh_h - rh
+                            rem_x = L - (sx + rw)
+                            score = waste_h * L + rem_x * 0.001
+                            if best_choice is None or score < best_choice[0]:
+                                best_choice = (score, bi, sh_i, rw, rh, ori)
+
+            if best_choice is not None:
+                _, bi, sh_i, rw, rh, ori = best_choice
+                sh = bins[bi]["shelves"][sh_i]
+                x = sh[2]
+                y = sh[0]
+                bins[bi]["placements"].append({
+                    "piece": pi + 1,
+                    "x": x,
+                    "y": y,
+                    "orientation": ori
+                })
+                sh[2] += rw
+                placed = True
+
+            if placed:
+                continue
+
+            # Try opening a new shelf in an existing stock.
+            best_choice = None
+            for bi, stock_bin in enumerate(bins):
+                cur_y = stock_bin["height_used"]
+                for rw, rh, ori in orientations:
+                    if cur_y + rh <= W + 1e-9 and rw <= L + 1e-9:
+                        score = (W - (cur_y + rh)) * L
+                        if best_choice is None or score < best_choice[0]:
+                            best_choice = (score, bi, rw, rh, ori)
+
+            if best_choice is not None:
+                _, bi, rw, rh, ori = best_choice
+                y = bins[bi]["height_used"]
+                bins[bi]["shelves"].append([y, rh, rw])
+                bins[bi]["height_used"] += rh
+                bins[bi]["placements"].append({
+                    "piece": pi + 1,
+                    "x": 0.0,
+                    "y": y,
+                    "orientation": ori
+                })
+                continue
+
+            # Open a new stock instance.
+            rw, rh, ori = orientations[0]
+            if rw > L + 1e-9 or rh > W + 1e-9:
+                return None
+            bins.append({
+                "height_used": rh,
+                "shelves": [[0.0, rh, rw]],
+                "placements": [{
+                    "piece": pi + 1,
+                    "x": 0.0,
+                    "y": 0.0,
+                    "orientation": ori
+                }]
+            })
+
+        return [b["placements"] for b in bins]
+
+    def build_solution(selected_stock_indices, counts):
+        if time.time() > deadline:
+            return None
+
+        selected_stock_indices = list(selected_stock_indices)
+        if len(selected_stock_indices) > 2:
+            return None
+
+        groups = {s: [] for s in selected_stock_indices}
+
+        # Assign each piece type to the smallest selected stock that can contain it.
+        for pi in range(m):
+            if counts[pi] <= 0:
+                continue
+            candidates = [s for s in selected_stock_indices if fits_piece_stock(pi, s)]
+            if not candidates:
+                return None
+            candidates.sort(key=lambda s: stock_area[s])
+            chosen = candidates[0]
+            groups[chosen].extend([pi] * counts[pi])
+
+        placements = {}
+        inst_id = 1
+        total_stock = 0.0
+        total_used = 0.0
+
+        for si in selected_stock_indices:
+            bins = pack_group(si, groups[si])
+            if bins is None:
+                return None
+            for b in bins:
+                if not b:
+                    continue
+                placements[inst_id] = {
+                    "stock_type": si + 1,
+                    "placements": b
+                }
+                inst_id += 1
+                total_stock += stock_area[si]
+                for pl in b:
+                    total_used += p_area[pl["piece"] - 1]
+
+        if total_stock <= 0:
+            return {"objective": 0.0, "placements": {}}
+
+        obj = max(0.0, (total_stock - total_used) / total_stock)
+        return {"objective": obj, "placements": placements}
+
+    # Candidate stock selections: singles and promising pairs.
+    selections = []
+    for s in range(n_stocks):
+        selections.append((s,))
+
+    for a in range(n_stocks):
+        for b in range(a + 1, n_stocks):
+            selections.append((a, b))
+
+    # Prefer selections that can cover mandatory pieces and have small stock area.
+    filtered = []
+    for sel in selections:
+        ok = True
+        for pi in range(m):
+            if p_min[pi] > 0 and not any(fits_piece_stock(pi, s) for s in sel):
+                ok = False
+                break
+        if ok:
+            filtered.append(sel)
+    selections = filtered
+    selections.sort(key=lambda sel: (len(sel), sum(stock_area[s] for s in sel)))
+
+    # Generate count vectors.
+    candidates = []
+    base = list(p_min)
+    candidates.append(base)
+
+    total_min = sum(p_min)
+    total_max = sum(p_max)
+
+    # Add moderate optional pieces greedily by area, avoiding huge outputs.
+    optional_order = sorted(range(m), key=lambda i: -p_area[i])
+
+    for target_extra in (5, 10, 25, 50, 100, 200, 500):
+        if total_min + target_extra > 2500:
+            continue
+        c = list(p_min)
+        rem = target_extra
+        changed = False
+        for pi in optional_order:
+            if rem <= 0:
+                break
+            add = min(p_max[pi] - c[pi], rem)
+            if add > 0:
+                c[pi] += add
+                rem -= add
+                changed = True
+        if changed:
+            candidates.append(c)
+
+    if total_max <= 2000 and total_max > total_min:
+        candidates.append(list(p_max))
+
+    # Fractional max candidates if not too large.
+    for frac in (0.25, 0.5, 0.75):
+        c = []
+        total = 0
+        for i in range(m):
+            val = p_min[i] + int((p_max[i] - p_min[i]) * frac)
+            c.append(val)
+            total += val
+        if total <= 2500 and c not in candidates:
+            candidates.append(c)
+
+    best = None
+
+    for counts in candidates:
+        if time.time() > deadline:
+            break
+        for sel in selections:
+            if time.time() > deadline:
+                break
+            sol = build_solution(sel, counts)
+            if sol is None:
+                continue
+            if best is None or sol["objective"] < best["objective"] - 1e-12:
+                best = sol
+
+    # If no heuristic packing succeeded, construct a guaranteed valid one-piece-per-stock fallback.
+    if best is None:
+        placements = {}
+        inst = 1
+        total_stock = 0.0
+        total_used = 0.0
+        used_stock_types = []
+
+        for pi in range(m):
+            for _ in range(p_min[pi]):
+                candidates = [s for s in range(n_stocks) if fits_piece_stock(pi, s)]
+                if not candidates:
+                    continue
+                candidates.sort(key=lambda s: stock_area[s])
+
+                # Respect at most two stock types.
+                chosen = None
+                for s in candidates:
+                    if s in used_stock_types or len(used_stock_types) < 2:
+                        chosen = s
+                        break
+                if chosen is None:
+                    chosen = used_stock_types[0]
+
+                if chosen not in used_stock_types:
+                    used_stock_types.append(chosen)
+
+                od = orient_dims(pi, chosen)
+                if od is None:
+                    continue
+                _, _, ori = od
+                placements[inst] = {
+                    "stock_type": chosen + 1,
+                    "placements": [{
+                        "piece": pi + 1,
+                        "x": 0.0,
+                        "y": 0.0,
+                        "orientation": ori
+                    }]
+                }
+                inst += 1
+                total_stock += stock_area[chosen]
+                total_used += p_area[pi]
+
+        obj = 1.0 if total_stock <= 0 else max(0.0, (total_stock - total_used) / total_stock)
+        best = {"objective": obj, "placements": placements}
+
+    return best
+```
+Stdout:
+score=0.5691
+raw_score=0.5691
+Eval feedback:
+assort1.txt -> Scores: ['0.472']
+assort10.txt -> Scores: ['0.457']
+assort4.txt -> Scores: ['0.476']
+assort7.txt -> Scores: ['0.871']
+Avg Dev Score: 0.5691
+
+--- Task: bin_packing___one_dimensional [SUCCESS score=0.848] ---
+Script:
+```python
+def solve(**kwargs):
+    import time
+    import bisect
+    import random
+    import math
+
+    start_time = time.time()
+    deadline = start_time + 9.2
+
+    capacity = int(kwargs.get("bin_capacity"))
+    items = list(kwargs.get("items", []))
+    n = int(kwargs.get("num_items", len(items)))
+
+    if n == 0:
+        return {"num_bins": 0, "bins": []}
+
+    # If an impossible item appears, still return a complete assignment.
+    # Such cases are normally not present in valid bin-packing benchmarks.
+    if any(x > capacity for x in items):
+        return {"num_bins": n, "bins": [[i + 1] for i in range(n)]}
+
+    total_size = sum(items)
+    lower_bound = (total_size + capacity - 1) // capacity
+
+    def pack_order(order):
+        """Best-fit packing for a given order of 0-based item indices."""
+        bins = []
+        rems = []
+        sorted_rems = []  # (remaining_capacity, bin_id)
+
+        for idx in order:
+            w = items[idx]
+            pos = bisect.bisect_left(sorted_rems, (w, -1))
+            if pos == len(sorted_rems):
+                bid = len(bins)
+                bins.append([idx + 1])
+                rem = capacity - w
+                rems.append(rem)
+                bisect.insort(sorted_rems, (rem, bid))
+            else:
+                rem, bid = sorted_rems.pop(pos)
+                bins[bid].append(idx + 1)
+                rem -= w
+                rems[bid] = rem
+                bisect.insort(sorted_rems, (rem, bid))
+        return bins
+
+    # Build several strong deterministic initial solutions.
+    indexed = list(range(n))
+    decreasing = sorted(indexed, key=lambda i: (-items[i], i))
+    increasing = sorted(indexed, key=lambda i: (items[i], i))
+
+    best_bins = pack_order(decreasing)
+
+    if len(best_bins) > lower_bound and time.time() < deadline:
+        cand = pack_order(indexed)
+        if len(cand) < len(best_bins):
+            best_bins = cand
+
+    if len(best_bins) > lower_bound and time.time() < deadline:
+        cand = pack_order(increasing)
+        if len(cand) < len(best_bins):
+            best_bins = cand
+
+    # Try a few randomized tie-breakings among similarly sized items.
+    if len(best_bins) > lower_bound and n <= 5000:
+        rng = random.Random(1234567 + n + capacity)
+        attempts = 8 if n <= 1000 else 3
+        for _ in range(attempts):
+            if time.time() >= deadline:
+                break
+            order = decreasing[:]
+            # Shuffle inside coarse size buckets to diversify while preserving decreasing structure.
+            grouped = []
+            i = 0
+            while i < n:
+                j = i + 1
+                key = items[order[i]]
+                while j < n and items[order[j]] == key:
+                    j += 1
+                block = order[i:j]
+                rng.shuffle(block)
+                grouped.extend(block)
+                i = j
+            cand = pack_order(grouped)
+            if len(cand) < len(best_bins):
+                best_bins = cand
+                if len(best_bins) == lower_bound:
+                    break
+
+    def normalize_bins(bins):
+        return [b for b in bins if b]
+
+    def improve_by_elimination(bins):
+        """Repeatedly try to remove one bin by repacking its items into the others."""
+        bins = [list(b) for b in bins if b]
+        changed = True
+        while changed and len(bins) > lower_bound and time.time() < deadline:
+            changed = False
+            loads = [sum(items[i - 1] for i in b) for b in bins]
+            rems = [capacity - x for x in loads]
+
+            # Prefer eliminating sparsely loaded bins, but also try bins with few items first.
+            candidates = sorted(range(len(bins)), key=lambda k: (loads[k], len(bins[k])))
+
+            for kill in candidates:
+                if time.time() >= deadline:
+                    break
+
+                moving = sorted(bins[kill], key=lambda x: -items[x - 1])
+                temp_bins = [list(bins[i]) for i in range(len(bins)) if i != kill]
+                temp_rems = [rems[i] for i in range(len(bins)) if i != kill]
+
+                feasible = True
+                for item_idx in moving:
+                    w = items[item_idx - 1]
+                    best_j = -1
+                    best_after = capacity + 1
+                    for j, r in enumerate(temp_rems):
+                        if r >= w:
+                            after = r - w
+                            if after < best_after:
+                                best_after = after
+                                best_j = j
+                                if after == 0:
+                                    break
+                    if best_j == -1:
+                        feasible = False
+                        break
+                    temp_bins[best_j].append(item_idx)
+                    temp_rems[best_j] -= w
+
+                if feasible:
+                    bins = temp_bins
+                    changed = True
+                    break
+        return normalize_bins(bins)
+
+    if len(best_bins) > lower_bound:
+        cand = improve_by_elimination(best_bins)
+        if len(cand) < len(best_bins):
+            best_bins = cand
+
+    # Exact branch-and-bound / feasibility search for small and medium instances.
+    # It attempts to prove feasibility with k bins for k < current best.
+    if len(best_bins) > lower_bound and n <= 70 and time.time() < deadline:
+        sorted_items = sorted([(items[i], i + 1) for i in range(n)], reverse=True)
+        weights = [x[0] for x in sorted_items]
+        ids = [x[1] for x in sorted_items]
+
+        suffix_sum = [0] * (n + 1)
+        for i in range(n - 1, -1, -1):
+            suffix_sum[i] = suffix_sum[i + 1] + weights[i]
+
+        node_counter = [0]
+
+        def feasible_with_k(k):
+            rem = [capacity] * k
+            assign = [[] for _ in range(k)]
+
+            def dfs(pos):
+                node_counter[0] += 1
+                if node_counter[0] & 2047 == 0:
+                    if time.time() >= deadline:
+                        raise TimeoutError
+
+                if pos == n:
+                    return True
+
+                # Remaining total capacity pruning.
+                if suffix_sum[pos] > sum(rem):
+                    return False
+
+                w = weights[pos]
+                item_id = ids[pos]
+
+                seen_remainders = set()
+                # Try tighter bins first.
+                order_bins = sorted(range(k), key=lambda b: rem[b])
+                for b in order_bins:
+                    r = rem[b]
+                    if r < w or r in seen_remainders:
+                        continue
+                    seen_remainders.add(r)
+
+                    rem[b] -= w
+                    assign[b].append(item_id)
+
+                    if dfs(pos + 1):
+                        return True
+
+                    assign[b].pop()
+                    rem[b] += w
+
+                    # Symmetry: if placing into an empty bin failed, other empty bins are equivalent.
+                    if r == capacity:
+                        break
+
+                return False
+
+            try:
+                if dfs(0):
+                    return [list(b) for b in assign if b]
+            except TimeoutError:
+                return None
+            return None
+
+        target = len(best_bins) - 1
+        k = lower_bound
+        while k <= target and time.time() < deadline:
+            result = feasible_with_k(k)
+            if result is not None:
+                best_bins = result
+                target = k - 1
+                break
+            k += 1
+
+    # Final validity safeguard: ensure every item appears exactly once.
+    seen = set()
+    valid = True
+    for b in best_bins:
+        load = 0
+        for idx in b:
+            if idx < 1 or idx > n or idx in seen:
+                valid = False
+                break
+            seen.add(idx)
+            load += items[idx - 1]
+        if load > capacity:
+            valid = False
+        if not valid:
+            break
+
+    if not valid or len(seen) != n:
+        best_bins = pack_order(decreasing)
+
+    return {
+        "num_bins": len(best_bins),
+        "bins": best_bins
+    }
+```
+Stdout:
+score=0.8475
+raw_score=0.8475
+Eval feedback:
+...txt -> Scores: ['0.980', '0.980', '1.000', '0.979', '1.000']
+binpack2.txt -> Scores: ['0.990', '0.981', '0.980', '0.990', '0.980']
+binpack3.txt -> Scores: ['0.990', '0.985', '0.985', '0.985', '0.990']
+binpack4.txt -> Scores: ['0.990', '0.988', '0.993', '0.990', '0.988']
+binpack5.txt -> Scores: ["can't multiply sequence by non-int of type 'float'", "can't multiply sequence by non-int of type 'float'", "can't multiply sequence by non-int of type 'float'", "can't multiply sequence by non-int of type 'float'", "can't multiply sequence by non-int of type 'float'"]
+binpack6.txt -> Scores: ['0.952', '0.930', '0.930', '0.930', '0.952']
+binpack7.txt -> Scores: ['0.933', '0.943', '0.943', '0.943', '0.943']
+binpack8.txt -> Scores: ['0.954', '0.954', '0.949', '0.949', '0.949']
+Avg Dev Score: 0.8475
+
+--- Task: capacitated_warehouse_location [SUCCESS score=0.655] ---
+Script:
+```python
+def solve(**kwargs):
+    import time
+    import math
+    import random
+
+    start_time = time.time()
+    deadline = start_time + 9.0
+
+    m = kwargs["m"]
+    n = kwargs["n"]
+    warehouses = kwargs["warehouses"]
+    customers = kwargs["customers"]
+
+    capacities = [float(w["capacity"]) for w in warehouses]
+    fixed = [float(w["fixed_cost"]) for w in warehouses]
+    demands = [float(c["demand"]) for c in customers]
+    costs = [list(map(float, c["costs"])) for c in customers]
+
+    total_demand = sum(demands)
+    total_capacity = sum(capacities)
+
+    def allocate(open_set):
+        """Greedy transportation allocation over a given open set."""
+        if time.time() > deadline:
+            return None
+
+        cap_sum = sum(capacities[j] for j in open_set)
+        if cap_sum + 1e-9 < total_demand:
+            return None
+
+        rem_d = demands[:]
+        rem_c = [0.0] * m
+        for j in open_set:
+            rem_c[j] = capacities[j]
+
+        assignments = [[0.0] * m for _ in range(n)]
+
+        pairs = []
+        for i in range(n):
+            if demands[i] <= 1e-12:
+                continue
+            ci = costs[i]
+            for j in open_set:
+                if capacities[j] > 1e-12:
+                    pairs.append((ci[j], i, j))
+
+        pairs.sort(key=lambda x: x[0])
+
+        assign_cost = 0.0
+        remaining_total = total_demand
+
+        for c, i, j in pairs:
+            if remaining_total <= 1e-8:
+                break
+            if rem_d[i] <= 1e-12 or rem_c[j] <= 1e-12:
+                continue
+            q = rem_d[i] if rem_d[i] < rem_c[j] else rem_c[j]
+            assignments[i][j] = q
+            rem_d[i] -= q
+            rem_c[j] -= q
+            remaining_total -= q
+            assign_cost += q * c
+
+        if any(x > 1e-7 for x in rem_d):
+            return None
+
+        used = [0] * m
+        fixed_cost = 0.0
+        for j in range(m):
+            used_amount = capacities[j] - rem_c[j]
+            if used_amount > 1e-9:
+                used[j] = 1
+                fixed_cost += fixed[j]
+
+        return fixed_cost + assign_cost, used, assignments
+
+    best = None
+
+    # If total capacity is insufficient, return the least-bad all-open partial allocation.
+    # Such an instance is infeasible by definition, but this avoids crashes.
+    if total_capacity + 1e-9 < total_demand:
+        open_set = [j for j in range(m) if capacities[j] > 1e-12]
+        rem_d = demands[:]
+        rem_c = capacities[:]
+        assignments = [[0.0] * m for _ in range(n)]
+        pairs = []
+        for i in range(n):
+            for j in open_set:
+                pairs.append((costs[i][j], i, j))
+        pairs.sort(key=lambda x: x[0])
+        total_cost = sum(fixed[j] for j in open_set)
+        for c, i, j in pairs:
+            if rem_d[i] <= 1e-12 or rem_c[j] <= 1e-12:
+                continue
+            q = rem_d[i] if rem_d[i] < rem_c[j] else rem_c[j]
+            assignments[i][j] = q
+            rem_d[i] -= q
+            rem_c[j] -= q
+            total_cost += q * c
+        return {
+            "total_cost": total_cost,
+            "warehouse_open": [1 if j in open_set else 0 for j in range(m)],
+            "assignments": assignments,
+        }
+
+    def evaluate(open_set):
+        nonlocal best
+        if not open_set:
+            return
+        res = allocate(open_set)
+        if res is None:
+            return
+        if best is None or res[0] < best[0]:
+            best = res
+
+    all_open = [j for j in range(m) if capacities[j] > 1e-12]
+    evaluate(all_open)
+
+    if time.time() > deadline:
+        total_cost, used, assignments = best
+        return {"total_cost": total_cost, "warehouse_open": used, "assignments": assignments}
+
+    avg_cost = []
+    min_cost = []
+    for j in range(m):
+        s = 0.0
+        mn = float("inf")
+        for i in range(n):
+            v = costs[i][j]
+            s += v
+            if v < mn:
+                mn = v
+        avg_cost.append(s / n if n else 0.0)
+        min_cost.append(mn if mn < float("inf") else 0.0)
+
+    # Deterministic candidate subsets.
+    orderings = []
+
+    orderings.append(sorted(range(m), key=lambda j: fixed[j] / max(capacities[j], 1e-9)))
+    orderings.append(sorted(range(m), key=lambda j: avg_cost[j]))
+    orderings.append(sorted(range(m), key=lambda j: min_cost[j]))
+    orderings.append(sorted(range(m), key=lambda j: fixed[j] / max(capacities[j], 1e-9) + avg_cost[j]))
+    orderings.append(sorted(range(m), key=lambda j: fixed[j] / max(capacities[j], 1e-9) + min_cost[j]))
+
+    for alpha in (0.05, 0.1, 0.25, 0.5, 1.0, 2.0, 5.0, 10.0):
+        orderings.append(
+            sorted(
+                range(m),
+                key=lambda j, a=alpha: avg_cost[j] + a * fixed[j] / max(capacities[j], 1e-9),
+            )
+        )
+
+    for order in orderings:
+        if time.time() > deadline:
+            break
+        s = []
+        cap = 0.0
+        for j in order:
+            if capacities[j] <= 1e-12:
+                continue
+            s.append(j)
+            cap += capacities[j]
+            if cap + 1e-9 >= total_demand:
+                break
+        evaluate(s)
+
+    # Customer-cheapest driven candidate.
+    if time.time() <= deadline:
+        chosen = set()
+        cap = 0.0
+        cust_order = sorted(range(n), key=lambda i: demands[i], reverse=True)
+        for i in cust_order:
+            ranked = sorted(range(m), key=lambda j: costs[i][j] + fixed[j] / max(capacities[j], 1e-9))
+            for j in ranked[:max(1, min(5, m))]:
+                if j not in chosen and capacities[j] > 1e-12:
+                    chosen.add(j)
+                    cap += capacities[j]
+                    if cap + 1e-9 >= total_demand:
+                        break
+            if cap + 1e-9 >= total_demand:
+                break
+        if cap + 1e-9 < total_demand:
+            for j in sorted(range(m), key=lambda x: fixed[x] / max(capacities[x], 1e-9)):
+                if j not in chosen and capacities[j] > 1e-12:
+                    chosen.add(j)
+                    cap += capacities[j]
+                    if cap + 1e-9 >= total_demand:
+                        break
+        evaluate(list(chosen))
+
+    # Local improvement on best used set: try removing warehouses.
+    if best is not None and time.time() <= deadline:
+        improved = True
+        while improved and time.time() <= deadline:
+            improved = False
+            current_open = [j for j, v in enumerate(best[1]) if v]
+            if len(current_open) <= 1:
+                break
+
+            # Try removing expensive/low-utilization-looking warehouses first.
+            removal_order = sorted(
+                current_open,
+                key=lambda j: fixed[j] / max(capacities[j], 1e-9),
+                reverse=True,
+            )
+
+            for j in removal_order:
+                if time.time() > deadline:
+                    break
+                cand = [x for x in current_open if x != j]
+                if sum(capacities[x] for x in cand) + 1e-9 < total_demand:
+                    continue
+                old_cost = best[0]
+                evaluate(cand)
+                if best[0] + 1e-9 < old_cost:
+                    improved = True
+                    break
+
+    # Local improvement: try add/remove swaps around current best.
+    if best is not None and time.time() <= deadline:
+        current = set(j for j, v in enumerate(best[1]) if v)
+        closed = [j for j in range(m) if j not in current and capacities[j] > 1e-12]
+        closed.sort(key=lambda j: avg_cost[j] + fixed[j] / max(capacities[j], 1e-9))
+
+        tries = 0
+        max_tries = 100
+        for add_j in closed[:min(len(closed), 20)]:
+            if time.time() > deadline or tries >= max_tries:
+                break
+            base = set(current)
+            base.add(add_j)
+            evaluate(list(base))
+            tries += 1
+
+            current2 = set(j for j, v in enumerate(best[1]) if v)
+            for rem_j in list(current2):
+                if time.time() > deadline or tries >= max_tries:
+                    break
+                if rem_j == add_j:
+                    continue
+                cand = set(current2)
+                cand.add(add_j)
+                cand.discard(rem_j)
+                if sum(capacities[x] for x in cand) + 1e-9 >= total_demand:
+                    evaluate(list(cand))
+                    tries += 1
+
+    if best is None:
+        # Fallback, should rarely happen.
+        res = allocate(all_open)
+        if res is None:
+            assignments = [[0.0] * m for _ in range(n)]
+            return {
+                "total_cost": 0.0,
+                "warehouse_open": [0] * m,
+                "assignments": assignments,
+            }
+        best = res
+
+    total_cost, warehouse_open, assignments = best
+
+    # Recompute objective defensively.
+    recomputed = 0.0
+    for j in range(m):
+        if warehouse_open[j]:
+            recomputed += fixed[j]
+    for i in range(n):
+        for j in range(m):
+            if assignments[i][j]:
+                recomputed += assignments[i][j] * costs[i][j]
+
+    return {
+        "total_cost": recomputed,
+        "warehouse_open": warehouse_open,
+        "assignments": assignments,
+    }
+```
+Stdout:
+score=0.6546
+raw_score=0.6546
+Eval feedback:
+cap101.txt -> Scores: ['0.957']
+cap112.txt -> Scores: ['0.715']
+cap123.txt -> Scores: ['0.604']
+cap134.txt -> Scores: ['0.502']
+cap41.txt -> Scores: ['0.933']
+cap62.txt -> Scores: ['0.954']
+cap73.txt -> Scores: ['0.918']
+cap84.txt -> Scores: ['0.830']
+cap91.txt -> Scores: ['0.957']
+capa-12000.txt -> Scores: ['0.098']
+capb-5000.txt -> Scores: ['0.182']
+capc-7250.txt -> Scores: ['0.206']
+Avg Dev Score: 0.6546
+
+--- Task: common_due_date_scheduling [SUCCESS score=0.926] ---
+Script:
+```python
+def solve(**kwargs):
+    """
+    Solves the restricted single-machine common due date scheduling problem.
+    Returns {'schedule': [...]} with 1-based job indices.
+    """
+    import time
+    import random
+
+    jobs = kwargs.get("jobs", [])
+    h = kwargs.get("h", 0.6)
+    n = len(jobs)
+
+    if n == 0:
+        return {"schedule": []}
+    if n == 1:
+        return {"schedule": [1]}
+
+    start_time = time.time()
+    deadline = start_time + 9.0
+
+    p = [int(j[0]) for j in jobs]
+    a = [int(j[1]) for j in jobs]
+    b = [int(j[2]) for j in jobs]
+
+    total_p = sum(p)
+    d = int(total_p * h)
+
+    indices = list(range(n))
+
+    def penalty_of_schedule(schedule):
+        t = 0
+        cost = 0
+        for idx in schedule:
+            t += p[idx]
+            if t < d:
+                cost += a[idx] * (d - t)
+            elif t > d:
+                cost += b[idx] * (t - d)
+        return cost
+
+    def make_schedule(early_set):
+        early = [i for i in indices if early_set[i]]
+        late = [i for i in indices if not early_set[i]]
+
+        # V-shaped property heuristic:
+        # Early side: decreasing p/a.
+        # Tardy side: increasing p/b.
+        early.sort(key=lambda i: (-(p[i] / (a[i] if a[i] > 0 else 1e-9)), -p[i], i))
+        late.sort(key=lambda i: ((p[i] / (b[i] if b[i] > 0 else 1e-9)), p[i], i))
+        return early + late
+
+    def evaluate_set(early_set):
+        return penalty_of_schedule(make_schedule(early_set))
+
+    def build_by_order(order):
+        early_set = [False] * n
+        s = 0
+        for i in order:
+            if s + p[i] <= d:
+                early_set[i] = True
+                s += p[i]
+        return early_set, s
+
+    candidates = []
+
+    orders = []
+
+    orders.append(sorted(indices, key=lambda i: (-(p[i] / (a[i] if a[i] > 0 else 1e-9)), -a[i], i)))
+    orders.append(sorted(indices, key=lambda i: (-(a[i] / (p[i] if p[i] > 0 else 1e-9)), -a[i], i)))
+    orders.append(sorted(indices, key=lambda i: (-a[i], p[i], i)))
+    orders.append(sorted(indices, key=lambda i: (b[i], -a[i], p[i], i)))
+    orders.append(sorted(indices, key=lambda i: (-(a[i] / ((a[i] + b[i]) if (a[i] + b[i]) > 0 else 1e-9)), p[i], i)))
+    orders.append(sorted(indices, key=lambda i: (-(a[i] - b[i]), p[i], i)))
+    orders.append(sorted(indices, key=lambda i: (p[i], -a[i], i)))
+
+    for order in orders:
+        es, sp = build_by_order(order)
+        candidates.append((es, sp))
+
+    # Greedy randomized-ish deterministic variants: start with high earliness benefit
+    if n <= 2000:
+        rng = random.Random(12345)
+        base = sorted(indices, key=lambda i: (-(a[i] / (p[i] if p[i] else 1)), b[i], i))
+        for _ in range(4):
+            arr = base[:]
+            # small deterministic shuffle among nearby elements
+            for k in range(n):
+                j = k + rng.randrange(min(8, n - k))
+                arr[k], arr[j] = arr[j], arr[k]
+            es, sp = build_by_order(arr)
+            candidates.append((es, sp))
+
+    best_set = None
+    best_sum = 0
+    best_cost = None
+
+    for es, sp in candidates:
+        c = evaluate_set(es)
+        if best_cost is None or c < best_cost:
+            best_cost = c
+            best_set = es[:]
+            best_sum = sp
+
+    # Local improvement on early/tardy partition.
+    # Keep early processing sum <= d, which is usually desirable for restricted CDD.
+    def local_improve(early_set, early_sum, current_cost):
+        improved = True
+        passes = 0
+
+        while improved and passes < 6 and time.time() < deadline:
+            improved = False
+            passes += 1
+
+            # Single-job flips
+            order = sorted(indices, key=lambda i: -max(a[i], b[i]))
+            for i in order:
+                if time.time() >= deadline:
+                    break
+
+                if early_set[i]:
+                    early_set[i] = False
+                    nc = evaluate_set(early_set)
+                    if nc < current_cost:
+                        current_cost = nc
+                        early_sum -= p[i]
+                        improved = True
+                    else:
+                        early_set[i] = True
+                else:
+                    if early_sum + p[i] <= d:
+                        early_set[i] = True
+                        nc = evaluate_set(early_set)
+                        if nc < current_cost:
+                            current_cost = nc
+                            early_sum += p[i]
+                            improved = True
+                        else:
+                            early_set[i] = False
+
+            if time.time() >= deadline:
+                break
+
+            # Pair exchange: one early out, one tardy in
+            if n <= 600:
+                early_jobs = [i for i in indices if early_set[i]]
+                late_jobs = [i for i in indices if not early_set[i]]
+
+                early_jobs.sort(key=lambda i: (a[i] - b[i], -p[i]))
+                late_jobs.sort(key=lambda i: (-(a[i] - b[i]), p[i]))
+
+                max_e = min(len(early_jobs), 80)
+                max_l = min(len(late_jobs), 80)
+
+                for x in early_jobs[:max_e]:
+                    if time.time() >= deadline:
+                        break
+                    for y in late_jobs[:max_l]:
+                        if early_sum - p[x] + p[y] > d:
+                            continue
+                        early_set[x] = False
+                        early_set[y] = True
+                        nc = evaluate_set(early_set)
+                        if nc < current_cost:
+                            current_cost = nc
+                            early_sum = early_sum - p[x] + p[y]
+                            improved = True
+                            break
+                        early_set[x] = True
+                        early_set[y] = False
+                    if improved:
+                        break
+
+        return early_set, early_sum, current_cost
+
+    if time.time() < deadline:
+        best_set, best_sum, best_cost = local_improve(best_set, best_sum, best_cost)
+
+    best_schedule = make_schedule(best_set)
+    best_cost = penalty_of_schedule(best_schedule)
+
+    # Final permutation-level adjacent-swap cleanup.
+    # This can improve cases where the strict V-order heuristic is slightly off.
+    if n <= 800 and time.time() < deadline:
+        sched = best_schedule[:]
+        improved = True
+        passes = 0
+        while improved and passes < 4 and time.time() < deadline:
+            improved = False
+            passes += 1
+            for k in range(n - 1):
+                if time.time() >= deadline:
+                    break
+                sched[k], sched[k + 1] = sched[k + 1], sched[k]
+                nc = penalty_of_schedule(sched)
+                if nc < best_cost:
+                    best_cost = nc
+                    improved = True
+                else:
+                    sched[k], sched[k + 1] = sched[k + 1], sched[k]
+        best_schedule = sched
+
+    return {"schedule": [i + 1 for i in best_schedule]}
+```
+Stdout:
+score=0.9255
+raw_score=0.9255
+Eval feedback:
+sch10.txt -> Scores: ['0.947', '0.981', '1.000']
+sch100.txt -> Scores: ['0.921', '0.915', '0.956']
+sch1000.txt -> Scores: ['0.894', '0.903', '0.919']
+sch20.txt -> Scores: ['1.010', '0.722', '0.975']
+sch200.txt -> Scores: ['0.921', '0.904', '0.901']
+sch50.txt -> Scores: ['0.971', '0.973', '0.931']
+sch500.txt -> Scores: ['0.890', '0.892', '0.910']
+Avg Dev Score: 0.9255
+
+## Baseline Comparison
+
+Tasks unchanged: 6
+Net effect: +0.000 mean score change
+
+## Previously Injected Code (layers below you)
+(none — you are the first meta-layer)
+
+## What You Can Produce
+
+You can output any combination of:
+
+### pre_process (strategy guidance)
+Python code that runs BEFORE the solver sees the task. Your code has access to:
+- `task` (read-only TaskDescription with .task_id, .description, .metadata)
+- `outer_context` (string: guidance from higher meta-layers — use this to ADAPT your intervention based on higher layers' strategic decisions; empty if you are the outermost layer)
+
+You MUST set the `additional_context` variable (a string that gets appended to the solver's prompt).
+
+CRITICAL: Set the `additional_context` variable directly. Do NOT modify the `task` object — it is read-only.
+
+Example:
+```pre_process
+# Adapt tactics based on higher layer's strategy (if any)
+if "greedy" in outer_context.lower():
+    additional_context = "Implement greedy assignment: sort by cost, assign iteratively."
+elif "file" in task.description.lower():
+    additional_context = "Remember to use proper quoting for file paths with spaces."
+else:
+    additional_context = ""
+```
+
+### solver_lib (solver-visible code library)
+Python functions that will be PREPENDED to the solver's generated code and available at runtime inside the sandbox. The solver sees their signatures in its prompt and can call them directly.
+
+Use this to provide working algorithm implementations that the solver cannot reliably write from scratch. This is different from pre_process (which provides strategy guidance as text) — solver_lib provides actual executable code.
+
+Example:
+```solver_lib:local_search
+def local_search(solution, evaluate_fn, time_limit=8.0):
+    """Iteratively improve solution via random swaps within time limit."""
+    import time, random
+    best, best_score = solution, evaluate_fn(solution)
+    start = time.time()
+    while time.time() - start < time_limit:
+        keys = list(best.keys())
+        if len(keys) < 2:
+            break
+        i, j = random.sample(range(len(keys)), 2)
+        neighbor = dict(best)
+        neighbor[keys[i]], neighbor[keys[j]] = neighbor[keys[j]], neighbor[keys[i]]
+        score = evaluate_fn(neighbor)
+        if score > best_score:
+            best, best_score = neighbor, score
+    return best
+```
+
+IMPORTANT for solver_lib:
+- Functions run inside the sandbox, NOT in the meta-layer
+- Only use Python standard library imports (no numpy, scipy, etc.)
+- Each block should define a single self-contained function
+- Later layers can override a function by providing a solver_lib block with the same name
+- solver_lib functions from different layers share a runtime namespace and can call each other
+- Every function MUST include type annotations and a docstring with (a) one-line summary, (b) Args section listing every parameter with its expected type and meaning, (c) Returns section describing the return type and structure. The solver only sees the signature and docstring, not the full source — the docstring is the API contract. Example:
+      def pack_items(items: list, capacity: int) -> tuple:
+          """Pack items into bins using first-fit decreasing.
+
+          Args:
+              items: list[tuple[int, int, str]] — each is (width, height, item_id).
+              capacity: int — max bin weight.
+
+          Returns:
+              tuple[int, list[dict]] — (total_cost, placements) where each dict
+              has keys 'id' (str), 'x' (int), 'y' (int).
+          """
+
+## Output Format
+
+Respond with EXACTLY this structure (omit sections you don't need):
+
+```rationale
+<your reasoning about what patterns you see and what improvements to make>
+```
+
+```pre_process
+<python code>
+```
+
+```solver_lib:<name>
+<python function code>
+```
+
+IMPORTANT:
+- pre_process must be self-contained Python. Do not import external packages beyond the standard library.
+- Focus on the highest-impact improvement based on the failure patterns you observe.
+- Be specific about what failure patterns you're addressing.
+- GENERALIZE: condition your intervention on task STRUCTURE (problem size, presence of hard constraints, metadata fields) — NEVER branch on specific task_id string literals. Code that keys off task_id values cannot transfer to unseen tasks and is wasted effort.
+- If you add a solver_lib helper, it must target a specific failing task: name that task in your rationale and explain why the solver cannot write it reliably itself.
+- Keep code simple and robust — complex code is more likely to break.
+- Favor small (≤30 lines), audit-able helpers over large multi-purpose ones. Helpers that break the runtime env (creating envs, installing packages, depending on uncommon CLIs) introduce more failures than they prevent.

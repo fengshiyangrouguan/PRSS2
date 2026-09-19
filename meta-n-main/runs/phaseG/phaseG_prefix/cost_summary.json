@@ -1,0 +1,9 @@
+{
+  "outer_calls": 22,
+  "outer_prompt_tokens": 44990,
+  "outer_completion_tokens": 56353,
+  "outer_cached_tokens": 0,
+  "outer_cost_usd": 0.0,
+  "model": "gpt-5.5",
+  "backend": "openrouter"
+}

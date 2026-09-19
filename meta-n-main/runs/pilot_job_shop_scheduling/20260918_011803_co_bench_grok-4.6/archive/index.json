@@ -1,0 +1,83 @@
+{
+  "size": 5,
+  "best_mean_score": 0.11411928258301773,
+  "best_candidate_id": "gen1_b0_k0",
+  "per_task_best": {
+    "job_shop_scheduling": {
+      "score": 0.11411928258301773,
+      "candidate_id": "gen0_seed"
+    }
+  },
+  "candidates": [
+    {
+      "candidate_id": "gen0_seed",
+      "parent_id": null,
+      "iteration": 0,
+      "depth": 1,
+      "mean_score": 0.0874634414733067,
+      "pass_at_1": 1.0,
+      "num_children": 2,
+      "temperature_used": 0.7,
+      "total_tokens": 3247,
+      "per_task_scores": {
+        "job_shop_scheduling": 0.0874634414733067
+      }
+    },
+    {
+      "candidate_id": "gen1_b0_k0",
+      "parent_id": "gen0_seed",
+      "iteration": 1,
+      "depth": 2,
+      "mean_score": 0.11411928258301773,
+      "pass_at_1": 1.0,
+      "num_children": 2,
+      "temperature_used": 0.7,
+      "total_tokens": 9563,
+      "per_task_scores": {
+        "job_shop_scheduling": 0.11411928258301773
+      }
+    },
+    {
+      "candidate_id": "gen2_b0_k0",
+      "parent_id": "gen0_seed",
+      "iteration": 2,
+      "depth": 2,
+      "mean_score": 0.08773294953387124,
+      "pass_at_1": 1.0,
+      "num_children": 0,
+      "temperature_used": 0.9,
+      "total_tokens": 6352,
+      "per_task_scores": {
+        "job_shop_scheduling": 0.08773294953387124
+      }
+    },
+    {
+      "candidate_id": "gen3_b0_k0",
+      "parent_id": "gen1_b0_k0",
+      "iteration": 3,
+      "depth": 3,
+      "mean_score": 0.11411928258301773,
+      "pass_at_1": 1.0,
+      "num_children": 0,
+      "temperature_used": 0.5,
+      "total_tokens": 11221,
+      "per_task_scores": {
+        "job_shop_scheduling": 0.11411928258301773
+      }
+    },
+    {
+      "candidate_id": "gen4_b0_k0",
+      "parent_id": "gen1_b0_k0",
+      "iteration": 4,
+      "depth": 3,
+      "mean_score": 0.0,
+      "pass_at_1": 0.0,
+      "num_children": 0,
+      "temperature_used": 0.7,
+      "total_tokens": 8511,
+      "per_task_scores": {
+        "job_shop_scheduling": 0.0
+      }
+    }
+  ]
+}

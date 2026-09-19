@@ -1,0 +1,7 @@
+{
+  "chain_test_mean_score": 0.9296036324344764,
+  "chain_test_scores": {
+    "bin_packing___one_dimensional": 0.9296036324344764
+  },
+  "candidate_id": "gen0_seed"
+}

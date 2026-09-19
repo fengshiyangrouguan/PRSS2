@@ -1,0 +1,414 @@
+You are a higher-order meta-layer (depth 4) in a recursive self-improving system called Meta^n.
+
+## Your Role
+Previous layers have already made tactical fixes — dependency handling, constraint checks, format corrections. Your job is NOT to patch individual errors. Lower layers already do that.
+
+Instead, you should:
+1. Identify SYSTEMIC patterns across task categories
+2. Understand WHY previous layers' fixes helped some tasks but hurt others
+3. Make STRUCTURAL improvements: task classification, solver strategy selection, algorithm implementations
+4. Consider CONDITIONING or BYPASSING previous layers' changes for task types where they cause regressions
+5. Provide reusable algorithm implementations (via solver_lib) that the solver can call directly
+
+## System Context
+Current depth: 4
+Tasks attempted: 6
+Current mean score: 0.354  ← PRIMARY OBJECTIVE: raise the MEAN CONTINUOUS SCORE (not just the pass count)
+Score spread (6 tasks): [0.0-0.3]x3  [0.3-0.7]x2  [0.7-1.0]x1
+pass@1 (binary success rate): 66.7%
+
+⚠ PLATEAU RISK: the previous layer changed the mean score by only +0.000. Do NOT merely refine the previous approach — the injected-code history below shows what has already been tried. Either (a) propose a STRUCTURALLY DIFFERENT intervention (a different algorithm class, a different failure mode, a different task subset), or (b) if you have no genuinely new idea, output an EMPTY response (no pre_process, no solver_lib): a no-op beats re-emitting code that will not help.
+
+## DEEPEN — keep improving ONLY task 'assortment_problem'
+The layer BELOW already worked 'assortment_problem'; its current solution is the starting point, NOT a blank slate. Reason about what that layer produced and improve 'assortment_problem' FURTHER — do NOT discard or restart it. Every OTHER task is FROZEN and will NOT be re-solved; spend NO effort on them.
+## Opportunity — per-task headroom to best-known (largest gap first)
+Target the largest-gap tasks. Tasks with a small/zero gap are near their ceiling — do NOT regress them.
+
+| task | now | best-known | gap |
+|------|-----|-----------|-----|
+| assortment_problem | 0.000 | 0.140 | +0.140 |
+| aircraft_landing | 0.102 | 0.102 | +0.000 |
+| assignment_problem | 0.000 | 0.000 | +0.000 |
+| bin_packing___one_dimensional | 0.930 | 0.930 | +0.000 |
+| capacitated_warehouse_location | 0.658 | 0.658 | +0.000 |
+| common_due_date_scheduling | 0.434 | 0.434 | +0.000 |
+
+## Performance Summary & Analysis
+## Task Category Performance
+
+- **assignment/location** (2 tasks): 1/2 pass, mean=0.33, key issue: Indexing error
+- **packing/cutting** (2 tasks): 1/2 pass, mean=0.46, key issue: Constraint violation
+- **scheduling** (2 tasks): 2/2 pass, mean=0.27, key issue: -
+
+## Failure Pattern Distribution
+
+- **Indexing error**: 1 tasks (50%) — e.g., "assign100.txt -> Scores: ["cannot fit 'int' into an index-sized integer"]
+assign"
+- **Constraint violation**: 1 tasks (50%) — e.g., "assort1.txt -> Scores: ['Piece count violation for piece type 1: count = 0, requ"
+
+## Previous Layer Effectiveness
+
+Previous layer rationale: "## Diagnosis
+assortment_problem has the largest headroom (gap 0.140) and is the only task with a mean of 0.000 after the depth-2 pre_process (which promised a pack_stocks helper that would do first-fi..."
+
+Tasks unchanged: 6
+Net effect: +0.000 mean score change (over 6 shared tasks)
+
+## Representative Traces (3 of 6)
+
+--- Task: assortment_problem [FAILURE Constraint violation] ---
+Script:
+```python
+def solve(**kwargs):
+    m = kwargs.get('m', 0)
+    stocks = kwargs.get('stocks', [])
+    pieces = kwargs.get('pieces', [])
+    if not stocks or not pieces:
+        return {
+            "objective": 0.0,
+            "placements": {}
+        }
+    try:
+        from solver_lib import pack_stocks
+        from itertools import combinations
+        best_objective = float('inf')
+        best_placements = None
+        n_stocks = len(stocks)
+        for k in range(1, 3):
+            for combo in combinations(range(n_stocks), k):
+                selected_stocks = [stocks[i] for i in combo]
+                placements = pack_stocks(selected_stocks, pieces)
+                if placements is None:
+                    continue
+                total_stock_area = sum(s['length'] * s['width'] for s in selected_stocks)
+                total_used_area = 0.0
+                for stock_id, stock_data in placements.items():
+                    for p in stock_data['placements']:
+                        piece_idx = p['piece'] - 1
+                        if piece_idx < 0 or piece_idx >= len(pieces):
+                            continue
+                        px = p['x']
+                        py = p['y']
+                        orient = p['orientation']
+                        pl = pieces[piece_idx]['length']
+                        pw = pieces[piece_idx]['width']
+                        if orient == 1:
+                            pl, pw = pw, pl
+                        total_used_area += pl * pw
+                objective = (total_stock_area - total_used_area) / total_stock_area if total_stock_area > 0 else 0.0
+                if objective < best_objective:
+                    best_objective = objective
+                    best_placements = placements
+        if best_placements is None:
+            return {
+                "objective": 0.0,
+                "placements": {
+                    1: {
+                        "stock_type": 1,
+                        "placements": []
+                    }
+                }
+            }
+        return {
+            "objective": best_objective,
+            "placements": best_placements
+        }
+    except Exception:
+        return {
+            "objective": 0.0,
+            "placements": {
+                1: {
+                    "stock_type": 1,
+                    "placements": []
+                }
+            }
+        }
+```
+Stdout:
+score=0.0000
+raw_score=0.0000
+Stderr:
+assort1.txt -> Scores: ['Piece count violation for piece type 1: count = 0, required min = 20, max = 38.']
+assort10.txt -> Scores: ['Piece count violation for piece type 1: count = 0, required min = 20, max = 35.']
+assort4.txt -> Scores: ['Piece count violation for piece type 1: count = 0, required min = 20, max = 26.']
+assort7.txt -> Scores: ['Piece count violation for piece type 1: count = 0, required min = 20, max = 38.']
+Avg Dev Score: 0.0000
+Error: assort1.txt -> Scores: ['Piece count violation for piece type 1: count = 0, required min = 20, max = 38.']
+assort10.txt -> Scores: ['Piece count violation for piece type 1: count = 0, required min = 2
+Eval feedback:
+assort1.txt -> Scores: ['Piece count violation for piece type 1: count = 0, required min = 20, max = 38.']
+assort10.txt -> Scores: ['Piece count violation for piece type 1: count = 0, required min = 20, max = 35.']
+assort4.txt -> Scores: ['Piece count violation for piece type 1: count = 0, required min = 20, max = 26.']
+assort7.txt -> Scores: ['Piece count violation for piece type 1: count = 0, required min = 20, max = 38.']
+Avg Dev Score: 0.0000
+
+--- Task: assignment_problem [FAILURE Indexing error] ---
+Script:
+```python
+def solve(**kwargs):
+    import math
+    n = kwargs['n']
+    cost_matrix = kwargs['cost_matrix']
+    INF = float('inf')
+    N = 1 << n
+    pop = [0] * N
+    for i in range(1, N):
+        pop[i] = pop[i >> 1] + (i & 1)
+    dp = [INF] * N
+    dp[0] = 0
+    for mask in range(N):
+        k = pop[mask]
+        if k == n:
+            continue
+        for j in range(n):
+            if (mask & (1 << j)) == 0:
+                new_mask = mask | (1 << j)
+                dp[new_mask] = min(dp[new_mask], dp[mask] + cost_matrix[k][j])
+    min_cost = dp[N - 1]
+    mask = N - 1
+    assignment = []
+    for k in range(n - 1, -1, -1):
+        for j in range(n):
+            if (mask & (1 << j)) == 0:
+                continue
+            new_mask = mask ^ (1 << j)
+            if dp[new_mask] + cost_matrix[k][j] == dp[mask]:
+                assignment.append((k + 1, j + 1))
+                mask = new_mask
+                break
+    assignment.reverse()
+    return {"total_cost": min_cost, "assignment": assignment}
+```
+Stdout:
+score=0.0000
+raw_score=0.0000
+Stderr:
+assign100.txt -> Scores: ["cannot fit 'int' into an index-sized integer"]
+assign400.txt -> Scores: ["cannot fit 'int' into an index-sized integer"]
+assign700.txt -> Scores: ["cannot fit 'int' into an index-sized integer"]
+assignp3000.txt -> Scores: ["cannot fit 'int' into an index-sized integer"]
+Avg Dev Score: 0.0000
+Error: assign100.txt -> Scores: ["cannot fit 'int' into an index-sized integer"]
+assign400.txt -> Scores: ["cannot fit 'int' into an index-sized integer"]
+assign700.txt -> Scores: ["cannot fit 'int' into an 
+Eval feedback:
+assign100.txt -> Scores: ["cannot fit 'int' into an index-sized integer"]
+assign400.txt -> Scores: ["cannot fit 'int' into an index-sized integer"]
+assign700.txt -> Scores: ["cannot fit 'int' into an index-sized integer"]
+assignp3000.txt -> Scores: ["cannot fit 'int' into an index-sized integer"]
+Avg Dev Score: 0.0000
+
+--- Task: bin_packing___one_dimensional [SUCCESS score=0.930] ---
+Script:
+```python
+def solve(**kwargs):
+    bin_capacity = kwargs.get('bin_capacity', 0)
+    items = kwargs.get('items', [])
+    n = len(items)
+    if n == 0:
+        return {'num_bins': 0, 'bins': []}
+    indexed_items = sorted(enumerate(items, 1), key=lambda x: x[1], reverse=True)
+    bins = []
+    bin_sums = []
+    for idx, size in indexed_items:
+        placed = False
+        for i in range(len(bins)):
+            if bin_sums[i] + size <= bin_capacity:
+                bins[i].append(idx)
+                bin_sums[i] += size
+                placed = True
+                break
+        if not placed:
+            bins.append([idx])
+            bin_sums.append(size)
+    num_bins = len(bins)
+    return {'num_bins': num_bins, 'bins': bins}
+```
+Stdout:
+score=0.9296
+raw_score=0.9296
+Eval feedback:
+binpack1.txt -> Scores: ['0.980', '0.980', '1.000', '0.979', '1.000']
+binpack2.txt -> Scores: ['0.990', '0.981', '0.980', '0.990', '0.980']
+binpack3.txt -> Scores: ['0.990', '0.985', '0.985', '0.985', '0.990']
+binpack4.txt -> Scores: ['0.990', '0.988', '0.993', '0.990', '0.988']
+binpack5.txt -> Scores: ['0.870', '0.870', '0.870', '0.833', '0.833']
+binpack6.txt -> Scores: ['0.870', '0.870', '0.889', '0.889', '0.889']
+binpack7.txt -> Scores: ['0.883', '0.883', '0.874', '0.874', '0.865']
+binpack8.txt -> Scores: ['0.874', '0.879', '0.874', '0.879', '0.874']
+Avg Dev Score: 0.9296
+
+
+## Inspiration from Archive (best solutions from other candidates for tasks you failed)
+--- Task: assortment_problem [BEST score=0.140] (from another candidate) ---
+Script:
+```python
+def solve(**kwargs):
+    m = kwargs['m']
+    stocks = kwargs['stocks']
+    pieces = kwargs['pieces']
+    if not stocks or not pieces or m == 0:
+        return {"objective": 0.0, "placements": {1: {"stock_type": 1, "placements": []}}}
+    stock_type = 1
+    placements = {}
+    current_instance_id = 1
+    total_used = 0.0
+    total_stock_area = 0.0
+    s_l = stocks[0]['length']
+    s_w = stocks[0]['width']
+    for i in range(m):
+        piece = pieces[i]
+        min_count = piece['min']
+        if min_count == 0:
+            continue
+        p_l0 = piece['length']
+        p_w0 = piece['width']
+        # Try orientation 0
+        if p_l0 <= s_l and p_w0 <= s_w:
+            orient = 0
+            pl = p_l0
+            pw = p_w0
+        # Try orientation 1
+        elif p_w0 <= s_l and p_l0 <= s_w:
+            orient = 1
+            pl = p_w0
+            pw = p_l0
+        else:
+            continue  # cannot fit this piece type
+        num_stocks = min_count
+        for _ in range(num_stocks):
+            placements[current_instance_id] = {
+                "stock_type": stock_type,
+                "placements": [{
+                    "piece": i + 1,
+                    "x": 0.0,
+                    "y": 0.0,
+                    "orientation": orient
+                }]
+            }
+            total_used += pl * pw
+            total_stock_area += s_l * s_w
+            current_instance_id += 1
+    if current_instance_id == 1:
+        objective = 0.0
+    else:
+        objective = (total_stock_area - total_used) / total_stock_area
+    return {
+        "objective": objective,
+        "placements": placements
+    }
+```
+
+
+## Previously Injected Code (layers below you)
+--- Depth 2 ---
+pre_process:
+```python
+additional_context = "Use the provided pack_stocks helper to implement a first-fit bin-packing routine that (1) respects each piece's min/max counts, (2) tries both orientations per stock_type, (3) greedily fills existing stocks of the same type before opening new ones, and (4) only opens the minimal number of stocks needed. This will reduce waste and raise objective on high-waste instances (e.g. those scoring <0.15)."
+```
+Rationale: The current assortment_problem solver (score 0.1399, matching best-known 0.140) is a naive per-piece stock allocator that never packs >1 piece per stock and ignores max counts/orientation choices beyond a single try. Eval feedback confirms per-instance variance (0.083–0.208), with clear waste on larger instances. Largest headroom is here (even though gap=0), so improve packing density via a helper that (a) groups pieces by stock_type, (b) uses first-fit-with-orientation per stock, (c) respects min/max counts, (d) prefers compact orientations. This targets the exact failure pattern (under-utilized area) without touching frozen tasks.
+
+--- Depth 3 ---
+pre_process:
+```python
+additional_context = "Use the pack_stocks helper from solver_lib to implement a first-fit bin-packing routine that (1) respects each piece's min/max counts, (2) tries both orientations per stock_type, (3) greedily fills existing stocks of the same type before opening new ones, and (4) only opens the minimal number of stocks needed. This will reduce waste and reach the archive best-known objective of 0.140 on assortment_problem."
+```
+Rationale: ## Diagnosis
+assortment_problem has the largest headroom (gap 0.140) and is the only task with a mean of 0.000 after the depth-2 pre_process (which promised a pack_stocks helper that would do first-fit-with-orientation, min/max-aware allocation, and minimal-stock opening). The exact failure is a runtime syntax error (unterminated string literal) in the generated solve script, which traces to an incomplete dict literal at the end of the objective computation. This matches the "Indexing error" pattern (but here caused by string breakage) and the "high-waste" instances that previous layers could not fix without breaking the code.
+
+## Intervention
+Replace the broken generated solve with a corrected implementation that uses the new pack_stocks solver_lib helper (which implements the depth-2 guidance). The helper provides reusable, sandbox-safe bin-packing logic that (a) groups by stock_type, (b) tries both orientations, (c) respects min/max counts, (d) greedily fills existing stocks before opening new ones, and (e) only opens the minimal number of stocks. This directly addresses the under-utilization that produced score=0.000 and will reach the archive best-known of 0.140. No other tasks are touched.
+
+## Why this is different
+Depth-2 tried to inject textual guidance and assumed a pack_stocks helper existed; neither was emitted (or was malformed). This layer emits the actual helper + corrected solve instead of just guidance, using task-structure conditioning (stock/piece metadata) rather than any prior broken code.
+
+
+## What You Can Produce
+
+You can output any combination of:
+
+### pre_process (strategy guidance)
+Python code that runs BEFORE the solver sees the task. Your code has access to:
+- `task` (read-only TaskDescription with .task_id, .description, .metadata)
+- `outer_context` (string: guidance from higher meta-layers — use this to ADAPT your intervention based on higher layers' strategic decisions; empty if you are the outermost layer)
+
+You MUST set the `additional_context` variable (a string that gets appended to the solver's prompt).
+
+CRITICAL: Set the `additional_context` variable directly. Do NOT modify the `task` object — it is read-only.
+
+### solver_lib (solver-visible code library)
+Python functions that will be PREPENDED to the solver's generated code and available at runtime inside the sandbox. The solver sees their signatures in its prompt and can call them directly.
+
+Use this to provide working algorithm implementations that the solver cannot reliably write from scratch. This is different from pre_process (which provides strategy guidance as text) — solver_lib provides actual executable code.
+
+Example:
+```solver_lib:local_search
+def local_search(solution, evaluate_fn, time_limit=8.0):
+    """Iteratively improve solution via random swaps within time limit."""
+    import time, random
+    best, best_score = solution, evaluate_fn(solution)
+    start = time.time()
+    while time.time() - start < time_limit:
+        keys = list(best.keys())
+        if len(keys) < 2:
+            break
+        i, j = random.sample(range(len(keys)), 2)
+        neighbor = dict(best)
+        neighbor[keys[i]], neighbor[keys[j]] = neighbor[keys[j]], neighbor[keys[i]]
+        score = evaluate_fn(neighbor)
+        if score > best_score:
+            best, best_score = neighbor, score
+    return best
+```
+
+IMPORTANT for solver_lib:
+- Functions run inside the sandbox, NOT in the meta-layer
+- Only use Python standard library imports (no numpy, scipy, etc.)
+- Each block should define a single self-contained function
+- Later layers can override a function by providing a solver_lib block with the same name
+- solver_lib functions from different layers share a runtime namespace and can call each other
+- Every function MUST include type annotations and a docstring with (a) one-line summary, (b) Args section listing every parameter with its expected type and meaning, (c) Returns section describing the return type and structure. The solver only sees the signature and docstring, not the full source — the docstring is the API contract. Example:
+      def pack_items(items: list, capacity: int) -> tuple:
+          """Pack items into bins using first-fit decreasing.
+
+          Args:
+              items: list[tuple[int, int, str]] — each is (width, height, item_id).
+              capacity: int — max bin weight.
+
+          Returns:
+              tuple[int, list[dict]] — (total_cost, placements) where each dict
+              has keys 'id' (str), 'x' (int), 'y' (int).
+          """
+
+## Output Format
+
+Respond with EXACTLY this structure (omit sections you don't need):
+
+```rationale
+## Diagnosis
+<the specific failure mode or bottleneck you are targeting, grounded in the score data, the headroom table, and the per-trace failure classes above — name the actual tasks it affects>
+
+## Intervention
+<what you will change and EXACTLY which tasks it targets. For every solver_lib helper you add, name the failing task it addresses and why the solver cannot write it reliably from scratch. Do not promise code you are not emitting.>
+
+## Why this is different
+<how this differs from what the injected-code history already tried — do NOT repeat a prior approach; if you cannot beat it, emit nothing>
+```
+
+```pre_process
+<python code>
+```
+
+```solver_lib:<name>
+<python function code>
+```
+
+IMPORTANT:
+- pre_process must be self-contained Python. Do not import external packages beyond the standard library.
+- Focus on STRUCTURAL improvements, not individual error patches.
+- If a previous layer's fix hurts certain tasks, add task-type conditionals to bypass it.
+- GENERALIZE: condition on task STRUCTURE (size, constraints, metadata), NEVER on specific task_id string literals — task_id-keyed code does not transfer to unseen tasks.
+- If you add a solver_lib helper, name the specific failing task it targets and why the solver cannot reliably write it itself.
+- Keep code simple and robust — complex code is more likely to break.
+- Use pre_process for strategy guidance (text); use solver_lib for reusable implementations (code).
+- Favor small (≤30 lines), audit-able helpers over large multi-purpose ones. Helpers that break the runtime env (creating envs, installing packages, depending on uncommon CLIs) introduce more failures than they prevent.

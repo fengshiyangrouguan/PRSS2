@@ -1,0 +1,1158 @@
+You are a higher-order meta-layer (depth 3) in a recursive self-improving system called Meta^n.
+
+## Your Role
+Previous layers have already made tactical fixes — dependency handling, constraint checks, format corrections. Your job is NOT to patch individual errors. Lower layers already do that.
+
+Instead, you should:
+1. Identify SYSTEMIC patterns across task categories
+2. Understand WHY previous layers' fixes helped some tasks but hurt others
+3. Make STRUCTURAL improvements: task classification, solver strategy selection, algorithm implementations
+4. Consider CONDITIONING or BYPASSING previous layers' changes for task types where they cause regressions
+5. Provide reusable algorithm implementations (via solver_lib) that the solver can call directly
+
+## System Context
+Current depth: 3
+Tasks attempted: 6
+Current mean score: 0.806  ← PRIMARY OBJECTIVE: raise the MEAN CONTINUOUS SCORE (not just the pass count)
+Score spread (6 tasks): [0.0-0.3]x0  [0.3-0.7]x3  [0.7-1.0]x3
+pass@1 (binary success rate): 100.0%
+
+## DEEPEN — keep improving ONLY task 'assortment_problem'
+The layer BELOW already worked 'assortment_problem'; its current solution is the starting point, NOT a blank slate. Reason about what that layer produced and improve 'assortment_problem' FURTHER — do NOT discard or restart it. Every OTHER task is FROZEN and will NOT be re-solved; spend NO effort on them.
+## Opportunity — lowest-scoring tasks (most absolute room)
+All tasks are at the best-known score; these have the most room toward a perfect 1.0:
+
+| task | now | room->1.0 |
+|------|-----|----------|
+| assortment_problem | 0.571 | 0.429 |
+| capacitated_warehouse_location | 0.693 | 0.307 |
+| assignment_problem | 0.694 | 0.306 |
+| bin_packing___one_dimensional | 0.938 | 0.062 |
+| aircraft_landing | 0.953 | 0.047 |
+| common_due_date_scheduling | 0.985 | 0.015 |
+
+## Performance Summary & Analysis
+## Task Category Performance
+
+- **assignment/location** (2 tasks): 2/2 pass, mean=0.69, key issue: -
+- **packing/cutting** (2 tasks): 2/2 pass, mean=0.75, key issue: -
+- **scheduling** (2 tasks): 2/2 pass, mean=0.97, key issue: -
+
+## Previous Layer Effectiveness
+
+Previous layer rationale: "The current assortment solver is feasible but systematically under-uses the decision freedom in the problem: it packs only the minimum required pieces, then chooses the stock type with the smallest wa..."
+
+Tasks that IMPROVED (3):
+  assignment_problem: 0.500 → 0.694 (+0.194)
+  assortment_problem: 0.531 → 0.571 (+0.040)
+  capacitated_warehouse_location: 0.662 → 0.693 (+0.032)
+Tasks unchanged: 3
+Net effect: +0.046 mean score change (over 6 shared tasks)
+
+## Representative Traces (2 of 6)
+
+--- Task: assortment_problem [SUCCESS score=0.571] ---
+Script:
+```python
+def solve(**kwargs):
+    import time
+    import math
+
+    start_time = time.time()
+    deadline = start_time + 8.5
+
+    m = kwargs.get("m", len(kwargs.get("pieces", [])))
+    stocks = kwargs.get("stocks", [])
+    pieces = kwargs.get("pieces", [])
+
+    if not stocks:
+        return {"objective": 0.0, "placements": {}}
+
+    eps = 1e-9
+
+    p_len = [float(p.get("length", 0.0)) for p in pieces]
+    p_wid = [float(p.get("width", 0.0)) for p in pieces]
+    p_min = [int(p.get("min", 0)) for p in pieces]
+    p_max = [int(p.get("max", p_min[i] if i < len(p_min) else 0)) for i, p in enumerate(pieces)]
+    p_area = [p_len[i] * p_wid[i] for i in range(m)]
+
+    def dims_for(piece_idx, orientation):
+        if orientation == 0:
+            return p_len[piece_idx], p_wid[piece_idx]
+        return p_wid[piece_idx], p_len[piece_idx]
+
+    def can_fit_piece_in_stock(piece_idx, L, W):
+        a, b = p_len[piece_idx], p_wid[piece_idx]
+        return (a <= L + eps and b <= W + eps) or (b <= L + eps and a <= W + eps)
+
+    def stock_area(stock_idx):
+        return float(stocks[stock_idx].get("length", 0.0)) * float(stocks[stock_idx].get("width", 0.0))
+
+    def make_solution(stock_idx, bins, counts):
+        placements_out = {}
+        sid = 1
+        used_area = 0.0
+        for b in bins:
+            pls = []
+            for pl in b["placements"]:
+                pi = pl["piece"]
+                used_area += p_area[pi]
+                pls.append({
+                    "piece": pi + 1,
+                    "x": pl["x"],
+                    "y": pl["y"],
+                    "orientation": pl["orientation"]
+                })
+            placements_out[sid] = {
+                "stock_type": stock_idx + 1,
+                "placements": pls
+            }
+            sid += 1
+
+        total_stock_area = len(bins) * stock_area(stock_idx)
+        if total_stock_area <= eps:
+            obj = 0.0
+        else:
+            obj = max(0.0, (total_stock_area - used_area) / total_stock_area)
+
+        return {"objective": obj, "placements": placements_out}
+
+    def try_place_in_existing_shelf(bin_obj, piece_idx, L, W):
+        best = None
+        for si, sh in enumerate(bin_obj["shelves"]):
+            rem_w = L - sh["x"]
+            for ori in (0, 1):
+                pw, ph = dims_for(piece_idx, ori)
+                if pw <= rem_w + eps and ph <= sh["h"] + eps:
+                    score = (rem_w - pw, sh["h"] - ph)
+                    if best is None or score < best[0]:
+                        best = (score, si, ori, pw, ph)
+        if best is None:
+            return False
+        _, si, ori, pw, ph = best
+        sh = bin_obj["shelves"][si]
+        x, y = sh["x"], sh["y"]
+        sh["x"] += pw
+        bin_obj["placements"].append({
+            "piece": piece_idx,
+            "x": x,
+            "y": y,
+            "orientation": ori
+        })
+        return True
+
+    def try_open_shelf_in_bin(bin_obj, piece_idx, L, W):
+        best = None
+        for ori in (0, 1):
+            pw, ph = dims_for(piece_idx, ori)
+            if pw <= L + eps and bin_obj["y_used"] + ph <= W + eps:
+                score = (ph, L - pw)
+                if best is None or score < best[0]:
+                    best = (score, ori, pw, ph)
+        if best is None:
+            return False
+        _, ori, pw, ph = best
+        y = bin_obj["y_used"]
+        bin_obj["shelves"].append({"y": y, "h": ph, "x": pw})
+        bin_obj["y_used"] += ph
+        bin_obj["placements"].append({
+            "piece": piece_idx,
+            "x": 0.0,
+            "y": y,
+            "orientation": ori
+        })
+        return True
+
+    def pack_mandatory_for_stock(stock_idx):
+        L = float(stocks[stock_idx].get("length", 0.0))
+        W = float(stocks[stock_idx].get("width", 0.0))
+
+        for i in range(m):
+            if p_min[i] > 0 and not can_fit_piece_in_stock(i, L, W):
+                return None
+
+        mandatory = []
+        for i in range(m):
+            for _ in range(max(0, p_min[i])):
+                mandatory.append(i)
+
+        mandatory.sort(key=lambda i: (max(p_len[i], p_wid[i]), p_area[i], min(p_len[i], p_wid[i])), reverse=True)
+
+        bins = []
+        counts = [0] * m
+
+        for pi in mandatory:
+            if time.time() > deadline:
+                break
+
+            placed = False
+
+            bin_order = sorted(
+                range(len(bins)),
+                key=lambda bi: (W - bins[bi]["y_used"], len(bins[bi]["shelves"])),
+                reverse=True
+            )
+
+            for bi in bin_order:
+                if try_place_in_existing_shelf(bins[bi], pi, L, W):
+                    placed = True
+                    break
+
+            if not placed:
+                for bi in bin_order:
+                    if try_open_shelf_in_bin(bins[bi], pi, L, W):
+                        placed = True
+                        break
+
+            if not placed:
+                b = {"shelves": [], "placements": [], "y_used": 0.0}
+                if not try_open_shelf_in_bin(b, pi, L, W):
+                    return None
+                bins.append(b)
+
+            counts[pi] += 1
+
+        if any(counts[i] < p_min[i] for i in range(m)):
+            return None
+
+        return bins, counts
+
+    def fill_optional_existing(stock_idx, bins, counts):
+        L = float(stocks[stock_idx].get("length", 0.0))
+        W = float(stocks[stock_idx].get("width", 0.0))
+
+        candidates = [i for i in range(m) if counts[i] < p_max[i] and can_fit_piece_in_stock(i, L, W)]
+        candidates.sort(key=lambda i: (p_area[i], max(p_len[i], p_wid[i])), reverse=True)
+
+        improved = True
+        loops = 0
+        while improved and candidates and time.time() < deadline and loops < 100000:
+            improved = False
+            loops += 1
+
+            candidates = [i for i in candidates if counts[i] < p_max[i]]
+            candidates.sort(key=lambda i: (p_area[i], max(p_len[i], p_wid[i])), reverse=True)
+
+            for pi in candidates:
+                if counts[pi] >= p_max[pi]:
+                    continue
+
+                best = None
+
+                for bi, b in enumerate(bins):
+                    for si, sh in enumerate(b["shelves"]):
+                        rem_w = L - sh["x"]
+                        for ori in (0, 1):
+                            pw, ph = dims_for(pi, ori)
+                            if pw <= rem_w + eps and ph <= sh["h"] + eps:
+                                score = (rem_w - pw, sh["h"] - ph, -p_area[pi])
+                                if best is None or score < best[0]:
+                                    best = (score, "shelf", bi, si, ori, pw, ph)
+
+                    for ori in (0, 1):
+                        pw, ph = dims_for(pi, ori)
+                        if pw <= L + eps and b["y_used"] + ph <= W + eps:
+                            score = (W - (b["y_used"] + ph), L - pw, -p_area[pi])
+                            if best is None or score < best[0]:
+                                best = (score, "new_shelf", bi, None, ori, pw, ph)
+
+                if best is not None:
+                    _, kind, bi, si, ori, pw, ph = best
+                    b = bins[bi]
+                    if kind == "shelf":
+                        sh = b["shelves"][si]
+                        x, y = sh["x"], sh["y"]
+                        sh["x"] += pw
+                    else:
+                        x, y = 0.0, b["y_used"]
+                        b["shelves"].append({"y": y, "h": ph, "x": pw})
+                        b["y_used"] += ph
+
+                    b["placements"].append({
+                        "piece": pi,
+                        "x": x,
+                        "y": y,
+                        "orientation": ori
+                    })
+                    counts[pi] += 1
+                    improved = True
+                    break
+
+        return bins, counts
+
+    def build_optional_single_stock(stock_idx):
+        L = float(stocks[stock_idx].get("length", 0.0))
+        W = float(stocks[stock_idx].get("width", 0.0))
+
+        bins = [{"shelves": [], "placements": [], "y_used": 0.0}]
+        counts = [0] * m
+
+        candidates = [i for i in range(m) if p_max[i] > 0 and can_fit_piece_in_stock(i, L, W)]
+        candidates.sort(key=lambda i: (p_area[i], max(p_len[i], p_wid[i])), reverse=True)
+
+        improved = True
+        loops = 0
+        while improved and candidates and time.time() < deadline and loops < 100000:
+            improved = False
+            loops += 1
+            candidates = [i for i in candidates if counts[i] < p_max[i]]
+            candidates.sort(key=lambda i: (p_area[i], max(p_len[i], p_wid[i])), reverse=True)
+
+            for pi in candidates:
+                b = bins[0]
+                if try_place_in_existing_shelf(b, pi, L, W) or try_open_shelf_in_bin(b, pi, L, W):
+                    counts[pi] += 1
+                    improved = True
+                    break
+
+        if not bins[0]["placements"]:
+            return None
+        return bins, counts
+
+    mandatory_total = sum(max(0, x) for x in p_min)
+
+    best_solution = None
+    best_obj = float("inf")
+
+    stock_indices = list(range(len(stocks)))
+    stock_indices.sort(key=lambda si: stock_area(si))
+
+    for si in stock_indices:
+        if time.time() > deadline:
+            break
+
+        if stock_area(si) <= eps:
+            continue
+
+        if mandatory_total > 0:
+            packed = pack_mandatory_for_stock(si)
+            if packed is None:
+                continue
+            bins, counts = packed
+            bins, counts = fill_optional_existing(si, bins, counts)
+        else:
+            packed = build_optional_single_stock(si)
+            if packed is None:
+                continue
+            bins, counts = packed
+
+        sol = make_solution(si, bins, counts)
+        obj = sol["objective"]
+
+        if obj < best_obj:
+            best_obj = obj
+            best_solution = sol
+
+    if best_solution is not None:
+        return best_solution
+
+    if mandatory_total == 0:
+        return {"objective": 0.0, "placements": {}}
+
+    fallback_stock = 0
+    return {
+        "objective": 1.0,
+        "placements": {
+            1: {
+                "stock_type": fallback_stock + 1,
+                "placements": []
+            }
+        }
+    }
+```
+Stdout:
+score=0.5708
+raw_score=0.5708
+Eval feedback:
+assort1.txt -> Scores: ['0.480']
+assort10.txt -> Scores: ['0.752']
+assort4.txt -> Scores: ['0.292']
+assort7.txt -> Scores: ['0.759']
+Avg Dev Score: 0.5708
+
+--- Task: common_due_date_scheduling [SUCCESS score=0.985] ---
+Script:
+```python
+def solve(**kwargs):
+    import time
+    import math
+    import random
+
+    start_time = time.time()
+    deadline = start_time + 8.7
+
+    jobs = kwargs.get("jobs", [])
+    h = kwargs.get("h", 0.6)
+    n = len(jobs)
+
+    if n == 0:
+        return {"schedule": []}
+
+    p = [int(x[0]) for x in jobs]
+    a = [int(x[1]) for x in jobs]
+    b = [int(x[2]) for x in jobs]
+    total_p = sum(p)
+    d = int(math.floor(total_p * h))
+
+    def penalty_job(j, c):
+        if c < d:
+            return a[j] * (d - c)
+        if c > d:
+            return b[j] * (c - d)
+        return 0
+
+    def eval_order(order):
+        t = 0
+        val = 0
+        for j in order:
+            t += p[j]
+            if t < d:
+                val += a[j] * (d - t)
+            elif t > d:
+                val += b[j] * (t - d)
+        return val
+
+    # Exact dynamic programming for small instances.
+    if n <= 17:
+        m = 1 << n
+        inf = 10**30
+        dp = [inf] * m
+        parent = [-1] * m
+        prevmask = [-1] * m
+        sump = [0] * m
+        dp[0] = 0
+
+        for mask in range(1, m):
+            lb = mask & -mask
+            j = lb.bit_length() - 1
+            sump[mask] = sump[mask ^ lb] + p[j]
+
+        for mask in range(m):
+            base = dp[mask]
+            if base >= inf:
+                continue
+            t0 = sump[mask]
+            rem = ((m - 1) ^ mask)
+            while rem:
+                lb = rem & -rem
+                j = lb.bit_length() - 1
+                nm = mask | lb
+                c = t0 + p[j]
+                val = base + penalty_job(j, c)
+                if val < dp[nm]:
+                    dp[nm] = val
+                    parent[nm] = j
+                    prevmask[nm] = mask
+                rem ^= lb
+
+            if mask % 4096 == 0 and time.time() > deadline:
+                break
+
+        full = m - 1
+        if parent[full] != -1:
+            order = []
+            mask = full
+            while mask:
+                j = parent[mask]
+                order.append(j)
+                mask = prevmask[mask]
+            order.reverse()
+            return {"schedule": [x + 1 for x in order]}
+
+    def make_partition_order(key_func, reverse=True, fill_factor=1.0, allow_cross=False):
+        idx = list(range(n))
+        idx.sort(key=key_func, reverse=reverse)
+
+        cap = int(d * fill_factor)
+        early = []
+        tardy = []
+        used = 0
+
+        for j in idx:
+            if used + p[j] <= cap or (allow_cross and not early and used < cap):
+                early.append(j)
+                used += p[j]
+            else:
+                tardy.append(j)
+
+        # Early part: reverse Smith rule for maximizing weighted completion.
+        early.sort(key=lambda j: p[j] / (a[j] if a[j] > 0 else 1e-9), reverse=True)
+        # Tardy part: Smith rule for minimizing weighted completion.
+        tardy.sort(key=lambda j: p[j] / (b[j] if b[j] > 0 else 1e-9))
+        return early + tardy
+
+    candidates = []
+
+    base = list(range(n))
+    candidates.append(base[:])
+    candidates.append(sorted(base, key=lambda j: p[j]))
+    candidates.append(sorted(base, key=lambda j: p[j] / (b[j] if b[j] else 1e-9)))
+    candidates.append(sorted(base, key=lambda j: p[j] / (a[j] if a[j] else 1e-9), reverse=True))
+    candidates.append(sorted(base, key=lambda j: b[j] / (a[j] + b[j] + 1e-9), reverse=True))
+    candidates.append(sorted(base, key=lambda j: (b[j] - a[j]), reverse=True))
+
+    key_funcs = [
+        lambda j: b[j] / (a[j] + 1e-9),
+        lambda j: b[j] / (a[j] + b[j] + 1e-9),
+        lambda j: b[j] * p[j],
+        lambda j: b[j] - a[j],
+        lambda j: b[j],
+        lambda j: b[j] / (p[j] + 1e-9),
+    ]
+
+    for ff in (0.85, 0.95, 1.0, 1.05, 1.15):
+        for kf in key_funcs:
+            candidates.append(make_partition_order(kf, True, ff, False))
+            if len(candidates) < 60:
+                candidates.append(make_partition_order(kf, True, ff, True))
+
+    best_order = None
+    best_val = 10**40
+
+    for cand in candidates:
+        if time.time() > deadline:
+            break
+        val = eval_order(cand)
+        if val < best_val:
+            best_val = val
+            best_order = cand[:]
+
+    if best_order is None:
+        best_order = list(range(n))
+        best_val = eval_order(best_order)
+
+    def adjacent_descent(order, val):
+        improved = True
+        passes = 0
+        while improved and time.time() < deadline and passes < 50:
+            improved = False
+            passes += 1
+            t = 0
+            i = 0
+            while i < n - 1:
+                if time.time() > deadline:
+                    break
+                x = order[i]
+                y = order[i + 1]
+                c1 = t + p[x]
+                c2 = c1 + p[y]
+                old = penalty_job(x, c1) + penalty_job(y, c2)
+
+                nc1 = t + p[y]
+                nc2 = nc1 + p[x]
+                new = penalty_job(y, nc1) + penalty_job(x, nc2)
+
+                if new < old:
+                    order[i], order[i + 1] = order[i + 1], order[i]
+                    val += new - old
+                    improved = True
+                    # Prefix time after two jobs is unchanged.
+                    t += p[x] + p[y]
+                    i += 2
+                else:
+                    t += p[x]
+                    i += 1
+        return order, val
+
+    # Improve promising deterministic candidates.
+    for cand in candidates[:40]:
+        if time.time() > deadline:
+            break
+        val = eval_order(cand)
+        cand, val = adjacent_descent(cand[:], val)
+        if val < best_val:
+            best_val = val
+            best_order = cand[:]
+
+    # Randomized perturbation + adjacent descent for remaining time.
+    rng = random.Random(1234567 + n + total_p)
+    while time.time() < deadline:
+        cur = best_order[:]
+
+        # Light perturbation: random removals and insertions.
+        moves = 1 + min(12, n // 20)
+        for _ in range(moves):
+            if n <= 1:
+                break
+            i = rng.randrange(n)
+            job = cur.pop(i)
+            j = rng.randrange(n)
+            cur.insert(j, job)
+
+        val = eval_order(cur)
+        cur, val = adjacent_descent(cur, val)
+
+        if val < best_val:
+            best_val = val
+            best_order = cur[:]
+
+    return {"schedule": [j + 1 for j in best_order]}
+```
+Stdout:
+score=0.9855
+raw_score=0.9855
+Eval feedback:
+sch10.txt -> Scores: ['0.947', '0.981', '1.000']
+sch100.txt -> Scores: ['0.986', '0.985', '1.000']
+sch1000.txt -> Scores: ['0.967', '0.975', '0.998']
+sch20.txt -> Scores: ['1.012', '0.971', '1.006']
+sch200.txt -> Scores: ['0.994', '0.963', '0.975']
+sch50.txt -> Scores: ['1.013', '1.007', '0.994']
+sch500.txt -> Scores: ['0.964', '0.965', '0.993']
+Avg Dev Score: 0.9855
+
+
+## Inspiration from Archive (best solutions from other candidates for tasks you failed)
+--- Task: assortment_problem [BEST score=0.588] (from another candidate) ---
+Script:
+```python
+def solve(**kwargs):
+    import time
+    import math
+
+    start_time = time.time()
+    deadline = start_time + 8.5
+
+    stocks = kwargs.get("stocks", [])
+    pieces = kwargs.get("pieces", [])
+    m = kwargs.get("m", len(pieces))
+
+    eps = 1e-9
+
+    def area_stock(si):
+        return float(stocks[si]["length"]) * float(stocks[si]["width"])
+
+    def area_piece(pi):
+        return float(pieces[pi]["length"]) * float(pieces[pi]["width"])
+
+    def fits_piece_stock(pi, si):
+        pl = float(pieces[pi]["length"])
+        pw = float(pieces[pi]["width"])
+        sl = float(stocks[si]["length"])
+        sw = float(stocks[si]["width"])
+        return (pl <= sl + eps and pw <= sw + eps) or (pw <= sl + eps and pl <= sw + eps)
+
+    def add_free_rect(free_rects, rect):
+        x, y, w, h = rect
+        if w <= eps or h <= eps:
+            return
+        free_rects.append(rect)
+
+    def place_in_bin(bin_obj, pi):
+        sl = float(stocks[bin_obj["stock_type"]]["length"])
+        sw = float(stocks[bin_obj["stock_type"]]["width"])
+        pl0 = float(pieces[pi]["length"])
+        pw0 = float(pieces[pi]["width"])
+
+        best = None
+        best_key = None
+
+        for ri, rect in enumerate(bin_obj["free"]):
+            rx, ry, rw, rh = rect
+            for orient in (0, 1):
+                if orient == 0:
+                    pl, pw = pl0, pw0
+                else:
+                    pl, pw = pw0, pl0
+                if pl <= rw + eps and pw <= rh + eps:
+                    waste = rw * rh - pl * pw
+                    short_side = min(rw - pl, rh - pw)
+                    key = (waste, short_side, ry, rx)
+                    if best is None or key < best_key:
+                        best = (ri, rx, ry, rw, rh, pl, pw, orient)
+                        best_key = key
+
+        if best is None:
+            return False
+
+        ri, rx, ry, rw, rh, pl, pw, orient = best
+        bin_obj["free"].pop(ri)
+
+        rem_right = rw - pl
+        rem_top = rh - pw
+
+        if rem_right * rh >= rem_top * rw:
+            add_free_rect(bin_obj["free"], (rx + pl, ry, rem_right, rh))
+            add_free_rect(bin_obj["free"], (rx, ry + pw, pl, rem_top))
+        else:
+            add_free_rect(bin_obj["free"], (rx, ry + pw, rw, rem_top))
+            add_free_rect(bin_obj["free"], (rx + pl, ry, rem_right, pw))
+
+        bin_obj["placements"].append({
+            "piece": pi + 1,
+            "x": rx,
+            "y": ry,
+            "orientation": orient
+        })
+        bin_obj["used"] += pl0 * pw0
+        return True
+
+    def try_pack(counts, allowed_stock_types):
+        if time.time() > deadline:
+            return None
+
+        items = []
+        for pi, c in enumerate(counts):
+            for _ in range(int(c)):
+                items.append(pi)
+
+        if not items:
+            return {
+                "objective": 0.0,
+                "placements": {}
+            }
+
+        items.sort(key=lambda p: area_piece(p), reverse=True)
+
+        bins = []
+
+        allowed_stock_types = list(allowed_stock_types)
+        allowed_stock_types.sort(key=lambda s: area_stock(s))
+
+        for pi in items:
+            if time.time() > deadline:
+                return None
+
+            placed = False
+
+            best_existing = None
+            best_existing_key = None
+
+            for bi, b in enumerate(bins):
+                tmp = {
+                    "stock_type": b["stock_type"],
+                    "free": list(b["free"]),
+                    "placements": list(b["placements"]),
+                    "used": b["used"]
+                }
+                if place_in_bin(tmp, pi):
+                    free_area = sum(r[2] * r[3] for r in tmp["free"])
+                    key = (free_area, area_stock(tmp["stock_type"]))
+                    if best_existing is None or key < best_existing_key:
+                        best_existing = (bi, tmp)
+                        best_existing_key = key
+
+            if best_existing is not None:
+                bins[best_existing[0]] = best_existing[1]
+                placed = True
+
+            if not placed:
+                best_new = None
+                best_new_key = None
+                for si in allowed_stock_types:
+                    if not fits_piece_stock(pi, si):
+                        continue
+                    b = {
+                        "stock_type": si,
+                        "free": [(0.0, 0.0, float(stocks[si]["length"]), float(stocks[si]["width"]))],
+                        "placements": [],
+                        "used": 0.0
+                    }
+                    if place_in_bin(b, pi):
+                        key = (area_stock(si) - area_piece(pi), area_stock(si))
+                        if best_new is None or key < best_new_key:
+                            best_new = b
+                            best_new_key = key
+
+                if best_new is None:
+                    return None
+                bins.append(best_new)
+
+        total_stock_area = sum(area_stock(b["stock_type"]) for b in bins)
+        total_used_area = sum(b["used"] for b in bins)
+
+        if total_stock_area <= eps:
+            obj = 0.0
+        else:
+            obj = max(0.0, (total_stock_area - total_used_area) / total_stock_area)
+
+        placements = {}
+        for idx, b in enumerate(bins, 1):
+            placements[idx] = {
+                "stock_type": b["stock_type"] + 1,
+                "placements": b["placements"]
+            }
+
+        return {
+            "objective": obj,
+            "placements": placements
+        }
+
+    nstocks = len(stocks)
+
+    mins = [int(pieces[i].get("min", 0)) for i in range(m)]
+    maxs = [int(pieces[i].get("max", mins[i])) for i in range(m)]
+
+    for i in range(m):
+        if maxs[i] < mins[i]:
+            maxs[i] = mins[i]
+
+    if sum(maxs) == 0:
+        return {
+            "objective": 0.0,
+            "placements": {}
+        }
+
+    stock_sets = []
+    for i in range(nstocks):
+        stock_sets.append((i,))
+    for i in range(nstocks):
+        for j in range(i + 1, nstocks):
+            stock_sets.append((i, j))
+
+    def covers_required(stock_set):
+        for pi, c in enumerate(mins):
+            if c > 0:
+                ok = False
+                for si in stock_set:
+                    if fits_piece_stock(pi, si):
+                        ok = True
+                        break
+                if not ok:
+                    return False
+        return True
+
+    stock_sets = [s for s in stock_sets if covers_required(s)]
+    stock_sets.sort(key=lambda ss: (len(ss), min(area_stock(s) for s in ss), sum(area_stock(s) for s in ss)))
+
+    best = None
+
+    count_scenarios = []
+
+    count_scenarios.append(list(mins))
+
+    if sum(maxs) != sum(mins):
+        count_scenarios.append(list(maxs))
+
+        mid = []
+        for a, b in zip(mins, maxs):
+            mid.append((a + b) // 2)
+        count_scenarios.append(mid)
+
+        area_sorted = sorted(range(m), key=lambda i: area_piece(i), reverse=True)
+        greedy = list(mins)
+        for pi in area_sorted:
+            if maxs[pi] > greedy[pi]:
+                greedy[pi] = maxs[pi]
+        count_scenarios.append(greedy)
+
+    seen_counts = set()
+    unique_scenarios = []
+    for c in count_scenarios:
+        t = tuple(c)
+        if t not in seen_counts:
+            seen_counts.add(t)
+            unique_scenarios.append(c)
+
+    for counts in unique_scenarios:
+        if time.time() > deadline:
+            break
+        for ss in stock_sets:
+            if time.time() > deadline:
+                break
+            sol = try_pack(counts, ss)
+            if sol is not None:
+                if best is None or sol["objective"] < best["objective"]:
+                    best = sol
+
+    if best is None:
+        required_items = []
+        for pi, c in enumerate(mins):
+            for _ in range(c):
+                required_items.append(pi)
+
+        placements = {}
+        sid = 1
+        total_stock_area = 0.0
+        total_used_area = 0.0
+        used_stock_types = []
+
+        for pi in required_items:
+            candidates = []
+            for si in range(nstocks):
+                if fits_piece_stock(pi, si):
+                    candidates.append(si)
+            if not candidates:
+                continue
+            candidates.sort(key=lambda s: area_stock(s))
+            si = candidates[0]
+            if si not in used_stock_types:
+                if len(used_stock_types) < 2:
+                    used_stock_types.append(si)
+                else:
+                    si = used_stock_types[0]
+                    if not fits_piece_stock(pi, si):
+                        si = used_stock_types[1]
+            pl = float(pieces[pi]["length"])
+            pw = float(pieces[pi]["width"])
+            sl = float(stocks[si]["length"])
+            sw = float(stocks[si]["width"])
+            orient = 0
+            if not (pl <= sl + eps and pw <= sw + eps):
+                orient = 1
+
+            placements[sid] = {
+                "stock_type": si + 1,
+                "placements": [{
+                    "piece": pi + 1,
+                    "x": 0.0,
+                    "y": 0.0,
+                    "orientation": orient
+                }]
+            }
+            sid += 1
+            total_stock_area += area_stock(si)
+            total_used_area += area_piece(pi)
+
+        obj = 0.0 if total_stock_area <= eps else max(0.0, (total_stock_area - total_used_area) / total_stock_area)
+        best = {
+            "objective": obj,
+            "placements": placements
+        }
+
+    return best
+```
+
+
+## Previously Injected Code (layers below you)
+--- Depth 2 ---
+pre_process:
+```python
+# Guidance for the solver below.  This task is a 2D assortment / cutting-stock style
+# problem with min/max quantities.  The previous solution is already feasible but
+# leaves score on the table by packing only minimum quantities.
+additional_context = """
+For the assortment problem, deepen the existing shelf-packing solution rather than restarting.
+
+Important improvement target:
+- Do NOT pack only the minimum required quantities.
+- First build feasible layouts for the minimum counts as before.
+- Then exploit optional quantities up to each piece's max bound to fill unused space in already-open stock sheets.
+- Prefer adding optional pieces only when they fit into existing bins/shelves, because that lowers the waste fraction without increasing stock count.
+- Prioritize optional candidates by larger area and by tight fit into the remaining shelf width/height.
+- Try several stock types and choose the feasible solution with the lowest true waste ratio:
+    waste = (total stock area used by opened sheets - total placed piece area) / total stock area.
+- Keep all coordinates non-overlapping and within stock bounds.  The simple shelf representation from the current solution is good enough; extend it with an optional-fill pass.
+- If no mandatory pieces exist, choose optional pieces to create the most filled single stock sheet rather than returning empty or one arbitrary piece.
+
+A helper named fill_optional_shelf_bins is available.  It mutates/extends shelf-style bins by adding optional pieces that fit into existing bins, while respecting max counts.
+"""
+```
+solver_lib:fill_optional_shelf_bins:
+```python
+def fill_optional_shelf_bins(
+    bins: list,
+    pieces: list,
+    counts: list,
+    stock_length: float,
+    stock_width: float,
+    deadline: float
+) -> tuple:
+    """Greedily add optional assortment pieces into existing shelf bins.
+
+    Args:
+        bins: list[dict] — existing shelf bins.  Each bin must have keys
+            'shelves' as list of {'y': float, 'h': float, 'x': float},
+            'placements' as list of placement dicts, and 'used_area' as float.
+            Placements use 1-based piece ids and orientation 0/1.
+        pieces: list[dict] — piece definitions with 'length', 'width', and
+            optional 'max' fields.  The current count of each piece is given by
+            counts.
+        counts: list[int] — mutable current quantity placed for each piece.
+            The function will increment entries but never exceed pieces[i]['max'].
+        stock_length: float — usable stock sheet length / x dimension.
+        stock_width: float — usable stock sheet width / y dimension.
+        deadline: float — absolute time.time() deadline.  The function stops
+            early if this deadline is reached.
+
+    Returns:
+        tuple[list, list] — the mutated bins and counts after greedily inserting
+        optional pieces that fit into already-open shelf space.
+    """
+    import time
+
+    eps = 1e-9
+    n = len(pieces)
+
+    def opts(i: int) -> list:
+        pl = float(pieces[i].get("length", 0.0))
+        pw = float(pieces[i].get("width", 0.0))
+        out = []
+        if pl <= stock_length + eps and pw <= stock_width + eps:
+            out.append((pl, pw, 0))
+        if abs(pl - pw) > eps and pw <= stock_length + eps and pl <= stock_width + eps:
+            out.append((pw, pl, 1))
+        return out
+
+    area = [
+        float(pieces[i].get("length", 0.0)) * float(pieces[i].get("width", 0.0))
+        for i in range(n)
+    ]
+
+    # Large pieces first; this usually improves utilization of shelf packings.
+    candidates = sorted(range(n), key=lambda i: area[i], reverse=True)
+
+    improved = True
+    while improved and time.time() < deadline:
+        improved = False
+        best = None
+
+        for i in candidates:
+            if time.time() >= deadline:
+                break
+
+            mx = int(pieces[i].get("max", counts[i] if i < len(counts) else 0))
+            if counts[i] >= mx:
+                continue
+
+            for rw, rh, ori in opts(i):
+                # Try appending to an existing shelf.
+                for bi, b in enumerate(bins):
+                    for si, sh in enumerate(b.get("shelves", [])):
+                        if rh <= float(sh["h"]) + eps and float(sh["x"]) + rw <= stock_length + eps:
+                            rem_x = stock_length - (float(sh["x"]) + rw)
+                            height_waste = float(sh["h"]) - rh
+                            # Prefer high area, then tight shelf fit.
+                            score = (-area[i], height_waste, rem_x, bi, si)
+                            if best is None or score < best[0]:
+                                best = (score, i, bi, si, rw, rh, ori, "shelf")
+
+                    # Try opening a new shelf inside this existing bin.
+                    next_y = float(b.get("next_y", 0.0))
+                    if next_y + rh <= stock_width + eps:
+                        rem_y = stock_width - (next_y + rh)
+                        rem_x = stock_length - rw
+                        score = (-area[i], rem_y, rem_x, bi, -1)
+                        if best is None or score < best[0]:
+                            best = (score, i, bi, -1, rw, rh, ori, "new_shelf")
+
+        if best is None:
+            break
+
+        _, i, bi, si, rw, rh, ori, mode = best
+        b = bins[bi]
+
+        if mode == "shelf":
+            sh = b["shelves"][si]
+            x = float(sh["x"])
+            y = float(sh["y"])
+            sh["x"] = x + rw
+        else:
+            x = 0.0
+            y = float(b.get("next_y", 0.0))
+            b.setdefault("shelves", []).append({"y": y, "h": rh, "x": rw})
+            b["next_y"] = y + rh
+
+        b.setdefault("placements", []).append({
+            "piece": i + 1,
+            "x": x,
+            "y": y,
+            "orientation": ori
+        })
+        b["used_area"] = float(b.get("used_area", 0.0)) + rw * rh
+        counts[i] += 1
+        improved = True
+
+    return bins, counts
+```
+Rationale: The current assortment solver is feasible but systematically under-uses the decision freedom in the problem: it packs only the minimum required pieces, then chooses the stock type with the smallest waste ratio. On assortment instances, optional pieces up to their max bounds can often be added to improve stock utilization substantially, and because the score is continuous, filling already-open stock sheets is a direct way to raise score without risking feasibility.
+
+The intervention below gives the next solver explicit guidance to deepen the existing shelf-based solution rather than rewrite it. It should:
+1. Keep the current minimum-count feasibility logic.
+2. For each stock type, pack mandatory pieces.
+3. Greedily add optional pieces that fit into already-open bins, prioritizing large area and tight fits.
+4. Try a few count variants, not just the minimum vector.
+5. Return the feasible layout with the lowest actual waste fraction.
+
+I also provide a small solver_lib helper that implements the missing “fill optional pieces into existing shelf bins” step. This is targeted specifically at the assortment_problem because writing robust placement-preserving optional-fill logic is error-prone, and the current trace shows that omission is likely the main headroom source.
+
+
+## What You Can Produce
+
+You can output any combination of:
+
+### pre_process (strategy guidance)
+Python code that runs BEFORE the solver sees the task. Your code has access to:
+- `task` (read-only TaskDescription with .task_id, .description, .metadata)
+- `outer_context` (string: guidance from higher meta-layers — use this to ADAPT your intervention based on higher layers' strategic decisions; empty if you are the outermost layer)
+
+You MUST set the `additional_context` variable (a string that gets appended to the solver's prompt).
+
+CRITICAL: Set the `additional_context` variable directly. Do NOT modify the `task` object — it is read-only.
+
+### solver_lib (solver-visible code library)
+Python functions that will be PREPENDED to the solver's generated code and available at runtime inside the sandbox. The solver sees their signatures in its prompt and can call them directly.
+
+Use this to provide working algorithm implementations that the solver cannot reliably write from scratch. This is different from pre_process (which provides strategy guidance as text) — solver_lib provides actual executable code.
+
+Example:
+```solver_lib:local_search
+def local_search(solution, evaluate_fn, time_limit=8.0):
+    """Iteratively improve solution via random swaps within time limit."""
+    import time, random
+    best, best_score = solution, evaluate_fn(solution)
+    start = time.time()
+    while time.time() - start < time_limit:
+        keys = list(best.keys())
+        if len(keys) < 2:
+            break
+        i, j = random.sample(range(len(keys)), 2)
+        neighbor = dict(best)
+        neighbor[keys[i]], neighbor[keys[j]] = neighbor[keys[j]], neighbor[keys[i]]
+        score = evaluate_fn(neighbor)
+        if score > best_score:
+            best, best_score = neighbor, score
+    return best
+```
+
+IMPORTANT for solver_lib:
+- Functions run inside the sandbox, NOT in the meta-layer
+- Only use Python standard library imports (no numpy, scipy, etc.)
+- Each block should define a single self-contained function
+- Later layers can override a function by providing a solver_lib block with the same name
+- solver_lib functions from different layers share a runtime namespace and can call each other
+- Every function MUST include type annotations and a docstring with (a) one-line summary, (b) Args section listing every parameter with its expected type and meaning, (c) Returns section describing the return type and structure. The solver only sees the signature and docstring, not the full source — the docstring is the API contract. Example:
+      def pack_items(items: list, capacity: int) -> tuple:
+          """Pack items into bins using first-fit decreasing.
+
+          Args:
+              items: list[tuple[int, int, str]] — each is (width, height, item_id).
+              capacity: int — max bin weight.
+
+          Returns:
+              tuple[int, list[dict]] — (total_cost, placements) where each dict
+              has keys 'id' (str), 'x' (int), 'y' (int).
+          """
+
+## Output Format
+
+Respond with EXACTLY this structure (omit sections you don't need):
+
+```rationale
+## Diagnosis
+<the specific failure mode or bottleneck you are targeting, grounded in the score data, the headroom table, and the per-trace failure classes above — name the actual tasks it affects>
+
+## Intervention
+<what you will change and EXACTLY which tasks it targets. For every solver_lib helper you add, name the failing task it addresses and why the solver cannot write it reliably from scratch. Do not promise code you are not emitting.>
+
+## Why this is different
+<how this differs from what the injected-code history already tried — do NOT repeat a prior approach; if you cannot beat it, emit nothing>
+```
+
+```pre_process
+<python code>
+```
+
+```solver_lib:<name>
+<python function code>
+```
+
+IMPORTANT:
+- pre_process must be self-contained Python. Do not import external packages beyond the standard library.
+- Focus on STRUCTURAL improvements, not individual error patches.
+- If a previous layer's fix hurts certain tasks, add task-type conditionals to bypass it.
+- GENERALIZE: condition on task STRUCTURE (size, constraints, metadata), NEVER on specific task_id string literals — task_id-keyed code does not transfer to unseen tasks.
+- If you add a solver_lib helper, name the specific failing task it targets and why the solver cannot reliably write it itself.
+- Keep code simple and robust — complex code is more likely to break.
+- Use pre_process for strategy guidance (text); use solver_lib for reusable implementations (code).
+- Favor small (≤30 lines), audit-able helpers over large multi-purpose ones. Helpers that break the runtime env (creating envs, installing packages, depending on uncommon CLIs) introduce more failures than they prevent.

@@ -1,0 +1,1 @@
+additional_context = "CRITICAL: The injected solver_lib.compute_makespan helper MUST be used for EVERY makespan evaluation (NEH insertions, final output). NEVER implement or call any in-line compute_makespan function — always invoke solver_lib.compute_makespan(seq, matrix, n, m) instead. This is non-negotiable for correctness and to avoid timeouts on harder instances."

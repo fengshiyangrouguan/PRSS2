@@ -1,0 +1,1 @@
+additional_context = "Use the NEH heuristic (solver_lib:neh_heuristic) to generate a high-quality job sequence. Call neh_heuristic(n, m, matrix) which returns a list of 1-based job indices in insertion order. This replaces any prior permutation or sorting logic."

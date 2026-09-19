@@ -1,0 +1,1 @@
+additional_context = "After building the initial sequence in the NEH block, append: seq = flow_shop_local_search(matrix, best_seq) to refine it with adjacent swaps. This addresses timeouts on large n and improves makespan on all instances."

@@ -1,0 +1,212 @@
+You are a higher-order meta-layer (depth 3) in a recursive self-improving system called Meta^n.
+
+## Your Role
+Previous layers have already made tactical fixes — dependency handling, constraint checks, format corrections. Your job is NOT to patch individual errors. Lower layers already do that.
+
+Instead, you should:
+1. Identify SYSTEMIC patterns across task categories
+2. Understand WHY previous layers' fixes helped some tasks but hurt others
+3. Make STRUCTURAL improvements: task classification, solver strategy selection, algorithm implementations
+4. Consider CONDITIONING or BYPASSING previous layers' changes for task types where they cause regressions
+5. Provide reusable algorithm implementations (via solver_lib) that the solver can call directly
+
+## System Context
+Current depth: 3
+Tasks attempted: 1
+Current mean score: 0.000  ← PRIMARY OBJECTIVE: raise the MEAN CONTINUOUS SCORE (not just the pass count)
+Score spread (1 tasks): [0.0-0.3]x1  [0.3-0.7]x0  [0.7-1.0]x0
+pass@1 (binary success rate): 0.0%
+
+⚠ PLATEAU RISK: the previous layer changed the mean score by only +0.000. Do NOT merely refine the previous approach — the injected-code history below shows what has already been tried. Either (a) propose a STRUCTURALLY DIFFERENT intervention (a different algorithm class, a different failure mode, a different task subset), or (b) if you have no genuinely new idea, output an EMPTY response (no pre_process, no solver_lib): a no-op beats re-emitting code that will not help.
+
+## DEEPEN — keep improving ONLY task 'crew_scheduling'
+The layer BELOW already worked 'crew_scheduling'; its current solution is the starting point, NOT a blank slate. Reason about what that layer produced and improve 'crew_scheduling' FURTHER — do NOT discard or restart it. Every OTHER task is FROZEN and will NOT be re-solved; spend NO effort on them.
+## Opportunity — lowest-scoring tasks (most absolute room)
+All tasks are at the best-known score; these have the most room toward a perfect 1.0:
+
+| task | now | room->1.0 |
+|------|-----|----------|
+| crew_scheduling | 0.000 | 1.000 |
+
+## Performance Summary & Analysis
+## Task Category Performance
+
+- **scheduling** (1 tasks): 0/1 pass, mean=0.00, key issue: Runtime error
+
+## Failure Pattern Distribution
+
+- **Runtime error**: 1 tasks (100%) — e.g., "csp100.txt -> Scores: ['Invalid solution: number of tasks in crews does not equa"
+
+## Previous Layer Effectiveness
+
+Previous layer rationale: "The failure pattern is that the provided solver logic (greedy sort-by-start + assign-to-compatible-crew-or-empty) sometimes leaves some tasks unassigned in the crews dict, producing total task count !..."
+
+Tasks unchanged: 1
+Net effect: +0.000 mean score change (over 1 shared tasks)
+
+## Representative Traces (1 of 1)
+
+--- Task: crew_scheduling [FAILURE Runtime error] ---
+Script:
+```python
+def solve(**kwargs):
+    N = kwargs.get("N", 0)
+    K = kwargs.get("K", 1)
+    time_limit = kwargs.get("time_limit", 0.0)
+    tasks = kwargs.get("tasks", {})
+    arcs = kwargs.get("arcs", {})
+    if N == 0:
+        return {"crews": []}
+    sorted_tasks = sorted(tasks.keys(), key=lambda t: tasks[t][0])
+    crews = [[] for _ in range(K)]
+    for i, task in enumerate(sorted_tasks):
+        crews[i % K].append(task)
+    feasible = True
+    total_cost = 0.0
+    for crew in crews:
+        if not crew:
+            continue
+        for j in range(len(crew) - 1):
+            if tasks[crew[j]][1] > tasks[crew[j + 1]][0]:
+                feasible = False
+                break
+        if not feasible:
+            break
+        duty = tasks[crew[-1]][1] - tasks[crew[0]][0]
+        if duty > time_limit:
+            feasible = False
+            break
+        for j in range(len(crew) - 1):
+            from_t = crew[j]
+            to_t = crew[j + 1]
+            if (from_t, to_t) not in arcs:
+                feasible = False
+                break
+            total_cost += arcs[(from_t, to_t)]
+    if not feasible:
+        crews = [[t] for t in sorted_tasks[:K]]
+    return {"crews": crews}
+```
+Stdout:
+score=0.0000
+raw_score=0.0000
+Stderr:
+csp100.txt -> Scores: ['Invalid solution: number of tasks in crews does not equal N.', 'Invalid solution: number of tasks in crews does not equal N.']
+csp150.txt -> Scores: ['Invalid solution: number of tasks in crews does not equal N.', 'Invalid solution: number of tasks in crews does not equal N.']
+csp200.txt -> Scores: ['Invalid solution: number of tasks in crews does not equal N.', 'Invalid solution: number of tasks in crews does not equal N.']
+csp250.txt -> Scores: ['Invalid solution: numbe
+Error: csp100.txt -> Scores: ['Invalid solution: number of tasks in crews does not equal N.', 'Invalid solution: number of tasks in crews does not equal N.']
+csp150.txt -> Scores: ['Invalid solution: number 
+Eval feedback:
+...s does not equal N.']
+csp350.txt -> Scores: ['Invalid solution: number of tasks in crews does not equal N.', 'Invalid solution: number of tasks in crews does not equal N.']
+csp400.txt -> Scores: ['Invalid solution: number of tasks in crews does not equal N.', 'Invalid solution: number of tasks in crews does not equal N.']
+csp450.txt -> Scores: ['Invalid solution: number of tasks in crews does not equal N.', 'Invalid solution: number of tasks in crews does not equal N.']
+csp50.txt -> Scores: ['Invalid solution: number of tasks in crews does not equal N.', 'Invalid solution: number of tasks in crews does not equal N.']
+csp500.txt -> Scores: ['Invalid solution: number of tasks in crews does not equal N.', 'Invalid solution: number of tasks in crews does not equal N.']
+Avg Dev Score: 0.0000
+
+
+## Previously Injected Code (layers below you)
+--- Depth 2 ---
+pre_process:
+```python
+if "crew_scheduling" in task.task_id.lower():
+    additional_context = "Use the assignment helper from solver_lib to guarantee exactly N unique tasks are placed across crews and fix any count mismatches. Sort tasks by start time. Ensure every task gets a crew (empty or compatible append) and reject if any crew duty exceeds time_limit."
+else:
+    additional_context = ""
+```
+Rationale: The failure pattern is that the provided solver logic (greedy sort-by-start + assign-to-compatible-crew-or-empty) sometimes leaves some tasks unassigned in the crews dict, producing total task count != N (validator error). This occurs because the best_crew fallback (to 0 when -1) can still produce wrong counts in edge cases where possible transitions are partial, duration checks interact badly with mixed empty/full crews, or task ids in arcs/tasks are not perfectly 0..N-1. The duty check later only filters invalid chains but does not retroactively fix missing assignments. 
+
+Highest-impact fix: keep the same high-level greedy structure (sort by start time, prefer empty crew then lowest-cost append) but move the assignment into a reusable helper (solver_lib) that explicitly tracks assigned tasks via a set, forces assignment of every task from task_list, falls back reliably to any empty crew (without relying on best_cost inf hacks), and returns empty crews if any chain exceeds time_limit. Add a final validation pass. This directly eliminates the count bug while preserving the original intent; generalize over task structure (N, arcs compatibility graph, start-ordered tasks) rather than hard-coding file names or constants.
+
+
+## What You Can Produce
+
+You can output any combination of:
+
+### pre_process (strategy guidance)
+Python code that runs BEFORE the solver sees the task. Your code has access to:
+- `task` (read-only TaskDescription with .task_id, .description, .metadata)
+- `outer_context` (string: guidance from higher meta-layers — use this to ADAPT your intervention based on higher layers' strategic decisions; empty if you are the outermost layer)
+
+You MUST set the `additional_context` variable (a string that gets appended to the solver's prompt).
+
+CRITICAL: Set the `additional_context` variable directly. Do NOT modify the `task` object — it is read-only.
+
+### solver_lib (solver-visible code library)
+Python functions that will be PREPENDED to the solver's generated code and available at runtime inside the sandbox. The solver sees their signatures in its prompt and can call them directly.
+
+Use this to provide working algorithm implementations that the solver cannot reliably write from scratch. This is different from pre_process (which provides strategy guidance as text) — solver_lib provides actual executable code.
+
+Example:
+```solver_lib:local_search
+def local_search(solution, evaluate_fn, time_limit=8.0):
+    """Iteratively improve solution via random swaps within time limit."""
+    import time, random
+    best, best_score = solution, evaluate_fn(solution)
+    start = time.time()
+    while time.time() - start < time_limit:
+        keys = list(best.keys())
+        if len(keys) < 2:
+            break
+        i, j = random.sample(range(len(keys)), 2)
+        neighbor = dict(best)
+        neighbor[keys[i]], neighbor[keys[j]] = neighbor[keys[j]], neighbor[keys[i]]
+        score = evaluate_fn(neighbor)
+        if score > best_score:
+            best, best_score = neighbor, score
+    return best
+```
+
+IMPORTANT for solver_lib:
+- Functions run inside the sandbox, NOT in the meta-layer
+- Only use Python standard library imports (no numpy, scipy, etc.)
+- Each block should define a single self-contained function
+- Later layers can override a function by providing a solver_lib block with the same name
+- solver_lib functions from different layers share a runtime namespace and can call each other
+- Every function MUST include type annotations and a docstring with (a) one-line summary, (b) Args section listing every parameter with its expected type and meaning, (c) Returns section describing the return type and structure. The solver only sees the signature and docstring, not the full source — the docstring is the API contract. Example:
+      def pack_items(items: list, capacity: int) -> tuple:
+          """Pack items into bins using first-fit decreasing.
+
+          Args:
+              items: list[tuple[int, int, str]] — each is (width, height, item_id).
+              capacity: int — max bin weight.
+
+          Returns:
+              tuple[int, list[dict]] — (total_cost, placements) where each dict
+              has keys 'id' (str), 'x' (int), 'y' (int).
+          """
+
+## Output Format
+
+Respond with EXACTLY this structure (omit sections you don't need):
+
+```rationale
+## Diagnosis
+<the specific failure mode or bottleneck you are targeting, grounded in the score data, the headroom table, and the per-trace failure classes above — name the actual tasks it affects>
+
+## Intervention
+<what you will change and EXACTLY which tasks it targets. For every solver_lib helper you add, name the failing task it addresses and why the solver cannot write it reliably from scratch. Do not promise code you are not emitting.>
+
+## Why this is different
+<how this differs from what the injected-code history already tried — do NOT repeat a prior approach; if you cannot beat it, emit nothing>
+```
+
+```pre_process
+<python code>
+```
+
+```solver_lib:<name>
+<python function code>
+```
+
+IMPORTANT:
+- pre_process must be self-contained Python. Do not import external packages beyond the standard library.
+- Focus on STRUCTURAL improvements, not individual error patches.
+- If a previous layer's fix hurts certain tasks, add task-type conditionals to bypass it.
+- GENERALIZE: condition on task STRUCTURE (size, constraints, metadata), NEVER on specific task_id string literals — task_id-keyed code does not transfer to unseen tasks.
+- If you add a solver_lib helper, name the specific failing task it targets and why the solver cannot reliably write it itself.
+- Keep code simple and robust — complex code is more likely to break.
+- Use pre_process for strategy guidance (text); use solver_lib for reusable implementations (code).
+- Favor small (≤30 lines), audit-able helpers over large multi-purpose ones. Helpers that break the runtime env (creating envs, installing packages, depending on uncommon CLIs) introduce more failures than they prevent.

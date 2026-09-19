@@ -1,0 +1,462 @@
+You are one layer in a recursive self-improving system called Meta^n.
+
+## Your Role
+Given the execution traces and context of the system below you, produce code that improves its performance — specifically, that raises the MEAN CONTINUOUS SCORE across tasks. Treat a higher score as the goal even on tasks that already "pass": most tasks here are scored on a 0.0–1.0 continuum, not pass/fail. You do NOT solve tasks directly — you write code that helps the solver below you perform better.
+
+## System Context
+Current depth: 2
+Tasks attempted: 1
+Current mean score: 0.932  ← PRIMARY OBJECTIVE: raise the MEAN CONTINUOUS SCORE (not just the pass count)
+Score spread (1 tasks): [0.0-0.3]x0  [0.3-0.7]x0  [0.7-1.0]x1
+pass@1 (binary success rate): 100.0%
+## Opportunity — lowest-scoring tasks (most absolute room)
+All tasks are at the best-known score; these have the most room toward a perfect 1.0:
+
+| task | now | room->1.0 |
+|------|-----|----------|
+| bin_packing___one_dimensional | 0.932 | 0.068 |
+
+## Execution Traces (sampled: 0 failures, 1 successes)
+--- Task: bin_packing___one_dimensional [SUCCESS score=0.932] ---
+Script:
+```python
+def solve(**kwargs):
+    import time
+    import random
+    import itertools
+
+    start = time.perf_counter()
+    deadline = start + 9.2
+
+    cap = kwargs.get('bin_capacity')
+    items = kwargs.get('items', [])
+    n = len(items)
+
+    if n == 0:
+        return {'num_bins': 0, 'bins': []}
+
+    # Sort items descending by size
+    sorted_idx = sorted(range(n), key=lambda i: items[i], reverse=True)
+    sorted_items = [(items[i], i) for i in sorted_idx]
+
+    def ffd(order):
+        bins = []
+        loads = []
+        for idx in order:
+            s = items[idx]
+            placed = False
+            for j in range(len(bins)):
+                if loads[j] + s <= cap:
+                    bins[j].append(idx)
+                    loads[j] += s
+                    placed = True
+                    break
+            if not placed:
+                bins.append([idx])
+                loads.append(s)
+        return bins, loads
+
+    def bfd(order):
+        bins = []
+        loads = []
+        for idx in order:
+            s = items[idx]
+            best_j = -1
+            best_rem = cap + 1
+            for j in range(len(bins)):
+                rem = cap - loads[j]
+                if rem >= s and rem < best_rem:
+                    best_rem = rem
+                    best_j = j
+            if best_j == -1:
+                bins.append([idx])
+                loads.append(s)
+            else:
+                bins[best_j].append(idx)
+                loads[best_j] += s
+        return bins, loads
+
+    # Initial solutions
+    sol1, load1 = ffd(sorted_idx)
+    sol2, load2 = bfd(sorted_idx)
+    if len(sol1) <= len(sol2):
+        bins, loads = sol1, load1
+    else:
+        bins, loads = sol2, load2
+
+    # Lower bound
+    total_size = sum(items)
+    lb_sum = (total_size + cap - 1) // cap
+    lb_half = sum(1 for s in items if 2 * s > cap)
+    lower = max(lb_sum, lb_half)
+
+    def try_pack_into_bins(place_items, bins, loads, cap, deadline):
+        m = len(place_items)
+        if m == 0:
+            return True
+        total_size = sum(s for s, _ in place_items)
+        total_rem = sum(cap - l for l in loads)
+        if total_size > total_rem:
+            return False
+
+        place_items.sort(key=lambda x: x[0], reverse=True)
+
+        # Greedy fallback for many items
+        if m > 25:
+            added = []
+            for s, idx in place_items:
+                best_j = -1
+                best_rem = cap + 1
+                for j in range(len(loads)):
+                    rem = cap - loads[j]
+                    if rem >= s and rem < best_rem:
+                        best_rem = rem
+                        best_j = j
+                if best_j == -1:
+                    for bj, i, sz in reversed(added):
+                        bins[bj].pop()
+                        loads[bj] -= sz
+                    return False
+                bins[best_j].append(idx)
+                loads[best_j] += s
+                added.append((best_j, idx, s))
+            return True
+
+        suffix_sum = [0] * (m + 1)
+        for i in range(m - 1, -1, -1):
+            suffix_sum[i] = suffix_sum[i + 1] + place_items[i][0]
+
+        failed = set()
+
+        def dfs(i):
+            if i == m:
+                return True
+            if time.perf_counter() > deadline:
+                return False
+            if suffix_sum[i] > sum(cap - l for l in loads):
+                return False
+            if place_items[i][0] > max(cap - l for l in loads):
+                return False
+
+            state = (i, tuple(sorted(loads)))
+            if state in failed:
+                return False
+
+            s, idx = place_items[i]
+            tried_loads = set()
+            candidates = []
+            for j in range(len(loads)):
+                rem = cap - loads[j]
+                if rem >= s:
+                    candidates.append((rem, j))
+            candidates.sort()
+
+            for rem, j in candidates:
+                if loads[j] in tried_loads:
+                    continue
+                tried_loads.add(loads[j])
+                loads[j] += s
+                bins[j].append(idx)
+                if dfs(i + 1):
+                    return True
+                bins[j].pop()
+                loads[j] -= s
+
+            failed.add(state)
+            return False
+
+        return dfs(0)
+
+    def remove_one(bins, loads, cap, deadline):
+        B = len(bins)
+        if B <= 1:
+            return False
+        order = sorted(range(B), key=lambda j: len(bins[j]))
+        for j in order:
+            if time.perf_counter() > deadline:
+                return False
+            new_bins = [bins[k][:] for k in range(B) if k != j]
+            new_loads = [loads[k] for k in range(B) if k != j]
+            place_items = [(items[idx], idx) for idx in bins[j]]
+            if try_pack_into_bins(place_items, new_bins, new_loads, cap, deadline):
+                bins[:] = new_bins
+                loads[:] = new_loads
+                return True
+        return False
+
+    def remove_set(bins, loads, cap, deadline, max_remove=2):
+        B = len(bins)
+        if B <= max_remove:
+            return False
+        candidates = sorted(range(B), key=lambda j: len(bins[j]))
+        if B > 20:
+            candidates = candidates[:15]
+
+        for r in range(2, max_remove + 1):
+            cnt = 0
+            for combo in itertools.combinations(candidates, r):
+                if time.perf_counter() > deadline:
+                    return False
+                total_items = sum(len(bins[j]) for j in combo)
+                if total_items > 30:
+                    continue
+                total_size = sum(loads[j] for j in combo)
+                combo_set = set(combo)
+                rem_cap = sum(cap - loads[k] for k in range(B) if k not in combo_set)
+                if total_size > rem_cap:
+                    continue
+
+                new_bins = [bins[k][:] for k in range(B) if k not in combo_set]
+                new_loads = [loads[k] for k in range(B) if k not in combo_set]
+                place_items = []
+                for j in combo:
+                    for idx in bins[j]:
+                        place_items.append((items[idx], idx))
+
+                if try_pack_into_bins(place_items, new_bins, new_loads, cap, deadline):
+                    bins[:] = new_bins
+                    loads[:] = new_loads
+                    return True
+
+                cnt += 1
+                if cnt > 200:
+                    break
+        return False
+
+    def pack_fixed_k(items_sorted, K, cap, deadline):
+        n = len(items_sorted)
+        if K == 0:
+            return [] if n == 0 else None
+
+        bins = [[] for _ in range(K)]
+        loads = [0] * K
+        suffix_sum = [0] * (n + 1)
+        for i in range(n - 1, -1, -1):
+            suffix_sum[i] = suffix_sum[i + 1] + items_sorted[i][0]
+
+        failed = set()
+
+        def dfs(i, used_bins):
+            if i == n:
+                return [b for b in bins if b]
+            if time.perf_counter() > deadline:
+                return None
+
+            total_rem = sum(cap - loads[j] for j in range(used_bins)) + (K - used_bins) * cap
+            if suffix_sum[i] > total_rem:
+                return None
+
+            state = (i, tuple(sorted(loads[:used_bins])))
+            if state in failed:
+                return None
+
+            s, idx = items_sorted[i]
+            tried_loads = set()
+            candidates = []
+            for j in range(used_bins):
+                if loads[j] + s <= cap:
+                    candidates.append((cap - loads[j], j))
+            candidates.sort()
+
+            for rem, j in candidates:
+                if loads[j] in tried_loads:
+                    continue
+                tried_loads.add(loads[j])
+                loads[j] += s
+                bins[j].append(idx)
+                res = dfs(i + 1, used_bins)
+                if res is not None:
+                    return res
+                bins[j].pop()
+                loads[j] -= s
+
+            if used_bins < K and 0 not in tried_loads:
+                bins[used_bins].append(idx)
+                loads[used_bins] = s
+                res = dfs(i + 1, used_bins + 1)
+                if res is not None:
+                    return res
+                bins[used_bins].pop()
+                loads[used_bins] = 0
+
+            failed.add(state)
+            return None
+
+        return dfs(0, 0)
+
+    # Main improvement loop
+    while time.perf_counter() < deadline - 0.1 and len(bins) > lower:
+        improved = False
+
+        if remove_one(bins, loads, cap, deadline):
+            improved = True
+            continue
+
+        if remove_set(bins, loads, cap, deadline, max_remove=2):
+            improved = True
+            continue
+
+        if remove_set(bins, loads, cap, deadline, max_remove=3):
+            improved = True
+            continue
+
+        if (n <= 60 or len(bins) <= 20) and len(bins) > lower:
+            slice_deadline = min(deadline, time.perf_counter() + 2.0)
+            res = pack_fixed_k(sorted_items, len(bins) - 1, cap, slice_deadline)
+            if res is not None:
+                bins = res
+                loads = [sum(items[i] for i in b) for b in bins]
+                improved = True
+                continue
+
+        if n > 1 and time.perf_counter() < deadline - 0.5:
+            best_count = len(bins)
+            best_bins = bins
+            best_loads = loads
+            iters = 100 if n > 500 else 500 if n > 200 else 2000
+            for _ in range(iters):
+                if time.perf_counter() > deadline - 0.5:
+                    break
+                order = sorted_idx[:]
+                swaps = max(1, n // 10)
+                for __ in range(swaps):
+                    i = random.randrange(n - 1)
+                    order[i], order[i + 1] = order[i + 1], order[i]
+                new_bins, new_loads = ffd(order)
+                if len(new_bins) < best_count:
+                    best_count = len(new_bins)
+                    best_bins = new_bins
+                    best_loads = new_loads
+            if best_count < len(bins):
+                bins = best_bins
+                loads = best_loads
+                improved = True
+                continue
+
+        if not improved:
+            break
+
+    # Convert to 1-based indices
+    final_bins = []
+    for b in bins:
+        final_bins.append([idx + 1 for idx in b])
+
+    return {
+        'num_bins': len(final_bins),
+        'bins': final_bins
+    }
+```
+Stdout:
+score=0.9319
+raw_score=0.9319
+Eval feedback:
+binpack1.txt -> Scores: ['0.980', '1.000', '1.000', '0.979', '1.000']
+binpack2.txt -> Scores: ['0.990', '0.981', '0.980', '0.990', '0.980']
+binpack3.txt -> Scores: ['0.990', '0.985', '0.985', '0.985', '0.990']
+binpack4.txt -> Scores: ['0.990', '0.988', '0.993', '0.990', '0.988']
+binpack5.txt -> Scores: ['0.870', '0.870', '0.870', '0.870', '0.870']
+binpack6.txt -> Scores: ['0.870', '0.870', '0.889', '0.889', '0.889']
+binpack7.txt -> Scores: ['0.883', '0.883', '0.874', '0.874', '0.865']
+binpack8.txt -> Scores: ['0.874', '0.879', '0.874', '0.879', '0.874']
+Avg Dev Score: 0.9319
+
+## Baseline Comparison
+
+Tasks unchanged: 1
+Net effect: +0.000 mean score change
+
+## Previously Injected Code (layers below you)
+(none — you are the first meta-layer)
+
+## What You Can Produce
+
+You can output any combination of:
+
+### pre_process (strategy guidance)
+Python code that runs BEFORE the solver sees the task. Your code has access to:
+- `task` (read-only TaskDescription with .task_id, .description, .metadata)
+- `outer_context` (string: guidance from higher meta-layers — use this to ADAPT your intervention based on higher layers' strategic decisions; empty if you are the outermost layer)
+
+You MUST set the `additional_context` variable (a string that gets appended to the solver's prompt).
+
+CRITICAL: Set the `additional_context` variable directly. Do NOT modify the `task` object — it is read-only.
+
+Example:
+```pre_process
+# Adapt tactics based on higher layer's strategy (if any)
+if "greedy" in outer_context.lower():
+    additional_context = "Implement greedy assignment: sort by cost, assign iteratively."
+elif "file" in task.description.lower():
+    additional_context = "Remember to use proper quoting for file paths with spaces."
+else:
+    additional_context = ""
+```
+
+### solver_lib (solver-visible code library)
+Python functions that will be PREPENDED to the solver's generated code and available at runtime inside the sandbox. The solver sees their signatures in its prompt and can call them directly.
+
+Use this to provide working algorithm implementations that the solver cannot reliably write from scratch. This is different from pre_process (which provides strategy guidance as text) — solver_lib provides actual executable code.
+
+Example:
+```solver_lib:local_search
+def local_search(solution, evaluate_fn, time_limit=8.0):
+    """Iteratively improve solution via random swaps within time limit."""
+    import time, random
+    best, best_score = solution, evaluate_fn(solution)
+    start = time.time()
+    while time.time() - start < time_limit:
+        keys = list(best.keys())
+        if len(keys) < 2:
+            break
+        i, j = random.sample(range(len(keys)), 2)
+        neighbor = dict(best)
+        neighbor[keys[i]], neighbor[keys[j]] = neighbor[keys[j]], neighbor[keys[i]]
+        score = evaluate_fn(neighbor)
+        if score > best_score:
+            best, best_score = neighbor, score
+    return best
+```
+
+IMPORTANT for solver_lib:
+- Functions run inside the sandbox, NOT in the meta-layer
+- Only use Python standard library imports (no numpy, scipy, etc.)
+- Each block should define a single self-contained function
+- Later layers can override a function by providing a solver_lib block with the same name
+- solver_lib functions from different layers share a runtime namespace and can call each other
+- Every function MUST include type annotations and a docstring with (a) one-line summary, (b) Args section listing every parameter with its expected type and meaning, (c) Returns section describing the return type and structure. The solver only sees the signature and docstring, not the full source — the docstring is the API contract. Example:
+      def pack_items(items: list, capacity: int) -> tuple:
+          """Pack items into bins using first-fit decreasing.
+
+          Args:
+              items: list[tuple[int, int, str]] — each is (width, height, item_id).
+              capacity: int — max bin weight.
+
+          Returns:
+              tuple[int, list[dict]] — (total_cost, placements) where each dict
+              has keys 'id' (str), 'x' (int), 'y' (int).
+          """
+
+## Output Format
+
+Respond with EXACTLY this structure (omit sections you don't need):
+
+```rationale
+<your reasoning about what patterns you see and what improvements to make>
+```
+
+```pre_process
+<python code>
+```
+
+```solver_lib:<name>
+<python function code>
+```
+
+IMPORTANT:
+- pre_process must be self-contained Python. Do not import external packages beyond the standard library.
+- Focus on the highest-impact improvement based on the failure patterns you observe.
+- Be specific about what failure patterns you're addressing.
+- GENERALIZE: condition your intervention on task STRUCTURE (problem size, presence of hard constraints, metadata fields) — NEVER branch on specific task_id string literals. Code that keys off task_id values cannot transfer to unseen tasks and is wasted effort.
+- If you add a solver_lib helper, it must target a specific failing task: name that task in your rationale and explain why the solver cannot write it reliably itself.
+- Keep code simple and robust — complex code is more likely to break.
+- Favor small (≤30 lines), audit-able helpers over large multi-purpose ones. Helpers that break the runtime env (creating envs, installing packages, depending on uncommon CLIs) introduce more failures than they prevent.

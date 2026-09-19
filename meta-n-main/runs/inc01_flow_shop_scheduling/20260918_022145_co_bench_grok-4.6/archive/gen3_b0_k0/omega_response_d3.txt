@@ -1,0 +1,62 @@
+```rationale
+## Diagnosis
+The systemic failure is indexing errors during NEH heuristic execution for n>5 on Taillard instances (e.g., tai100_10.txt), stemming from incorrect sequence construction in the insertion loop (temp_seq building) and makespan computation where C[i][j] assumes valid i-1 or j-1 without boundary checks, causing list index out of range when i=0 or j=0 in non-first positions. This affects all tested instances, yielding 0/1 pass despite 0.794 best-known.
+
+## Intervention
+Replace the previous NEH with a corrected version in solver_lib:neh_heuristic that properly implements makespan with explicit boundary handling for i==0/j==0 cases and no mutable-tuple comparisons, and pre_process that sets additional_context to force invocation of neh_heuristic for flow_shop_scheduling (bypassing any prior DP fallback). This targets ONLY flow_shop_scheduling, directly addressing the +0.794 gap by providing a reliable heuristic implementation the solver can call.
+
+## Why this is different
+Unlike the injected johnson_heuristic (which had similar insertion bugs in its NEH part for m>2), this new helper uses a cleaner O(n^2 m) simulation with explicit boundary handling and no mutable-tuple comparisons — a structural rewrite of the algorithm class rather than incremental patch.
+```
+
+```pre_process
+if task.task_id == "flow_shop_scheduling":
+    additional_context = """You are solving the m-machine flow-shop scheduling problem. Use the provided neh_heuristic from solver_lib to compute the job sequence. Never implement DP or other algorithms; always call neh_heuristic(n, m, matrix). Return {'job_sequence': list_of_job_indices_0based}. The returned sequence must be a valid permutation (all jobs 0..n-1 exactly once)."""
+else:
+    additional_context = ""
+```
+
+```solver_lib:neh_heuristic
+def neh_heuristic(n: int, m: int, matrix: list) -> list:
+    """NEH heuristic for m-machine flow shop scheduling.
+    Args:
+        n: number of jobs
+        m: number of machines
+        matrix: n x m list of processing times
+    Returns:
+        list of job indices (0-based) in the order to process them.
+    """
+    # Compute total processing time for each job
+    totals = [sum(row) for row in matrix]
+    # Sort jobs by total time descending
+    jobs = list(range(n))
+    jobs.sort(key=lambda j: totals[j], reverse=True)
+    # NEH insertion heuristic
+    def compute_makespan(seq):
+        C = [[0] * m for _ in range(n)]
+        for j in range(m):
+            for i in range(n):
+                p = matrix[seq[i]][j]
+                if i == 0 and j == 0:
+                    C[i][j] = p
+                elif i == 0:
+                    C[i][j] = C[i][j-1] + p
+                elif j == 0:
+                    C[i][j] = C[i-1][j] + p
+                else:
+                    C[i][j] = max(C[i-1][j], C[i][j-1]) + p
+        return C[n-1][m-1]
+    # Start with first two jobs
+    seq = jobs[:2]
+    for j in jobs[2:]:
+        best_makespan = float('inf')
+        best_pos = 0
+        for pos in range(len(seq) + 1):
+            temp_seq = seq[:pos] + [j] + seq[pos:]
+            ms = compute_makespan(temp_seq)
+            if ms < best_makespan:
+                best_makespan = ms
+                best_pos = pos
+        seq = seq[:best_pos] + [j] + seq[best_pos:]
+    return jobs
+```

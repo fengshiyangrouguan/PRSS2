@@ -1,0 +1,9 @@
+{
+  "outer_calls": 0,
+  "outer_prompt_tokens": 0,
+  "outer_completion_tokens": 0,
+  "outer_cached_tokens": 0,
+  "outer_cost_usd": 0.0,
+  "model": "claude-haiku-4-5-20251001",
+  "backend": "openrouter"
+}

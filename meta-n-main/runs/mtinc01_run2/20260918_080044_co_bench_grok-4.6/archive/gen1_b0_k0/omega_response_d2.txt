@@ -1,0 +1,41 @@
+```rationale
+The current bin_packing___one_dimensional implementation (FFD first-fit on descending sort) already reaches 0.9296/0.930 and is near ceiling per the gap table, but sampled failures on binpack5/6/7/8 show occasional 0.83-0.88 scores. These stem from suboptimal bin selection (first-fit can waste space on early bins). Replacing with Best-Fit Decreasing (BFD) in a solver_lib helper will tighten packing without complexity, raising raw_score and thus mean across all instances. pre_process appends guidance to force the below-layer solver to invoke the helper (generalized via problem structure: "use best-fit on sorted items" instead of brittle task_id checks). No other tasks touched; code kept to 25 lines, stdlib-only, self-contained.
+
+```pre_process
+if "bin packing" in task.description.lower() or "one dimensional" in task.description.lower():
+    additional_context = "Use the prepended best_fit_decreasing helper for first-fit-style assignment; it finds the tightest-fitting bin instead of the first one."
+else:
+    additional_context = ""
+```
+
+```solver_lib:best_fit_decreasing
+def best_fit_decreasing(items: list, bin_capacity: int) -> tuple:
+    """Best-Fit Decreasing heuristic for 1D bin packing.
+
+    Args:
+        items: list of item sizes (positive floats <= bin_capacity).
+        bin_capacity: max items per bin.
+
+    Returns:
+        (num_bins: int, bins: list) where bins is a list of lists each containing item indices in that bin.
+    """
+    if not items:
+        return 0, []
+    indexed = sorted(enumerate(items), key=lambda x: x[1], reverse=True)
+    bins = []
+    for item_idx, size in indexed:
+        if size > bin_capacity:
+            continue
+        best_bin_idx = -1
+        best_remaining = bin_capacity + 1
+        for b_idx, b in enumerate(bins):
+            remaining = bin_capacity - sum(items[j] for j in b)
+            if remaining >= size and remaining < best_remaining:
+                best_remaining = remaining
+                best_bin_idx = b_idx
+        if best_bin_idx >= 0:
+            bins[best_bin_idx].append(item_idx)
+        else:
+            bins.append([item_idx])
+    return len(bins), [[idx + 1 for idx in b] for b in bins]
+```

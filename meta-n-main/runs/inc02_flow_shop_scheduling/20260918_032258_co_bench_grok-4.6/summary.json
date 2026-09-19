@@ -1,0 +1,31 @@
+{
+  "archive_size": 5,
+  "total_iterations": 4,
+  "total_tokens": 49471,
+  "token_usage": {
+    "outer_total": 49471,
+    "outer_prompt": 19862,
+    "outer_completion": 29609,
+    "outer_calls": 11,
+    "inner_total": 0,
+    "inner_prompt": 0,
+    "inner_completion": 0,
+    "inner_calls": 0
+  },
+  "best_mean_score": 0.7953454716949414,
+  "best_candidate_id": "gen1_b0_k0",
+  "oracle_mean_score": 0.7953454716949414,
+  "test_mean_score": 0.7910924214690839,
+  "chain_test_mean_score": 0.7910924214690839,
+  "per_task_best_scores": {
+    "flow_shop_scheduling": 0.7953454716949414
+  },
+  "convergence_history": [
+    0.0,
+    0.7953454716949414,
+    0.7953454716949414,
+    0.7953454716949414,
+    0.7953454716949414
+  ],
+  "run_status": "completed"
+}

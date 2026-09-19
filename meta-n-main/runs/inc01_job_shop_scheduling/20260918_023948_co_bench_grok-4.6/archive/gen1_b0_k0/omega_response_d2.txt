@@ -1,0 +1,44 @@
+```rationale
+Current heuristic (critical-path list scheduling via suffix sums + earliest-start dispatching) is basic and inconsistent: strong on some large tai instances (~0.67) but weak on small/medium ones like tai20_20 (~0.45-0.53) and tai15_15 (~0.48-0.65), yielding only 0.58 avg. This indicates the greedy ordering doesn't always escape local optima on the disjunctive job-machine graph. Failure pattern is sensitivity to problem size/structure (hard precedence + machine contention). Improvement: prepend local-search refinement (random adjacent swaps on same machine, accept if makespan drops). This is a lightweight, standard post-processing step that the solver can invoke directly and that reliably lifts schedule quality without changing the core solver logic. Use pre_process to inject the call into the existing script; keep solver_lib minimal (single self-contained function, 100 iterations, only stdlib).
+```
+
+```pre_process
+additional_context = "After the code block that builds start_times and machine_finish, immediately call local_search(schedule, times, machines, n_jobs, n_machines) and replace the start_times with the returned value. This applies limited random adjacent swaps on each machine to reduce makespan."
+```
+
+```solver_lib:local_search
+def local_search(schedule: dict, times: list[list[int]], machines: list[list[int]], n_jobs: int, n_machines: int) -> dict:
+    """Refine an initial schedule via limited random adjacent swaps on machines.
+    Args:
+        schedule: dict containing 'start_times' (list[list[int]] of job x machine starts)
+        times: list[list[int]] — processing times (n_jobs x n_machines)
+        machines: list[list[int]] — machine assignments (n_jobs x n_machines)
+        n_jobs: int — number of jobs
+        n_machines: int — number of machines
+    Returns:
+        updated dict with improved 'start_times' (lower makespan)
+    """
+    import copy
+    import random
+    s = copy.deepcopy(schedule["start_times"])
+    def makespan():
+        finish = [0] * n_machines
+        for j in range(n_jobs):
+            for m in range(n_machines):
+                mach = machines[j][m]
+                finish[mach] = max(finish[mach], s[j][m] + times[j][m])
+        return max(finish)
+    best = makespan()
+    for _ in range(100):
+        j1, m = random.randint(0, n_jobs - 1), random.randint(0, n_machines - 1)
+        j2 = random.randint(0, n_jobs - 1)
+        if m == machines[j1][m] and m == machines[j2][m]:  # same machine
+            s[j1][m], s[j2][m] = s[j2][m], s[j1][m]
+            new = makespan()
+            if new < best:
+                best = new
+            else:
+                s[j1][m], s[j2][m] = s[j2][m], s[j1][m]  # revert
+    schedule["start_times"] = s
+    return schedule
+```

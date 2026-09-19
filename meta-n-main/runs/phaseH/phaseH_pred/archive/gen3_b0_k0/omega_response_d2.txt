@@ -1,0 +1,145 @@
+```rationale
+The only unfrozen target is assortment_problem, with modest but real headroom. The likely scoring pattern is continuous objective quality, so the solver should avoid merely returning any feasible assortment and instead optimize expected revenue. Many assortment benchmarks use multinomial-logit/no-purchase choice models, where the expected revenue of an offered set S is sum(v_i*r_i)/(v0+sum(v_i)). A robust improvement is to give the solver a small exact/near-exact helper for MNL assortments, especially with optional cardinality limits. This addresses a common weakness: solvers often use revenue sorting or value sorting, which is suboptimal because low-revenue high-attraction products can cannibalize demand.
+
+The helper below is intentionally generic: it does not branch on task_id and accepts products as dicts, tuples, or raw revenues. It implements the fixed-point / parametric characterization: for a candidate revenue R, products with positive v_i*(r_i-R) are beneficial; with a cardinality cap, keep the top positive contributions. This yields strong solutions quickly, and the solver can still wrap it with local add/drop/swap search if the instance has extra constraints.
+```
+
+```pre_process
+# Provide targeted guidance only when the task description structurally looks like
+# an assortment/revenue choice optimization problem. Do not modify the task object.
+desc = (getattr(task, "description", "") or "").lower()
+meta = str(getattr(task, "metadata", "") or "").lower()
+text = desc + " " + meta
+
+if ("assortment" in text) or ("multinomial" in text) or ("logit" in text) or ("no-purchase" in text) or ("no purchase" in text):
+    additional_context = """
+For assortment-style revenue problems, optimize the expected objective, not just feasibility.
+If the model is multinomial-logit/MNL with revenues r_i, preference weights v_i, and no-purchase
+weight v0, the expected revenue of offered set S is:
+
+    R(S) = sum_{i in S} v_i*r_i / (v0 + sum_{i in S} v_i)
+
+Do NOT simply sort by revenue or by preference weight: high-attraction low-revenue products can
+cannibalize better items. Use the provided helper `mnl_assortment(...)` when the input resembles
+an MNL assortment problem. It handles optional cardinality limits and returns 1-based product
+indices plus the expected revenue. If the benchmark has additional constraints, use the helper's
+selected set as a high-quality starting point, then run small add/drop/swap local search while
+recomputing the true objective and preserving feasibility.
+"""
+else:
+    additional_context = ""
+```
+
+```solver_lib:mnl_assortment
+def mnl_assortment(products: list, no_purchase_weight: float = 1.0, max_items: int | None = None,
+                   revenue_key: str = "revenue", weight_key: str = "weight") -> dict:
+    """Compute a high-quality MNL revenue-maximizing assortment.
+
+    Args:
+        products: list — products in original order. Each product may be a dict with revenue and
+            preference/attraction weight fields, a tuple/list like (revenue, weight), or a numeric
+            revenue value. Recognized dict alternatives include revenue/profit/price and
+            weight/preference/attraction/value/v.
+        no_purchase_weight: float — outside-option/no-purchase preference weight v0.
+        max_items: int | None — optional maximum number of offered products. If None, no cardinality
+            cap is applied.
+        revenue_key: str — preferred dict key for revenue if present.
+        weight_key: str — preferred dict key for MNL preference weight if present.
+
+    Returns:
+        dict — {'selected': list[int], 'expected_revenue': float}, where selected contains 1-based
+        product indices in ascending order.
+    """
+    def fields(p):
+        if isinstance(p, dict):
+            r = None
+            for k in (revenue_key, "revenue", "profit", "price", "margin", "r"):
+                if k in p:
+                    r = p[k]
+                    break
+            if r is None:
+                r = 0.0
+            v = None
+            for k in (weight_key, "weight", "preference", "attraction", "value", "utility", "v"):
+                if k in p:
+                    v = p[k]
+                    break
+            if v is None:
+                v = 1.0
+            return float(r), float(v)
+        if isinstance(p, (tuple, list)):
+            if len(p) >= 2:
+                return float(p[0]), float(p[1])
+            if len(p) == 1:
+                return float(p[0]), 1.0
+        return float(p), 1.0
+
+    items = []
+    for idx, p in enumerate(products, 1):
+        r, v = fields(p)
+        if v > 0.0 and r > 0.0:
+            items.append((idx, r, v))
+
+    if not items:
+        return {"selected": [], "expected_revenue": 0.0}
+
+    if max_items is not None:
+        try:
+            max_items = int(max_items)
+        except Exception:
+            max_items = None
+    if max_items is not None and max_items <= 0:
+        return {"selected": [], "expected_revenue": 0.0}
+
+    v0 = float(no_purchase_weight)
+    if v0 < 0.0:
+        v0 = 0.0
+
+    def eval_set(sel):
+        num = 0.0
+        den = v0
+        for _, r, v in sel:
+            num += r * v
+            den += v
+        return num / den if den > 0.0 else 0.0
+
+    def best_for_threshold(R):
+        cand = []
+        for it in items:
+            _, r, v = it
+            gain = v * (r - R)
+            if gain > 1e-12:
+                cand.append((gain, it))
+        cand.sort(reverse=True, key=lambda x: x[0])
+        if max_items is not None:
+            cand = cand[:max_items]
+        return [it for _, it in cand]
+
+    # Parametric fixed-point iteration. For MNL, the optimal set consists of items
+    # with positive contribution relative to the optimal revenue; with a cardinality
+    # cap, keep the largest positive contributions.
+    R = 0.0
+    best_sel = []
+    best_R = 0.0
+    for _ in range(80):
+        sel = best_for_threshold(R)
+        new_R = eval_set(sel)
+        if new_R > best_R + 1e-12:
+            best_R = new_R
+            best_sel = sel
+        if abs(new_R - R) <= 1e-11 * (1.0 + abs(R)):
+            break
+        R = new_R
+
+    # Safety pass over revenue thresholds catches edge cases/ties and is cheap.
+    thresholds = sorted(set([0.0] + [r for _, r, _ in items]))
+    for R0 in thresholds:
+        sel = best_for_threshold(R0 - 1e-12)
+        val = eval_set(sel)
+        if val > best_R + 1e-12:
+            best_R = val
+            best_sel = sel
+
+    selected = sorted(idx for idx, _, _ in best_sel)
+    return {"selected": selected, "expected_revenue": float(best_R)}
+```

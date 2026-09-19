@@ -1,0 +1,10 @@
+{
+  "oracle_mean_score": 0.0,
+  "num_contributing_chains": 1,
+  "per_task_best_sources": {
+    "affine_transform_2d": {
+      "score": 0.0,
+      "candidate_id": "gen0_seed"
+    }
+  }
+}

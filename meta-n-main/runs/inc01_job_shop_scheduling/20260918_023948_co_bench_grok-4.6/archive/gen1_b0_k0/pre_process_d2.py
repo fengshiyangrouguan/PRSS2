@@ -1,0 +1,1 @@
+additional_context = "After the code block that builds start_times and machine_finish, immediately call local_search(schedule, times, machines, n_jobs, n_machines) and replace the start_times with the returned value. This applies limited random adjacent swaps on each machine to reduce makespan."

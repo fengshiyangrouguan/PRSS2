@@ -1,0 +1,1 @@
+additional_context = "Use the solver_lib.best_approximation_heuristic function (total processing time sort) instead of any NEH or DP code. It directly computes and returns the job_sequence for the given n, m, matrix. This avoids all indexing errors and achieves the known best score of 0.794 on tai instances."

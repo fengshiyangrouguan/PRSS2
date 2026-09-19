@@ -1,0 +1,28 @@
+```rationale
+## Diagnosis
+The hybrid (setup*processing descending) permutation added by the prior layer produces only marginal +0.006 mean lift because the solver still emits round-robin batch_assignment that fails to deprioritize high-setup jobs when they land on the same machine (reentrancy conflict source) and because the product key overweights setup at the expense of processing times that dominate makespan variance (evident in the 0.524-0.798 spread and especially weak hrs-50_1.txt / hrs-50_2.txt scores). Largest remaining headroom (0.269) sits exactly in this permutation+assignment pair; simple sequential baseline already beats it at 0.969, proving the current logic is not solving the core failure class.
+
+## Intervention
+Replace the product-key helper with a new LPT (longest-processing-time) permutation solver_lib helper that the solver will be forced to call; keep batch_assignment round-robin but condition the pre_process guidance to prefer LPT over any prior hybrid product logic. Targets only hybrid_reentrant_shop_scheduling (the sole active task) because LPT is a proven machine-scheduling heuristic that directly attacks the processing-time bottleneck ignored by the product key; solver cannot reliably derive LPT from scratch without explicit guidance and the helper guarantees it is called with correct signature.
+
+## Why this is different
+Prior layer injected a product-key helper + pre_process text that the solver ignored or under-used; this intervention supplies an entirely new algorithm class (LPT, standard in scheduling literature) plus conditional bypass text in pre_process that forces the solver to discard the product key rather than patch it—structurally different intervention on the exact same task subset without touching any other category.
+```
+
+```pre_process
+additional_context = "Ignore any prior hybrid product key. Instead call the lpt_permutation helper from solver_lib to obtain a longest-processing-time (descending) 1-based permutation. Keep batch_assignment exactly as round-robin. The LPT heuristic prioritizes jobs with long processing times to reduce makespan under reentrancy; document this choice in the returned dict."
+```
+
+```solver_lib:lpt_permutation
+def lpt_permutation(n_jobs: int, processing_times: list[float]) -> list[int]:
+    """Return 1-based job permutation sorted by longest processing time (descending).
+
+    Args:
+        n_jobs: int — number of jobs in the instance
+        processing_times: list[float] — processing time per job
+
+    Returns:
+        list[int] — permutation of job numbers (1-based) sorted by processing time descending
+    """
+    return [p + 1 for p in sorted(range(n_jobs), key=lambda i: processing_times[i], reverse=True)]
+```

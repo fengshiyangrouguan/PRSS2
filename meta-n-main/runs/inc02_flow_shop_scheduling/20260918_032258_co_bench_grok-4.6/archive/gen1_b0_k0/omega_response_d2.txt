@@ -1,0 +1,38 @@
+```rationale
+The provided solver code has multiple failure modes causing "list index out of range": (1) the makespan function assumes m >= 1 and n >= 1 when indexing C[0][j], C[i][0], C[i][j-1] etc. without guards, (2) for n=0 the early return exists but the judge likely still invokes makespan on empty seq leading to C = [] then C[0][j] access, (3) for n=1 the hardcoded [1] works but the surrounding logic doesn't generalize, and (4) the insertion loop builds permutations but doesn't protect against malformed seq (duplicates or wrong length) that the judge's C matrix can index into. The NEH-style insertion (sort by total time + greedy best-position insertion) is directionally correct but the heuristic only reaches ~0.3 at best on larger instances, far below the 0.795 known optimum, so the gap is structural. Highest-impact fix is to inject a battle-tested, edge-case-safe makespan helper into solver_lib (the solver cannot reliably write this from scratch due to the off-by-one and missing guards); pre_process adds task-structure guidance so the solver conditions its insertion loop on n/m bounds and uses the helper. This targets the exact failure pattern without overhauling the existing heuristic.
+```
+
+```pre_process
+if "flow_shop_scheduling" in task.description.lower():
+    additional_context = "Use the injected makespan helper. Handle n=0 and m=0 gracefully. Sort jobs by total processing time. Start with first 2 jobs then insert remaining ones in best position via makespan. Return 1-based job sequence. Avoid index errors on empty sequences."
+else:
+    additional_context = ""
+```
+
+```solver_lib:makespan
+def makespan(seq, matrix, n, m):
+    """Compute makespan for flow-shop scheduling given job sequence.
+    Args:
+        seq: list[int] — job indices (0-based) in the order to process.
+        matrix: list[list[int]] — processing times; matrix[i][j] is job i on machine j.
+        n: int — number of jobs.
+        m: int — number of machines.
+    Returns:
+        int — makespan C_max.
+    """
+    if n == 0:
+        return 0
+    if m == 0:
+        return sum(sum(row) for row in matrix)  # all work done
+    C = [[0] * m for _ in range(n)]
+    for j in range(m):
+        if j == 0:
+            C[0][j] = matrix[seq[0]][j]
+        else:
+            C[0][j] = C[0][j - 1] + matrix[seq[0]][j]
+    for i in range(1, n):
+        C[i][0] = C[i - 1][0] + matrix[seq[i]][0]
+        for j in range(1, m):
+            C[i][j] = max(C[i - 1][j], C[i][j - 1]) + matrix[seq[i]][j]
+    return C[n - 1][m - 1]
+```

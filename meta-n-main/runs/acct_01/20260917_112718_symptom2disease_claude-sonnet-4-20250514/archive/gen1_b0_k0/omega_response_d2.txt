@@ -1,0 +1,13 @@
+```rationale
+mock layer at depth 2: keep the contract, change nothing observable.
+```
+
+```pre_process
+def pre_process(task, solution):
+    return solution
+```
+
+```solver_lib:mock_helper
+def mock_helper(x):
+    return x
+```

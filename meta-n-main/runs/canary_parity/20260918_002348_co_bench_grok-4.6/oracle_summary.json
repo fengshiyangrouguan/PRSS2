@@ -1,0 +1,10 @@
+{
+  "oracle_mean_score": 0.8292276664199938,
+  "num_contributing_chains": 1,
+  "per_task_best_sources": {
+    "flow_shop_scheduling": {
+      "score": 0.8292276664199938,
+      "candidate_id": "gen1_b0_k0"
+    }
+  }
+}

@@ -1,0 +1,180 @@
+You are one layer in a recursive self-improving system called Meta^n.
+
+## Your Role
+Given the execution traces and context of the system below you, produce code that improves its performance — specifically, that raises the MEAN CONTINUOUS SCORE across tasks. Treat a higher score as the goal even on tasks that already "pass": most tasks here are scored on a 0.0–1.0 continuum, not pass/fail. You do NOT solve tasks directly — you write code that helps the solver below you perform better.
+
+## System Context
+Current depth: 2
+Tasks attempted: 1
+Current mean score: 0.000  ← PRIMARY OBJECTIVE: raise the MEAN CONTINUOUS SCORE (not just the pass count)
+Score spread (1 tasks): [0.0-0.3]x1  [0.3-0.7]x0  [0.7-1.0]x0
+pass@1 (binary success rate): 0.0%
+
+## DEEPEN — keep improving ONLY task 'flow_shop_scheduling'
+The layer BELOW already worked 'flow_shop_scheduling'; its current solution is the starting point, NOT a blank slate. Reason about what that layer produced and improve 'flow_shop_scheduling' FURTHER — do NOT discard or restart it. Every OTHER task is FROZEN and will NOT be re-solved; spend NO effort on them.
+## Opportunity — per-task headroom to best-known (largest gap first)
+Target the largest-gap tasks. Tasks with a small/zero gap are near their ceiling — do NOT regress them.
+
+| task | now | best-known | gap |
+|------|-----|-----------|-----|
+| flow_shop_scheduling | 0.000 | 0.712 | +0.712 |
+
+## Execution Traces (sampled: 1 failures, 0 successes)
+--- Task: flow_shop_scheduling [FAILURE Indexing error] ---
+Script:
+```python
+def solve(**kwargs):
+    n = kwargs['n']
+    m = kwargs['m']
+    matrix = kwargs['matrix']
+    if n == 0:
+        return {'job_sequence': []}
+    if n == 1:
+        return {'job_sequence': [1]}
+    # compute total processing times
+    totals = [sum(row) for row in matrix]
+    jobs = list(range(n))
+    jobs.sort(key=lambda j: totals[j], reverse=True)
+    # nested function to compute makespan using classical recurrence
+    def compute_makespan(seq):
+        C = [[0] * m for _ in range(n)]
+        for j in range(m):
+            C[0][j] = sum(matrix[seq[i]][j] for i in range(j + 1))
+        for i in range(1, n):
+            C[i][0] = sum(matrix[seq[k]][0] for k in range(i + 1))
+        for i in range(1, n):
+            for j in range(1, m):
+                C[i][j] = max(C[i - 1][j], C[i][j - 1]) + matrix[seq[i]][j]
+        return C[n - 1][m - 1]
+    # NEH heuristic
+    seq = [jobs[0]]
+    for k in range(1, n):
+        best_makespan = float('inf')
+        best_pos = 0
+        for pos in range(len(seq) + 1):
+            temp_seq = seq[:pos] + [jobs[k]] + seq[pos:]
+            makespan = compute_makespan(temp_seq)
+            if makespan < best_makespan:
+                best_makespan = makespan
+                best_pos = pos
+        seq.insert(best_pos, jobs[k])
+    return {'job_sequence': [j + 1 for j in seq]}
+```
+Stdout:
+score=0.0000
+raw_score=0.0000
+Stderr:
+tai100_10.txt -> Scores: ['list index out of range', 'list index out of range', 'list index out of range', 'list index out of range', 'list index out of range']
+tai100_20.txt -> Scores: ['list index out of range', 'list index out of range', 'list index out of range', 'list index out of range', 'list index out of range']
+tai100_5.txt -> Scores: ['list index out of range', 'list index out of range', 'list index out of range', 'list index out of range', 'list index out of range']
+tai200_10.txt -> S
+Error: tai100_10.txt -> Scores: ['list index out of range', 'list index out of range', 'list index out of range', 'list index out of range', 'list index out of range']
+tai100_20.txt -> Scores: ['list index o
+Eval feedback:
+...['list index out of range', 'list index out of range', 'list index out of range', 'list index out of range', 'list index out of range']
+tai500_20.txt -> Scores: ['list index out of range', 'list index out of range', 'list index out of range', 'list index out of range', 'list index out of range']
+tai50_10.txt -> Scores: ['list index out of range', 'list index out of range', 'list index out of range', 'list index out of range', 'list index out of range']
+tai50_20.txt -> Scores: ['list index out of range', 'list index out of range', 'list index out of range', 'list index out of range', 'list index out of range']
+tai50_5.txt -> Scores: ['list index out of range', 'list index out of range', 'list index out of range', 'list index out of range', 'list index out of range']
+Avg Dev Score: 0.0000
+
+## Baseline Comparison
+
+Tasks unchanged: 1
+Net effect: +0.000 mean score change
+
+## Previously Injected Code (layers below you)
+(none — you are the first meta-layer)
+
+## What You Can Produce
+
+You can output any combination of:
+
+### pre_process (strategy guidance)
+Python code that runs BEFORE the solver sees the task. Your code has access to:
+- `task` (read-only TaskDescription with .task_id, .description, .metadata)
+- `outer_context` (string: guidance from higher meta-layers — use this to ADAPT your intervention based on higher layers' strategic decisions; empty if you are the outermost layer)
+
+You MUST set the `additional_context` variable (a string that gets appended to the solver's prompt).
+
+CRITICAL: Set the `additional_context` variable directly. Do NOT modify the `task` object — it is read-only.
+
+Example:
+```pre_process
+# Adapt tactics based on higher layer's strategy (if any)
+if "greedy" in outer_context.lower():
+    additional_context = "Implement greedy assignment: sort by cost, assign iteratively."
+elif "file" in task.description.lower():
+    additional_context = "Remember to use proper quoting for file paths with spaces."
+else:
+    additional_context = ""
+```
+
+### solver_lib (solver-visible code library)
+Python functions that will be PREPENDED to the solver's generated code and available at runtime inside the sandbox. The solver sees their signatures in its prompt and can call them directly.
+
+Use this to provide working algorithm implementations that the solver cannot reliably write from scratch. This is different from pre_process (which provides strategy guidance as text) — solver_lib provides actual executable code.
+
+Example:
+```solver_lib:local_search
+def local_search(solution, evaluate_fn, time_limit=8.0):
+    """Iteratively improve solution via random swaps within time limit."""
+    import time, random
+    best, best_score = solution, evaluate_fn(solution)
+    start = time.time()
+    while time.time() - start < time_limit:
+        keys = list(best.keys())
+        if len(keys) < 2:
+            break
+        i, j = random.sample(range(len(keys)), 2)
+        neighbor = dict(best)
+        neighbor[keys[i]], neighbor[keys[j]] = neighbor[keys[j]], neighbor[keys[i]]
+        score = evaluate_fn(neighbor)
+        if score > best_score:
+            best, best_score = neighbor, score
+    return best
+```
+
+IMPORTANT for solver_lib:
+- Functions run inside the sandbox, NOT in the meta-layer
+- Only use Python standard library imports (no numpy, scipy, etc.)
+- Each block should define a single self-contained function
+- Later layers can override a function by providing a solver_lib block with the same name
+- solver_lib functions from different layers share a runtime namespace and can call each other
+- Every function MUST include type annotations and a docstring with (a) one-line summary, (b) Args section listing every parameter with its expected type and meaning, (c) Returns section describing the return type and structure. The solver only sees the signature and docstring, not the full source — the docstring is the API contract. Example:
+      def pack_items(items: list, capacity: int) -> tuple:
+          """Pack items into bins using first-fit decreasing.
+
+          Args:
+              items: list[tuple[int, int, str]] — each is (width, height, item_id).
+              capacity: int — max bin weight.
+
+          Returns:
+              tuple[int, list[dict]] — (total_cost, placements) where each dict
+              has keys 'id' (str), 'x' (int), 'y' (int).
+          """
+
+## Output Format
+
+Respond with EXACTLY this structure (omit sections you don't need):
+
+```rationale
+<your reasoning about what patterns you see and what improvements to make>
+```
+
+```pre_process
+<python code>
+```
+
+```solver_lib:<name>
+<python function code>
+```
+
+IMPORTANT:
+- pre_process must be self-contained Python. Do not import external packages beyond the standard library.
+- Focus on the highest-impact improvement based on the failure patterns you observe.
+- Be specific about what failure patterns you're addressing.
+- GENERALIZE: condition your intervention on task STRUCTURE (problem size, presence of hard constraints, metadata fields) — NEVER branch on specific task_id string literals. Code that keys off task_id values cannot transfer to unseen tasks and is wasted effort.
+- If you add a solver_lib helper, it must target a specific failing task: name that task in your rationale and explain why the solver cannot write it reliably itself.
+- Keep code simple and robust — complex code is more likely to break.
+- Favor small (≤30 lines), audit-able helpers over large multi-purpose ones. Helpers that break the runtime env (creating envs, installing packages, depending on uncommon CLIs) introduce more failures than they prevent.

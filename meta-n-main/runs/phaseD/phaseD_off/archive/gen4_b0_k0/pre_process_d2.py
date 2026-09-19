@@ -1,0 +1,1 @@
+additional_context = "Use the calculate_makespan helper (provided via solver_lib) to compute makespan for every permutation. Replace the buggy inline C matrix code with a call to the helper; this eliminates both indexing errors and will let the solver finish all permutations on the tai* test instances."

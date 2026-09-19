@@ -1,0 +1,9 @@
+{
+  "pre_process": "additional_context = \"Read the complete instance data from kwargs (jobs matrix with processing times, reentrant visit orders, machine speeds, setups). Sort the permutation by descending total processing time (or longest-first when reentrant visits are present). Replace round-robin batch_assignment with a load-aware round-robin that balances machine loads after each reentrant visit and respects any machine-specific capacities. Keep permutation and batch_assignment outputs exactly as the expected schema but make them instance-optimal. Use only standard Python; do not import external libs.\"",
+  "code_library": {},
+  "code_library_bash": {},
+  "rationale": "The current solver only uses n_jobs and n_machines and emits a trivial sequential permutation + round-robin batches, ignoring all instance-specific data (processing times, reentrant visit sequences, machine speeds, setup costs, etc.) that must be present in kwargs. This explains why we sit at 0.9686 instead of 1.0: many instances are solved sub-optimally, especially on the harder hrs-50_*.txt sets where makespan or tardiness penalties are large. A modest but reliable lift comes from (a) reading the full job matrix from kwargs, (b) sorting the permutation by a fast proxy like sum of processing times (or longest first for reentrant jobs), and (c) replacing pure round-robin with a load-aware assignment that respects reentrant machine sequences. This is a small, self-contained change that the lower layer can adopt without restarting from scratch. I will therefore emit pre_process guidance that the solver sees before it writes its solve() function.",
+  "source_depth": 2,
+  "task_solution_map": {},
+  "sandbox_verified_names": []
+}

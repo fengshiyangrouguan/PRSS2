@@ -1,0 +1,233 @@
+You are a higher-order meta-layer (depth 3) in a recursive self-improving system called Meta^n.
+
+## Your Role
+Previous layers have already made tactical fixes — dependency handling, constraint checks, format corrections. Your job is NOT to patch individual errors. Lower layers already do that.
+
+Instead, you should:
+1. Identify SYSTEMIC patterns across task categories
+2. Understand WHY previous layers' fixes helped some tasks but hurt others
+3. Make STRUCTURAL improvements: task classification, solver strategy selection, algorithm implementations
+4. Consider CONDITIONING or BYPASSING previous layers' changes for task types where they cause regressions
+5. Provide reusable algorithm implementations (via solver_lib) that the solver can call directly
+
+## System Context
+Current depth: 3
+Tasks attempted: 1
+Current mean score: 0.000  ← PRIMARY OBJECTIVE: raise the MEAN CONTINUOUS SCORE (not just the pass count)
+Score spread (1 tasks): [0.0-0.3]x1  [0.3-0.7]x0  [0.7-1.0]x0
+pass@1 (binary success rate): 0.0%
+
+⚠ PLATEAU RISK: the previous layer changed the mean score by only +0.000. Do NOT merely refine the previous approach — the injected-code history below shows what has already been tried. Either (a) propose a STRUCTURALLY DIFFERENT intervention (a different algorithm class, a different failure mode, a different task subset), or (b) if you have no genuinely new idea, output an EMPTY response (no pre_process, no solver_lib): a no-op beats re-emitting code that will not help.
+
+## DEEPEN — keep improving ONLY task 'flow_shop_scheduling'
+The layer BELOW already worked 'flow_shop_scheduling'; its current solution is the starting point, NOT a blank slate. Reason about what that layer produced and improve 'flow_shop_scheduling' FURTHER — do NOT discard or restart it. Every OTHER task is FROZEN and will NOT be re-solved; spend NO effort on them.
+## Opportunity — per-task headroom to best-known (largest gap first)
+Target the largest-gap tasks. Tasks with a small/zero gap are near their ceiling — do NOT regress them.
+
+| task | now | best-known | gap |
+|------|-----|-----------|-----|
+| flow_shop_scheduling | 0.000 | 0.794 | +0.794 |
+
+## Performance Summary & Analysis
+## Task Category Performance
+
+- **scheduling** (1 tasks): 0/1 pass, mean=0.00, key issue: Runtime error
+
+## Failure Pattern Distribution
+
+- **Runtime error**: 1 tasks (100%) — e.g., "tai100_10.txt -> Scores: ["name 'calculate_makespan' is not defined", "name 'cal"
+
+## Previous Layer Effectiveness
+
+Previous layer rationale: "The solver's inline DP for makespan has two fatal indexing bugs that trigger the reported "list index out of range" on every test case (including small n): (1) the inner loop starts at k=0 so C[j][k-1..."
+
+Tasks unchanged: 1
+Net effect: +0.000 mean score change (over 1 shared tasks)
+
+## Representative Traces (1 of 1)
+
+--- Task: flow_shop_scheduling [FAILURE Runtime error] ---
+Script:
+```python
+def solve(**kwargs):
+    n = kwargs['n']
+    m = kwargs['m']
+    matrix = kwargs['matrix']
+    if n <= 1:
+        return {'job_sequence': [1]}
+    from itertools import permutations
+    best_makespan = float('inf')
+    best_perm = None
+    for p in permutations(range(n)):
+        seq = [x + 1 for x in p]
+        makespan = calculate_makespan(matrix, p)
+        if makespan < best_makespan:
+            best_makespan = makespan
+            best_perm = p
+    return {'job_sequence': list(best_perm) + [1]}
+```
+Stdout:
+score=0.0000
+raw_score=0.0000
+Stderr:
+tai100_10.txt -> Scores: ["name 'calculate_makespan' is not defined", "name 'calculate_makespan' is not defined", "name 'calculate_makespan' is not defined", "name 'calculate_makespan' is not defined", "name 'calculate_makespan' is not defined"]
+tai100_20.txt -> Scores: ["name 'calculate_makespan' is not defined", "name 'calculate_makespan' is not defined", "name 'calculate_makespan' is not defined", "name 'calculate_makespan' is not defined", "name 'calculate_makespan' is not defined"]
+tai100_5
+Error: tai100_10.txt -> Scores: ["name 'calculate_makespan' is not defined", "name 'calculate_makespan' is not defined", "name 'calculate_makespan' is not defined", "name 'calculate_makespan' is not defined"
+Eval feedback:
+...ame 'calculate_makespan' is not defined"]
+tai50_10.txt -> Scores: ["name 'calculate_makespan' is not defined", "name 'calculate_makespan' is not defined", "name 'calculate_makespan' is not defined", "name 'calculate_makespan' is not defined", "name 'calculate_makespan' is not defined"]
+tai50_20.txt -> Scores: ["name 'calculate_makespan' is not defined", "name 'calculate_makespan' is not defined", "name 'calculate_makespan' is not defined", "name 'calculate_makespan' is not defined", "name 'calculate_makespan' is not defined"]
+tai50_5.txt -> Scores: ["name 'calculate_makespan' is not defined", "name 'calculate_makespan' is not defined", "name 'calculate_makespan' is not defined", "name 'calculate_makespan' is not defined", "name 'calculate_makespan' is not defined"]
+Avg Dev Score: 0.0000
+
+
+## Inspiration from Archive (best solutions from other candidates for tasks you failed)
+--- Task: flow_shop_scheduling [BEST score=0.794] (from another candidate) ---
+Script:
+```python
+def solve(**kwargs):
+    n = kwargs['n']
+    m = kwargs['m']
+    matrix = kwargs['matrix']
+    if m == 2:
+        jobs = list(range(n))
+        a = [matrix[j][0] for j in jobs]
+        b = [matrix[j][1] for j in jobs]
+        A = [j for j in jobs if a[j] < b[j]]
+        B = [j for j in jobs if a[j] > b[j]]
+        A.sort(key=lambda j: a[j])
+        B.sort(key=lambda j: b[j], reverse=True)
+        order = A + B
+        job_sequence = [j + 1 for j in order]
+    else:
+        totals = [sum(row) for row in matrix]
+        order = sorted(range(n), key=lambda i: totals[i])
+        job_sequence = [i + 1 for i in order]
+    return {'job_sequence': job_sequence}
+```
+
+
+## Previously Injected Code (layers below you)
+--- Depth 2 ---
+pre_process:
+```python
+additional_context = "Use the calculate_makespan helper (provided via solver_lib) to compute makespan for every permutation. Replace the buggy inline C matrix code with a call to the helper; this eliminates both indexing errors and will let the solver finish all permutations on the tai* test instances."
+```
+solver_lib:calculate_makespan:
+```python
+def calculate_makespan(matrix: list[list[int]], perm: tuple[int, ...]) -> int:
+    """Compute makespan for a flow-shop schedule.
+
+    Args:
+        matrix: 2D list where matrix[j][k] is processing time of job j on machine k (0-based)
+        perm: tuple of job indices in the sequence order (0-based)
+
+    Returns:
+        int: makespan (completion time of the last job on the last machine)
+    """
+    n = len(perm)
+    m = len(matrix[0]) if matrix else 0
+    C = [[0] * m for _ in range(n + 1)]
+    for j in range(1, n + 1):
+        for k in range(m):
+            if k == 0:
+                C[j][k] = C[j - 1][k] + matrix[perm[j - 1]][k]
+            elif j == 1:
+                C[j][k] = C[j][k - 1] + matrix[perm[j - 1]][k]
+            else:
+                C[j][k] = max(C[j - 1][k], C[j][k - 1]) + matrix[perm[j - 1]][k]
+    return C[n][m - 1]
+```
+Rationale: The solver's inline DP for makespan has two fatal indexing bugs that trigger the reported "list index out of range" on every test case (including small n): (1) the inner loop starts at k=0 so C[j][k-1] dereferences a negative index, and (2) it reads C[n][m] but the matrix only has columns 0..m-1. Brute-force permutation search is also doomed for n>10-12 because of combinatorial explosion, but the immediate failure is the crash, which is why score=0.0. The largest headroom is in this task (+0.794 gap), so I will not touch other tasks. I supply a single, self-contained, correctly-bounded helper that follows the classic O(nm) DP for flow-shop makespan; the solver can call it directly after the pre_process hint. This is small, auditable, uses only stdlib, and will let the existing solver code run without rewriting the DP logic it cannot yet produce reliably.
+
+
+## What You Can Produce
+
+You can output any combination of:
+
+### pre_process (strategy guidance)
+Python code that runs BEFORE the solver sees the task. Your code has access to:
+- `task` (read-only TaskDescription with .task_id, .description, .metadata)
+- `outer_context` (string: guidance from higher meta-layers — use this to ADAPT your intervention based on higher layers' strategic decisions; empty if you are the outermost layer)
+
+You MUST set the `additional_context` variable (a string that gets appended to the solver's prompt).
+
+CRITICAL: Set the `additional_context` variable directly. Do NOT modify the `task` object — it is read-only.
+
+### solver_lib (solver-visible code library)
+Python functions that will be PREPENDED to the solver's generated code and available at runtime inside the sandbox. The solver sees their signatures in its prompt and can call them directly.
+
+Use this to provide working algorithm implementations that the solver cannot reliably write from scratch. This is different from pre_process (which provides strategy guidance as text) — solver_lib provides actual executable code.
+
+Example:
+```solver_lib:local_search
+def local_search(solution, evaluate_fn, time_limit=8.0):
+    """Iteratively improve solution via random swaps within time limit."""
+    import time, random
+    best, best_score = solution, evaluate_fn(solution)
+    start = time.time()
+    while time.time() - start < time_limit:
+        keys = list(best.keys())
+        if len(keys) < 2:
+            break
+        i, j = random.sample(range(len(keys)), 2)
+        neighbor = dict(best)
+        neighbor[keys[i]], neighbor[keys[j]] = neighbor[keys[j]], neighbor[keys[i]]
+        score = evaluate_fn(neighbor)
+        if score > best_score:
+            best, best_score = neighbor, score
+    return best
+```
+
+IMPORTANT for solver_lib:
+- Functions run inside the sandbox, NOT in the meta-layer
+- Only use Python standard library imports (no numpy, scipy, etc.)
+- Each block should define a single self-contained function
+- Later layers can override a function by providing a solver_lib block with the same name
+- solver_lib functions from different layers share a runtime namespace and can call each other
+- Every function MUST include type annotations and a docstring with (a) one-line summary, (b) Args section listing every parameter with its expected type and meaning, (c) Returns section describing the return type and structure. The solver only sees the signature and docstring, not the full source — the docstring is the API contract. Example:
+      def pack_items(items: list, capacity: int) -> tuple:
+          """Pack items into bins using first-fit decreasing.
+
+          Args:
+              items: list[tuple[int, int, str]] — each is (width, height, item_id).
+              capacity: int — max bin weight.
+
+          Returns:
+              tuple[int, list[dict]] — (total_cost, placements) where each dict
+              has keys 'id' (str), 'x' (int), 'y' (int).
+          """
+
+## Output Format
+
+Respond with EXACTLY this structure (omit sections you don't need):
+
+```rationale
+## Diagnosis
+<the specific failure mode or bottleneck you are targeting, grounded in the score data, the headroom table, and the per-trace failure classes above — name the actual tasks it affects>
+
+## Intervention
+<what you will change and EXACTLY which tasks it targets. For every solver_lib helper you add, name the failing task it addresses and why the solver cannot write it reliably from scratch. Do not promise code you are not emitting.>
+
+## Why this is different
+<how this differs from what the injected-code history already tried — do NOT repeat a prior approach; if you cannot beat it, emit nothing>
+```
+
+```pre_process
+<python code>
+```
+
+```solver_lib:<name>
+<python function code>
+```
+
+IMPORTANT:
+- pre_process must be self-contained Python. Do not import external packages beyond the standard library.
+- Focus on STRUCTURAL improvements, not individual error patches.
+- If a previous layer's fix hurts certain tasks, add task-type conditionals to bypass it.
+- GENERALIZE: condition on task STRUCTURE (size, constraints, metadata), NEVER on specific task_id string literals — task_id-keyed code does not transfer to unseen tasks.
+- If you add a solver_lib helper, name the specific failing task it targets and why the solver cannot reliably write it itself.
+- Keep code simple and robust — complex code is more likely to break.
+- Use pre_process for strategy guidance (text); use solver_lib for reusable implementations (code).
+- Favor small (≤30 lines), audit-able helpers over large multi-purpose ones. Helpers that break the runtime env (creating envs, installing packages, depending on uncommon CLIs) introduce more failures than they prevent.

@@ -1,0 +1,1 @@
+additional_context = "Replace the current sequential job processing with list scheduling: sort all operations by longest processing time (LPT) priority. Dispatch ready operations (those whose predecessor in the job is complete) to the machine that can start them earliest. This allows interleaving across jobs for better utilization on large instances like tai100_20.txt."

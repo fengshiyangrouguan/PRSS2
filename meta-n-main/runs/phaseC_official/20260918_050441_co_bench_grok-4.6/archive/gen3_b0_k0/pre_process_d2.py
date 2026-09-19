@@ -1,0 +1,1 @@
+additional_context = "After obtaining a candidate job_sequence from the solver, call local_search from solver_lib to refine it with a few adjacent swaps for a better makespan on large n. This targets the O(n²m) timeouts seen on tai200_* and tai500_* instances while keeping the core NEH logic intact."

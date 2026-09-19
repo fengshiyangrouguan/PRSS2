@@ -1,0 +1,46 @@
+```rationale
+## Diagnosis
+bin_packing___one_dimensional at 0.930 with failures concentrated in binpack5-8 (0.83-0.88 scores). The current hardcoded FFD/BFD logic (descending sort + best-fit bin selection by smallest remainder) produces suboptimal packings on harder instances because it mixes first-fit biases and lacks a clean reusable helper; lower layers' BFD attempt did not propagate to the generated script.
+
+## Intervention
+Add solver_lib:bin_pack_bfd implementing Best-Fit Decreasing (BFD) with type annotations/docstring API. Update pre_process to unconditionally set additional_context instructing the solver to call bin_pack_bfd (instead of writing equivalent logic from scratch). This directly targets the binpack5-8 regressions while generalizing via structure ("1D bin packing with descending sort").
+
+## Why this is different
+Previous layers injected BFD under "bin packing" checks but the generated bin_packing script bypassed the helper and rewrote the logic; new pre_process forces the exact call site and keeps the injected helper as the single source of truth without task_id strings.
+```
+
+```pre_process
+additional_context = "For this 1D bin-packing task, use the bin_pack_bfd solver_lib helper (Best-Fit Decreasing on descending-sized items). Call it exactly as shown in the helper signature and then format the output as {'num_bins': N, 'bins': [list of 1-based indices per bin]}. Do not implement packing logic yourself."
+```
+
+```solver_lib:bin_pack_bfd
+def bin_pack_bfd(items: list, bin_capacity: int) -> tuple:
+    """Best-Fit Decreasing heuristic for 1D bin packing.
+
+    Args:
+        items: list of item sizes (floats <= bin_capacity).
+        bin_capacity: int, maximum size per bin.
+
+    Returns:
+        tuple[int, list[list[int]]]: (num_bins, bins) where each inner list is 1-based item indices in that bin.
+    """
+    if not items:
+        return 0, []
+    indexed = sorted(enumerate(items), key=lambda x: x[1], reverse=True)
+    bins = []
+    for item_idx, size in indexed:
+        if size > bin_capacity:
+            return 1000000, []
+        best_bin_idx = -1
+        best_remaining = bin_capacity + 1
+        for b_idx, b in enumerate(bins):
+            remaining = bin_capacity - sum(items[j] for j in b)
+            if remaining >= size and remaining < best_remaining:
+                best_remaining = remaining
+                best_bin_idx = b_idx
+        if best_bin_idx >= 0:
+            bins[best_bin_idx].append(item_idx)
+        else:
+            bins.append([item_idx])
+    return len(bins), [[idx + 1 for idx in b] for b in bins]
+```

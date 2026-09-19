@@ -1,0 +1,1 @@
+additional_context = "Start from the longest-path heuristic schedule produced by the solver. Then apply the local_search helper (targeting same-machine consecutive operation swaps) to refine the schedule and reduce makespan, which directly raises the score."

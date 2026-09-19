@@ -1,0 +1,11 @@
+{
+  "test_mean_score": 0.3803758814841287,
+  "test_scores": {
+    "aircraft_landing": 0.1670212404332877,
+    "assignment_problem": 0.0,
+    "assortment_problem": 0.09445258640712291,
+    "bin_packing___one_dimensional": 0.9296803294125237,
+    "capacitated_warehouse_location": 0.6645757730108384,
+    "common_due_date_scheduling": 0.42652535964099964
+  }
+}

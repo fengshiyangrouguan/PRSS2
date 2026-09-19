@@ -1,0 +1,1 @@
+additional_context = "Use the injected compute_makespan from solver_lib inside the insertion loop to evaluate every neighbor sequence; this guarantees correct makespan without index errors and allows the heuristic to produce valid scores on all instances."

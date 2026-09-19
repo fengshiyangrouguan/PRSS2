@@ -1,0 +1,10 @@
+{
+  "oracle_mean_score": 0.9686154018196307,
+  "num_contributing_chains": 1,
+  "per_task_best_sources": {
+    "hybrid_reentrant_shop_scheduling": {
+      "score": 0.9686154018196307,
+      "candidate_id": "gen0_seed"
+    }
+  }
+}

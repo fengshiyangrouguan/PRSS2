@@ -1,0 +1,43 @@
+```rationale
+The current solver processes jobs sequentially in fixed order, committing to entire jobs before moving to the next. This ignores interleaving opportunities across jobs and does not dynamically assign free machines to the best available ready operation. This leads to poor utilization on larger instances (e.g., tai100_20.txt scores ~0.065-0.082 vs. best-known 0.114). The failure pattern is "non-interleaved static scheduling" — no priority among ready ops, no dynamic dispatch when a machine frees mid-job. Headroom is largest here (gap +0.027). A static list-scheduling heuristic with longest-processing-time priority will improve machine utilization and balance load without adding runtime complexity. Prepend guidance in pre_process and provide the helper in solver_lib so the lower layer can swap in the improved dispatch rule (no external libs, pure stdlib).
+```
+
+```pre_process
+additional_context = "Replace the current sequential job processing with list scheduling: sort all operations by longest processing time (LPT) priority. Dispatch ready operations (those whose predecessor in the job is complete) to the machine that can start them earliest. This allows interleaving across jobs for better utilization on large instances like tai100_20.txt."
+```
+
+```solver_lib:list_scheduling
+def list_scheduling(times, machines, n_jobs, n_machines):
+    """List scheduling heuristic for job shop scheduling using LPT priority.
+
+    Args:
+        times: list[list[int]] — n_jobs x n_machines processing times
+        machines: list[list[int]] — n_jobs x n_machines machine assignments (1-indexed)
+        n_jobs: int
+        n_machines: int
+
+    Returns:
+        start_times: list[list[int]] — n_jobs x n_machines start times (0-indexed internally)
+    """
+    import heapq
+
+    # Flatten all operations with LPT key
+    operations = []
+    for j in range(n_jobs):
+        for i in range(n_machines):
+            m = machines[j][i] - 1
+            t = times[j][i]
+            # priority = processing time (longest first)
+            heapq.heappush(operations, (-t, j, i, m, t))
+
+    start_times = [[0 for _ in range(n_machines)] for _ in range(n_jobs)]
+    machine_avail = [0] * n_machines
+
+    while operations:
+        _, j, i, m, t = heapq.heappop(operations)
+        start = machine_avail[m]
+        start_times[j][i] = start
+        machine_avail[m] = start + t
+
+    return start_times
+```

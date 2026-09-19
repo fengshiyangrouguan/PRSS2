@@ -1,0 +1,1 @@
+additional_context = "Use the injected compute_makespan helper from solver_lib to evaluate any temporary sequence during NEH insertion. The helper implements the standard flow-shop completion-time recurrence so all makespan calculations are numerically correct and never raise IndexError."

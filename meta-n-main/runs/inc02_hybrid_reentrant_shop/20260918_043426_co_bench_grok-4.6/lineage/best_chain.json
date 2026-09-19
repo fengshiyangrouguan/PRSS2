@@ -1,0 +1,22 @@
+{
+  "best_candidate_id": "gen1_b0_k0",
+  "depth": 2,
+  "mean_score": 0.7002202190793545,
+  "injected_codes": [
+    {
+      "pre_process": "additional_context = \"Improve the permutation by calling the improved_permutation helper (provided in solver_lib) to sort jobs using the hybrid key setup_times[i] * processing_times[i] (descending). This prioritizes jobs with both high setup and high processing to reduce makespan under reentrancy. Keep batch_assignment as round-robin but document the hybrid permutation logic in the returned dict.\"",
+      "code_library": {
+        "improved_permutation": "def improved_permutation(n_jobs: int, setup_times: list[float], processing_times: list[float]) -> list[int]:\n    \"\"\"Return 1-based job permutation sorted by hybrid key (setup * processing descending).\n\n    Args:\n        n_jobs: int \u2014 number of jobs in the instance\n        setup_times: list[float] \u2014 setup time per job (scalar per job)\n        processing_times: list[float] \u2014 processing time per job\n\n    Returns:\n        list[int] \u2014 permutation of job numbers (1-based) sorted by setup*processing descending\n    \"\"\"\n    def key(i):\n        return setup_times[i] * processing_times[i]\n    return [p + 1 for p in sorted(range(n_jobs), key=key, reverse=True)]"
+      },
+      "code_library_bash": {},
+      "rationale": "The solver's current permutation (sorted solely by setup_times descending) and round-robin batch_assignment ignore processing_times, which strongly influence shop makespan and reentrancy conflicts (high-setup jobs should also be deprioritized if they have long processing to avoid machine bottlenecks). Failure patterns across instances show high variance (0.524\u20130.798) with lower scores on hrs-50_* where processing/setup ratios differ; the 0.694 avg reflects this gap. Largest headroom (+0.275) is here, so target by adding a hybrid key (setup * processing descending) in solver_lib \u2014 the lower layer cannot reliably derive this without explicit guidance and will continue using the naive sort. pre_process appends the exact strategy to the solver's prompt so it rewrites its own permutation using the helper while keeping batch_assignment; this is small, auditable, and generalizes to any n_jobs/n_machines without task_id branching.",
+      "source_depth": 2,
+      "task_solution_map": {},
+      "sandbox_verified_names": []
+    }
+  ],
+  "ancestry": [
+    "gen0_seed",
+    "gen1_b0_k0"
+  ]
+}

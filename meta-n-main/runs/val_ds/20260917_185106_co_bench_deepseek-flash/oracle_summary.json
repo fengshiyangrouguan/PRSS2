@@ -1,0 +1,10 @@
+{
+  "oracle_mean_score": 0.9431707127906513,
+  "num_contributing_chains": 1,
+  "per_task_best_sources": {
+    "bin_packing___one_dimensional": {
+      "score": 0.9431707127906513,
+      "candidate_id": "gen1_b0_k0"
+    }
+  }
+}

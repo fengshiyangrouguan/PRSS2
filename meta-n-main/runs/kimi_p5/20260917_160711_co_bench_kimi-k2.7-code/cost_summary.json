@@ -1,0 +1,9 @@
+{
+  "outer_calls": 5,
+  "outer_prompt_tokens": 6547,
+  "outer_completion_tokens": 33037,
+  "outer_cached_tokens": 2560,
+  "outer_cost_usd": 0.0,
+  "model": "kimi-k2.7-code",
+  "backend": "openrouter"
+}

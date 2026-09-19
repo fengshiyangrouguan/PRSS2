@@ -1,0 +1,27 @@
+{
+  "size": 1,
+  "best_mean_score": 0.7953454716949414,
+  "best_candidate_id": "gen0_seed",
+  "per_task_best": {
+    "flow_shop_scheduling": {
+      "score": 0.7953454716949414,
+      "candidate_id": "gen0_seed"
+    }
+  },
+  "candidates": [
+    {
+      "candidate_id": "gen0_seed",
+      "parent_id": null,
+      "iteration": 0,
+      "depth": 1,
+      "mean_score": 0.7953454716949414,
+      "pass_at_1": 1.0,
+      "num_children": 4,
+      "temperature_used": 0.7,
+      "total_tokens": 5313,
+      "per_task_scores": {
+        "flow_shop_scheduling": 0.7953454716949414
+      }
+    }
+  ]
+}

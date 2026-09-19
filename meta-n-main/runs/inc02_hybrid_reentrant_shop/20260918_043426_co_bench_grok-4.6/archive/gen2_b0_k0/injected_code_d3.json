@@ -1,0 +1,11 @@
+{
+  "pre_process": "additional_context = \"Improve the batch_assignment by calling the improved_batch_assignment helper (provided in solver_lib) to assign each job (in hybrid_permutation order) to the machine with the current minimum load, using processing_times for load calculation (list scheduling heuristic). Keep the permutation as the hybrid setup*processing sort. Document the load-balanced assignment logic in the returned dict.\"",
+  "code_library": {
+    "improved_batch_assignment": "def improved_batch_assignment(n_jobs: int, n_machines: int, permutation: list[int], processing_times: list[float]) -> list[int]:\n    \"\"\"Greedy list scheduling: assign jobs to machine with current min load.\n\n    Args:\n        n_jobs: int \u2014 number of jobs\n        n_machines: int \u2014 number of machines\n        permutation: list[int] \u2014 1-based job order (from improved_permutation)\n        processing_times: list[float] \u2014 processing time per job\n\n    Returns:\n        list[int] \u2014 batch_assignment (1-based machine id for each job in order)\n    \"\"\"\n    loads = [0.0] * n_machines\n    batch_assignment = []\n    for job_id in permutation:\n        machine = loads.index(min(loads))\n        batch_assignment.append(machine + 1)\n        loads[machine] += processing_times[job_id - 1]\n    return batch_assignment"
+  },
+  "code_library_bash": {},
+  "rationale": "",
+  "source_depth": 3,
+  "task_solution_map": {},
+  "sandbox_verified_names": []
+}

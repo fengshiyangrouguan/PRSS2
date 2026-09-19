@@ -1,0 +1,14 @@
+```rationale
+## Diagnosis
+The current heuristic (grouping by comparing first/last ptime then sorting within groups) is a weak approximation that performs especially poorly on instances with high processing-time variance or machine-specific bottlenecks (e.g. tai20_10.txt at 0.747 and several tai50/tai100 entries <0.82). Headroom table shows 0.171 absolute room to 1.0; NEH (already injected for n>8) is only partially effective because the pre_process guidance is not enforced strongly enough and the generated code still prefers the simple rule. This is a systemic structural failure in the solver's strategy-selection logic rather than an individual bug.
+
+## Intervention
+Update pre_process to inject stronger, task-structure-conditioned guidance that forces the solver to call the existing NEH heuristic from solver_lib on ALL instances (bypassing the current grouping logic entirely). Do not add any new solver_lib functions; reuse the already-present _compute_makespan + neh_heuristic (the latter is a standard O(n²m) insertion heuristic that the solver cannot reliably re-implement correctly from scratch under the current prompt constraints). Target exactly flow_shop_scheduling; all other tasks remain frozen.
+
+## Why this is different
+Previous layer injected NEH only for n>8 while leaving the simple grouping rule intact for n<=8; the new pre_process removes the rule entirely and conditions on raw task structure (n,m) so the solver cannot regress back to the weak baseline, unlike the prior conditional fallback that still allowed the mediocre average.
+```
+
+```pre_process
+additional_context = "You are solving a flow-shop scheduling problem (minimizing makespan). The optimal exact solution via permutations is only feasible for n<=8. For every instance, regardless of n, call the NEH heuristic from solver_lib.neh_heuristic (which returns a list of 0-based job indices) and return its job sequence. Never use or fall back to any grouping/sorting logic; NEH is the required strategy."
+```

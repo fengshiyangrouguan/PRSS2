@@ -1,0 +1,1 @@
+additional_context = "After the provided solver code runs, call the local_search helper from the solver_lib block to improve the returned start_times by swapping consecutive machine operations when it reduces makespan. This will raise the continuous score without changing the core heuristic."

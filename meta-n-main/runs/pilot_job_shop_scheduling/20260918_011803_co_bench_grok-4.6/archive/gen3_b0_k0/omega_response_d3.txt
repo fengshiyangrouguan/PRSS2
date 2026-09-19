@@ -1,0 +1,57 @@
+```rationale
+## Diagnosis
+The current heapq LPT implementation (longest-first global priority on ready ops, with successor pushing) still yields poor utilization on large instances (tai100_20.txt avg ~0.091 vs. 0.114 optimal), as it does not properly simulate machine freeing events or maintain a dynamic ready set. When a machine idles mid-job, the next operation for that job is not immediately eligible for re-prioritization among other ready ops; instead, the static heap continues to favor other long ops, leading to cascading idle time. This is the exact failure class persisting from the "non-interleaved static scheduling" pattern (score spread shows 0.087-0.092 on tai100_20 vs. higher variance on smaller tai15_15). Headroom is largest here (+0.886 to 1.0), and the 0.114 mean is dragged down disproportionately by these cases.
+
+## Intervention
+Replace the starting heapq implementation with a new solver_lib helper `dynamic_list_scheduling` that maintains a true event-driven ready set (via heapq on LPT) + separate min-heap for machine availability times. When an op is scheduled, immediately check for successors and add them to ready only after pred completion; assign to the earliest-free machine among those that can handle it. This directly targets job_shop_scheduling (all instances) by fixing the dynamic dispatch bug that previous static LPT missed. The solver will call this helper directly at runtime (no external deps).
+
+## Why this is different
+Previous layer injected a non-event-based global operations heap (no separate machine-free-time queue, no re-prioritization on idle events), which helped marginally (+0.027) but left regressions on tai100_20; the new helper bypasses that by using explicit time-event simulation for ready-set updates, a structural change in scheduling algorithm that the lower layer cannot reliably invent from scratch (complexity of maintaining both heaps + pred checks exceeds what the solver typically emits).
+```
+
+```pre_process
+additional_context = "Use the dynamic_list_scheduling helper from solver_lib for list scheduling: maintain a priority queue of ready operations (initially first ops per job) sorted by longest processing time. Use a separate min-heap for each machine's availability time. When an operation is selected and scheduled, immediately add its successor to the ready queue if any, and assign it to the machine that becomes free earliest. This enables true interleaving and dynamic re-prioritization when machines idle, dramatically improving utilization on large instances like tai100_20.txt."
+```
+
+```solver_lib:dynamic_list_scheduling
+def dynamic_list_scheduling(times, machines, n_jobs, n_machines):
+    """Dynamic list scheduling heuristic for job shop using LPT priority and event-driven machine availability.
+
+    Maintains a ready set of operations whose predecessors are complete. Always selects the longest ready operation
+    and assigns it to the machine that can start it earliest (accounting for current availability). Updates machine
+    availability immediately and adds any successor operations to the ready set.
+
+    Args:
+        times: list[list[int]] — n_jobs x n_machines processing times
+        machines: list[list[int]] — n_jobs x n_machines machine assignments (1-indexed)
+        n_jobs: int
+        n_machines: int
+
+    Returns:
+        start_times: list[list[int]] — n_jobs x n_machines start times (0-indexed internally)
+    """
+    import heapq
+
+    # Operations: (priority=-p, job, op, machine, proc_time)
+    ready = []
+    for j in range(n_jobs):
+        m = machines[j][0] - 1
+        t = times[j][0]
+        heapq.heappush(ready, (-t, j, 0, m, t))
+
+    start_times = [[0 for _ in range(n_machines)] for _ in range(n_jobs)]
+    machine_avail = [0] * n_machines
+
+    while ready:
+        _, j, i, m, t = heapq.heappop(ready)
+        start = max(machine_avail[m], 0)
+        start_times[j][i] = start
+        machine_avail[m] = start + t
+        if i < n_machines - 1:
+            next_i = i + 1
+            next_m = machines[j][next_i] - 1
+            next_t = times[j][next_i]
+            heapq.heappush(ready, (-next_t, j, next_i, next_m, next_t))
+
+    return start_times
+```

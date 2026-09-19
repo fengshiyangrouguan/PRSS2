@@ -1,0 +1,37 @@
+```rationale
+The current brute-force permutation solver times out on all benchmarks (even n=5) due to n! growth and O(n! * n * m) complexity. This matches the observed failures and zero score. I will address this by prepending a complete NEH heuristic implementation (standard O(n^2 m) FSSP approximation that produces strong solutions on Tai benchmarks) via solver_lib. The NEH will be invoked directly by the solver below; pre_process additionally instructs it to prefer NEH over permutations, with a makespan evaluator helper. This targets the exact failure mode (combinatorial explosion) and should raise the continuous score toward the 0.792 best-known gap without external deps or complexity.
+```
+
+```pre_process
+if "NEH" in outer_context:
+    additional_context = "Use the provided NEH solver_lib function as your primary solver; ignore permutations and timeouts."
+else:
+    additional_context = "Implement the NEH heuristic from solver_lib to avoid timeouts on large instances."
+```
+
+```solver_lib:flow_shop_scheduling
+def calculate_makespan(seq, matrix):
+    """Calculate makespan for a job sequence on given machines.
+
+    Args:
+        seq: list of job indices (0-based) in processing order.
+        matrix: 2D list of processing times (n_jobs x n_machines).
+
+    Returns:
+        float: makespan (completion time of last job on last machine).
+    """
+    n = len(seq)
+    m = len(matrix[0])
+    C = [[0.0] * m for _ in range(n)]
+    for j in range(m):
+        for i in range(n):
+            job = seq[i]
+            if j == 0:
+                C[i][j] = matrix[job][j]
+            else:
+                prev = 0.0 if i == 0 else C[i - 1][j]
+                C[i][j] = max(prev, C[i][j - 1]) + matrix[job][j]
+    return C[n - 1][m - 1]
+
+
+def ne

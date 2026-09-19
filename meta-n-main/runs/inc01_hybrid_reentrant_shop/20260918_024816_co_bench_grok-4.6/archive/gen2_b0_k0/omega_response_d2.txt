@@ -1,0 +1,31 @@
+```rationale
+The current solve function uses identity permutation (no priority ordering) and round-robin batch assignment. This is a weak heuristic that ignores dynamic machine loads, leading to the observed score variance (e.g. dips to 0.958/0.955 on certain instances like hrs-50_175.txt). Room to 1.0 is only 0.031, so a small, targeted fix is needed: replace round-robin with least-loaded-machine assignment (LMA) for batches. This is a standard, easily-implementable scheduling heuristic that balances load without adding much complexity. It directly improves makespan-like objectives in reentrant/hybrid shop problems while remaining robust (O(n log m) time, pure stdlib). No need to touch permutation yet; focus on assignment first.
+```
+
+```solver_lib:least_loaded_assignment
+def least_loaded_assignment(n_jobs, n_machines):
+    """Assign jobs to machines using Least Loaded Machine heuristic for better load balancing.
+
+    Args:
+        n_jobs: int — number of jobs to schedule.
+        n_machines: int — number of available machines.
+
+    Returns:
+        list[int] — length n_jobs list of machine IDs (1-based) for each job's batch.
+    """
+    import heapq
+    # Min-heap of (current_load, machine_id)
+    load_heap = [(0, i + 1) for i in range(n_machines)]
+    assignment = []
+    for j in range(1, n_jobs + 1):
+        load, machine = heapq.heappop(load_heap)
+        assignment.append(machine)
+        heapq.heappush(load_heap, (load + 1, machine))
+    return assignment
+```
+
+```pre_process
+# Use the new least-loaded assignment helper when generating solver code for this task.
+# This replaces the weak round-robin batch logic with a simple, effective load-balancing heuristic.
+additional_context = "For hybrid_reentrant_shop_scheduling, improve batch_assignment by calling the least_loaded_assignment helper (min-heap on loads). This is a better dynamic load-balancing approach than fixed round-robin. Keep permutation simple (identity)."
+```

@@ -1,0 +1,20 @@
+{
+  "candidate_id": "merge_oracle",
+  "parent_id": null,
+  "iteration": 3,
+  "depth": 2,
+  "mean_score": 0.8171569235451934,
+  "pass_at_1": 1.0,
+  "per_task_scores": {
+    "aircraft_landing": 0.9527004480588209,
+    "assignment_problem": 0.6939066492683128,
+    "assortment_problem": 0.6396298920789327,
+    "bin_packing___one_dimensional": 0.9380312331811949,
+    "capacitated_warehouse_location": 0.6931798839533595,
+    "common_due_date_scheduling": 0.9854934347305396
+  },
+  "num_children": 0,
+  "temperature_used": 0.7,
+  "total_tokens": 0,
+  "created_at": "2026-09-18T09:52:37.157658"
+}

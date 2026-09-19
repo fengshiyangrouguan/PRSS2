@@ -1,0 +1,35 @@
+{
+  "archive_size": 4,
+  "total_iterations": 2,
+  "total_tokens": 101343,
+  "token_usage": {
+    "outer_total": 101343,
+    "outer_prompt": 44990,
+    "outer_completion": 56353,
+    "outer_calls": 22,
+    "inner_total": 0,
+    "inner_prompt": 0,
+    "inner_completion": 0,
+    "inner_calls": 0
+  },
+  "best_mean_score": 0.8388283576950156,
+  "best_candidate_id": "gen2_b0_k0",
+  "oracle_mean_score": 0.8388283576950156,
+  "test_mean_score": 0.7821058792156431,
+  "chain_test_mean_score": 0.7821057047314356,
+  "per_task_best_scores": {
+    "aircraft_landing": 0.9780502190003152,
+    "assignment_problem": 0.7211845323225563,
+    "assortment_problem": 0.7005468362894764,
+    "bin_packing___one_dimensional": 0.9536087442254139,
+    "capacitated_warehouse_location": 0.6942660727133884,
+    "common_due_date_scheduling": 0.9853137416189437
+  },
+  "convergence_history": [
+    0.7265767741482954,
+    0.8387240300111278,
+    0.8388283576950156
+  ],
+  "run_status": "completed",
+  "merge_candidate_id": "merge_oracle"
+}

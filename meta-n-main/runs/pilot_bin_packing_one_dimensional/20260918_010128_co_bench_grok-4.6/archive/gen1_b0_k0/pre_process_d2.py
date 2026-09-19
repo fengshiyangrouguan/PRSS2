@@ -1,0 +1,1 @@
+additional_context = "For 1D bin packing, prefer First Fit Decreasing over Best Fit as it often yields lower bin counts and better continuous scores on challenging test cases (e.g., binpack5-8 patterns)."

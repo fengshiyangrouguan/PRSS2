@@ -1,0 +1,27 @@
+{
+  "task_id": "symptom2disease",
+  "depth": 2,
+  "script": "# --- injected code library ---\n\n# lib:mock_helper\n\ndef mock_helper(x):\n    return x\n\nimport types as _types\nsolver_lib = _types.SimpleNamespace(mock_helper=mock_helper)\n\n# --- end injected code library ---\n\nimport sys\n\n\ndef solve(task, llm=None):\n    \"\"\"Mock solver. Deterministic, no network, no model.\"\"\"\n    return \"mock\"",
+  "stdout": "score=0.0000\nraw_score=0.0000",
+  "stderr": "solve() error: _ChunkError: chunk subprocess failed: TypeError: solve() takes from 1 to 2 positional arguments but 3 were given",
+  "exit_code": 1,
+  "success": false,
+  "score": 0.0,
+  "reasoning": "import sys\n\n\ndef solve(task, llm=None):\n    \"\"\"Mock solver. Deterministic, no network, no model.\"\"\"\n    return \"mock\"\n",
+  "duration_s": 0.04913592338562012,
+  "error_summary": "solve() error: _ChunkError: chunk subprocess failed: TypeError: solve() takes from 1 to 2 positional arguments but 3 were given",
+  "eval_feedback": "solve() error: _ChunkError: chunk subprocess failed: TypeError: solve() takes from 1 to 2 positional arguments but 3 were given",
+  "failure_class": "Runtime error",
+  "terminated_by": "",
+  "inner_tokens": 0,
+  "inner_prompt_tokens": 0,
+  "inner_completion_tokens": 0,
+  "inner_calls": 0,
+  "utilities_available": [
+    "mock_helper"
+  ],
+  "utilities_called": [],
+  "utilities_call_counts": {},
+  "command_count": 1,
+  "parse_failure_turns": 0
+}

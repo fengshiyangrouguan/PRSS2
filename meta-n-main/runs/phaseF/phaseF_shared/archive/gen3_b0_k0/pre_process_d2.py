@@ -1,0 +1,3 @@
+# Fix the known indexing bug that causes list index out of range on every test instance
+# (C matrix is (n+1) x m but final access used m instead of m-1)
+additional_context = "The provided solve function has a critical off-by-one error: after the inner loop, set makespan = C[n][m-1] (not C[n][m]). Also change best_makespan = float('inf') for type safety. Re-run the full permutation search with this correction on all .txt instances. This will eliminate the crash and produce valid sequences whose makespans can be evaluated."

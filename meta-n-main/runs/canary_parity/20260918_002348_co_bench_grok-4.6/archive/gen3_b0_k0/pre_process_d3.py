@@ -1,0 +1,1 @@
+additional_context = "For flow_shop_scheduling, ALWAYS invoke neh_heuristic from solver_lib to produce the job sequence. Do not use any grouping, sorting by first/last times, or permutation search. NEH is the required strategy for all instances."

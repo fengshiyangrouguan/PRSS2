@@ -183,6 +183,42 @@ units, `tier_dist {0:10, 1:6, 2:4, 3:0}`).
 Record the host's hash and its rollout number. Every result you report is
 relative to it.
 
+
+### Host candidates —— what exists publicly (surveyed)
+
+**There is no released LIBERO-Mem checkpoint.** The LIBERO-Mem authors
+(`github.com/libero-mem/libero-mem`) publish **data only** —— their README links
+`datasets/libero-mem/LIBERO-Mem` and `LIBERO-Mem-Raw`, and the repo has **zero
+releases**.
+
+What does exist:
+
+| source | trained on | usable? |
+|---|---|---|
+| `shihao1895/memvla-libero-{spatial,object,goal,100}` (+ `-plus-` variants, `memvla-plus-libero-mix`) | standard LIBERO suites | **best candidate** —— same codebase: ships `checkpoints/<name>.pt` in the MemoryVLA/OpenVLA layout **plus `dataset_statistics.json`**. But *not* trained on the 3-times task |
+| `shihao1895/memvla-{bridge,mikasa,fractal}`, `memvla-plus-maniskill2` | other benchmarks | no —— wrong embodiment/suite |
+| `Dexmal/libero-db-memvla` | standard LIBERO | **no** —— Dexbotic codebase, backbone `Qwen2.5-7B`; architecture-incompatible with this repo (Llama-2-7b-pure prismatic) |
+| `aleksantari/memvla-libero-ckpts` | unknown | one bare `step_0030000.pt`, no README, suite unstated |
+| `tarmus/memvla-libero-100k` | — | empty repo |
+
+**Recommended path.** Try `shihao1895/memvla-libero-100` (LIBERO-100 is the
+closest suite to our kitchen/long-horizon task) as the host:
+
+1. **Check the config matches** what `load_vla()` builds here: `mem_length`,
+   `retrieval_layers`, `fusion_type`, `per_token_size`, `action_model_type`
+   (`DiT-L`), `action_dim=7`. A mismatch means the weights will not mean the
+   same thing.
+2. **Watch the load line.** `--init-from-weights` reports unexpected / missing
+   keys. A small number is normal; a large number means you are silently
+   loading a partially-matching model —— that invalidates the comparison.
+3. **Measure its rollout on T3.** This is the gate that decides everything.
+   It has never seen the 3-times task, so expect a low number —— possibly 0.
+   **If it is 0, this host does not work** and you are back to training one.
+
+Because this host is not the one the historical numbers came from, its
+*measured* rollout becomes the baseline for every seed. Do not compare against
+23.3% —— that belonged to a different, lost checkpoint.
+
 ---
 
 ## Phase 4 — Train the sweep

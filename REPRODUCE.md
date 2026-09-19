@@ -299,3 +299,9 @@ removed (~9% of frames). That filter script was never committed. Two options:
 
 Disk budget: 30 + 13.5 + 18.4 + 0.7 ≈ 63 GB of inputs, plus ~9.3 GB per run.
 Budget **200 GB+**.
+
+---
+
+**If you are an AI agent asked to run the sweep, start with
+[`RUN_THE_SWEEP.md`](RUN_THE_SWEEP.md)** —— it is the gated, top-to-bottom task
+spec. This file is the reference behind it.

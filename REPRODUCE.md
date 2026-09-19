@@ -1,6 +1,6 @@
 # Reproducing the Stage8 run (the one that produced the 25.0% peak)
 
-Short answer: **the code clones and runs; the run cannot be resumed, and a
+Short answer: **the code clones and runs; the run cannot be resumed, and a bit-exact
 exact rerun needs work you cannot skip.** This file says exactly which parts
 you get from the clone, which you must supply yourself, and which are gone.
 

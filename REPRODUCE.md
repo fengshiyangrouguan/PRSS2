@@ -102,3 +102,62 @@ AutoDL container, 1× A800 80 GB, Python at `/root/env_eval/bin/python`
 (torch 2.8.0+cu128, `torch.func` available), `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`,
 `HF_HUB_OFFLINE=1` with a local Llama-2 path. Training used ~20-22 GB of the
 80 GB; a concurrent rollout eval added ~17 GB.
+
+## 7. Code identity —— what to check before a multi-seed sweep
+
+If you are running several seeds and the only requirement is that they all run
+the **same code**, this is the check:
+
+```bash
+bash reproduce/check_code_identity.sh          # default: HEAD
+bash reproduce/check_code_identity.sh <ref>    # any commit/tag/branch
+```
+
+It hashes the git tree entries of the three code roots ——
+`third_party/memoryvla`, `src/rpbe_embodied`, `scripts/tiered_eval.py`
+(138 files) —— and compares against the frozen value:
+
+```
+634c18f53b59099f5b0c09af2b29c639cc34f94ea5c6031f352beebb98b03926
+```
+
+frozen at **`c05e4fb8b6fd89f0bccd99ed4c3b9ef3448aed36`**. Because it hashes
+tree entries rather than files on disk, it is stable across machines, checkout
+order, line endings and mtimes —— only a real content change moves it, and on
+a mismatch it prints the per-file diff.
+
+Every commit after the freeze touched only `results/` and `_recovered/`, so
+the branch tip carries identical code; pin `c05e4fb` if you want it explicit
+in the record.
+
+### What a fingerprint does not pin
+
+The code can be byte-identical while the run still differs. For a multi-seed
+sweep these are the things to hold fixed deliberately:
+
+| knob | value used here | why it matters |
+|---|---|---|
+| host checkpoint | `avg_s42_stage5_official/best.pt` | a different host is a different experiment, not another seed |
+| `--seed` | 42 | only this was ever run |
+| budget / structure | 15000 steps, then a **weight warm start** for the next 10000 | see §8 —— the second stage is a fresh optimiser, not a resume |
+| data | `libero-mem-no-noops` | a different dataset build changes every number |
+| eval protocol | 20 demos, `exec=8`, `maxsteps=370`, seed 42 | `exec` in particular moves the success rate a lot |
+
+## 8. The two stages are NOT one trajectory
+
+Stage 2 (`run_ours_s8h.sh`) was launched with `--init-from-weights`, i.e. it
+**loads stage-1 weights and starts a fresh optimiser, scheduler and RNG**.
+Stage 1 ran with `--no-fullstate 1`, so there was no optimiser state to
+continue from in the first place.
+
+Consequences, which any multi-seed design has to decide about:
+
+- The 15000 → 21000 "curve" is two separate runs sampled at successive weight
+  points, not one training trajectory.
+- The overfitting decline (25.0 → 23.3 → 18.3) is therefore measured across a
+  run that had its optimiser reset at 15000. A single uninterrupted 25000-step
+  run might not show the same shape.
+- If the sweep is meant to answer "does RPBE hold up", each seed needs the
+  **same structure** as the recorded run —— two stages, one warm start —— or
+  the comparison is between different training procedures.
+

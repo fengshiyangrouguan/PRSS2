@@ -34,9 +34,14 @@ echo "  Starting point: scripts/probe_libero_mem_hdf5.py"
 echo "  If you skip it, point --data-root at the raw directory instead, but then"
 echo "  list it explicitly in the write-up: it is a different dataset build."
 
-echo "### 3/5  base VLA checkpoint  (30 GB)"
+echo "### 3/5  BASE VLA checkpoint  (30 GB)"
 echo "  repo: huggingface.co/openvla/openvla-7b-prismatic"
 echo "  file: checkpoints/step-295000-epoch-40-loss=0.2200.pt"
+echo "  DO NOT confuse with openvla/openvla-7b -- that is a different model and"
+echo "  is NOT what this experiment uses.  Only ONE file is needed from the repo."
+echo "  This is the BASE (--pretrained-checkpoint): it builds the architecture."
+echo "  It does NOT contain MemoryVLA's DiT action head or memory banks --"
+echo "  loading it prints 'No ActionModel found ... Initializing a new one.'"
 python -m pip install -q -U huggingface_hub || true
 python - <<PY
 from huggingface_hub import snapshot_download
@@ -46,6 +51,10 @@ print("OPENVLA_DONE")
 PY
 
 echo "### 4/5  Llama-2-7b-hf  (13.5 GB, the LLM backbone)"
+echo "  Use NousResearch/Llama-2-7b-hf, NOT meta-llama/Llama-2-7b-hf (gated)."
+echo "  This is NOT a second training start point: the prismatic loader first"
+echo "  builds the Llama-2 backbone from this HF layout, then the OpenVLA"
+echo "  checkpoint overwrites the matching parameters."
 python - <<PY
 from huggingface_hub import snapshot_download
 snapshot_download(repo_id="NousResearch/Llama-2-7b-hf",

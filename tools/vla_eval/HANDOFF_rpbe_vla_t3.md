@@ -11,18 +11,29 @@
 - 磁盘：**至少 200 GB**（openvla 基座 30G + Llama-2 13.5G + T3 数据 18.4G + metainfo 0.7G + checkpoint 若干 1.85G）
 - 需要能连 **HuggingFace 镜像**（`hf-mirror.com`），见 §3
 
-### 0.1 配套脚本（随本文件一起给你）
+### 0.1 配套脚本 —— 在 git 里，不用另外传
 
-目录 `vla_eval/` 下 6 个文件，**必须一起拿到**：
+**分支 `vla_eval_tools`（从 `develop_VLA` 分出）里直接就有：**
+
+```bash
+git fetch origin
+git checkout origin/vla_eval_tools -- tools/vla_eval    # 或直接切到该分支
+```
+
+`tools/vla_eval/` 下的文件，按重要性：
 
 | 文件 | 用途 |
 |---|---|
 | `tiered_eval_t1.py` | **LIBERO 评测器**（名字虽叫 t1，已泛化，任何 task 都能跑） |
 | `run_tiered.sh` | 评测启动器，**内置 `ulimit -n 65536`**（见 §7.5） |
 | `finalize_run_dir.py` | 补齐 run 目录的 `config.json` / `dataset_statistics.json`（见 §7.6） |
-| `compare_images.py` | 验证图像翻转方向的实测脚本（见 §7.1） |
+| `compare_images.py` | **换任务先跑这个**，实测确认图像翻转方向（见 §7.1） |
 | `watch_steps.py` | 按指定步数保存 checkpoint 快照 |
-| `run_t1_rpbe.sh` | 训练启动器模板（路径需按你的环境改） |
+| `patch_reset_cap.py` | 给 LIBERO 那个**无上限的 reset 重试循环**加上限（不加会永久挂死评测，且无任何输出） |
+| `patch_libero_torchload.py` | torch ≥ 2.6 下 `.pruned_init` 的 `weights_only` 修复 |
+| `audit_stage1.py` / `audit_stage2.py` | 校验训练 checkpoint 能否完整映射回模型架构 |
+
+其余是早期 Flask 版本的实现和辅助脚本，参考用。
 
 脚本里的路径可用环境变量覆盖，**不用改代码**：
 
@@ -32,6 +43,8 @@ export LIBERO_MEM_REPO=<libero-mem clone 路径>
 export MEMVLA_DIR=<PRSS2>/third_party/memoryvla
 export PRSS2_SRC=<PRSS2>/src
 export RPBE_PYTHON=<ROOT>/env_memvla/bin/python
+export RPBE_DATA_ROOT=<ROOT>/datasets/LIBERO-Mem
+export RPBE_TASK=KITCHEN_SCENE1_3_lift_the_bowl_and_place_it_back_on_the_plate_3_times
 ```
 
 ---

@@ -82,19 +82,35 @@ REJECTED_DIRNAME = "rejected"
 DEFAULT_DATA_DIR = "./data/co_bench"
 
 
-#: The relay this work uses. `--base-url` DEFAULTS to openrouter.ai and
-#: `--api-key` to OPENROUTER_API_KEY, so an arm that passes neither targets the
-#: wrong provider with no key. `LLM_BACKEND=relay` does not fill either in: for a
-#: paid kind the client takes base_url/api_key straight from LLMConfig (see
-#: meta_n/core/llm_client.py), and meta_n/rpbe/backends only gates the spend.
-RELAY_BASE_URL_DEFAULT = "https://api-key.xyz/api/v1"
-
-
 def launch_endpoint() -> Dict[str, Any]:
-    """The API endpoint an arm will actually be launched against."""
-    return {"base_url": os.environ.get("RELAY_BASE_URL",
-                                       RELAY_BASE_URL_DEFAULT).strip(),
-            "api_key": os.environ.get("RELAY_API_KEY", "").strip()}
+    """Resolve the endpoint from $LLM_BACKEND, through the client's OWN table.
+
+    `meta_n/rpbe/backends.PAID_PROVIDERS` already names each provider's base-url
+    env, default url and key env. Reading it here means the runner cannot
+    disagree with the client about which provider is in use -- and it is no
+    longer hardcoded to one: the relay went DOWN mid-run (gpt-5.5 stopped being
+    provisioned between the root and the arm stage; a genuineness probe then got
+    empty responses from both gpt-5.5 and grok-4.6 while the user's own deepseek
+    key answered correctly). A ten-hour run needs whichever provider is up.
+
+    `--base-url` otherwise defaults to openrouter.ai and `--api-key` to
+    $OPENROUTER_API_KEY, i.e. a silent wrong-provider-with-no-key.
+
+    The KEY is deliberately not returned for the command line: `--api-key` puts a
+    credential in the process table, where `ps` shows it to every other tenant on
+    a shared box, and into any command log -- observed live. `subprocess_env`
+    maps it onto $OPENROUTER_API_KEY instead, which the client reads when the
+    flag is absent (meta_n/core/llm_client.py:294).
+    """
+    from meta_n.rpbe import backends as bk
+    kind = os.environ.get(bk.BACKEND_ENV, "").strip().lower()
+    spec = bk.PAID_PROVIDERS.get(kind)
+    if not spec:
+        return {"backend": kind or None, "base_url": "", "api_key": ""}
+    return {"backend": kind,
+            "base_url": (os.environ.get(spec["base_url_env"], "")
+                         or spec["base_url_default"]).strip(),
+            "api_key": os.environ.get(spec["key_env"], "").strip()}
 
 
 def assert_launch_env(args, profile: SRIProfile) -> Dict[str, Any]:
@@ -112,19 +128,28 @@ def assert_launch_env(args, profile: SRIProfile) -> Dict[str, Any]:
     """
     if not args.execute:
         return {}
+    from meta_n.rpbe import backends as bk
     problems: List[str] = []
-    backend = os.environ.get("LLM_BACKEND", "").strip().lower()
-    if not backend or backend in ("mock", "local"):
-        problems.append("LLM_BACKEND={!r}: a paid run needs a paid backend "
-                        "(export LLM_BACKEND=relay)".format(backend))
-    if not os.environ.get("ALLOW_PAID_API", "").strip():
-        problems.append("ALLOW_PAID_API is unset (export "
-                        "ALLOW_PAID_API=YES_I_ACCEPT_REAL_COST)")
-    if not os.environ.get("RELAY_API_KEY", "").strip():
-        problems.append("RELAY_API_KEY is unset (source the run's .env)")
-    if not os.environ.get("META_N_EXTRA_HEADERS_JSON", "").strip():
-        problems.append("META_N_EXTRA_HEADERS_JSON is unset (this relay needs "
+    backend = os.environ.get(bk.BACKEND_ENV, "").strip().lower()
+    spec = bk.PAID_PROVIDERS.get(backend)
+    if spec is None:
+        problems.append(
+            "LLM_BACKEND={!r}: a paid run needs one of {} (e.g. export "
+            "LLM_BACKEND=deepseek)".format(backend,
+                                           sorted(bk.PAID_PROVIDERS)))
+    elif not os.environ.get(spec["key_env"], "").strip():
+        problems.append("{} is unset (source the run's .env)".format(
+            spec["key_env"]))
+    # The relay drops the Accept-Encoding header this client sends unless the
+    # workaround is exported; the direct providers do not need it. Demanding it
+    # of them would be a false refusal, so it is asked for only where it matters.
+    if backend == bk.RELAY and not os.environ.get(
+            "META_N_EXTRA_HEADERS_JSON", "").strip():
+        problems.append("META_N_EXTRA_HEADERS_JSON is unset (the relay needs "
                         "the Accept-Encoding workaround)")
+    if not os.environ.get(bk.ALLOW_PAID_ENV, "").strip():
+        problems.append("{} is unset (export {}={})".format(
+            bk.ALLOW_PAID_ENV, bk.ALLOW_PAID_ENV, bk.ALLOW_PAID_TOKEN))
     cb = os.environ.get("CODEBERT_PATH", "").strip()
     if not cb or not Path(cb).is_dir():
         problems.append("CODEBERT_PATH={!r} is unset or not a directory (the "
@@ -133,17 +158,19 @@ def assert_launch_env(args, profile: SRIProfile) -> Dict[str, Any]:
         raise StageError(
             "refusing to launch: the paid-run environment is incomplete.\n"
             "  - " + "\n  - ".join(problems) +
-            "\nThe configuration the phaseH runs proved:\n"
+            "\nFor a direct provider such as deepseek:\n"
             "    set -a; . /root/autodl-tmp/meta-n-main/.env; set +a\n"
-            "    export LLM_BACKEND=relay ALLOW_PAID_API=YES_I_ACCEPT_REAL_COST\n"
-            '    export META_N_EXTRA_HEADERS_JSON=\'{"Accept-Encoding": '
-            '"identity"}\'\n'
-            "    export RELAY_BASE_URL=" + RELAY_BASE_URL_DEFAULT + "\n"
-            "    export CODEBERT_PATH=/root/autodl-tmp/models/codebert-base")
+            "    export LLM_BACKEND=deepseek {}={}\n"
+            "    export CODEBERT_PATH=/root/autodl-tmp/models/codebert-base\n"
+            "For the relay, additionally: RELAY_BASE_URL, and\n"
+            "    export META_N_EXTRA_HEADERS_JSON="
+            "'{\"Accept-Encoding\": \"identity\"}'".format(
+                bk.ALLOW_PAID_ENV, bk.ALLOW_PAID_TOKEN))
     ep = launch_endpoint()
     if not ep["base_url"] or not ep["api_key"]:
         raise StageError("endpoint resolution failed (base_url/api_key empty)")
-    return {"base_url": ep["base_url"], "api_key_present": True}
+    return {"backend": ep["backend"], "base_url": ep["base_url"],
+            "api_key_present": True}
 
 
 def subprocess_env() -> Dict[str, str]:
@@ -156,7 +183,7 @@ def subprocess_env() -> Dict[str, str]:
     never appears in argv.
     """
     env = dict(os.environ)
-    key = os.environ.get("RELAY_API_KEY", "").strip()
+    key = launch_endpoint()["api_key"]
     if key:
         env["OPENROUTER_API_KEY"] = key
     return env
@@ -413,7 +440,8 @@ def stage_preflight(args, profile: SRIProfile, out: Path) -> dict:
 
     launch = assert_launch_env(args, profile)
     if launch:
-        print("LAUNCH: base_url={} (api key present)".format(launch["base_url"]))
+        print("LAUNCH: backend={} base_url={} (api key present)".format(
+            launch["backend"], launch["base_url"]))
     pinned = pinned_for(args, profile)
     print("PINNED PARAMETERS (§8):")
     for k in sorted(pinned):
@@ -599,6 +627,7 @@ def build_arm_manifest(args, profile: SRIProfile, out: Path, arm: str, *,
         "backbone": args.backbone,
         "search_seed": args.search_seed,
         "evaluator_mode": args.evaluator,
+        "backend": launch_endpoint()["backend"],
         "base_url": launch_endpoint()["base_url"],
         "pinned": pinned,
         "pairing": read_stage_manifest(out).get(

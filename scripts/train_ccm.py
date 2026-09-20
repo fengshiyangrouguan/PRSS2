@@ -150,10 +150,12 @@ def parse_args():
                         "cadence reproduction arm (frozen cadence is "
                         "window-matched for the three main arms; the "
                         "official arm is reported separately)")
-    p.add_argument("--host", default="llama", choices=["llama", "qwen3"],
+    p.add_argument("--host", default="llama",
+                   choices=["llama", "qwen3", "gemma4"],
                    help="backbone host: llama = vendored LlamaModelCCM "
                         "(R8-R10 line); qwen3 = Qwen3-4B CCM port "
-                        "(feature_QWEN)")
+                        "(feature_QWEN); gemma4 = Gemma-4-E4B CCM port "
+                        "(feature_GEMMA, transformers 5.x)")
     p.add_argument("--frozen", default="",
                    help="override the frozen spec path (llama v2 "
                         "comp-trainable experiment)")
@@ -436,6 +438,38 @@ def build_tokenizer(args):
         tok.sum_token_id = ids[N_TOK:]
         tok._qwen3_host = True  # eval collator dispatch marker
         return tok
+    if args.host == "gemma4":
+        from transformers import AutoTokenizer
+        from transformers.models.gemma4.configuration_gemma4 import (
+            Gemma4TextConfig)
+        tok = AutoTokenizer.from_pretrained(args.model_name_or_path)
+        # Gemma4 ships without a pad token; config default pad id is 0
+        # (a real reserved row, distinct from eos=1/bos=2), which keeps
+        # the EOS exclusion semantics clean (qwen3 lesson).
+        if tok.pad_token_id is None:
+            tok.pad_token_id = 0
+            tok.pad_token = "<pad>"
+        tok.padding_side = "left"
+        # CRITICAL alignment (qwen3 lesson, resize route): comp ids must
+        # land >= config.vocab_size so resize_token_embeddings grows the
+        # main table (trainable comp rows) and the PLE table (zero rows)
+        # past the frozen pretrained rows.
+        cfg_vocab = Gemma4TextConfig.from_pretrained(
+            args.model_name_or_path).vocab_size
+        if len(tok) < cfg_vocab:
+            tok.add_tokens(
+                ["<|extra_{}|>".format(i)
+                 for i in range(cfg_vocab - len(tok))])
+        added = [f"<COMP{k}>" for k in range(N_TOK)] \
+            + [f"<SUM{k}>" for k in range(N_TOK)]
+        tok.add_special_tokens({"additional_special_tokens": added})
+        ids = tok.additional_special_tokens_ids[-2 * N_TOK:]
+        assert ids[0] >= cfg_vocab, \
+            "comp ids must exceed config.vocab_size (resize route)"
+        tok.comp_token_id = ids[:N_TOK]
+        tok.sum_token_id = ids[N_TOK:]
+        tok._gemma4_host = True  # eval collator dispatch marker
+        return tok
     from transformers import LlamaTokenizer
     tok = LlamaTokenizer.from_pretrained(args.model_name_or_path)
     tok.pad_token = tok.eos_token
@@ -478,6 +512,51 @@ def build_model(args, device):
             [config.vocab_size + k for k in range(N_TOK)],
             [config.vocab_size + N_TOK + k for k in range(N_TOK)])
         return model.to(device)
+    if args.host == "gemma4":
+        import torch as _t
+        from transformers.models.gemma4.configuration_gemma4 import (
+            Gemma4TextConfig)
+        from transformers.models.gemma4.modeling_gemma4 import (
+            Gemma4ForConditionalGeneration)
+        from src.arch.ccm_gemma4 import Gemma4ForCausalLM_CCM
+        if args.official_host or args.foundation:
+            raise SystemExit(
+                "[gemma4] --official-host/--foundation are Llama-line "
+                "artifacts; the gemma4 host builds from the released "
+                "Gemma-4-E4B checkpoint directly")
+        text_cfg = Gemma4TextConfig.from_pretrained(
+            args.model_name_or_path)
+        text_cfg.comp_relative_embedding = args.relative_embedding
+        model = Gemma4ForCausalLM_CCM(text_cfg)
+        # Load the released multimodal checkpoint and keep the text
+        # decoder only: model.language_model.* -> model.*, lm_head.
+        dtype = (torch.bfloat16 if device.type == "cuda"
+                 else torch.float32)
+        full = Gemma4ForConditionalGeneration.from_pretrained(
+            args.model_name_or_path, torch_dtype=dtype)
+        prefix = "model.language_model."
+        text_sd = {}
+        for k, v in full.state_dict().items():
+            if k.startswith(prefix):
+                text_sd[k[len(prefix):]] = v
+            elif k == "lm_head.weight":
+                text_sd[k] = v
+        del full
+        _t.cuda.empty_cache() if device.type == "cuda" else None
+        missing, unexpected = model.load_state_dict(text_sd, strict=False)
+        print("[gemma4] load text-only: {} missing / {} unexpected".format(
+            len(missing), len(unexpected)), flush=True)
+        if unexpected:
+            raise RuntimeError(
+                "unexpected keys in text-only load: {}".format(
+                    unexpected[:8]))
+        model.to(device)
+        model.resize_token_embeddings(text_cfg.vocab_size + 2 * N_TOK,
+                                      mean_resizing=False)
+        model.update_comp_token(
+            [text_cfg.vocab_size + k for k in range(N_TOK)],
+            [text_cfg.vocab_size + N_TOK + k for k in range(N_TOK)])
+        return model
     from transformers.models.llama.configuration_llama import LlamaConfig
     from src.arch.ccm_llama import LlamaForCausalLM_CCM
     config = LlamaConfig.from_pretrained(args.model_name_or_path)
@@ -553,6 +632,17 @@ def build_dataset(args, tokenizer):
             Qwen3DialogueDataset, Qwen3DialogueCollator)
         dialog = Qwen3DialogueDataset(tokenizer, mirror=args.dialog_mirror)
         collator = Qwen3DialogueCollator(
+            dataset=dialog, tokenizer=tokenizer, comp_args=comp_args,
+            comp_token=tokenizer.comp_token_id,
+            sum_token=tokenizer.sum_token_id,
+            pad_token=tokenizer.pad_token_id,
+            label_pad_token_id=-100)
+        return dialog, collator
+    if args.host == "gemma4":
+        from src.data.dialogue.gemma4_data import (
+            Gemma4DialogueDataset, Gemma4DialogueCollator)
+        dialog = Gemma4DialogueDataset(tokenizer, mirror=args.dialog_mirror)
+        collator = Gemma4DialogueCollator(
             dataset=dialog, tokenizer=tokenizer, comp_args=comp_args,
             comp_token=tokenizer.comp_token_id,
             sum_token=tokenizer.sum_token_id,

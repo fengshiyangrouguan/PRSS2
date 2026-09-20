@@ -62,6 +62,11 @@ def build_eval_dataset(args, tokenizer, pooled, online, comp_type):
         dialog = Qwen3DialogueDataset(
             tokenizer, mirror=args.dialog_mirror)
         return dialog, comp_args
+    if getattr(args, "host", "llama") == "gemma4":
+        from src.data.dialogue.gemma4_data import Gemma4DialogueDataset
+        dialog = Gemma4DialogueDataset(
+            tokenizer, mirror=args.dialog_mirror)
+        return dialog, comp_args
     from src.data.dialogue.data import DialogueDataset
     dialog = DialogueDataset(tokenizer, comp_token=tokenizer.comp_token_id,
                              online=online, add_comp_token=True,
@@ -74,6 +79,16 @@ def build_collator(dialog, tokenizer, comp_args, comp_type, sum_recur):
     if getattr(tokenizer, "_qwen3_host", False):
         from src.data.dialogue.qwen3_data import Qwen3DialogueCollator
         return Qwen3DialogueCollator(
+            dialog=dialog, tokenizer=tokenizer, comp_args=comp_args,
+            comp_token=tokenizer.comp_token_id,
+            sum_token=tokenizer.sum_token_id,
+            pad_token=tokenizer.pad_token_id,
+            label_pad_token_id=-100,
+            online=comp_type == "online",
+            neg_control=comp_type == "neg_control")
+    if getattr(tokenizer, "_gemma4_host", False):
+        from src.data.dialogue.gemma4_data import Gemma4DialogueCollator
+        return Gemma4DialogueCollator(
             dialog=dialog, tokenizer=tokenizer, comp_args=comp_args,
             comp_token=tokenizer.comp_token_id,
             sum_token=tokenizer.sum_token_id,
@@ -272,7 +287,8 @@ def main():
                     default="/root/autodl-tmp/llama-7b-hf")
     ap.add_argument("--dialog-mirror",
                     default="/root/autodl-tmp/dailydialog_mirror/ijcnlp_dailydialog")
-    ap.add_argument("--host", default="llama", choices=["llama", "qwen3"])
+    ap.add_argument("--host", default="llama",
+                    choices=["llama", "qwen3", "gemma4"])
     ap.add_argument("--gpu", type=int, default=0)
     ap.add_argument("--limit", type=int, default=0)
     ap.add_argument("--pooled", action="store_true",
@@ -306,7 +322,7 @@ def main():
             args, tokenizer, a.pooled, online=True, comp_type="online")
         collator = build_collator(dialog, tokenizer, comp_args,
                                   comp_type="online", sum_recur=True)
-        if args.host == "qwen3":
+        if args.host in ("qwen3", "gemma4"):
             eval_dialogs = [d["dialog"] for d in (
                 dialog.valset if a.pooled else dialog.testset)]
         else:
@@ -352,6 +368,29 @@ def main():
                 torch_dtype=torch.bfloat16).to(device)
             model.eval()
             print("ref arms use RAW pretrained Qwen3", flush=True)
+        elif a.host == "gemma4":
+            from transformers.models.gemma4.configuration_gemma4 import (
+                Gemma4TextConfig)
+            from src.arch.ccm_gemma4 import Gemma4ForCausalLM_CCM
+            from transformers.models.gemma4.modeling_gemma4 import (
+                Gemma4ForConditionalGeneration)
+            text_cfg = Gemma4TextConfig.from_pretrained(
+                a.model_name_or_path)
+            model = Gemma4ForCausalLM_CCM(text_cfg)
+            full = Gemma4ForConditionalGeneration.from_pretrained(
+                a.model_name_or_path, torch_dtype=torch.bfloat16)
+            prefix = "model.language_model."
+            text_sd = {k[len(prefix):]: v
+                       for k, v in full.state_dict().items()
+                       if k.startswith(prefix)}
+            text_sd["lm_head.weight"] = full.lm_head.weight.data
+            del full
+            torch.cuda.empty_cache()
+            model.load_state_dict(text_sd, strict=False)
+            model.to(device)
+            model.eval()
+            print("ref arms use RAW pretrained Gemma4 (text-only)",
+                  flush=True)
         else:
             from transformers.models.llama.modeling_llama import \
                 LlamaForCausalLM
@@ -366,8 +405,9 @@ def main():
         args, tokenizer, a.pooled, online=False, comp_type="online")
     collator_nc = build_collator(dialog_nc, tokenizer, comp_args_nc,
                                  comp_type="online", sum_recur=False)
-    if args.host == "qwen3":
-        # Qwen3DialogueDataset stores plain lists ({"dialog": ...} items)
+    if args.host in ("qwen3", "gemma4"):
+        # Qwen3/Gemma4 dialogue datasets store plain lists
+        # ({"dialog": ...} items)
         eval_dialogs = [d["dialog"] for d in (
             dialog_nc.valset if a.pooled else dialog_nc.testset)]
     else:

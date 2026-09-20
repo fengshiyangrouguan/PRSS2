@@ -550,7 +550,11 @@ def build_model(args, device):
             raise RuntimeError(
                 "unexpected keys in text-only load: {}".format(
                     unexpected[:8]))
-        model.to(device)
+        # .to(bf16) matches the native from_pretrained dtype conversion:
+        # persistent=False buffers (embed_scale etc.) are NOT in the
+        # state_dict, so they stay fp32 otherwise and shift every embed
+        # output by the bf16 rounding of the scale (G1 gate catch).
+        model.to(device, torch.bfloat16)
         model.resize_token_embeddings(text_cfg.vocab_size + 2 * N_TOK,
                                       mean_resizing=False)
         model.update_comp_token(

@@ -89,7 +89,7 @@ def build_model(model_path, device):
         len(missing), len(unexpected)), flush=True)
     if unexpected:
         raise RuntimeError("unexpected keys: {}".format(unexpected[:8]))
-    model.to(device)
+    model.to(device, torch.bfloat16)  # cast persistent=False buffers too (embed_scale fp32 -> bf16, G1 parity)
 
     # Official Table 14 LoRA (r8/alpha16/dropout0.05, q/k/v/o_proj).
     lora_cfg = LoraConfig(r=8, lora_alpha=16, lora_dropout=0.05,

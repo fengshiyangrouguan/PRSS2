@@ -387,7 +387,7 @@ def main():
             del full
             torch.cuda.empty_cache()
             model.load_state_dict(text_sd, strict=False)
-            model.to(device)
+            model.to(device, torch.bfloat16)
             model.eval()
             print("ref arms use RAW pretrained Gemma4 (text-only)",
                   flush=True)

@@ -739,6 +739,38 @@ def test_search_commands_forward_the_validated_data_directory():
         assert arm.count("--bench-data-dir") == 1
 
 
+def test_every_command_carries_its_own_reduction_mode():
+    """The treatment must be ON THE COMMAND LINE of the arm it names.
+
+    `reduction_mode` is deliberately kept out of the profile's `pinned` block and
+    out of the manifest's `shared` block -- it is the one thing the arms differ
+    in, so it lives in the treatment block and in the --sri-context file.
+
+    That is precisely why it went missing: when the runner was rewritten to
+    render its parameters from the profile, nothing rendered `--reduction-mode`,
+    so main.py fell back to its `official` default and the PREDICTIVE arm ran the
+    OFFICIAL method. A live run hit this: the predictive arm died with
+    '--sri-context says reduction_mode=predictive but this process is running
+    official' -- caught only because that consistency check exists.
+    """
+    with tempfile.TemporaryDirectory() as td:
+        out = Path(td)
+        args = _args(out)
+        ctx = out / "ctx.json"
+        cmds = {
+            "root": R.build_root_cmd(args, PROFILE, out),
+            "official": R.build_arm_cmd(args, PROFILE, out, "official", ctx),
+            "predictive": R.build_arm_cmd(args, PROFILE, out, "predictive", ctx),
+        }
+        for name, cmd in cmds.items():
+            assert cmd.count("--reduction-mode") == 1, (name, cmd)
+            got = cmd[cmd.index("--reduction-mode") + 1]
+            want = "official" if name in ("root", "official") else "predictive"
+            assert got == want, (name, got, want)
+        # the root is the treatment-free shared generation, said explicitly
+        assert cmds["root"][cmds["root"].index("--exp-name") + 1] == "phaseH_root"
+
+
 def _main() -> int:
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for fn in fns:

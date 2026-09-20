@@ -345,6 +345,9 @@ def build_root_cmd(args, profile: SRIProfile, out: Path) -> List[str]:
     return ([sys.executable, "-m", "meta_n.main"] + render_pinned_flags(pinned)
             + ["--no-test-eval", "--bench-data-dir", str(args.data_dir),
                "--base-url", ep["base_url"],
+               # explicit, so the root's config.json records that it was
+               # generated with NO treatment (both arms inherit it)
+               "--reduction-mode", "official",
                "--output-dir", str(out / "root"),
                "--exp-name", "phaseH_root"])
 
@@ -367,6 +370,11 @@ def build_arm_cmd(args, profile: SRIProfile, out: Path, arm: str,
             + render_pinned_flags(pinned)
             + ["--no-test-eval", "--bench-data-dir", str(args.data_dir),
                "--resume", "--base-url", ep["base_url"],
+               # THE treatment. It lives outside `shared`/`pinned` (it is the one
+               # thing the arms may differ in), so it must be rendered here --
+               # without it main.py falls back to `--reduction-mode official` and
+               # the predictive arm silently runs the official method.
+               "--reduction-mode", arm,
                "--output-dir", str(out / "arms"),
                "--exp-name", arm, "--sri-context", str(context_file)])
 

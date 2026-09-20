@@ -1,0 +1,36 @@
+# SRI formal profile -- PRIMARY paper cohort (design 2026-09-20, §3.1/§3.3/§12)
+#
+# The cohort is the frozen six CO-Bench tasks. It may NOT be replaced by the
+# extended cohort after any result is observed (§3.2). The `cohort` list below
+# is validated against `protocol.PRIMARY6` on load, so editing it here without
+# editing the frozen constant is refused rather than silently honoured.
+#
+# `nominal_slots` is DERIVED (B * K * T = 24) and deliberately absent.
+name: sri_primary6
+cohort:
+  - Aircraft landing
+  - Assignment problem
+  - Assortment problem
+  - Bin packing - one-dimensional
+  - Capacitated warehouse location
+  - Common due date scheduling
+
+# --- formal search profile (§3.3) -----------------------------------------
+beam_width: 2            # B
+beam_candidates: 2       # K
+max_iterations: 6        # T  (the 6th iteration is extra depth-4..6 opportunity)
+max_depth: 6
+no_early_stop: true
+
+# --- seed families (§3.3): all three are NESTED inside a search seed ------
+search_seeds: [0, 1, 2, 3, 4]
+search_eval_repeats: 3       # denoise a candidate's score during search
+audit_repeats: 3             # canonical transition-audit repeats
+test_repeats: 3              # held-out repeats (stochastic evaluators only)
+
+# --- frozen estimator constant (§2.2) -------------------------------------
+regression_threshold: 0.02
+
+# A deterministic evaluator may cache identical repeats; declaring it here keeps
+# the optimisation visible instead of implicit (§3.3).
+deterministic_evaluator_caches_repeats: true

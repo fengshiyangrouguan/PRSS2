@@ -1,0 +1,31 @@
+# SRI formal profile -- EXTENDED robustness cohort (design 2026-09-20, §3.2/§12)
+#
+# The primary six PLUS Crew / Flow shop / Hybrid Reentrant / Job shop.
+# This cohort is reported SEPARATELY and can never replace the primary cohort
+# after results are observed (§3.2). Validated against `protocol.EXTENDED10`.
+name: sri_extended10
+cohort:
+  - Aircraft landing
+  - Assignment problem
+  - Assortment problem
+  - Bin packing - one-dimensional
+  - Capacitated warehouse location
+  - Common due date scheduling
+  - Crew scheduling
+  - Flow shop scheduling
+  - Hybrid Reentrant Shop Scheduling
+  - Job shop scheduling
+
+beam_width: 2
+beam_candidates: 2
+max_iterations: 6
+max_depth: 6
+no_early_stop: true
+
+search_seeds: [0, 1, 2, 3, 4]
+search_eval_repeats: 3
+audit_repeats: 3
+test_repeats: 3
+
+regression_threshold: 0.02
+deterministic_evaluator_caches_repeats: true

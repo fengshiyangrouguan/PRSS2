@@ -66,13 +66,15 @@ def build_model(model_path, device):
     from transformers.models.gemma4.configuration_gemma4 import (
         Gemma4TextConfig)
     from transformers.models.gemma4.modeling_gemma4 import (
-        Gemma4ForConditionalGeneration)
-    from src.arch.ccm_gemma4 import Gemma4ForCausalLM_CCM
-    from src import peft_custom
-    from peft import LoraConfig
+        Gemma4ForConditionalGeneration, Gemma4ForCausalLM)
+    from peft import get_peft_model, LoraConfig
 
     text_cfg = Gemma4TextConfig.from_pretrained(model_path)
-    model = Gemma4ForCausalLM_CCM(text_cfg)
+    # Native class + plain peft LoRA: Step-1 is the official default
+    # LoRA fine-tune (NO comp tokens), exactly like the Llama-line
+    # GistLlama + peft construction.  The conditional peft_custom path
+    # (comp_mask-gated) is reserved for Step-2.
+    model = Gemma4ForCausalLM(text_cfg)
     full = Gemma4ForConditionalGeneration.from_pretrained(
         model_path, torch_dtype=torch.bfloat16)
     prefix = "model.language_model."
@@ -96,7 +98,7 @@ def build_model(model_path, device):
                           bias="none", task_type="CAUSAL_LM",
                           target_modules=["q_proj", "k_proj", "v_proj",
                                           "o_proj"])
-    model = peft_custom.get_peft_model(model, lora_cfg)
+    model = get_peft_model(model, lora_cfg)
     trainable = [n for n, p in model.named_parameters()
                  if p.requires_grad]
     print("[step1] trainable params: {} ({})".format(

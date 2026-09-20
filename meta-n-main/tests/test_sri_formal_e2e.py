@@ -344,18 +344,30 @@ def test_e2e_freeze_audit_final_aggregate():
         invalid = metrics["invalid_edges"]
         assert [d["slot_id"] for d in invalid] == ["it2-p1-c1"], invalid
         assert invalid[0]["transition"] == "23"
-        # ...so F is > 0 rather than silently 0
+        # ...so the failure counts are non-zero rather than silently 0
         assert off["drops"] >= 1
-        assert off["F"] > 0.0
-        # 2->3: attempted = (3 edges + 1 drop) * 6 tasks = 24, failed = 6
-        fa = metrics["failure_accounting"]["by_transition"]["R_2to3"]
+        assert off["F_overall"] > 0.0
+        assert off["complete"] is False
+        # §2.3 symbols are the OVERALL values; the 2->3 view is the diagnostic
+        fa_all = metrics["failure_accounting"]
+        assert fa_all["scope"] == "overall"
+        assert fa_all["expected_edge_task_pairs"] == fa_all[
+            "valid_edge_task_pairs"] + fa_all["missing_edge_task_pairs"]
+        assert metrics["completeness"]["ok"] is False
+        # 2->3: expected = (3 edges + 1 drop) * 6 tasks = 24, missing = 6
+        fa = fa_all["by_transition"]["R_2to3"]
         assert fa["attempted_edge_task_slots"] == 24, fa
         assert fa["failed_edge_task_slots"] == 6, fa
         assert abs(fa["F"] - 0.25) < 1e-12, fa
         assert metrics["evaluator_mode"] == "mock"
-        # repeats never enlarge the denominator
+        # repeats never enlarge the denominator, and they are never reported as
+        # independent observations
         assert metrics["transitions"]["R_2to3"]["valid_edge_task_pairs"] == \
             3 * len(COHORT)
+        assert metrics["repeats"]["requested"] == PROFILE.audit_repeats
+        assert metrics["repeats"]["executed"] <= metrics["repeats"]["requested"] \
+            * metrics["deduplicated_executions"]
+        assert "NEVER an independent observation" in metrics["repeats"]["note"]
 
         fin = R.stage_final(a, PROFILE, d0)
         off_fin = fin["outputs"]["arms"]["official"]

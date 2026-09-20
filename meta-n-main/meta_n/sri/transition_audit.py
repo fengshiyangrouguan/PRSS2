@@ -46,22 +46,50 @@ PRIMARY_TRANSITION: Tuple[int, int] = (2, 3)
 # Secondary, pre-specified transitions using the identical definition.
 SECONDARY_TRANSITIONS: Tuple[Tuple[int, int], ...] = ((1, 2), (3, 4), (4, 5))
 
-# Comparison tolerance for `delta < -threshold`.
-#
-# The rule is a strict float comparison, so a delta that is *decimally* exactly
-# -threshold can land a few ULPs below it (0.88 - 0.90 == -0.020000000000000018)
-# and be counted as a regression. Without a tolerance the published rate would
-# depend on the platform's arithmetic rather than on the protocol.
-#
-# This tolerance is therefore PART OF THE FROZEN DEFINITION, not a tunable:
-# `regression <=> delta < -threshold - REGRESSION_EPS`. One nanounit is far below
-# any score difference the estimators can resolve, so it cannot mask a real
-# regression.
-REGRESSION_EPS = 1e-9
-
 
 class InheritedScore(ProtocolError):
     """A score arrived that was not freshly executed. Invalid audit input."""
+
+
+# Comparison tolerance for `delta < -threshold`.
+#
+# This is a FLOATING-POINT BOUNDARY RESOLVER, not a statistical parameter, and it
+# is deliberately not part of the reported definition. The rule stays
+# `regression <=> delta < -threshold`; the tolerance only decides the case where
+# the computed delta is *decimally* exactly -threshold and float arithmetic
+# lands a few ULPs below it (0.88 - 0.90 == -0.020000000000000018). Publishing
+# `delta < -0.020000001` as the definition would be a different statistic; the
+# papers and the design doc keep `delta < -0.02`.
+#
+# If the underlying quantity were an integer success count over an integer
+# total, exact arithmetic would be preferable. CO-Bench reports a normalized
+# float ratio, so a boundary resolver is the honest option.
+BOUNDARY_TOLERANCE = 1e-9
+
+# §2.3 observation states. A nominal observation is EXPECTED to exist; the only
+# question is what became of it. Nothing here means "not there" -- a missing
+# observation is COUNTED as missing, never dropped from the denominator, because
+# a shrinking denominator is how a broken arm starts looking better.
+STATE_OK = "valid"                     # both sides scored; a delta exists
+STATE_UNDEFINED = "undefined_task"      # the material does not cover this task
+STATE_FAILED = "evaluation_failed"      # the evaluator crashed or was non-finite
+
+
+def classify_delta(delta: float, threshold: float) -> str:
+    """`regression` | `boundary_not_regression` | `not_regression`.
+
+    The boundary case is reported separately rather than silently folded into
+    either side: a reader can see how many comparisons sat exactly on -threshold.
+    """
+    if not math.isfinite(float(delta)):
+        raise InheritedScore(
+            "delta {!r} is not finite; a non-finite observation is a FAILED "
+            "observation, not a comparison".format(delta))
+    if float(delta) >= -float(threshold):
+        return "not_regression"
+    if abs(float(delta) + float(threshold)) <= BOUNDARY_TOLERANCE:
+        return "boundary_not_regression"
+    return "regression"
 
 
 # --------------------------------------------------------------------------
@@ -229,15 +257,20 @@ class RawEval:
     detail: str = ""
 
 
-def _check_raw(ev: RawEval, where: str) -> RawEval:
+def _check_input(ev: RawEval, where: str) -> RawEval:
+    """Refuse INHERITED input. A non-finite score is a FAILED observation instead.
+
+    These two used to share one raise, so a single crashed evaluator call aborted
+    the whole audit rather than being counted as the failed observation §2.3 asks
+    for. The distinction matters: an inherited score is invalid INPUT (the audit
+    would be measuring a parent's own trace), while a non-finite score is a
+    legitimate OUTCOME that must be COUNTED, never dropped -- a denominator that
+    shrinks when an arm breaks is how a broken arm starts looking better.
+    """
     if not ev.freshly_executed:
         raise InheritedScore(
             "{} returned a NON-fresh score (inherited/reused); the canonical "
             "audit only accepts freshly executed scores (§6)".format(where))
-    if ev.score is None or not math.isfinite(float(ev.score)):
-        raise InheritedScore(
-            "{} returned a non-finite score ({}); non-finite scores are failed "
-            "audit observations (§13)".format(where, ev.score))
     return ev
 
 
@@ -291,47 +324,70 @@ def run_canonical_audit(edges: Sequence[Edge], *, cohort: Sequence[str],
     cache: Dict[Tuple[str, str, int], RawEval] = {}
     rows: List[Dict[str, Any]] = []
     exec_count = 0
+    cached_reuses = 0
 
-    def score_of(mat: CandidateMaterial, task_id: str) -> Optional[float]:
-        nonlocal exec_count
+    def score_of(mat: CandidateMaterial, task_id: str
+                 ) -> Tuple[str, Optional[float]]:
+        nonlocal exec_count, cached_reuses
         if task_id not in mat.task_scripts:
-            return None
-        vals = []
+            return STATE_UNDEFINED, None
+        vals: List[float] = []
         for rep in range(int(repeats)):
             key = (mat.candidate_id, task_id, rep)
             if key not in cache:
                 seed = audit_seed(search_seed, task_id, rep)
-                ev = evaluator.evaluate(task_id, mat.task_scripts[task_id],
-                                        seed=seed)
-                ev = _check_raw(ev, "{}|{}|rep{}".format(
-                    mat.candidate_id, task_id, rep))
+                ev = _check_input(
+                    evaluator.evaluate(task_id, mat.task_scripts[task_id],
+                                       seed=seed),
+                    "{}|{}|rep{}".format(mat.candidate_id, task_id, rep))
                 cache[key] = ev
                 exec_count += 1
+                finite = (ev.score is not None
+                          and math.isfinite(float(ev.score)))
+                # The evaluator reports whether it served this observation from
+                # its deterministic-repeat cache; the row records that verbatim
+                # so "3 repeats" can never be misread as "3 executions".
+                from_cache = "cached_deterministic_repeat" in str(ev.detail)
+                cached_reuses += int(from_cache)
                 rows.append({
                     "schema_version": AUDIT_SCHEMA_VERSION,
                     "candidate_id": mat.candidate_id,
                     "structural_depth": mat.structural_depth,
                     "material_sha256": mat.sha256(),
                     "task_id": task_id, "repeat_index": rep, "seed": seed,
-                    "score": float(ev.score), "success": bool(ev.success),
-                    "freshly_executed": True, "detail": ev.detail,
+                    "score": (float(ev.score) if finite else None),
+                    "success": bool(ev.success),
+                    "freshly_executed": True,
+                    "executed": (not from_cache),
+                    "from_deterministic_cache": from_cache,
+                    "state": (STATE_OK if finite else STATE_FAILED),
+                    "detail": ev.detail,
                 })
-            vals.append(float(cache[key].score))
+            ev = cache[key]
+            if ev.score is None or not math.isfinite(float(ev.score)):
+                return STATE_FAILED, None
+            vals.append(float(ev.score))
         # median: an audit repeat is NESTED inside one edge-task observation and
         # must never enlarge the denominator (§2.2).
-        return statistics.median(vals)
+        return STATE_OK, statistics.median(vals)
 
-    # ---- pass 2: per-edge-task deltas -------------------------------------
-    metric_rows: List[Dict[str, Any]] = []
+    # ---- pass 2: per-edge-task states and deltas --------------------------
     edge_rows: List[Dict[str, Any]] = []
     for e in edges:
         per_task: Dict[str, Dict[str, Optional[float]]] = {}
+        per_task_state: Dict[str, str] = {}
         for t in cohort:
-            p = score_of(e.parent, t)
-            c = score_of(e.child, t)
-            if p is None or c is None:
-                continue                      # task not covered by the material
-            per_task[t] = {"parent": p, "child": c, "delta": c - p}
+            ps, pv = score_of(e.parent, t)
+            cs, cv = score_of(e.child, t)
+            if STATE_UNDEFINED in (ps, cs):
+                st = STATE_UNDEFINED
+            elif STATE_FAILED in (ps, cs):
+                st = STATE_FAILED
+            else:
+                st = STATE_OK
+            per_task_state[t] = st
+            if st == STATE_OK:
+                per_task[t] = {"parent": pv, "child": cv, "delta": cv - pv}
         edge_rows.append({
             "schema_version": AUDIT_SCHEMA_VERSION,
             "slot_id": e.slot_id, "iteration": e.iteration,
@@ -345,12 +401,14 @@ def run_canonical_audit(edges: Sequence[Edge], *, cohort: Sequence[str],
             "parent_material_sha256": e.parent.sha256(),
             "child_material_sha256": e.child.sha256(),
             "per_task": per_task,
+            "per_task_state": per_task_state,
         })
 
     # ---- aggregate per transition ----------------------------------------
     def agg(tr: Tuple[int, int]) -> Dict[str, Any]:
         eids = [r for r in edge_rows if r["transition"] == "{}{}".format(*tr)]
         regressions = 0
+        boundary = 0
         pairs = 0
         deltas: List[float] = []
         per_task_reg: Dict[str, List[int]] = {t: [] for t in cohort}
@@ -358,18 +416,24 @@ def run_canonical_audit(edges: Sequence[Edge], *, cohort: Sequence[str],
             for t, d in r["per_task"].items():
                 pairs += 1
                 deltas.append(d["delta"])
-                hit = 1 if d["delta"] < -float(threshold) - REGRESSION_EPS else 0
+                verdict = classify_delta(d["delta"], threshold)
+                hit = 1 if verdict == "regression" else 0
+                boundary += int(verdict == "boundary_not_regression")
                 regressions += hit
                 per_task_reg.setdefault(t, []).append(hit)
         r_valid = (regressions / pairs) if pairs else None
         return {
             "transition": "{}{}".format(*tr),
             "threshold": float(threshold),
-            "regression_eps": REGRESSION_EPS,
-            "rule": "regression <=> delta < -threshold - regression_eps",
+            "rule": "regression <=> delta < -threshold",
+            "boundary_rule": "a delta numerically equal to -threshold is NOT a "
+                             "regression (machine-precision tie, tolerance "
+                             "{}); that tolerance is NOT part of the "
+                             "definition".format(BOUNDARY_TOLERANCE),
             "edge_count": len(eids),
             "valid_edge_task_pairs": pairs,
             "regressions": regressions,
+            "boundary_ties": boundary,
             "R_valid": r_valid,
             "delta_mean": (statistics.fmean(deltas) if deltas else None),
             "delta_median": (statistics.median(deltas) if deltas else None),
@@ -399,52 +463,89 @@ def run_canonical_audit(edges: Sequence[Edge], *, cohort: Sequence[str],
         else:
             drops_by_tr.setdefault(str(tr), []).append(d)
 
-    def account(tr: Tuple[int, int], rows_for_tr: List[Dict[str, Any]],
-                regressions: int) -> Dict[str, Any]:
-        dr = drops_by_tr.get("{}{}".format(*tr), [])
-        attempted = (len(rows_for_tr) + len(dr)) * len(cohort)
-        missing_task_pairs = sum(len(cohort) - len(r["per_task"])
-                                 for r in rows_for_tr)
-        failed = missing_task_pairs + len(dr) * len(cohort)
+    def account(scope_rows: List[Dict[str, Any]], label: str, *,
+                extra_drops: int = 0,
+                transition: Optional[str] = None) -> Dict[str, Any]:
+        """Every EXPECTED observation, classified. Nothing leaves the denominator.
+
+        `valid + undefined_task + evaluation_failed + dropped == expected` is
+        asserted, so a failure cannot quietly shrink the denominator -- which is
+        how a broken arm starts looking better than a working one.
+        """
+        if transition is not None:
+            extra_drops = len(drops_by_tr.get(transition, []))
+        expected = (len(scope_rows) + extra_drops) * len(cohort)
+        counts: Dict[str, int] = {STATE_OK: 0, STATE_UNDEFINED: 0,
+                                  STATE_FAILED: 0}
+        regressions = 0
+        boundary = 0
+        for r in scope_rows:
+            for st in r["per_task_state"].values():
+                counts[st] = counts.get(st, 0) + 1
+            for d in r["per_task"].values():
+                verdict = classify_delta(d["delta"], threshold)
+                regressions += int(verdict == "regression")
+                boundary += int(verdict == "boundary_not_regression")
+        dropped_pairs = extra_drops * len(cohort)
+        missing = (counts[STATE_UNDEFINED] + counts[STATE_FAILED]
+                   + dropped_pairs)
+        accounted = counts[STATE_OK] + missing
+        if accounted != expected:
+            raise ProtocolError(
+                "failure accounting does not close: {} expected observation(s) "
+                "but {} accounted for (valid={} undefined={} failed={} "
+                "dropped={})".format(expected, accounted, counts[STATE_OK],
+                                     counts[STATE_UNDEFINED],
+                                     counts[STATE_FAILED], dropped_pairs))
         return {
-            "transition": "{}{}".format(*tr),
-            "edges": len(rows_for_tr),
-            "dropped_edges": len(dr),
-            "attempted_edge_task_slots": attempted,
-            "failed_edge_task_slots": failed,
-            "F": (failed / attempted) if attempted else None,
-            "R_worst": (((regressions or 0) + failed) / attempted
-                        if attempted else None),
+            "scope": label,
+            "expected_edge_task_pairs": expected,
+            "valid_edge_task_pairs": counts[STATE_OK],
+            "undefined_task_pairs": counts[STATE_UNDEFINED],
+            "evaluation_failed_pairs": counts[STATE_FAILED],
+            "dropped_edge_pairs": dropped_pairs,
+            "missing_edge_task_pairs": missing,
+            "attempted_edge_task_slots": expected,
+            "failed_edge_task_slots": missing,
+            "regressions": regressions,
+            "boundary_ties": boundary,
+            "F": (missing / expected) if expected else None,
+            "R_worst": (((regressions + missing) / expected)
+                        if expected else None),
+            "complete": missing == 0,
         }
 
     by_transition = {}
     for tr in (PRIMARY_TRANSITION,) + SECONDARY_TRANSITIONS:
         key = "R_{}to{}".format(*tr)
-        rows_tr = [r for r in edge_rows if r["transition"] == "{}{}".format(*tr)]
-        by_transition[key] = account(tr, rows_tr,
-                                     transitions[key]["regressions"] or 0)
+        trs = "{}{}".format(*tr)
+        rows_tr = [r for r in edge_rows if r["transition"] == trs]
+        by_transition[key] = account(rows_tr, key, transition=trs)
 
-    primary_fa = by_transition["R_2to3"]
-    # The overall view exists for the unplaceable rows, which belong to no single
-    # transition. A row whose structural depth is missing is a real defect (the
-    # ledger gate refuses it for an executed slot), so it is disclosed here
-    # rather than folded into one transition's rate.
-    all_rows = edge_rows
-    all_drops = [d for dr in drops_by_tr.values() for d in dr]
-    attempted_all = ((len(all_rows) + len(all_drops) + len(unplaceable))
-                     * len(cohort))
-    failed_all = (sum(len(cohort) - len(r["per_task"]) for r in all_rows)
-                  + (len(all_drops) + len(unplaceable)) * len(cohort))
-    overall = {
-        "attempted_edge_task_slots": attempted_all,
-        "failed_edge_task_slots": failed_all,
-        "F": (failed_all / attempted_all) if attempted_all else None,
-        "R_worst": None,          # a single-transition quantity; see by_transition
-        "unplaceable_rows": len(unplaceable),
-        "note": "overall F includes rows whose structural depth is missing; "
-                "R_worst is reported PER TRANSITION because a 2->3 regression "
-                "cannot be divided by a 3->4 denominator",
-    }
+    # §2.3's formulas carry no transition index, so `F` and `R_worst` are the
+    # OVERALL quantities; `by_transition` keeps the same counts scoped to one
+    # transition as a diagnostic and must never be relabelled F / R_worst.
+    #
+    # The overall scope also carries the rows we could not even place (no
+    # structural depth), which belong to no transition. They are failures like
+    # any other, so they are COUNTED rather than let to vanish.
+    overall = account(edge_rows, "overall",
+                      extra_drops=len(drops) - len(unplaceable))
+    overall["unplaceable_rows"] = len(unplaceable)
+    if unplaceable:
+        add = len(unplaceable) * len(cohort)
+        overall["complete"] = False
+        for k in ("expected_edge_task_pairs", "missing_edge_task_pairs",
+                  "attempted_edge_task_slots", "failed_edge_task_slots",
+                  "dropped_edge_pairs"):
+            overall[k] += add
+        exp = overall["expected_edge_task_pairs"]
+        overall["F"] = overall["failed_edge_task_slots"] / exp
+        overall["R_worst"] = ((overall["regressions"]
+                               + overall["failed_edge_task_slots"]) / exp)
+    overall["note"] = (
+        "§2.3's F and R_worst are these OVERALL values; by_transition holds the "
+        "same counts scoped to one transition and is a diagnostic only")
 
     # ---- §2.4 depth reporting ---------------------------------------------
     best_at_depth: Dict[int, float] = {}
@@ -468,21 +569,32 @@ def run_canonical_audit(edges: Sequence[Edge], *, cohort: Sequence[str],
         "schema_version": AUDIT_SCHEMA_VERSION,
         "search_seed": int(search_seed),
         "cohort": cohort,
-        "repeats": int(repeats),
-        "threshold": float(threshold),
+        # --- repeat bookkeeping: repeats are NESTED, never independent -------
+        "repeats": {
+            "requested": int(repeats),
+            "executed": len(rows) - cached_reuses,
+            "reused_from_deterministic_cache": cached_reuses,
+            "note": "a repeat is nested inside one (candidate, task) "
+                    "observation and is NEVER an independent observation: it "
+                    "must not contribute to an n, a standard deviation or a "
+                    "confidence interval, and `requested` is not a sample size",
+        },
         "deduplicated_executions": exec_count,
         "raw_observations": len(rows),
         "edges": len(edge_rows),
         "invalid_edges": list(drops or []),
         "transitions": transitions,
-        "failure_accounting": dict(
-            primary_fa,
-            by_transition=by_transition,
-            overall=overall,
-            unplaceable_rows=list(unplaceable),
-            note="R_valid is the paper's primary statistic; F and R_worst "
-                 "are mandatory robustness disclosures (§2.3) and are computed "
-                 "per transition from that transition's own denominator."),
+        # §2.3's symbols, plus the same counts scoped per transition
+        "failure_accounting": dict(overall, by_transition=by_transition),
+        "completeness": {
+            "ok": bool(overall["complete"]),
+            "expected_edge_task_pairs": overall["expected_edge_task_pairs"],
+            "missing_edge_task_pairs": overall["missing_edge_task_pairs"],
+            "unplaceable_rows": len(unplaceable),
+            "note": "a missing observation is COUNTED as missing, never dropped; "
+                    "when ok is False the run must disclose the gap rather than "
+                    "report a final number as if the denominator were intact",
+        },
         "pairing_limitations": list(pairing_limitations),
     }
     return AuditResult(raw_rows=rows, edges=edge_rows, metrics=metrics,
@@ -663,9 +775,23 @@ def self_test() -> int:
     rc = run_canonical_audit(bnd, cohort=["T1"], evaluator=ev_c, search_seed=0,
                              repeats=1, threshold=0.02)
     assert rc.metrics["transitions"]["R_2to3"]["regressions"] == 1
+    # the boundary case is REPORTED, not silently folded into either side
+    assert rb.metrics["transitions"]["R_2to3"]["boundary_ties"] == 1
+    assert rc.metrics["transitions"]["R_2to3"]["boundary_ties"] == 0
+    assert rb.metrics["transitions"]["R_2to3"]["rule"] == \
+        "regression <=> delta < -threshold"
+    assert "NOT part of the definition" in \
+        rb.metrics["transitions"]["R_2to3"]["boundary_rule"]
+    # classify_delta is the single comparator both the rates and the accounting
+    # use, so the two can never disagree about the boundary
+    assert classify_delta(-0.03, 0.02) == "regression"
+    assert classify_delta(-0.020000000000000018, 0.02) == \
+        "boundary_not_regression"
+    assert classify_delta(-0.01, 0.02) == "not_regression"
     print("OK  threshold boundary delta == -threshold is NOT a regression; "
-          "delta = -0.03 IS (tolerance {} is part of the frozen rule)"
-          .format(REGRESSION_EPS))
+          "delta = -0.03 IS. The tolerance ({}) is a machine-precision boundary "
+          "resolver only -- the reported rule stays `delta < -threshold`"
+          .format(BOUNDARY_TOLERANCE))
 
     # §14.8: repeats are nested -> they cannot inflate the denominator.
     # 3 distinct candidates (p2, c3a, c3b) x 2 tasks x 3 repeats = 18 raw rows,
@@ -709,12 +835,15 @@ def self_test() -> int:
     assert all(r["freshly_executed"] is True for r in res.raw_rows)
     print("OK  freshness recorded every raw row carries freshly_executed=True")
 
-    # §2.3 failure accounting
+    # §2.3 failure accounting: F and R_worst are the OVERALL quantities
     fa = m["failure_accounting"]
+    assert fa["scope"] == "overall", fa["scope"]
     assert fa["attempted_edge_task_slots"] == 4, fa
     assert fa["F"] == 0.0 and fa["R_worst"] == 0.25, fa
-    print("OK  failure accounting F={} R_worst={} (no missing material here)"
-          .format(fa["F"], fa["R_worst"]))
+    assert fa["complete"] is True
+    assert m["completeness"]["ok"] is True
+    print("OK  failure accounting F={} R_worst={} (OVERALL scope, no missing "
+          "material here)".format(fa["F"], fa["R_worst"]))
 
     # a missing-material edge is INVALID and visible, not dropped silently
     def material_of_drop(row, side):
@@ -730,32 +859,39 @@ def self_test() -> int:
     res2 = run_canonical_audit(edges2, cohort=cohort, evaluator=_StubEvaluator(table),
                                search_seed=0, repeats=1, drops=drops2)
     fa2 = res2.metrics["failure_accounting"]
-    # PER TRANSITION: the surviving 2->3 edge plus the dropped 2->3 edge give
-    # attempted = 2 * 2 = 4 and failed = 1 drop * 2 tasks = 2 -> F = 0.5. The
-    # dropped 1->2 row belongs to a DIFFERENT transition and must not appear in
-    # either the numerator or the denominator (mixing them reported F=4/6).
-    assert fa2["attempted_edge_task_slots"] == 4, fa2
-    assert fa2["failed_edge_task_slots"] == 2, fa2
-    assert abs(fa2["F"] - 0.5) < 1e-12, fa2
+    # §2.3's F/R_worst are OVERALL: both drops contribute, across both
+    # transitions: expected = (1 surviving + 2 dropped) * 2 tasks = 6, missing =
+    # 2 drops * 2 tasks = 4 -> F = 4/6.
+    assert fa2["scope"] == "overall", fa2["scope"]
+    assert fa2["attempted_edge_task_slots"] == 6, fa2
+    assert fa2["failed_edge_task_slots"] == 4, fa2
+    assert abs(fa2["F"] - 4 / 6) < 1e-12, fa2
     assert fa2["F"] <= 1.0
-    assert fa2["by_transition"]["R_1to2"]["F"] == 1.0, fa2["by_transition"]
-    print("OK  invalid visible    dropped edges raise the 2->3 F to {:.3f} "
-          "(attempted counts them); the 1->2 drop stays in its own transition"
-          .format(fa2["F"]))
+    assert fa2["complete"] is False and res2.metrics["completeness"]["ok"] is False
+    # ...and the SAME counts, scoped to one transition, are the diagnostic
+    bt = fa2["by_transition"]
+    assert bt["R_2to3"]["attempted_edge_task_slots"] == 4, bt["R_2to3"]
+    assert abs(bt["R_2to3"]["F"] - 0.5) < 1e-12, bt["R_2to3"]
+    assert bt["R_1to2"]["F"] == 1.0, bt["R_1to2"]
+    print("OK  invalid visible    dropped edges raise the OVERALL F to {:.3f} "
+          "(expected counts them, completeness.ok=False); by_transition keeps "
+          "2->3 at {:.3f} and 1->2 at {:.3f} as a diagnostic"
+          .format(fa2["F"], bt["R_2to3"]["F"], bt["R_1to2"]["F"]))
 
     # ---- the mixing bug: a 3->4 edge must not move the 2->3 rate ----------
-    # `R_worst` adds THIS transition's regressions to THIS transition's
-    # failures. The first revision divided 2->3 regressions by an attempt count
-    # that included every 3->4 edge, so a broken 3->4 arm pulled the published
-    # 2->3 rate towards zero.
+    # The first revision divided 2->3 regressions by an attempt count that
+    # included every 3->4 edge, so a broken 3->4 arm pulled the published 2->3
+    # rate towards zero. R_2to3 must be invariant to an unrelated transition;
+    # the OVERALL quantities legitimately move, because §2.3's formulas carry no
+    # transition index (that is the frozen definition, not a regression).
     wide = list(ledger) + [
-        {"slot_id": "it2-p0-c0", "iteration": 2, "parent_structural_depth": 3,
+        {"slot_id": "it3-p0-c0", "iteration": 3, "parent_structural_depth": 3,
          "proposed_child_depth": 4, "terminal_status": "execution_error",
          "archive_admitted": False, "parent_id": "c3a"}]
     mats_wide = dict(mats)
     mats_wide["it0-p0-c0"] = (parent, good)
     mats_wide["it0-p0-c1"] = (parent, bad)
-    mats_wide["it2-p0-c0"] = (_mat("c3a", 3, T1="a", T2="a"),
+    mats_wide["it3-p0-c0"] = (_mat("c3a", 3, T1="a", T2="a"),
                               _mat("c4", 4, T1="b", T2="b"))
 
     def material_of_wide(row, side):
@@ -771,11 +907,17 @@ def self_test() -> int:
     faw = res_w.metrics["failure_accounting"]
     r23_w = res_w.metrics["transitions"]["R_2to3"]
     assert r23_w["regressions"] == r23["regressions"], r23_w
-    assert faw["R_worst"] == fa["R_worst"], (faw, fa)
-    assert faw["attempted_edge_task_slots"] == fa["attempted_edge_task_slots"]
-    assert "R_3to4" in faw["by_transition"], sorted(faw["by_transition"])
-    print("OK  no cross-talk      adding a 3->4 edge leaves R_2to3 and its "
-          "F/R_worst unchanged (R_worst={})".format(faw["R_worst"]))
+    assert r23_w["R_valid"] == r23["R_valid"], r23_w
+    assert faw["by_transition"]["R_2to3"] == fa["by_transition"]["R_2to3"], (
+        "the 2->3 DIAGNOSTIC must be invariant to an unrelated transition")
+    assert faw["expected_edge_task_pairs"] > fa["expected_edge_task_pairs"], (
+        "the OVERALL denominator does include the extra transition -- that is "
+        "§2.3 as written")
+    assert "R_3to4" in faw["by_transition"]
+    print("OK  no cross-talk      adding a 3->4 edge leaves R_2to3 and its own "
+          "F/R_worst untouched ({}); the OVERALL denominator grows to {} by "
+          "design".format(faw["by_transition"]["R_2to3"]["R_worst"],
+                          faw["expected_edge_task_pairs"]))
 
     # an EXECUTED row with no structural depth is refused at freeze time
     try:

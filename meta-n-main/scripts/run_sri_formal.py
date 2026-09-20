@@ -1082,14 +1082,34 @@ def stage_audit(args, profile: SRIProfile, out: Path) -> dict:
             encoding="utf-8")
         r23 = res.metrics["transitions"]["R_2to3"]
         fa = res.metrics["failure_accounting"]
+        comp = res.metrics["completeness"]
+        rep = res.metrics["repeats"]
         print("  {:<11} edges={} drops={} pairs={} regressions={} R_2to3={} "
-              "F={}".format(arm, len(edges), len(drops),
-                            r23["valid_edge_task_pairs"], r23["regressions"],
-                            r23["R_valid"], fa["F"]))
+              "F_overall={} R_worst_overall={} complete={}".format(
+                  arm, len(edges), len(drops), r23["valid_edge_task_pairs"],
+                  r23["regressions"], r23["R_valid"], fa["F"], fa["R_worst"],
+                  comp["ok"]))
+        print("  {:<11} repeats requested={} executed={} reused={}".format(
+            "", rep["requested"], rep["executed"],
+            rep["reused_from_deterministic_cache"]))
         audits[arm] = {"planned": False, "edges": len(edges),
                        "drops": len(drops),
-                       "R_2to3": r23["R_valid"], "F": fa["F"],
-                       "R_worst": fa["R_worst"],
+                       "R_2to3": r23["R_valid"],
+                       "R_1to2": res.metrics["transitions"]["R_1to2"]["R_valid"],
+                       "R_3to4": res.metrics["transitions"]["R_3to4"]["R_valid"],
+                       # §2.3 symbols are the OVERALL values; the per-transition
+                       # counts live under `failure_accounting_by_transition`
+                       "F_overall": fa["F"], "R_worst_overall": fa["R_worst"],
+                       "failure_accounting_by_transition":
+                           {k: v["F"] for k, v in
+                            fa["by_transition"].items()},
+                       "complete": comp["ok"],
+                       "missing_edge_task_pairs":
+                           comp["missing_edge_task_pairs"],
+                       "repeats_requested": rep["requested"],
+                       "repeats_executed": rep["executed"],
+                       "repeats_reused_from_cache":
+                           rep["reused_from_deterministic_cache"],
                        "raw_observations": res.metrics["raw_observations"],
                        "deduplicated_executions":
                            res.metrics["deduplicated_executions"],

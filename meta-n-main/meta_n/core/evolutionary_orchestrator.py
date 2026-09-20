@@ -852,6 +852,14 @@ class EvolutionaryOrchestrator:
                         "cached": int(ckpt_usage.get("cached", 0) or 0),
                         "cost_usd": float(ckpt_usage.get("cost_usd", 0.0) or 0.0),
                     }
+                    for _usage_key in (
+                        "requests", "failed_calls", "retries",
+                        "empty_responses", "empty_escalations", "reasoning",
+                        "reasoning_reported_calls",
+                    ):
+                        if _usage_key in ckpt_usage:
+                            self.llm_client.cumulative_usage[_usage_key] = int(
+                                ckpt_usage.get(_usage_key, 0) or 0)
                 # Audit #1: restore the INNER-LLM token accounting too. The outer
                 # channel above (total_tokens + cumulative_usage) is restored, but
                 # result.inner_* start at 0 and only accumulate post-resume
@@ -1194,6 +1202,7 @@ class EvolutionaryOrchestrator:
                             # would find zero edges.
                             proposed_child_depth=child_depth,
                             temperature=temperature, focus_task=focus_task)
+                        _sri_usage_before = self._outer_usage_snapshot()
                         omega_start = time.time()
                         injected, omega_tokens = await self.omega.generate(
                             traces=parent.traces,
@@ -1264,13 +1273,15 @@ class EvolutionaryOrchestrator:
                                 # SRI formal: an empty Omega injection is a SPENT
                                 # slot (§8) -- it is labelled, never silently
                                 # turned into an extra proposal.
+                                _sri_u = self._outer_usage_since(
+                                    _sri_usage_before)
                                 self.sri.close(
                                     _sri_slot, "empty_injection",
                                     failure_class="empty_omega",
                                     failure_message="Omega returned an empty "
                                                     "injection; slot consumed",
                                     omega_wall_seconds=omega_time,
-                                    outer_calls=1, prompt_tokens=omega_tokens)
+                                    **self._sri_outer_accounting(_sri_u))
                                 continue
                             # G9: an empty Ω injection in consolidate mode is NOT a
                             # skip — fall through to re-solve the FOCUS task fresh (a
@@ -1426,6 +1437,10 @@ class EvolutionaryOrchestrator:
                                     candidate_id=child.candidate_id,
                                     structural_depth=child_depth,
                                     task_scripts=_scripts)
+                                _gate_inner = self._sum_inner_traces(
+                                    gate_traces.values())
+                                _sri_u = self._outer_usage_since(
+                                    _sri_usage_before)
                                 self.sri.close(
                                     _sri_slot, "gate_rejected",
                                     gate_status="rejected",
@@ -1434,7 +1449,15 @@ class EvolutionaryOrchestrator:
                                     material_path=_mp,
                                     omega_wall_seconds=omega_time,
                                     gate_wall_seconds=gate_time,
-                                    outer_calls=1)
+                                    evaluator_calls=(
+                                        len(gate_traces) * max(
+                                            1, self.config.gate_repeats)),
+                                    inner_calls=_gate_inner["inner_calls"],
+                                    inner_total_tokens=_gate_inner["inner_tokens"],
+                                    inner_prompt_tokens=_gate_inner["inner_prompt_tokens"],
+                                    inner_completion_tokens=_gate_inner[
+                                        "inner_completion_tokens"],
+                                    **self._sri_outer_accounting(_sri_u))
                                 result.total_tokens += omega_tokens
                                 iter_tokens += omega_tokens
                                 # Reaudit #6: the gate solves are real INNER-LLM
@@ -1449,9 +1472,6 @@ class EvolutionaryOrchestrator:
                                 # reconciliation above on the INNER channel; counted
                                 # once (the child is discarded). Empty gate_traces
                                 # (external-agent / native-only benchmarks) → no-op.
-                                _gate_inner = self._sum_inner_traces(
-                                    gate_traces.values()
-                                )
                                 result.inner_tokens += _gate_inner["inner_tokens"]
                                 result.inner_prompt_tokens += _gate_inner[
                                     "inner_prompt_tokens"
@@ -1556,15 +1576,22 @@ class EvolutionaryOrchestrator:
                             str(getattr(t, "task_id", ""))
                             for t in (child.traces or [])
                             if int(getattr(t, "depth", 0) or 0) != child.depth})
+                        _sri_u = self._outer_usage_since(
+                            _sri_usage_before)
                         self.sri.close(
                             _sri_slot, "evaluated_admitted",
                             archive_admitted=True,
                             fresh_task_ids=_fresh, inherited_task_ids=_inh,
                             omega_wall_seconds=omega_time,
                             eval_wall_seconds=eval_time,
-                            outer_calls=1, evaluator_calls=len(child.traces or []),
-                            prompt_tokens=omega_tokens,
-                            completion_tokens=child.total_tokens)
+                            evaluator_calls=(len(_fresh) * max(
+                                1, self.config.eval_repeats)),
+                            inner_calls=child.inner_calls,
+                            inner_total_tokens=child.inner_tokens,
+                            inner_prompt_tokens=child.inner_prompt_tokens,
+                            inner_completion_tokens=(
+                                child.inner_completion_tokens),
+                            **self._sri_outer_accounting(_sri_u))
                         self._print_candidate(child, child_id)
                         console.print(
                             f"    Eval tokens: {child.total_tokens:,} | "
@@ -2990,6 +3017,50 @@ class EvolutionaryOrchestrator:
             return int(cu.get("total", 0) or 0)
         except (TypeError, ValueError, AttributeError):
             return 0
+
+    def _outer_usage_snapshot(self) -> dict[str, int]:
+        """Snapshot transport/token counters for one formal proposal slot."""
+        cu = getattr(
+            getattr(self, "llm_client", None), "cumulative_usage", None) or {}
+        keys = (
+            "prompt", "completion", "total", "calls", "requests",
+            "failed_calls", "retries", "empty_responses", "reasoning",
+            "reasoning_reported_calls",
+        )
+        out: dict[str, int] = {}
+        for key in keys:
+            try:
+                out[key] = int(cu.get(key, 0) or 0)
+            except (TypeError, ValueError, AttributeError):
+                out[key] = 0
+        return out
+
+    def _outer_usage_since(self, before: dict[str, int]) -> dict[str, int]:
+        """Non-negative delta from a slot-open usage snapshot."""
+        after = self._outer_usage_snapshot()
+        return {key: max(0, after[key] - int(before.get(key, 0) or 0))
+                for key in after}
+
+    @staticmethod
+    def _sri_outer_accounting(usage: dict[str, int]) -> dict[str, object]:
+        """Map a usage delta to the explicit SlotLedger accounting schema."""
+        calls = int(usage.get("calls", 0) or 0)
+        reported = int(usage.get("reasoning_reported_calls", 0) or 0)
+        reasoning_available = calls > 0 and reported == calls
+        return {
+            "outer_calls": int(usage.get("requests", 0) or 0),
+            "outer_successful_calls": calls,
+            "failed_calls": int(usage.get("failed_calls", 0) or 0),
+            "retry_count": int(usage.get("retries", 0) or 0),
+            "empty_responses": int(usage.get("empty_responses", 0) or 0),
+            "prompt_tokens": int(usage.get("prompt", 0) or 0),
+            "completion_tokens": int(usage.get("completion", 0) or 0),
+            "total_tokens": int(usage.get("total", 0) or 0),
+            "reasoning_tokens": (
+                int(usage.get("reasoning", 0) or 0)
+                if reasoning_available else None),
+            "reasoning_tokens_available": reasoning_available,
+        }
 
     async def _gate_solve_one(
         self, solver, task: TaskDescription, candidate: Candidate,

@@ -476,6 +476,9 @@ class LLMClient:
         self.cumulative_usage = {
             "prompt": 0, "completion": 0, "total": 0, "calls": 0,
             "cached": 0, "cost_usd": 0.0,
+            "requests": 0, "failed_calls": 0, "retries": 0,
+            "empty_responses": 0, "empty_escalations": 0,
+            "reasoning": 0, "reasoning_reported_calls": 0,
         }
         self._usage_lock = asyncio.Lock()
         # Optional raw I/O logger. When set (typically by an orchestrator
@@ -564,6 +567,15 @@ class LLMClient:
             return await self._rpbe_backend.complete_with_breakdown(
                 messages, temperature=temperature, max_tokens=max_tokens,
                 seed=seed)
+        # Old checkpoints and third-party test doubles may carry the original
+        # six-key usage dictionary. Backfill the additive counters before any
+        # increment so resuming one cannot fail with KeyError.
+        async with self._usage_lock:
+            for key in (
+                "requests", "failed_calls", "retries", "empty_responses",
+                "empty_escalations", "reasoning", "reasoning_reported_calls",
+            ):
+                self.cumulative_usage.setdefault(key, 0)
         last_error: Exception | None = None
         # Build kwargs once per call. Reasoning families (gpt-5.x, o*) want
         # ``max_completion_tokens`` and reject custom ``temperature``;
@@ -637,6 +649,19 @@ class LLMClient:
                     parent_request_id=_parent_request_id)
                 if _kind == _acct.PRIMARY:
                     _primary_request_id = _req_id
+                # Count actual transport attempts, not just successful
+                # responses. reserve() has returned, so the money fuse permits
+                # this request and it is now about to be issued.
+                async with self._usage_lock:
+                    self.cumulative_usage["requests"] = int(
+                        self.cumulative_usage.get("requests", 0) or 0) + 1
+                    if attempt > 0:
+                        self.cumulative_usage["retries"] = int(
+                            self.cumulative_usage.get("retries", 0) or 0) + 1
+                    if _empty_retry_done:
+                        self.cumulative_usage["empty_escalations"] = int(
+                            self.cumulative_usage.get(
+                                "empty_escalations", 0) or 0) + 1
                 response = await self._client.chat.completions.create(
                     model=self.config.model,
                     messages=messages,
@@ -647,6 +672,8 @@ class LLMClient:
                 )
                 pt = ct = tt = 0
                 cached = 0
+                reasoning = 0
+                reasoning_reported = False
                 if response.usage is not None:
                     pt = int(getattr(response.usage, "prompt_tokens", 0) or 0)
                     ct = int(getattr(response.usage, "completion_tokens", 0) or 0)
@@ -654,6 +681,13 @@ class LLMClient:
                     pt_details = getattr(response.usage, "prompt_tokens_details", None)
                     if pt_details is not None:
                         cached = int(getattr(pt_details, "cached_tokens", 0) or 0)
+                    ct_details = getattr(
+                        response.usage, "completion_tokens_details", None)
+                    raw_reasoning = getattr(
+                        ct_details, "reasoning_tokens", None)
+                    if raw_reasoning is not None:
+                        reasoning = int(raw_reasoning or 0)
+                        reasoning_reported = True
 
                 # Record cost in the daily ledger before bumping in-mem
                 # counters, so a record() failure surfaces immediately.
@@ -673,9 +707,14 @@ class LLMClient:
                     self.cumulative_usage["calls"] += 1
                     self.cumulative_usage["cached"] += cached
                     self.cumulative_usage["cost_usd"] += cost
+                    self.cumulative_usage["reasoning"] += reasoning
+                    if reasoning_reported:
+                        self.cumulative_usage["reasoning_reported_calls"] += 1
 
                 if not response.choices:
                     logger.warning("LLM returned empty choices (tokens=%d)", tt)
+                    async with self._usage_lock:
+                        self.cumulative_usage["empty_responses"] += 1
                     if self.io_logger is not None and not _suppress_io_log:
                         self.io_logger.log(
                             messages=messages, response="",
@@ -686,6 +725,9 @@ class LLMClient:
                         )
                     return "", pt, ct, tt
                 text = response.choices[0].message.content or ""
+                if not text.strip():
+                    async with self._usage_lock:
+                        self.cumulative_usage["empty_responses"] += 1
                 # Surface a length-truncated completion so a reasoning model that
                 # spent its whole budget on hidden reasoning_tokens (leaving
                 # message.content empty) is LOGGED rather than silently becoming an
@@ -761,6 +803,8 @@ class LLMClient:
                 return text, pt, ct, tt
             except (NotFoundError, APIConnectionError, APITimeoutError,
                     JSONDecodeError, RateLimitError, InternalServerError) as e:
+                async with self._usage_lock:
+                    self.cumulative_usage["failed_calls"] += 1
                 last_error = e
                 if attempt < self.config.max_retries:
                     # Use a longer base delay for rate-limit/server errors

@@ -86,12 +86,16 @@ class PairingRecord:
         return asdict(self)
 
     def manifest_fields(self) -> Dict[str, Any]:
-        """Exactly the six required keys, for stamping into a run manifest."""
+        """Pairing fields stamped into every formal-run manifest.
+
+        ``crn_claimed`` is explicit: an inert provider leaves a durable false
+        instead of requiring readers to infer it from four channel booleans.
+        """
         d = self.to_dict()
         return {k: d[k] for k in (
             "pairing_requested", "pairing_outer_effective",
             "pairing_inner_effective", "pairing_executor_effective",
-            "pairing_test_effective", "pairing_limitations")}
+            "pairing_test_effective", "pairing_limitations", "crn_claimed")}
 
 
 def build_record(*, requested: bool, model: Optional[str],
@@ -236,13 +240,14 @@ def self_test() -> int:
     print("OK  worst-case merge   one unpaired seed makes the merged inner "
           "channel INERT (a lucky seed cannot hide it)")
 
-    # manifest fields are exactly the six required keys
+    # the manifest also carries the explicit CRN claim required by the protocol
     mf = good.manifest_fields()
     assert sorted(mf) == sorted([
         "pairing_requested", "pairing_outer_effective",
         "pairing_inner_effective", "pairing_executor_effective",
-        "pairing_test_effective", "pairing_limitations"]), sorted(mf)
-    print("OK  manifest fields    the six required keys are present verbatim")
+        "pairing_test_effective", "pairing_limitations", "crn_claimed"]), sorted(mf)
+    assert mf["crn_claimed"] is False
+    print("OK  manifest fields    channel state and crn_claimed=false are explicit")
 
     print()
     print("VERDICT: ALL OK")

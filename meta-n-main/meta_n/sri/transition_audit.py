@@ -661,11 +661,20 @@ def finalize_exact_depth(audit: AuditResult,
         "exact_depth_counts": {str(d): n for d, n in sorted(counts.items())},
         "available_depths": sorted(counts),
         "synthesized_excluded": excluded,
+        "archive_best_dev_by_recursive_depth": {},
+        "archive_best_depth_table_name":
+            "Archive-best development score by recursive depth",
         "note": "structural depth (candidate.depth); iteration-wise archive "
                 "best is a SEPARATE series and must not be substituted. "
                 "Synthesized (oracle/merge) candidates are excluded because "
                 "their depth is fabricated by assembly.",
     }
+    running_best = None
+    for d in sorted(counts):
+        if d in best:
+            score = float(best[d]["dev_score"])
+            running_best = score if running_best is None else max(running_best, score)
+        out["archive_best_dev_by_recursive_depth"][str(d)] = running_best
     audit.exact_depth.update(out)
     return out
 

@@ -251,10 +251,17 @@ class SlotLedger:
                  fresh_task_ids: Sequence[str] = (),
                  inherited_task_ids: Sequence[str] = (),
                  outer_calls: int = 0, inner_calls: int = 0,
+                 outer_successful_calls: Optional[int] = None,
                  evaluator_calls: int = 0,
                  prompt_tokens: int = 0, completion_tokens: int = 0,
+                 total_tokens: Optional[int] = None,
+                 reasoning_tokens: Optional[int] = None,
+                 reasoning_tokens_available: bool = False,
                  inner_prompt_tokens: int = 0,
                  inner_completion_tokens: int = 0,
+                 inner_total_tokens: int = 0,
+                 failed_calls: int = 0, retry_count: int = 0,
+                 empty_responses: int = 0,
                  omega_wall_seconds: float = 0.0,
                  gate_wall_seconds: float = 0.0,
                  eval_wall_seconds: float = 0.0) -> None:
@@ -278,6 +285,31 @@ class SlotLedger:
                 "finalize() -- it references an existing observation")
         wall = (float(omega_wall_seconds) + float(gate_wall_seconds)
                 + float(eval_wall_seconds))
+        outer_total = (int(total_tokens) if total_tokens is not None else
+                       int(prompt_tokens) + int(completion_tokens))
+        token_usage = {
+            "input_tokens": int(prompt_tokens) + int(inner_prompt_tokens),
+            "output_tokens": (int(completion_tokens) +
+                              int(inner_completion_tokens)),
+            "total_tokens": outer_total + int(inner_total_tokens),
+            "reasoning_tokens": (
+                int(reasoning_tokens)
+                if reasoning_tokens_available and reasoning_tokens is not None
+                else None),
+            "reasoning_tokens_available": bool(reasoning_tokens_available),
+        }
+        call_accounting = {
+            "api_calls": int(outer_calls) + int(inner_calls),
+            "outer_requests": int(outer_calls),
+            "outer_successful_calls": (
+                int(outer_successful_calls)
+                if outer_successful_calls is not None else None),
+            "inner_calls": int(inner_calls),
+            "evaluator_calls": int(evaluator_calls),
+            "failed_calls": int(failed_calls),
+            "retry_count": int(retry_count),
+            "empty_responses": int(empty_responses),
+        }
         frec = {
             "kind": "finalize", "slot_id": slot_id,
             "terminal_status": terminal_status,
@@ -299,6 +331,17 @@ class SlotLedger:
             "completion_tokens": int(completion_tokens),
             "inner_prompt_tokens": int(inner_prompt_tokens),
             "inner_completion_tokens": int(inner_completion_tokens),
+            "total_tokens": outer_total,
+            "inner_total_tokens": int(inner_total_tokens),
+            "reasoning_tokens": token_usage["reasoning_tokens"],
+            "reasoning_tokens_available": bool(reasoning_tokens_available),
+            "outer_successful_calls": call_accounting[
+                "outer_successful_calls"],
+            "failed_calls": int(failed_calls),
+            "retry_count": int(retry_count),
+            "empty_responses": int(empty_responses),
+            "token_usage": token_usage,
+            "call_accounting": call_accounting,
             "omega_wall_seconds": float(omega_wall_seconds),
             "gate_wall_seconds": float(gate_wall_seconds),
             "eval_wall_seconds": float(eval_wall_seconds),

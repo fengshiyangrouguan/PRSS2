@@ -155,6 +155,11 @@ def run_id_for(profile: SRIProfile, backbone: str, search_seed: int) -> str:
     return "{}:{}:{}".format(profile.name, backbone, int(search_seed))
 
 
+def arm_order_for_seed(search_seed: int) -> Tuple[str, str]:
+    """Pre-declared counterbalance: even seeds Official-first, odd reversed."""
+    return ARMS if int(search_seed) % 2 == 0 else tuple(reversed(ARMS))
+
+
 class StageError(RuntimeError):
     """A stage refused to run: its inputs changed or a prior stage is missing."""
 
@@ -322,8 +327,8 @@ def build_root_cmd(args, profile: SRIProfile, out: Path) -> List[str]:
     pinned["max_iterations"] = 0            # ROOT ONLY: generate, do not breed
     ep = launch_endpoint()
     return ([sys.executable, "-m", "meta_n.main"] + render_pinned_flags(pinned)
-            + ["--no-test-eval", "--base-url", ep["base_url"],
-               "--api-key", ep["api_key"],
+            + ["--no-test-eval", "--bench-data-dir", str(args.data_dir),
+               "--base-url", ep["base_url"], "--api-key", ep["api_key"],
                "--output-dir", str(out / "root"),
                "--exp-name", "phaseH_root"])
 
@@ -344,7 +349,8 @@ def build_arm_cmd(args, profile: SRIProfile, out: Path, arm: str,
     ep = launch_endpoint()
     return ([sys.executable, "-m", "meta_n.main"]
             + render_pinned_flags(pinned)
-            + ["--no-test-eval", "--resume", "--base-url", ep["base_url"],
+            + ["--no-test-eval", "--bench-data-dir", str(args.data_dir),
+               "--resume", "--base-url", ep["base_url"],
                "--api-key", ep["api_key"],
                "--output-dir", str(out / "arms"),
                "--exp-name", arm, "--sri-context", str(context_file)])
@@ -392,10 +398,12 @@ def stage_preflight(args, profile: SRIProfile, out: Path) -> dict:
     print("  {:<28} {}".format("evaluator_mode", args.evaluator))
     print("  {:<28} {}".format("audit_repeats", profile.audit_repeats))
     print("  {:<28} {}".format("test_repeats", profile.test_repeats))
+    order = list(arm_order_for_seed(args.search_seed))
+    print("  {:<28} {}".format("arm_order", order))
 
     outputs = {"effective_config": cfg, "pairing": pairing.manifest_fields(),
                "pinned": pinned, "evaluator_mode": args.evaluator,
-               "launch": launch}
+               "launch": launch, "arm_order": order}
     return record_stage(out, "preflight",
                         inputs={"profile_sha256": profile.sha256(),
                                 "backbone": args.backbone,
@@ -571,6 +579,7 @@ def build_arm_manifest(args, profile: SRIProfile, out: Path, arm: str, *,
         "pinned": pinned,
         "pairing": read_stage_manifest(out).get(
             "preflight", {}).get("outputs", {}).get("pairing"),
+        "arm_order": list(arm_order_for_seed(args.search_seed)),
     }
     treatment = {"reduction_mode": arm}
     if arm == "predictive":
@@ -1155,7 +1164,7 @@ def stage_audit(args, profile: SRIProfile, out: Path) -> dict:
                             inputs={"freeze": frz["inputs_sha256"]},
                             outputs={"planned": True})
     audits: Dict[str, Any] = {}
-    for arm in ARMS:
+    for arm in arm_order_for_seed(args.search_seed):
         rows = [json.loads(l) for l in
                 (out / "frozen" / "{}.slots.jsonl".format(arm)).read_text(
                     encoding="utf-8").splitlines() if l.strip()]
@@ -1264,7 +1273,7 @@ def stage_final(args, profile: SRIProfile, out: Path) -> dict:
                             inputs={"freeze": frz["inputs_sha256"]},
                             outputs={"planned": True})
     fin: Dict[str, Any] = {}
-    for arm in ARMS:
+    for arm in arm_order_for_seed(args.search_seed):
         a = arm_dir(out, arm)
         idx = read_json(a / "archive" / "index.json")
         if idx is None:
@@ -1274,10 +1283,11 @@ def stage_final(args, profile: SRIProfile, out: Path) -> dict:
             c["creation_index"] = i
 
         def executable(c, _a=a):
-            return load_material_from_dir(
+            material = load_material_from_dir(
                 _a / "archive" / str(c.get("candidate_id")),
                 str(c.get("candidate_id")), int(c.get("depth") or 1),
-                slugs) is not None
+                slugs)
+            return material is not None and material.is_executable_on(slugs)
 
         sel = select_deployable(cands, lambda c: c.get("mean_score"),
                                is_executable_of=executable)
@@ -1514,7 +1524,12 @@ def main() -> int:
         "EXECUTE" if args.execute else "PLAN (no API)", args.evaluator))
     print()
 
-    todo = STAGES if args.stage == "all" else (args.stage,)
+    if args.stage == "all":
+        todo = (("preflight", "root", "fork")
+                + arm_order_for_seed(args.search_seed)
+                + ("freeze", "audit", "final", "aggregate"))
+    else:
+        todo = (args.stage,)
     try:
         for st in todo:
             print("=== stage {} ===".format(st))

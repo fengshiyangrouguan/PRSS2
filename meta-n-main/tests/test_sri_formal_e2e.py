@@ -440,6 +440,37 @@ def test_e2e_freeze_audit_final_aggregate():
         del agg, d1  # assertions above are the point
 
 
+def test_counterbalanced_arm_order_is_predeclared_by_seed():
+    assert R.arm_order_for_seed(0) == ("official", "predictive")
+    assert R.arm_order_for_seed(1) == ("predictive", "official")
+    assert R.arm_order_for_seed(2) == ("official", "predictive")
+
+
+def test_final_excludes_high_scoring_partial_material():
+    """A candidate missing one cohort script is not deployable Final material."""
+    with tempfile.TemporaryDirectory() as td:
+        d = _seed_dir(Path(td), 0)
+        partial = "c_it6-p0-c0"
+        missing_task = COHORT[-1]
+        for arm in R.ARMS:
+            ad = R.arm_dir(d, arm)
+            (ad / "archive" / partial / "traces" /
+             (missing_task + ".py")).unlink()
+            idx_path = ad / "archive" / "index.json"
+            idx = json.loads(idx_path.read_text(encoding="utf-8"))
+            for candidate in idx["candidates"]:
+                if candidate["candidate_id"] == partial:
+                    candidate["mean_score"] = 1.0
+            idx_path.write_text(json.dumps(idx, indent=2, sort_keys=True),
+                                encoding="utf-8")
+        args = _args(d)
+        R.stage_freeze(args, PROFILE, d)
+        R.stage_audit(args, PROFILE, d)
+        fin = R.stage_final(args, PROFILE, d)
+        for arm in R.ARMS:
+            assert fin["outputs"]["arms"][arm]["selected"] != partial
+
+
 def test_audit_refuses_a_frozen_artifact_that_moved():
     with tempfile.TemporaryDirectory() as td:
         d = _seed_dir(Path(td), 0)
@@ -691,6 +722,21 @@ def test_aggregate_pools_depth_and_iteration_series_across_seeds():
         assert res["outer_calls"]["per_seed"]["0"] == 7
         assert res["outer_tokens_total"]["mean"] == 1234
         assert "wall" in json.dumps(res).lower()
+
+
+def test_search_commands_forward_the_validated_data_directory():
+    """Preflight's data path must be the path the root and both arms consume."""
+    with tempfile.TemporaryDirectory() as td:
+        out = Path(td)
+        args = _args(out, data_dir="/canonical/co_bench")
+        root = R.build_root_cmd(args, PROFILE, out)
+        arm = R.build_arm_cmd(
+            args, PROFILE, out, "official", out / "official.context.json")
+        for cmd in (root, arm):
+            i = cmd.index("--bench-data-dir")
+            assert cmd[i + 1] == "/canonical/co_bench"
+        assert root.count("--bench-data-dir") == 1
+        assert arm.count("--bench-data-dir") == 1
 
 
 def _main() -> int:

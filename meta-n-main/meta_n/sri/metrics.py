@@ -186,6 +186,13 @@ def per_run_metrics(*, selected: Deployable, test_result: Mapping[str, Any],
         if d not in exact or float(s) > exact[d]:
             exact[d] = float(s)
 
+    archive_best_by_depth = {}
+    running_best = None
+    for d in sorted(counts):
+        if d in exact:
+            running_best = exact[d] if running_best is None else max(running_best, exact[d])
+        archive_best_by_depth[d] = running_best
+
     out = {
         "schema_version": METRICS_SCHEMA_VERSION,
         "final": final_record(selected, test_result),
@@ -197,6 +204,10 @@ def per_run_metrics(*, selected: Deployable, test_result: Mapping[str, Any],
         "synthesized_excluded_from_depth": synthesized_excluded,
         "exact_depth_dev_best": {str(k): v for k, v in sorted(exact.items())},
         "exact_depth_counts": {str(k): v for k, v in sorted(counts.items())},
+        "archive_best_dev_by_recursive_depth": {
+            str(k): v for k, v in sorted(archive_best_by_depth.items())},
+        "archive_best_depth_table_name":
+            "Archive-best development score by recursive depth",
         "iteration_archive_best": list(iteration_archive_best or []),
         "transition_denominators": {
             tr: {"attempted": v.get("edge_count"),
@@ -212,8 +223,9 @@ def per_run_metrics(*, selected: Deployable, test_result: Mapping[str, Any],
     forbid_best_chain_label(out)
     # §2.4: depth and iteration are separate series and must not be conflated
     out["depth_vs_iteration_note"] = (
-        "exact_depth_* is structural (candidate.depth); iteration_archive_best "
-        "is iteration-indexed. They are different series.")
+        "archive_best_dev_by_recursive_depth is cumulative through each "
+        "structural candidate.depth; exact_depth_* is diagnostic only, and "
+        "iteration_archive_best is iteration-indexed. They are different series.")
     return out
 
 

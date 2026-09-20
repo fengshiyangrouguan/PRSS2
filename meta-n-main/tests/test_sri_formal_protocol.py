@@ -204,7 +204,7 @@ def test_08_repeats_do_not_inflate_the_denominator(tmp_path=None):
 
 
 # -- 9 ---------------------------------------------------------------------
-def test_09_exact_depth_is_independent_of_iteration(tmp_path=None):
+def test_09_archive_best_by_depth_is_cumulative_and_not_iteration(tmp_path=None):
     sel = M.select_deployable([{"candidate_id": "c3", "depth": 3, "creation_index": 2}],
                               lambda c: 0.8)
     pr = M.per_run_metrics(
@@ -212,11 +212,16 @@ def test_09_exact_depth_is_independent_of_iteration(tmp_path=None):
         audit_metrics={"transitions": {}, "failure_accounting": {}},
         ledger_counts={}, resource_use={},
         archive_candidates=[{"candidate_id": "c1", "depth": 1, "creation_index": 0},
+                            {"candidate_id": "c2", "depth": 2, "creation_index": 1},
                             {"candidate_id": "c3", "depth": 3, "creation_index": 2}],
-        dev_score_of=lambda c: {"c1": 0.4, "c3": 0.8}[c["candidate_id"]],
-        iteration_archive_best=[{"iteration": 0, "best_dev": 0.4},
+        dev_score_of=lambda c: {"c1": 0.7, "c2": 0.3,
+                                "c3": 0.8}[c["candidate_id"]],
+        iteration_archive_best=[{"iteration": 0, "best_dev": 0.7},
                                 {"iteration": 9, "best_dev": 0.8}])
     assert pr["exact_depth_dev_best"]["3"] == 0.8
+    assert pr["archive_best_dev_by_recursive_depth"] == {
+        "1": 0.7, "2": 0.7, "3": 0.8}
+    assert pr["archive_best_depth_table_name"] ==         "Archive-best development score by recursive depth"
     assert pr["iteration_archive_best"][-1]["iteration"] == 9
     assert "structural" in pr["depth_vs_iteration_note"]
 
@@ -360,6 +365,7 @@ def test_16_pairing_effectiveness_is_truthful_at_depth_gt_one(tmp_path=None):
     P.assert_formal_pairing(rec, formal=False)
     mf = rec.manifest_fields()
     assert "pairing_inner_effective" in mf and "pairing_limitations" in mf
+    assert mf["crn_claimed"] is False
 
 
 # -- 17 --------------------------------------------------------------------
@@ -649,6 +655,44 @@ def test_21_every_verified_key_exists_in_a_real_config_json(tmp_path=None):
         raise AssertionError("an unverifiable archive mode was accepted")
     except PR.ProtocolError as e:
         assert "UNVERIFIABLE" in str(e)
+
+
+def test_22_slot_accounting_is_actual_and_reasoning_unavailability_is_explicit(
+        tmp_path=None):
+    with tempfile.TemporaryDirectory() as td:
+        led = _ledger(Path(td))
+        sid = led.open_slot(
+            iteration=1, parent_slot=0, child_slot=0,
+            parent_id="p", parent_structural_depth=1,
+            gate_configured=0, gate_effective=False,
+            gate_reason="consolidation_focus", reduction_mode="official")
+        led.finalize(
+            sid, terminal_status="evaluated_admitted",
+            outer_calls=2, outer_successful_calls=1, inner_calls=3,
+            evaluator_calls=3, prompt_tokens=11, completion_tokens=7,
+            total_tokens=18, inner_prompt_tokens=3,
+            inner_completion_tokens=2, inner_total_tokens=5,
+            failed_calls=1, retry_count=1, empty_responses=1,
+            reasoning_tokens=None, reasoning_tokens_available=False)
+        row = led.rows()[0]
+        assert row["token_usage"] == {
+            "input_tokens": 14,
+            "output_tokens": 9,
+            "total_tokens": 23,
+            "reasoning_tokens": None,
+            "reasoning_tokens_available": False,
+        }
+        assert row["call_accounting"] == {
+            "api_calls": 5,
+            "outer_requests": 2,
+            "outer_successful_calls": 1,
+            "inner_calls": 3,
+            "evaluator_calls": 3,
+            "failed_calls": 1,
+            "retry_count": 1,
+            "empty_responses": 1,
+        }
+        assert row["total_wall_seconds"] == 0.0
 
 
 TESTS = [(n, o) for n, o in sorted(globals().items())

@@ -159,6 +159,14 @@ class RunPersistence:
                 "cached": int(cu.get("cached", 0) or 0),
                 "cost_usd": float(cu.get("cost_usd", 0.0) or 0.0),
             }
+            for key in (
+                "requests", "failed_calls", "retries", "empty_responses",
+                "empty_escalations", "reasoning", "reasoning_reported_calls",
+            ):
+                # Conditional preserves old/custom test ledgers exactly while
+                # current LLMClient instances persist the extended counters.
+                if key in cu:
+                    outer_usage[key] = int(cu.get(key, 0) or 0)
         checkpoint = {
             "iteration": iteration,
             "patience_counter": patience_counter,

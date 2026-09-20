@@ -31,7 +31,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
-from meta_n.sri.protocol import ProtocolError, sha256_of
+from meta_n.sri.protocol import (ProtocolError, is_synthesized_candidate,
+                                 sha256_of)
 
 METRICS_SCHEMA_VERSION = 1
 
@@ -49,16 +50,32 @@ class Deployable:
     structural_depth: int
     creation_index: int
     manifest_sha256: str = ""
+    # Every candidate the selector refused, WITH its reason: the report has to
+    # show that the winner was chosen against a stated pool, not an implicit one.
+    excluded_from_pool: List[Dict[str, Any]] = field(default_factory=list)
 
 
 def select_deployable(candidates: Sequence[Mapping[str, Any]],
                       dev_score_of,
-                      creation_index_of=None) -> Deployable:
+                      creation_index_of=None,
+                      is_executable_of=None,
+                      allow_synthesized: bool = False) -> Deployable:
     """§2.1 `x_hat = argmax_{x in A_deploy} macro_dev(x)`, deterministic ties.
 
     `candidates` is the FROZEN final archive. The root stays eligible (it is a
     candidate like any other); a non-executable or unscored candidate is
     excluded with a reason rather than silently skipped.
+
+    Two exclusions the first revision left out, both of which silently produced
+    the WRONG Final Score:
+
+      * `allow_synthesized=False` (the default) refuses to select a candidate
+        meta-n assembled rather than bred. `merge_oracle` is the virtual oracle
+        by construction and carries a fabricated depth; selecting it makes Final
+        Score a diagnostic, which is exactly what §2.1 forbids.
+      * `is_executable_of` (when supplied) refuses a candidate with no material
+        to deploy. Without it the archive's highest-scoring entry could be one
+        whose scripts do not exist on disk.
     """
     pool: List[Deployable] = []
     excluded: List[Dict[str, Any]] = []
@@ -66,6 +83,15 @@ def select_deployable(candidates: Sequence[Mapping[str, Any]],
         cid = str(c.get("candidate_id") or "")
         if not cid:
             excluded.append({"reason": "no_candidate_id", "index": i})
+            continue
+        if not allow_synthesized and is_synthesized_candidate(c):
+            excluded.append({"candidate_id": cid,
+                             "reason": "synthesized_oracle_not_deployable",
+                             "dev_score": c.get("mean_score")})
+            continue
+        if is_executable_of is not None and not is_executable_of(c):
+            excluded.append({"candidate_id": cid,
+                             "reason": "no_executable_material"})
             continue
         s = dev_score_of(c)
         if s is None or not math.isfinite(float(s)):
@@ -84,10 +110,11 @@ def select_deployable(candidates: Sequence[Mapping[str, Any]],
     # deterministic, method-independent tie-break
     pool.sort(key=lambda d: (-d.dev_score, d.creation_index, d.candidate_id))
     win = pool[0]
-    if len(pool) > 1 and pool[1].dev_score == win.dev_score:
-        # record that the tie-break was load-bearing, so a reader can see it
-        pass
-    return win
+    return Deployable(candidate_id=win.candidate_id, dev_score=win.dev_score,
+                      structural_depth=win.structural_depth,
+                      creation_index=win.creation_index,
+                      manifest_sha256=win.manifest_sha256,
+                      excluded_from_pool=excluded)
 
 
 def assert_no_oracle_as_final(final_record: Mapping[str, Any]) -> None:
@@ -142,7 +169,15 @@ def per_run_metrics(*, selected: Deployable, test_result: Mapping[str, Any],
     """Everything §11 asks for at run level, from frozen artifacts only."""
     exact = {}
     counts = {}
+    synthesized_excluded: List[str] = []
     for c in archive_candidates:
+        if is_synthesized_candidate(c):
+            # §2.4: `merge_oracle` is written with a FABRICATED depth (2) and the
+            # oracle's own macro score, so letting it into the depth series
+            # reports the virtual oracle as the best depth-2 candidate -- the
+            # exact conflation the depth series exists to prevent.
+            synthesized_excluded.append(str(c.get("candidate_id")))
+            continue
         d = int(c.get("depth") or 0)
         counts[d] = counts.get(d, 0) + 1
         s = dev_score_of(c)
@@ -154,6 +189,12 @@ def per_run_metrics(*, selected: Deployable, test_result: Mapping[str, Any],
     out = {
         "schema_version": METRICS_SCHEMA_VERSION,
         "final": final_record(selected, test_result),
+        "selected_pool": {
+            "excluded": list(selected.excluded_from_pool),
+            "note": "the pool Final Score was selected AGAINST; a synthesized "
+                    "oracle candidate is excluded by construction (§2.1)",
+        },
+        "synthesized_excluded_from_depth": synthesized_excluded,
         "exact_depth_dev_best": {str(k): v for k, v in sorted(exact.items())},
         "exact_depth_counts": {str(k): v for k, v in sorted(counts.items())},
         "iteration_archive_best": list(iteration_archive_best or []),
@@ -189,6 +230,15 @@ class SeedRun:
     profile_sha256: str
     cohort_id: str
     root_bundle_sha256: str
+    # §11: results from different backbones are NOT the same experiment, and the
+    # aggregator must say which one it pooled. Without this the merged report
+    # carried no model identity at all.
+    backbone: str = ""
+    # §9: the machine/process identity the run happened on, hashed from the root
+    # bundle's `environment_fingerprint`. Two arms of one seed MUST share it --
+    # scores produced on different machines are not a pair, however similar the
+    # numbers look.
+    environment_sha256: str = ""
     schema_version: int = METRICS_SCHEMA_VERSION
     final_macro: Optional[float] = None
     per_transition: Dict[str, Optional[float]] = field(default_factory=dict)
@@ -196,18 +246,38 @@ class SeedRun:
 
 
 def _assert_homogeneous(runs: Sequence[SeedRun]) -> None:
-    for key in ("schema_version", "profile_sha256", "cohort_id"):
+    for key in ("schema_version", "profile_sha256", "cohort_id", "backbone"):
         vals = {getattr(r, key) for r in runs}
         if len(vals) != 1:
             raise ProtocolError(
                 "aggregator refuses mixed {}: {}".format(key, sorted(map(str, vals))))
+    # One (arm, seed) may appear ONCE. A duplicate would silently overwrite in
+    # the seed-keyed dicts below, so the run that happened to be read last would
+    # decide the pooled number.
+    seen: Dict[Tuple[str, int], int] = {}
+    for r in runs:
+        k = (str(r.arm), int(r.search_seed))
+        seen[k] = seen.get(k, 0) + 1
+    dup = {k: n for k, n in seen.items() if n > 1}
+    if dup:
+        raise ProtocolError(
+            "aggregator refuses duplicate (arm, search_seed) run(s): {} -- one "
+            "run per arm per seed; repeats are nested inside a seed".format(dup))
     # root hashes must correspond one-to-one across arms per seed, which is a
     # stronger statement than "all equal": the arms share a root PER SEED.
+    # The environment must match across a seed's arms for the same reason (§9):
+    # a number produced on another machine is not a pair, whatever it looks like.
     by_seed: Dict[int, Dict[str, set]] = {}
     for r in runs:
         by_seed.setdefault(r.search_seed, {}).setdefault(r.arm, set()).add(
             r.root_bundle_sha256)
     for seed, arms in by_seed.items():
+        envs = {r.environment_sha256 for r in runs if r.search_seed == seed}
+        if len(envs) > 1:
+            raise ProtocolError(
+                "seed {} did not share one environment across arms: {} -- "
+                "cross-machine scores must never form a pair (§9)".format(
+                    seed, sorted(envs)))
         if len(arms) < 2:
             continue
         roots = set()
@@ -292,6 +362,8 @@ def aggregate(runs: Sequence[SeedRun]) -> Dict[str, Any]:
         "schema_version": METRICS_SCHEMA_VERSION,
         "cohort_id": runs[0].cohort_id,
         "profile_sha256": runs[0].profile_sha256,
+        "backbone": runs[0].backbone,
+        "environments": sorted({r.environment_sha256 for r in runs}),
         "n_runs": len(runs),
         "per_arm": per_arm,
         "paired": paired,
@@ -353,6 +425,37 @@ def self_test() -> int:
     assert sel3.candidate_id == "gen0_seed"
     print("OK  root eligible      the root competes like any other candidate")
 
+    # ---- the synthesized oracle may NOT become Final Score ---------------
+    # `merge_oracle` has the highest score in the archive because it IS the
+    # virtual oracle, and a fabricated depth of 2. Selecting it would publish a
+    # diagnostic as Final Score (§2.1/§2.4).
+    arch_with_oracle = list(cands) + [
+        {"candidate_id": "merge_oracle", "depth": 2, "creation_index": 9,
+         "mean_score": 0.99}]
+    dev_o = dict(dev, merge_oracle=0.99)      # the oracle IS the maximum
+    sel_o = select_deployable(arch_with_oracle,
+                              lambda c: dev_o[c["candidate_id"]])
+    assert sel_o.candidate_id == "gen1_b0_k0", sel_o
+    assert any(e.get("reason") == "synthesized_oracle_not_deployable"
+               for e in sel_o.excluded_from_pool)
+    print("OK  oracle excluded    merge_oracle (highest dev score) is refused as "
+          "Final Score and the exclusion is recorded")
+    # ...and the depth series must not contain it either
+    sel_all = select_deployable(arch_with_oracle, lambda c: dev_o[c["candidate_id"]],
+                                allow_synthesized=True)
+    assert sel_all.candidate_id == "merge_oracle"      # the pool WAS the guard
+    print("OK  override explicit  allow_synthesized=True selects it, which proves "
+          "the default was doing the work")
+
+    # a candidate with no deployable material is excluded
+    sel_x = select_deployable(cands, lambda c: dev[c["candidate_id"]],
+                              is_executable_of=lambda c: c["candidate_id"] != "gen2_b0_k0")
+    assert sel_x.candidate_id == "gen1_b0_k0", sel_x
+    assert any(e.get("reason") == "no_executable_material"
+               for e in sel_x.excluded_from_pool)
+    print("OK  executability     a candidate with no material on disk is "
+          "excluded, not deployed")
+
     # an unscored candidate is excluded with a reason
     try:
         select_deployable([{"candidate_id": "x", "depth": 2}], lambda c: None)
@@ -404,6 +507,18 @@ def self_test() -> int:
     assert pr["R_valid"]["R_2to3"] == 0.125
     print("OK  depth vs iteration exact_depth_dev_best and "
           "iteration_archive_best are separate series")
+
+    # the synthesized oracle is kept OUT of the depth series
+    pr_o = per_run_metrics(
+        selected=sel, test_result={"test_mean_score": 0.77},
+        audit_metrics=audit, ledger_counts={}, resource_use={},
+        archive_candidates=list(cands) + [
+            {"candidate_id": "merge_oracle", "depth": 2, "creation_index": 9}],
+        dev_score_of=lambda c: dev_o.get(c["candidate_id"], 0.0))
+    assert pr_o["exact_depth_dev_best"]["2"] == 0.80, pr_o["exact_depth_dev_best"]
+    assert pr_o["synthesized_excluded_from_depth"] == ["merge_oracle"]
+    print("OK  depth uncontaminated merge_oracle (0.99 at fabricated depth 2) "
+          "does not become the depth-2 best")
 
     # -- aggregation ---------------------------------------------------------
     runs = []
@@ -463,6 +578,52 @@ def self_test() -> int:
     except ProtocolError as e:
         assert "did not share one root" in str(e)
     print("OK  root pairing       arms without a shared per-seed root refused")
+
+    # a duplicate (arm, seed) run is refused rather than silently overwriting
+    try:
+        aggregate(list(runs) + [SeedRun(search_seed=0, arm="official",
+                                        profile_sha256="P" * 64,
+                                        cohort_id="sri_primary6:6",
+                                        root_bundle_sha256="R0" + "x" * 62,
+                                        final_macro=0.0)])
+        raise AssertionError("a duplicate (arm, seed) run was aggregated")
+    except ProtocolError as e:
+        assert "duplicate" in str(e)
+    print("OK  duplicate seed      two runs for the same (arm, seed) refused")
+
+    # mixing backbones is refused: they are not the same experiment
+    try:
+        aggregate(list(runs) + [SeedRun(search_seed=3, arm="official",
+                                        profile_sha256="P" * 64,
+                                        cohort_id="sri_primary6:6",
+                                        root_bundle_sha256="R3" + "x" * 62,
+                                        backbone="grok-4.6", final_macro=0.9)])
+        raise AssertionError("two backbones were aggregated")
+    except ProtocolError as e:
+        assert "mixed backbone" in str(e)
+    print("OK  backbone recorded   the aggregate names its backbone and refuses "
+          "to pool two of them")
+
+    # §9: two arms of one seed produced on different machines cannot pair
+    cross = []
+    for s in (0,):
+        cross.append(SeedRun(search_seed=s, arm="official",
+                             profile_sha256="P" * 64, cohort_id="sri_primary6:6",
+                             root_bundle_sha256="A" * 64,
+                             environment_sha256="E1" + "0" * 62,
+                             final_macro=0.7))
+        cross.append(SeedRun(search_seed=s, arm="predictive",
+                             profile_sha256="P" * 64, cohort_id="sri_primary6:6",
+                             root_bundle_sha256="A" * 64,
+                             environment_sha256="E2" + "0" * 62,
+                             final_macro=0.8))
+    try:
+        aggregate(cross)
+        raise AssertionError("cross-machine arms were paired")
+    except ProtocolError as e:
+        assert "cross-machine" in str(e)
+    print("OK  cross-machine      arms of one seed from two environments are "
+          "refused as a pair")
 
     print()
     print("VERDICT: ALL OK")

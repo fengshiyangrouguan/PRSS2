@@ -84,10 +84,21 @@ class SRIHooks:
              gate_effective: bool, proposed_child_id: Optional[str] = None,
              proposed_child_depth: Optional[int] = None,
              temperature: Optional[float] = None,
-             focus_task: Optional[str] = None) -> Optional[SlotHandle]:
-        if not self.enabled:
-            return None
+             focus_task: Optional[str] = None) -> SlotHandle:
+        """Open a slot and ALWAYS return a handle.
+
+        Even with hooks disabled this returns a real :class:`SlotHandle`, whose
+        ``slot_id`` is computed the same way. That is deliberate: an earlier
+        version returned None when disabled, and the gate-failure path --
+        `capture_material(slot_id=_sri_slot.slot_id, ...)` -- then raised
+        ``AttributeError: 'NoneType' object has no attribute 'slot_id'`` on every
+        gate rejection. Returning a uniform handle makes every call site safe
+        regardless of whether instrumentation is on.
+        """
         sid = slot_id_for(iteration, parent_slot, child_slot)
+        h = SlotHandle(sid, iteration, parent_slot, child_slot)
+        if not self.enabled:
+            return h
         if sid in self._open:
             raise ProtocolError(
                 "slot {!r} opened twice in one process -- a nominal slot is "
@@ -103,7 +114,6 @@ class SRIHooks:
             proposed_child_depth=proposed_child_depth,
             temperature=temperature,
             focus_task=focus_task)
-        h = SlotHandle(sid, iteration, parent_slot, child_slot)
         self._open[sid] = h
         return h
 
@@ -232,17 +242,13 @@ class SRIHooks:
                                          encoding="utf-8")
         return str(d)
 
-    # -- provenance --------------------------------------------------------
-    def root_bundle(self, extra: Optional[Mapping[str, Any]] = None) -> Dict[str, Any]:
-        """The hashable root bundle (§4) -- what both arms must agree on."""
-        from meta_n.sri.protocol import ROOT_BUNDLE_FIELDS
-        base = {k: None for k in ROOT_BUNDLE_FIELDS}
-        base.update({"cohort": list(self.cohort)})
-        if self.ledger is not None:
-            base["software_revision"] = "proposal_slots.jsonl"
-            base["root_candidate_id"] = "gen0_seed"
-        base.update(dict(extra or {}))
-        return base
+    # NOTE: there is deliberately no `root_bundle()` here. An earlier revision
+    # had one that returned placeholder values for `rng_state`,
+    # `evaluator_manifest`, `software_revision` and `environment_fingerprint` --
+    # a bundle that hashes to a stable 64 hex chars while pinning NOTHING. The
+    # single implementation is `protocol.collect_root_bundle`, which reads real
+    # artifacts; keeping a second, hollow one here would be a false source of
+    # truth for exactly the guarantee §4 depends on.
 
 
 # --------------------------------------------------------------------------
@@ -256,18 +262,21 @@ def self_test() -> int:
 
     with tempfile.TemporaryDirectory() as td:
         td = Path(td)
-        # -- disabled hooks are a strict no-op -----------------------------
+        # -- disabled hooks are a strict no-op, but STILL return a handle ----
         off = SRIHooks.disabled()
         h = off.open(iteration=0, parent_slot=0, child_slot=0, parent_id="p",
                      parent_structural_depth=1, gate_effective=False)
-        assert h is None
-        off.close(None, "evaluated_admitted")
+        # NOT None: a disabled hook must still hand back a usable handle, or any
+        # call site that touches .slot_id (the gate-failure path does) crashes.
+        assert h is not None and h.slot_id == "it0-p0-c0", h
+        off.close(h, "evaluated_admitted")
         assert off.sweep_iteration(0) == 0
-        assert off.capture_material(slot_id="s", candidate_id="c",
+        assert off.capture_material(slot_id=h.slot_id, candidate_id="c",
                                     structural_depth=2,
                                     task_scripts={"T": "x"}) is None
         assert not any(td.iterdir())
-        print("OK  disabled no-op     every hook returns without touching disk")
+        print("OK  disabled no-op     every hook returns without touching disk, "
+              "and open() still returns a usable handle")
 
         led = SlotLedger(td / "proposal_slots.jsonl", run_id="r", arm="official",
                          backbone="gpt-5.5", cohort_id="sri_primary6:6",
@@ -357,13 +366,12 @@ def self_test() -> int:
         print("OK  dangling on resume a crashed slot is closed with "
               "failure_class=crashed_process")
 
-        # root bundle is hashable and carries the cohort
-        rb = hk.root_bundle({"dev_scores": {"T1": 0.5},
-                             "task_order": ["T1", "T2"]})
-        from meta_n.sri.protocol import root_bundle_sha256
-        assert len(root_bundle_sha256(rb)) == 64
-        assert rb["cohort"] == ["T1", "T2"]
-        print("OK  root bundle       hashes and carries the cohort order")
+        # the hooks module must NOT grow a second, hollow root-bundle source
+        assert not hasattr(hk, "root_bundle"), \
+            "SRIHooks must not fabricate a root bundle; use " \
+            "protocol.collect_root_bundle (which hashes real artifacts)"
+        print("OK  no hollow bundle   the only root-bundle source is "
+              "protocol.collect_root_bundle")
 
     print()
     print("VERDICT: ALL OK")

@@ -129,9 +129,18 @@ class SlotLedger:
         self._load()
 
     # -- persistence -------------------------------------------------------
-    def _load(self) -> None:
+    def _load(self, *, check_header: bool = True) -> None:
+        """Fold the append-only file.
+
+        With `check_header` (the normal path) every record's provenance fields
+        must agree with this ledger's constructor arguments. Without it a
+        `SlotLedger` pointed at ANOTHER arm's or seed's file would silently
+        absorb its rows -- the arm/seed/root identity is exactly what makes a
+        row interpretable, so a mismatch is fatal rather than a warning.
+        """
         if not self.path.is_file():
             return
+        expected = {k: v for k, v in self._hdr.items()} if check_header else {}
         for line in self.path.open(encoding="utf-8"):
             line = line.strip()
             if not line:
@@ -142,8 +151,20 @@ class SlotLedger:
                 raise ProtocolError(
                     "slot ledger {!r} has a corrupt line: {}".format(
                         str(self.path), e))
+            if expected:
+                bad = {k: {"file": rec.get(k, "<absent>"), "expected": v}
+                       for k, v in expected.items()
+                       if k in rec and rec.get(k) != v}
+                if bad:
+                    raise ProtocolError(
+                        "slot ledger {!r} carries a different provenance than "
+                        "this run: {}".format(self.path.name, bad))
             sid = rec.get("slot_id")
             if rec.get("kind") == "open":
+                if sid in self._open:
+                    raise ProtocolError(
+                        "slot {!r} is opened twice in {!r}".format(
+                            sid, str(self.path)))
                 self._open[sid] = rec
             elif rec.get("kind") == "finalize":
                 if sid in self._final:
@@ -151,6 +172,9 @@ class SlotLedger:
                         "slot {!r} was finalized twice in {!r}".format(
                             sid, str(self.path)))
                 self._final[sid] = rec
+
+    def header(self) -> Dict[str, Any]:
+        return dict(self._hdr)
 
     def _append(self, rec: Dict[str, Any]) -> None:
         rec = dict(rec)
@@ -481,6 +505,55 @@ def self_test() -> int:
         except ProtocolError as e:
             assert "Gamma checkpoint hash" in str(e)
         print("OK  arm provenance     predictive requires its Gamma hash")
+
+        # ---- reopening ANOTHER arm's/seed's file is refused --------------
+        # The audit found this could not be detected: _load() ignored the
+        # header, so a ledger pointed at the wrong file absorbed its rows and
+        # reported a complete-looking run built from someone else's slots.
+        other_arm = SlotLedger(p, run_id="r0", arm="official", backbone="gpt-5.5",
+                               cohort_id="sri_primary6:6", search_seed=0,
+                               root_bundle_sha256="R" * 64)
+        assert other_arm.counts_by_status()["gate_rejected"] == 1
+        print("OK  same arm/seed ok   re-opening a matching ledger still folds")
+
+        try:
+            SlotLedger(p, run_id="r0", arm="official", backbone="gpt-5.5",
+                       cohort_id="sri_primary6:6", search_seed=7,
+                       root_bundle_sha256="R" * 64)
+            raise AssertionError("a ledger from another SEED was accepted")
+        except ProtocolError as e:
+            assert "search_seed" in str(e) and "provenance" in str(e)
+        try:
+            SlotLedger(p, run_id="r0", arm="official", backbone="gpt-5.5",
+                       cohort_id="sri_primary6:6", search_seed=0,
+                       root_bundle_sha256="S" * 64)
+            raise AssertionError("a ledger from another ROOT was accepted")
+        except ProtocolError as e:
+            assert "root_bundle_sha256" in str(e)
+        try:
+            SlotLedger(p, run_id="r0", arm="predictive", backbone="gpt-5.5",
+                       cohort_id="sri_primary6:6", search_seed=0,
+                       root_bundle_sha256="R" * 64,
+                       gamma_checkpoint_sha256="G" * 64)
+            raise AssertionError("a ledger from the OTHER ARM was accepted")
+        except ProtocolError as e:
+            assert "arm" in str(e)
+        print("OK  provenance check   a ledger from another seed, root or arm is "
+              "refused instead of silently absorbed")
+
+        # a duplicate open in the FILE is refused on read (not only live)
+        dup = Path(td) / "dup.jsonl"
+        rec = {"kind": "open", "slot_id": "it0-p0-c0", "iteration": 0,
+               "parent_slot": 0, "child_slot": 0}
+        dup.write_text(json.dumps(rec) + "\n" + json.dumps(rec) + "\n",
+                       encoding="utf-8")
+        try:
+            SlotLedger(dup, run_id="r", arm="official", backbone="b",
+                       cohort_id="c", search_seed=0, root_bundle_sha256="R" * 64)
+            raise AssertionError("a duplicated open row was accepted")
+        except ProtocolError as e:
+            assert "opened twice" in str(e)
+        print("OK  duplicate open     a repeated open row in the file is refused")
 
     print()
     print("VERDICT: ALL OK")

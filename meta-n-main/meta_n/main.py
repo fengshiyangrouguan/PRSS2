@@ -173,6 +173,17 @@ def build_parser() -> argparse.ArgumentParser:
              "be given as $META_N_GAMMA_CHECKPOINT.",
     )
     parser.add_argument(
+        "--sri-context",
+        default=None,
+        help="Path to a JSON SRI run context (formal protocol). Its presence "
+             "ENABLES the proposal-slot ledger and the orchestrator hooks; "
+             "without it every hook stays a strict no-op. Required keys: "
+             "run_id, arm, backbone, cohort_id, search_seed, "
+             "root_bundle_sha256, and ledger_path; optional: "
+             "gamma_checkpoint_sha256, gate_reason, cohort, "
+             "no_test_eval (default true for the formal arm stages).",
+    )
+    parser.add_argument(
         "--cost-ledger-dir",
         default=None,
         help="Directory for daily JSONL cost ledgers (default: ~/.meta_n_costs "
@@ -2074,6 +2085,73 @@ async def async_main(args: argparse.Namespace):
         # paths consume it; provenance via build_base_run_config).
         balanced_json_fallback=args.classify_balanced_json_fallback,
     )
+    # --- SRI formal instrumentation (opt-in; default OFF) ------------------
+    # Constructing the ledger HERE is what actually enables it. Without this the
+    # orchestrator keeps SRIHooks.disabled() no matter what the runner believes,
+    # so a "formal" run produces no proposal_slots.jsonl at all while the runner
+    # records a path to a file that does not exist.
+    if getattr(args, "sri_context", None):
+        from meta_n.sri.hooks import SRIHooks
+        from meta_n.sri.ledger import SlotLedger
+        _ctx = json.loads(Path(args.sri_context).read_text(encoding="utf-8"))
+        _need = ("run_id", "arm", "backbone", "cohort_id", "search_seed",
+                 "root_bundle_sha256", "ledger_path")
+        # `search_seed` may legitimately be 0, so test for ABSENCE, not falsiness.
+        _missing = [k for k in _need
+                    if k not in _ctx or _ctx[k] in (None, "")]
+        if _missing:
+            raise SystemExit(
+                "--sri-context is missing required key(s): {}".format(_missing))
+        if _ctx["arm"] == "predictive" and not _ctx.get(
+                "gamma_checkpoint_sha256"):
+            raise SystemExit(
+                "--sri-context arm=predictive requires gamma_checkpoint_sha256: "
+                "the arm must record its Gamma identity (§4)")
+        # The context names the TREATMENT; the process runs `_reduction_mode`.
+        # A disagreement would log one arm's ledger while running the other's
+        # mode -- caught here, before any paid call, rather than after.
+        if _ctx.get("reduction_mode") not in (None, _reduction_mode):
+            raise SystemExit(
+                "--sri-context says reduction_mode={!r} but this process is "
+                "running {!r}; the treatment would not be applied".format(
+                    _ctx.get("reduction_mode"), _reduction_mode))
+        _led = SlotLedger(
+            _ctx["ledger_path"], run_id=_ctx["run_id"], arm=_ctx["arm"],
+            backbone=_ctx["backbone"], cohort_id=_ctx["cohort_id"],
+            search_seed=_ctx["search_seed"],
+            root_bundle_sha256=_ctx["root_bundle_sha256"],
+            gamma_checkpoint_sha256=_ctx.get("gamma_checkpoint_sha256"))
+        orchestrator.sri = SRIHooks(
+            ledger=_led, run_dir=Path(output_dir),
+            gate_configured=orchestrator.config.gate_tasks,
+            gate_reason=_ctx.get("gate_reason", ""),
+            reduction_mode=_reduction_mode, cohort=_ctx.get("cohort") or [])
+        orchestrator.sri_no_test_eval = bool(_ctx.get("no_test_eval", True))
+        # §4/§10: the TREATMENT itself must be recorded in the run's own
+        # artifacts. `reduction_mode` and the Gamma identity never reached
+        # config.json, so a reader could not tell the two arms apart from the
+        # artifact set -- and one arm's silently wrong mode was undetectable.
+        # Additive and gated behind --sri-context, so a non-formal config.json
+        # stays byte-identical.
+        run_config["sri"] = {
+            "run_id": _ctx["run_id"], "arm": _ctx["arm"],
+            "backbone": _ctx["backbone"], "cohort_id": _ctx["cohort_id"],
+            "search_seed": _ctx["search_seed"],
+            "root_bundle_sha256": _ctx["root_bundle_sha256"],
+            "reduction_mode": _reduction_mode,
+            "gamma_checkpoint_sha256": _ctx.get("gamma_checkpoint_sha256"),
+            "ledger_path": _ctx["ledger_path"],
+            "no_test_eval": orchestrator.sri_no_test_eval,
+            "cohort": list(_ctx.get("cohort") or []),
+            "profile_sha256": _ctx.get("profile_sha256"),
+            "sri_context_sha256": _ctx.get("sri_context_sha256"),
+            "gate_reason": _ctx.get("gate_reason", ""),
+        }
+        console.print(
+            "  SRI ledger: {}  arm={}  seed={}  no_test_eval={}".format(
+                _ctx["ledger_path"], _ctx["arm"], _ctx["search_seed"],
+                orchestrator.sri_no_test_eval))
+
     result = await orchestrator.run(tasks, resume=args.resume, run_config=run_config)
 
     # Summary — oracle mean comes from run(), which averages over ALL

@@ -203,6 +203,7 @@ def build_edges(ledger_rows: Iterable[Mapping[str, Any]],
         cm = material_of(r, "child")
         if pm is None or cm is None:
             drops.append({"slot_id": sid, "reason": "missing_material",
+                          "transition": "{}{}".format(int(pd), int(cd)),
                           "parent_material": pm is not None,
                           "child_material": cm is not None,
                           "terminal_status": term})
@@ -382,18 +383,68 @@ def run_canonical_audit(edges: Sequence[Edge], *, cohort: Sequence[str],
     for tr in SECONDARY_TRANSITIONS:
         transitions["R_{}to{}".format(*tr)] = agg(tr)
 
-    # ---- §2.3 failure accounting -------------------------------------------
-    # The DENOMINATOR is every nominal transition observation the run set out to
-    # make: every edge that produced a row PLUS every edge that had to be
-    # dropped for missing material. Counting only the surviving edges would let
-    # `failed` exceed `attempted` (F > 1) exactly when the run is most broken.
+    # ---- §2.3 failure accounting, PER TRANSITION ---------------------------
+    # The numerator and the denominator must describe the SAME transition.
+    # The first revision divided the 2->3 regression count by an ALL-transition
+    # attempt count (and added every transition's drops to the same numerator),
+    # so `R_worst` was not the worst case of any quantity: adding unaudited
+    # 3->4 edges to the denominator could pull the published rate DOWN.
     drops = list(drops or [])
-    attempted = (len(edge_rows) + len(drops)) * len(cohort)
-    missing_task_pairs = sum(len(cohort) - len(r["per_task"]) for r in edge_rows)
-    failed = missing_task_pairs + len(drops) * len(cohort)
-    F = (failed / attempted) if attempted else None
-    R_worst = (((primary["regressions"] or 0) + failed) / attempted
-               if attempted else None)
+    drops_by_tr: Dict[str, List[Dict[str, Any]]] = {}
+    unplaceable: List[Dict[str, Any]] = []
+    for d in drops:
+        tr = d.get("transition")
+        if tr is None:
+            unplaceable.append(d)
+        else:
+            drops_by_tr.setdefault(str(tr), []).append(d)
+
+    def account(tr: Tuple[int, int], rows_for_tr: List[Dict[str, Any]],
+                regressions: int) -> Dict[str, Any]:
+        dr = drops_by_tr.get("{}{}".format(*tr), [])
+        attempted = (len(rows_for_tr) + len(dr)) * len(cohort)
+        missing_task_pairs = sum(len(cohort) - len(r["per_task"])
+                                 for r in rows_for_tr)
+        failed = missing_task_pairs + len(dr) * len(cohort)
+        return {
+            "transition": "{}{}".format(*tr),
+            "edges": len(rows_for_tr),
+            "dropped_edges": len(dr),
+            "attempted_edge_task_slots": attempted,
+            "failed_edge_task_slots": failed,
+            "F": (failed / attempted) if attempted else None,
+            "R_worst": (((regressions or 0) + failed) / attempted
+                        if attempted else None),
+        }
+
+    by_transition = {}
+    for tr in (PRIMARY_TRANSITION,) + SECONDARY_TRANSITIONS:
+        key = "R_{}to{}".format(*tr)
+        rows_tr = [r for r in edge_rows if r["transition"] == "{}{}".format(*tr)]
+        by_transition[key] = account(tr, rows_tr,
+                                     transitions[key]["regressions"] or 0)
+
+    primary_fa = by_transition["R_2to3"]
+    # The overall view exists for the unplaceable rows, which belong to no single
+    # transition. A row whose structural depth is missing is a real defect (the
+    # ledger gate refuses it for an executed slot), so it is disclosed here
+    # rather than folded into one transition's rate.
+    all_rows = edge_rows
+    all_drops = [d for dr in drops_by_tr.values() for d in dr]
+    attempted_all = ((len(all_rows) + len(all_drops) + len(unplaceable))
+                     * len(cohort))
+    failed_all = (sum(len(cohort) - len(r["per_task"]) for r in all_rows)
+                  + (len(all_drops) + len(unplaceable)) * len(cohort))
+    overall = {
+        "attempted_edge_task_slots": attempted_all,
+        "failed_edge_task_slots": failed_all,
+        "F": (failed_all / attempted_all) if attempted_all else None,
+        "R_worst": None,          # a single-transition quantity; see by_transition
+        "unplaceable_rows": len(unplaceable),
+        "note": "overall F includes rows whose structural depth is missing; "
+                "R_worst is reported PER TRANSITION because a 2->3 regression "
+                "cannot be divided by a 3->4 denominator",
+    }
 
     # ---- §2.4 depth reporting ---------------------------------------------
     best_at_depth: Dict[int, float] = {}
@@ -424,17 +475,44 @@ def run_canonical_audit(edges: Sequence[Edge], *, cohort: Sequence[str],
         "edges": len(edge_rows),
         "invalid_edges": list(drops or []),
         "transitions": transitions,
-        "failure_accounting": {
-            "attempted_edge_task_slots": attempted,
-            "failed_edge_task_slots": failed,
-            "F": F, "R_worst": R_worst,
-            "note": "R_valid is the paper's primary statistic; F and R_worst "
-                    "are mandatory robustness disclosures (§2.3).",
-        },
+        "failure_accounting": dict(
+            primary_fa,
+            by_transition=by_transition,
+            overall=overall,
+            unplaceable_rows=list(unplaceable),
+            note="R_valid is the paper's primary statistic; F and R_worst "
+                 "are mandatory robustness disclosures (§2.3) and are computed "
+                 "per transition from that transition's own denominator."),
         "pairing_limitations": list(pairing_limitations),
     }
     return AuditResult(raw_rows=rows, edges=edge_rows, metrics=metrics,
                        exact_depth=exact_depth)
+
+
+def assert_placeable(ledger_rows: Iterable[Mapping[str, Any]]) -> None:
+    """Every EXECUTED slot must carry both structural depths (§2.4, §13).
+
+    A row that ran but whose depth is unknown cannot be placed on the depth
+    axis, so it silently leaves every transition denominator -- the run would
+    look smaller rather than broken. This is checked at freeze time so the
+    defect surfaces before the paywalled audit, not after.
+    """
+    from meta_n.sri.ledger import EXECUTABLE_STATUSES
+    bad = []
+    for r in ledger_rows:
+        if (r.get("terminal_status") or "OPEN") not in EXECUTABLE_STATUSES:
+            continue
+        if r.get("parent_structural_depth") is None or \
+                r.get("proposed_child_depth") is None:
+            bad.append({"slot_id": r.get("slot_id"),
+                        "terminal_status": r.get("terminal_status"),
+                        "parent_structural_depth":
+                            r.get("parent_structural_depth"),
+                        "proposed_child_depth": r.get("proposed_child_depth")})
+    if bad:
+        raise ProtocolError(
+            "{} executed slot(s) have no structural depth and could not be "
+            "placed in any transition denominator: {}".format(len(bad), bad))
 
 
 def finalize_exact_depth(audit: AuditResult,
@@ -443,11 +521,19 @@ def finalize_exact_depth(audit: AuditResult,
     """§2.4: `exact_depth_best(d)` over the FINAL ARCHIVE, structurally.
 
     Kept separate from any iteration-based view so `depth` can never be
-    confused with `iteration`.
+    confused with `iteration`. Synthesized candidates are excluded: `merge_oracle`
+    is written with a FABRICATED depth and the oracle's own macro score, so it
+    would otherwise be reported as the best candidate at whatever depth it
+    claimed.
     """
+    from meta_n.sri.protocol import is_synthesized_candidate
     best: Dict[int, Dict[str, Any]] = {}
     counts: Dict[int, int] = {}
+    excluded: List[str] = []
     for c in archive_candidates:
+        if is_synthesized_candidate(c):
+            excluded.append(str(c.get("candidate_id")))
+            continue
         d = int(c.get("depth") or 0)
         counts[d] = counts.get(d, 0) + 1
         s = dev_score_of(c)
@@ -462,8 +548,11 @@ def finalize_exact_depth(audit: AuditResult,
         "exact_depth_best": {str(d): v for d, v in sorted(best.items())},
         "exact_depth_counts": {str(d): n for d, n in sorted(counts.items())},
         "available_depths": sorted(counts),
+        "synthesized_excluded": excluded,
         "note": "structural depth (candidate.depth); iteration-wise archive "
-                "best is a SEPARATE series and must not be substituted",
+                "best is a SEPARATE series and must not be substituted. "
+                "Synthesized (oracle/merge) candidates are excluded because "
+                "their depth is fabricated by assembly.",
     }
     audit.exact_depth.update(out)
     return out
@@ -641,14 +730,69 @@ def self_test() -> int:
     res2 = run_canonical_audit(edges2, cohort=cohort, evaluator=_StubEvaluator(table),
                                search_seed=0, repeats=1, drops=drops2)
     fa2 = res2.metrics["failure_accounting"]
-    # attempted = (1 surviving edge + 2 dropped edges) * 2 tasks = 6
-    # failed    = 0 missing task pairs + 2 drops * 2 tasks = 4  -> F = 4/6
-    assert fa2["attempted_edge_task_slots"] == 6, fa2
-    assert fa2["failed_edge_task_slots"] == 4, fa2
-    assert abs(fa2["F"] - 4 / 6) < 1e-12, fa2
+    # PER TRANSITION: the surviving 2->3 edge plus the dropped 2->3 edge give
+    # attempted = 2 * 2 = 4 and failed = 1 drop * 2 tasks = 2 -> F = 0.5. The
+    # dropped 1->2 row belongs to a DIFFERENT transition and must not appear in
+    # either the numerator or the denominator (mixing them reported F=4/6).
+    assert fa2["attempted_edge_task_slots"] == 4, fa2
+    assert fa2["failed_edge_task_slots"] == 2, fa2
+    assert abs(fa2["F"] - 0.5) < 1e-12, fa2
     assert fa2["F"] <= 1.0
-    print("OK  invalid visible    dropped edges raise F to {:.3f} (attempted "
-          "counts them) and appear in invalid_edges".format(fa2["F"]))
+    assert fa2["by_transition"]["R_1to2"]["F"] == 1.0, fa2["by_transition"]
+    print("OK  invalid visible    dropped edges raise the 2->3 F to {:.3f} "
+          "(attempted counts them); the 1->2 drop stays in its own transition"
+          .format(fa2["F"]))
+
+    # ---- the mixing bug: a 3->4 edge must not move the 2->3 rate ----------
+    # `R_worst` adds THIS transition's regressions to THIS transition's
+    # failures. The first revision divided 2->3 regressions by an attempt count
+    # that included every 3->4 edge, so a broken 3->4 arm pulled the published
+    # 2->3 rate towards zero.
+    wide = list(ledger) + [
+        {"slot_id": "it2-p0-c0", "iteration": 2, "parent_structural_depth": 3,
+         "proposed_child_depth": 4, "terminal_status": "execution_error",
+         "archive_admitted": False, "parent_id": "c3a"}]
+    mats_wide = dict(mats)
+    mats_wide["it0-p0-c0"] = (parent, good)
+    mats_wide["it0-p0-c1"] = (parent, bad)
+    mats_wide["it2-p0-c0"] = (_mat("c3a", 3, T1="a", T2="a"),
+                              _mat("c4", 4, T1="b", T2="b"))
+
+    def material_of_wide(row, side):
+        pair = mats_wide.get(row["slot_id"])
+        if pair is None:
+            return _mat("gen0", 1, T1="g", T2="g") if side == "parent" else None
+        return pair[0] if side == "parent" else pair[1]
+
+    edges_w, drops_w = build_edges(wide, material_of_wide)
+    res_w = run_canonical_audit(edges_w, cohort=cohort,
+                                evaluator=_StubEvaluator(table),
+                                search_seed=0, repeats=1, drops=drops_w)
+    faw = res_w.metrics["failure_accounting"]
+    r23_w = res_w.metrics["transitions"]["R_2to3"]
+    assert r23_w["regressions"] == r23["regressions"], r23_w
+    assert faw["R_worst"] == fa["R_worst"], (faw, fa)
+    assert faw["attempted_edge_task_slots"] == fa["attempted_edge_task_slots"]
+    assert "R_3to4" in faw["by_transition"], sorted(faw["by_transition"])
+    print("OK  no cross-talk      adding a 3->4 edge leaves R_2to3 and its "
+          "F/R_worst unchanged (R_worst={})".format(faw["R_worst"]))
+
+    # an EXECUTED row with no structural depth is refused at freeze time
+    try:
+        assert_placeable(ledger + [{"slot_id": "x", "terminal_status":
+                                    "evaluated_admitted",
+                                    "parent_structural_depth": None,
+                                    "proposed_child_depth": 3}])
+        raise AssertionError("an unplaceable executed row was accepted")
+    except ProtocolError as e:
+        assert "structural depth" in str(e)
+    # ...but a FAILED row that never produced a child is fine
+    assert_placeable(ledger + [{"slot_id": "y", "terminal_status":
+                                "empty_injection",
+                                "parent_structural_depth": 2,
+                                "proposed_child_depth": None}])
+    print("OK  placeability gate  an executed slot without a depth is refused; "
+          "a failed slot without one is not")
 
     # exact-depth reporting is structural
     finalize_exact_depth(res, [

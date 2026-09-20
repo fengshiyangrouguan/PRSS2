@@ -1405,14 +1405,27 @@ class EvolutionaryOrchestrator:
                                 # written OUTSIDE the archive so persistence can
                                 # never make it a parent or a Final-Score
                                 # candidate.
+                                #
+                                # The scripts come from `gate_traces`, NOT from
+                                # `child.traces`: the gate solves the child and
+                                # only THEN rejects it, whereas `child.traces`
+                                # is populated by `_evaluate_candidate`, which a
+                                # gate failure skips entirely. Reading
+                                # `child.traces` here wrote an empty directory and
+                                # the audit could only report missing material.
+                                _scripts: Dict[str, str] = {
+                                    str(getattr(t, "task_id", "")):
+                                        str(getattr(t, "script", "") or "")
+                                    for t in (child.traces or [])}
+                                for _tid, _tr in (gate_traces or {}).items():
+                                    _sc = str(getattr(_tr, "script", "") or "")
+                                    if _sc and not _scripts.get(str(_tid)):
+                                        _scripts[str(_tid)] = _sc
                                 _mp = self.sri.capture_material(
                                     slot_id=_sri_slot.slot_id,
                                     candidate_id=child.candidate_id,
                                     structural_depth=child_depth,
-                                    task_scripts={
-                                        str(getattr(t, "task_id", "")):
-                                            str(getattr(t, "script", "") or "")
-                                        for t in (child.traces or [])})
+                                    task_scripts=_scripts)
                                 self.sri.close(
                                     _sri_slot, "gate_rejected",
                                     gate_status="rejected",
@@ -3966,6 +3979,14 @@ class EvolutionaryOrchestrator:
         adapter's ``evaluate_test`` re-runs the evolved ``solve()`` on test
         examples internally, so no separate re-solve step is needed here.
         """
+        # SRI formal: the held-out test is run ONLY by the formal `final` stage,
+        # after the archive is frozen and ONE dev-selected candidate is chosen.
+        # Testing here would evaluate the search itself (and would do so once per
+        # arm, plus at the shared root), which both leaks test into the search
+        # loop and destroys the frozen protocol.
+        if getattr(self, "sri_no_test_eval", False):
+            logger.info("SRI formal: in-search oracle test evaluation skipped")
+            return {}
         if not hasattr(self.executor, "adapter") or not hasattr(
             self.executor.adapter, "evaluate_test"
         ):
@@ -4016,6 +4037,11 @@ class EvolutionaryOrchestrator:
         (oracle), this method uses one candidate for all tasks — the overall
         best candidate from the archive.
         """
+        # SRI formal: see `_run_test_evaluation` -- held-out test is the formal
+        # `final` stage's job, on ONE dev-selected candidate, after freeze.
+        if getattr(self, "sri_no_test_eval", False):
+            logger.info("SRI formal: in-search chain test evaluation skipped")
+            return {}
         if not hasattr(self.executor, "adapter") or not hasattr(
             self.executor.adapter, "evaluate_test"
         ):

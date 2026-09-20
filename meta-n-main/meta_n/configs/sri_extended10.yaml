@@ -27,5 +27,30 @@ search_eval_repeats: 3
 audit_repeats: 3
 test_repeats: 3
 
+# Generation knobs -- pinned here for the same reason as in sri_primary6: the
+# runner renders the command from this file and then verifies config.json.
+max_tokens: 1024
+empty_retry_max_tokens: 0
+max_retries: 0
+reasoning_effort: low
+temperatures: [0.5, 0.7, 0.9]
+novelty_alpha: 0.3
+
+# consolidate=true SKIPS the gate, so gate_tasks must be 0 (a profile that
+# claims an active gate that can never run is refused at load).
+consolidate: true
+gate_tasks: 0
+gate_repeats: 1
+gate_margin: 0.0
+protect_floor: null
+regression_guard: true
+regression_guard_repeats: 3
+within_task_recursion: true
+focus_current_headroom: true
+symmetric_trace_sampling: true
+paired_eval: false
+elite_rotation: false
+benchmark_config: none
+
 regression_threshold: 0.02
 deterministic_evaluator_caches_repeats: true

@@ -6,6 +6,13 @@
 # editing the frozen constant is refused rather than silently honoured.
 #
 # `nominal_slots` is DERIVED (B * K * T = 24) and deliberately absent.
+#
+# EVERY result-affecting command parameter lives in this file. The runner
+# renders the CLI from it (protocol.render_pinned_flags) and then verifies the
+# run's real config.json against it field by field, so the shipped
+# benchmark-features YAML cannot move a number behind the profile's back. The
+# first revision omitted half of these flags and the run silently used argparse
+# defaults (max_depth 10 instead of 6, eval_repeats 1 instead of 3).
 name: sri_primary6
 cohort:
   - Aircraft landing
@@ -27,6 +34,36 @@ search_seeds: [0, 1, 2, 3, 4]
 search_eval_repeats: 3       # denoise a candidate's score during search
 audit_repeats: 3             # canonical transition-audit repeats
 test_repeats: 3              # held-out repeats (stochastic evaluators only)
+
+# --- generation knobs (result-affecting; pinned, never inherited) ---------
+max_tokens: 1024
+empty_retry_max_tokens: 0
+max_retries: 0
+reasoning_effort: low
+temperatures: [0.5, 0.7, 0.9]
+novelty_alpha: 0.3
+
+# --- gate / consolidation (§8) --------------------------------------------
+# consolidate=true SKIPS the quality gate, so gate_tasks MUST be 0: a profile
+# claiming an active three-task gate that can never run is refused at load.
+consolidate: true
+gate_tasks: 0
+gate_repeats: 1
+gate_margin: 0.0
+protect_floor: null
+regression_guard: true
+regression_guard_repeats: 3
+within_task_recursion: true
+focus_current_headroom: true
+symmetric_trace_sampling: true
+paired_eval: false
+elite_rotation: false
+
+# Formal runs never read the bundled benchmark-features YAML: its `defaults`
+# block sets result-affecting keys (consolidate / regression_guard /
+# within_task_recursion / focus_current_headroom / symmetric_trace_sampling)
+# that this profile names explicitly instead.
+benchmark_config: none
 
 # --- frozen estimator constant (§2.2) -------------------------------------
 regression_threshold: 0.02

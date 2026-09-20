@@ -82,6 +82,7 @@ class SRIHooks:
     def open(self, *, iteration: int, parent_slot: int, child_slot: int,
              parent_id: Optional[str], parent_structural_depth: int,
              gate_effective: bool, proposed_child_id: Optional[str] = None,
+             proposed_child_depth: Optional[int] = None,
              temperature: Optional[float] = None,
              focus_task: Optional[str] = None) -> Optional[SlotHandle]:
         if not self.enabled:
@@ -98,7 +99,9 @@ class SRIHooks:
             gate_configured=self.gate_configured,
             gate_effective=bool(gate_effective),
             gate_reason=self.gate_reason, reduction_mode=self.reduction_mode,
-            proposed_child_id=proposed_child_id, temperature=temperature,
+            proposed_child_id=proposed_child_id,
+            proposed_child_depth=proposed_child_depth,
+            temperature=temperature,
             focus_task=focus_task)
         h = SlotHandle(sid, iteration, parent_slot, child_slot)
         self._open[sid] = h

@@ -3,8 +3,10 @@
 Modules:
     protocol.py           profiles, manifests, drift validation, root bundles
     ledger.py             append-only proposal-slot ledger
+    hooks.py              orchestrator-side slot open/close + material capture
     transition_audit.py   canonical post-freeze depth-2 -> depth-3 audit
-    metrics.py            offline aggregation of frozen artifacts
+    metrics.py            final selection, per-run and cross-seed aggregation
+    pairing.py            per-channel paired-evaluation effectiveness (§9)
 """
 
 from meta_n.sri.protocol import (  # noqa: F401

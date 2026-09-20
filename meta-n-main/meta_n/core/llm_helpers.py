@@ -97,6 +97,7 @@ def _make_llm_funcs(
     model_provider,
     tracker: LLMUsageTracker | None,
     io_logger,
+    seed_provider=None,
 ):
     """Shared closure factory behind ``make_llm_func`` / ``make_llm_func_from_config``.
 
@@ -115,6 +116,12 @@ def _make_llm_funcs(
         model_provider: Zero-arg callable returning the model name for logs.
         tracker: Optional usage tracker to accumulate token counts.
         io_logger: Optional already-constructed LLMIOLogger (or None).
+        seed_provider: Optional zero-arg callable returning the CRN seed for the
+            CURRENT evaluation context (task/repeat), or None. When set, every
+            inner ``llm()`` / ``llm_batch()`` request carries it, which is what
+            pairs depth>1 and inner sampling across arms (§9.2: the historical
+            implementation left both unpaired). ``None`` (default) leaves every
+            request byte-identical.
     """
     runner = _LoopRunner()
 
@@ -154,6 +161,7 @@ def _make_llm_funcs(
             client.complete_with_breakdown(
                 messages, temperature=temperature, max_tokens=max_tokens,
                 _suppress_io_log=True,
+                seed=(seed_provider() if seed_provider is not None else None),
             )
         )
         _record_and_log(prompt, text, pt, ct, tt)
@@ -186,6 +194,7 @@ def _make_llm_funcs(
                     [{"role": "user", "content": prompt}],
                     temperature=temperature, max_tokens=max_tokens,
                     _suppress_io_log=True,
+                    seed=(seed_provider() if seed_provider is not None else None),
                 )
                 # Bind the prompt back into the result so we can log the
                 # (request, response) pair in order — gather() preserves
@@ -223,10 +232,30 @@ def _make_llm_funcs(
     return llm, llm_batch
 
 
+def _seed_provider_from(seed_context):
+    """Turn a serializable ``(run_seed, task_id, repeat_index)`` into a provider.
+
+    A CALLABLE cannot cross into a subprocess exec namespace, but a plain tuple
+    can -- so the pairing context travels as data and the subprocess derives the
+    same seed with the same function the parent would use. ``None`` => no seed on
+    any request (byte-identical).
+    """
+    if not seed_context:
+        return None
+    run_seed, task_id, repeat_index = seed_context
+
+    def _provider():
+        from meta_n.core.llm_client import stable_crn_seed
+        return stable_crn_seed(int(run_seed), str(task_id), int(repeat_index))
+
+    return _provider
+
+
 def make_llm_func(
     llm_client,
     tracker: LLMUsageTracker | None = None,
     log_path: str | Path | None = None,
+    seed_context=None,
 ):
     """Create sync llm() and llm_batch() closures for the main-process exec namespace.
 
@@ -251,13 +280,15 @@ def make_llm_func(
     # Model name resolved eagerly at factory time (contract: matches the
     # captured client, even if client.config mutates later).
     model = getattr(getattr(llm_client, "config", None), "model", "")
-    return _make_llm_funcs(lambda: llm_client, lambda: model, tracker, io_logger)
+    return _make_llm_funcs(lambda: llm_client, lambda: model, tracker, io_logger,
+                           seed_provider=_seed_provider_from(seed_context))
 
 
 def make_llm_func_from_config(
     config_dict: dict,
     tracker: LLMUsageTracker | None = None,
     log_path: str | Path | None = None,
+    seed_context=None,
 ):
     """Create sync llm() and llm_batch() closures for subprocess exec namespaces.
 
@@ -291,4 +322,5 @@ def make_llm_func_from_config(
     def _model_name() -> str:
         return config_dict.get("model", "") or ""
 
-    return _make_llm_funcs(_get_client, _model_name, tracker, io_logger)
+    return _make_llm_funcs(_get_client, _model_name, tracker, io_logger,
+                           seed_provider=_seed_provider_from(seed_context))

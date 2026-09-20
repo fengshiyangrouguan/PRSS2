@@ -1188,6 +1188,11 @@ class EvolutionaryOrchestrator:
                             gate_effective=bool(self.config.gate_tasks > 0
                                                 and not focus_task),
                             proposed_child_id=child_id,
+                            # the child's STRUCTURAL depth, so the canonical
+                            # transition audit can place the edge. Omitting it
+                            # would make every edge unplaceable and the audit
+                            # would find zero edges.
+                            proposed_child_depth=child_depth,
                             temperature=temperature, focus_task=focus_task)
                         omega_start = time.time()
                         injected, omega_tokens = await self.omega.generate(

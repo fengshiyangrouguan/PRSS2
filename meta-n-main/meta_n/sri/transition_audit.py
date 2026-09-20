@@ -184,12 +184,21 @@ def build_edges(ledger_rows: Iterable[Mapping[str, Any]],
     for r in ledger_rows:
         pd = r.get("parent_structural_depth")
         cd = r.get("proposed_child_depth")
-        if pd is None or cd is None:
-            continue
-        if (int(pd), int(cd)) not in (PRIMARY_TRANSITION,) + SECONDARY_TRANSITIONS:
-            continue
         sid = r.get("slot_id")
         term = r.get("terminal_status") or "OPEN"
+        if pd is None or cd is None:
+            # §13: an edge we cannot even PLACE is reported, never silently
+            # dropped -- a malformed row must not quietly shrink the
+            # denominator.
+            drops.append({"slot_id": sid, "reason": "missing_structural_depth",
+                          "parent_structural_depth": pd,
+                          "proposed_child_depth": cd,
+                          "terminal_status": term})
+            continue
+        if (int(pd), int(cd)) not in (PRIMARY_TRANSITION,) + SECONDARY_TRANSITIONS:
+            # A legitimate transition we are not auditing in this pass (e.g. a
+            # 3->4 edge). Out of scope, not a failure.
+            continue
         pm = material_of(r, "parent")
         cm = material_of(r, "child")
         if pm is None or cm is None:

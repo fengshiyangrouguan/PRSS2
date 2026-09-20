@@ -2064,7 +2064,12 @@ def main():
                             gd = g.detach()
                             aux_i = -lambda_kf * ((gd * z).sum()
                                                   - (gd * z.detach()).sum())
-                            aux_i.backward()
+                            # retain_graph: the SAME fwd_out graph is
+                            # replayed for every cut of this batch
+                            # (treewise bug found by the probe audit:
+                            # the second cut's backward died on a freed
+                            # graph — treewise mode had never run).
+                            aux_i.backward(retain_graph=True)
                             dirs.append(torch.cat(
                                 [p.grad.reshape(-1).float()
                                  for p in gamma_params]))

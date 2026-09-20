@@ -56,8 +56,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 logger = logging.getLogger("meta_n.sri.runner")
 from meta_n.sri.protocol import (  # noqa: E402
     OPERATIONAL_ALLOWLIST, ProtocolError, RunManifest, SRIProfile,
-    assert_no_protocol_drift, assert_treatment_parity, collect_root_bundle,
-    default_profile_path, format_effective_config_table, load_profile,
+    assert_no_protocol_drift, assert_treatment_parity, cohort_id_map,
+    collect_root_bundle, default_profile_path, format_effective_config_table,
+    load_profile,
     pinned_run_config, render_pinned_flags, resolve_effective_config,
     root_bundle_sha256, root_candidate_digest, sha256_file, sha256_of,
     verify_run_config)
@@ -329,6 +330,7 @@ def stage_root(args, profile: SRIProfile, out: Path) -> dict:
                           "search_seed": args.search_seed,
                           "evaluator": args.evaluator},
                   allow_planned=not args.execute)
+    slugs, name_of = cohort_ids(profile)
     cmd = build_root_cmd(args, profile, out)
     exp = root_exp_dir(out)
     log = out / "root.log"
@@ -358,11 +360,12 @@ def stage_root(args, profile: SRIProfile, out: Path) -> dict:
     verify_run_config(cfg, pinned_root, context="root {}".format(exp))
 
     bundle = collect_root_bundle(
-        archive_dir=exp / "archive", cohort=profile.cohort,
+        archive_dir=exp / "archive", cohort=slugs,
         backbone=args.backbone, search_seed=args.search_seed,
         data_dir=Path(args.data_dir), temperatures=profile.temperatures,
         max_tokens=profile.max_tokens,
         reasoning_effort=profile.reasoning_effort,
+        data_dir_name_of=name_of,
         worker_config={"parallel": cfg.get("parallel"),
                        "instance_workers": cfg.get("instance_workers")},
         repo_dir=Path(__file__).resolve().parent.parent)
@@ -376,7 +379,7 @@ def stage_root(args, profile: SRIProfile, out: Path) -> dict:
             "missing cohort material cannot seed a matched comparison".format(
                 missing))
     inherited = sha256_of(root_candidate_digest(exp / "archive",
-                                                profile.cohort))
+                                                slugs))
     print("root bundle sha256 = {}".format(rb))
     print("inherited root     = {}".format(inherited))
     return record_stage(out, "root",
@@ -466,10 +469,11 @@ def build_arm_manifest(args, profile: SRIProfile, out: Path, arm: str, *,
     """The immutable per-arm manifest; the ONLY fields allowed to differ are the
     treatment ones."""
     root = read_stage_manifest(out)["root"]
+    slugs, _name_of = cohort_ids(profile)
     pinned = pinned_for(args, profile)
     shared = {
         "profile_sha256": profile.sha256(),
-        "cohort": list(profile.cohort),
+        "cohort": list(slugs),
         "root_bundle_sha256": root["outputs"]["root_bundle_sha256"],
         # The root candidate's own content digest. `--resume` SHOULD inherit it
         # from the copied fork; this is what proves the resume actually happened
@@ -497,6 +501,7 @@ def build_arm_manifest(args, profile: SRIProfile, out: Path, arm: str, *,
 def write_sri_context(args, profile: SRIProfile, out: Path, arm: str,
                       manifest: RunManifest) -> Path:
     """The handoff file main.py reads to build the ledger (§5)."""
+    slugs, _name_of = cohort_ids(profile)
     man = read_stage_manifest(out)
     root_bundle = man["root"].get("root_bundle") or {}
     ctx = {
@@ -505,7 +510,7 @@ def write_sri_context(args, profile: SRIProfile, out: Path, arm: str,
         "backbone": args.backbone,
         "cohort_id": profile.cohort_id,
         "search_seed": int(args.search_seed),
-        "cohort": list(profile.cohort),
+        "cohort": list(slugs),
         "root_bundle_sha256": manifest.root_bundle_sha256,
         "ledger_path": str(arm_dir(out, arm) / LEDGER_NAME),
         "gamma_checkpoint_sha256": manifest.treatment.get(
@@ -557,6 +562,7 @@ def assert_root_inherited(arm_path: Path, want: Optional[str],
 
 def stage_arm(args, profile: SRIProfile, out: Path, arm: str, *,
               gamma_checkpoint: str | None) -> dict:
+    slugs, _name_of = cohort_ids(profile)
     root_sha = read_stage_manifest(out)["root"]["outputs"].get(
         "root_bundle_sha256")
     if not args.execute:
@@ -607,7 +613,7 @@ def stage_arm(args, profile: SRIProfile, out: Path, arm: str, *,
             .format(arm_dir(out, arm)))
     assert_root_inherited(arm_dir(out, arm),
                           man.shared.get("inherited_root_sha256"),
-                          profile.cohort,
+                          slugs,
                           label="arm {} (pre-flight)".format(arm))
 
     with log.open("w", encoding="utf-8") as f:
@@ -630,7 +636,7 @@ def stage_arm(args, profile: SRIProfile, out: Path, arm: str, *,
     # §4: the arm must have INHERITED the shared root, not regenerated one.
     assert_root_inherited(arm_dir(out, arm),
                           man.shared.get("inherited_root_sha256"),
-                          profile.cohort, label="arm {}".format(arm))
+                          slugs, label="arm {}".format(arm))
     return record_stage(out, arm,
                         inputs={"manifest_sha256": man.sha256(),
                                 "root_bundle_sha256": man.root_bundle_sha256},
@@ -681,6 +687,7 @@ def stage_freeze(args, profile: SRIProfile, out: Path) -> dict:
     digests recorded here, which is what makes "post-freeze evaluation" a
     property of the files rather than a promise in a docstring.
     """
+    slugs, _name_of = cohort_ids(profile)
     man = read_stage_manifest(out)
     root_sha = man.get("root", {}).get("outputs", {}).get("root_bundle_sha256")
     missing = [arm for arm in ARMS if arm not in man]
@@ -869,15 +876,18 @@ class COBenchEvaluator:
 
     mode = "real"
 
-    def __init__(self, cohort: Sequence[str], *, data_dir=DEFAULT_DATA_DIR,
-                 timeout: int = 10, instance_workers: int = 2,
-                 deterministic_cache: bool = False,
+    def __init__(self, cohort: Sequence[str], *, name_of=None,
+                 data_dir=DEFAULT_DATA_DIR, timeout: int = 10,
+                 instance_workers: int = 2, deterministic_cache: bool = False,
                  dev_repeats: int = 1) -> None:
         from meta_n.integrations.co_bench import _TaskEvaluator
         self.cohort = list(cohort)
+        # `cohort` is the canonical id space (slugs); the DATA directory and
+        # `_TaskEvaluator` want the display name (see protocol.task_slug).
+        self.name_of = dict(name_of or {})
         self.data_dir = Path(data_dir)
         self._make = lambda t: _TaskEvaluator(
-            t, self.data_dir, timeout=int(timeout),
+            self.name_of.get(t, t), self.data_dir, timeout=int(timeout),
             instance_workers=int(instance_workers))
         self._evals: Dict[str, Any] = {}
         self.deterministic_cache = bool(deterministic_cache)
@@ -972,11 +982,22 @@ class COBenchEvaluator:
         return self._run(task_id, source, "test")
 
 
+def cohort_ids(profile: SRIProfile) -> Tuple[Tuple[str, ...], Dict[str, str]]:
+    """`(canonical slug cohort, slug -> display name)`.
+
+    Every place that touches a RUN ARTIFACT (trace files, `per_task_scores`, the
+    ledger, the audit) uses the slugs; the DATA directory and `_TaskEvaluator`
+    use the display names.
+    """
+    return profile.canonical_cohort, cohort_id_map(profile.cohort)
+
+
 def make_evaluator(args, profile: SRIProfile, *, split: str = "dev"):
+    slugs, name_of = cohort_ids(profile)
     if args.evaluator == "mock":
-        return MockEvaluator(profile.cohort)
+        return MockEvaluator(slugs)
     return COBenchEvaluator(
-        profile.cohort, data_dir=args.data_dir, timeout=args.timeout,
+        slugs, name_of=name_of, data_dir=args.data_dir, timeout=args.timeout,
         instance_workers=args.instance_workers,
         deterministic_cache=(profile.deterministic_evaluator_caches_repeats
                             and split == "dev"),
@@ -1033,6 +1054,7 @@ def material_lookup(arm_path: Path, cohort: Sequence[str]):
 
 def stage_audit(args, profile: SRIProfile, out: Path) -> dict:
     """§6: canonical post-freeze depth-2 -> 3 audit, per arm, fresh evaluations."""
+    slugs, _name_of = cohort_ids(profile)
     frz = _assert_frozen(out, allow_planned=not args.execute)
     if not args.execute:
         print("[plan] would audit each arm's frozen slots: build the "
@@ -1049,10 +1071,10 @@ def stage_audit(args, profile: SRIProfile, out: Path) -> dict:
                 (out / "frozen" / "{}.slots.jsonl".format(arm)).read_text(
                     encoding="utf-8").splitlines() if l.strip()]
         edges, drops = build_edges(rows, material_lookup(arm_dir(out, arm),
-                                                         profile.cohort))
+                                                         slugs))
         evaluator = make_evaluator(args, profile, split="dev")
         res = run_canonical_audit(
-            edges, cohort=profile.cohort, evaluator=evaluator,
+            edges, cohort=slugs, evaluator=evaluator,
             search_seed=int(args.search_seed),
             repeats=int(profile.audit_repeats),
             threshold=float(profile.regression_threshold), drops=drops,
@@ -1134,6 +1156,7 @@ def _selected_material(arm_path: Path, selected, cohort: Sequence[str]):
 
 def stage_final(args, profile: SRIProfile, out: Path) -> dict:
     """§7: ONE dev-selected deployable candidate, evaluated on held-out test."""
+    slugs, _name_of = cohort_ids(profile)
     frz = _assert_frozen(out, allow_planned=not args.execute)
     if not args.execute:
         print("[plan] would select ONE deployable candidate per arm on DEV "
@@ -1156,11 +1179,11 @@ def stage_final(args, profile: SRIProfile, out: Path) -> dict:
             return load_material_from_dir(
                 _a / "archive" / str(c.get("candidate_id")),
                 str(c.get("candidate_id")), int(c.get("depth") or 1),
-                profile.cohort) is not None
+                slugs) is not None
 
         sel = select_deployable(cands, lambda c: c.get("mean_score"),
                                is_executable_of=executable)
-        mat = _selected_material(a, sel, profile.cohort)
+        mat = _selected_material(a, sel, slugs)
         if mat is None:
             raise StageError(
                 "arm {}: the selected candidate {} has no material on disk".format(
@@ -1169,7 +1192,7 @@ def stage_final(args, profile: SRIProfile, out: Path) -> dict:
         evaluator = make_evaluator(args, profile, split="test")
         raw: List[Dict[str, Any]] = []
         per_task: Dict[str, Optional[float]] = {}
-        for t in profile.cohort:
+        for t in slugs:
             src = mat.task_scripts.get(t)
             if not src:
                 per_task[t] = None

@@ -495,6 +495,45 @@ def test_19_nominal_grid_matches_the_orchestrators_iteration_base(tmp_path=None)
     assert len(ids) == 2 * 2 * 6 == len(set(ids))
 
 
+# -- 20 --------------------------------------------------------------------
+def test_20_task_slug_mirrors_the_integration(tmp_path=None):
+    """The SRI layer's slug must equal the id CO-Bench actually names things by.
+
+    Every run ARTIFACT is keyed by the slug: the trace FILENAME, every
+    `per_task_scores` / `per_task_best` key in the archive index, and the id the
+    ledger records. The SRI layer keeps the display name only for the DATA
+    directory and `--bench-tasks`. A real run proved the cost of getting this
+    wrong: material loaders asking for `traces/<display name>.py` find nothing,
+    so every edge becomes a missing-material drop.
+    """
+    # the shapes observed in a real run on the server
+    assert PR.task_slug("Aircraft landing") == "aircraft_landing"
+    assert PR.task_slug("Bin packing - one-dimensional") == \
+        "bin_packing___one_dimensional"
+    assert PR.task_slug("Common due date scheduling") == \
+        "common_due_date_scheduling"
+    # the profile keeps display names; the canonical cohort is the slugs
+    prof = _profile()
+    assert list(prof.cohort) == list(PR.PRIMARY6)
+    assert prof.canonical_cohort == tuple(
+        PR.task_slug(t) for t in prof.cohort)
+    assert prof.canonical_cohort != prof.cohort
+    assert PR.cohort_id_map(prof.cohort)[
+        "bin_packing___one_dimensional"] == "Bin packing - one-dimensional"
+
+    # ...and where the integration IS importable, check the mirror directly.
+    # It needs a POSIX-only import chain, so on a box that cannot import it the
+    # assertion above (pinned to the run's real keys) is what stands.
+    try:
+        from meta_n.integrations.co_bench import _task_id_from_name
+    except ImportError as e:
+        print("     (skipped the direct mirror check: {}; the pinned shapes "
+              "above are what the server's artifacts show)".format(e))
+        return
+    for name in PR.EXTENDED10:
+        assert PR.task_slug(name) == _task_id_from_name(name), name
+
+
 TESTS = [(n, o) for n, o in sorted(globals().items())
          if n.startswith("test_") and callable(o)]
 

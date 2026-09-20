@@ -85,6 +85,32 @@ class ProtocolError(RuntimeError):
     """A formal-protocol invariant was violated. Always fail closed."""
 
 
+def task_slug(name: str) -> str:
+    """The canonical CO-Bench task id: what the RUN's artifacts are keyed by.
+
+    CO-Bench has TWO id spaces and they are not interchangeable:
+
+      * the **display name** (`"Bin packing - one-dimensional"`) is the data
+        directory under `data/co_bench/` and the value `--bench-tasks` takes;
+      * the **slug** (`"bin_packing___one_dimensional"`) is `TaskDescription
+        .task_id`, and therefore the trace FILENAME, every `per_task_scores` /
+        `per_task_best` key in the archive index, and the id the ledger records.
+
+    Mirrors `meta_n.integrations.co_bench._task_id_from_name` exactly. A real run
+    proved why this matters: material loaders looking for
+    `traces/<display name>.py` find NOTHING, so every edge becomes a
+    missing-material drop and `task_programs_sha256` comes back all-None.
+    `tests/test_sri_formal_protocol.py::test_20` checks this mirror against the
+    integration on a box that can import it.
+    """
+    return str(name).lower().replace(" ", "_").replace("-", "_")
+
+
+def cohort_id_map(cohort: Sequence[str]) -> Dict[str, str]:
+    """slug -> display name, for the few places that must read a DATA directory."""
+    return {task_slug(t): str(t) for t in cohort}
+
+
 # §2.1: candidates meta-n SYNTHESIZES by assembly rather than breeding. The
 # archive holds one -- `merge_oracle`, the task-wise router over per-task
 # solutions, written with a fabricated `depth` (it is a merge of many depths)
@@ -264,6 +290,16 @@ class SRIProfile:
     def nominal_slots(self) -> int:
         """§3.3: nominal recursive slots per arm and search seed = B * K * T."""
         return self.beam_width * self.beam_candidates * self.max_iterations
+
+    @property
+    def canonical_cohort(self) -> Tuple[str, ...]:
+        """The cohort in the CANONICAL id space (slugs) -- see `task_slug`.
+
+        The profile keeps the display names because that is the frozen cohort
+        identity and what `--bench-tasks` accepts; everything that touches a
+        run ARTIFACT (trace files, `per_task_scores`, the ledger) uses this.
+        """
+        return tuple(task_slug(t) for t in self.cohort)
 
     @property
     def cohort_id(self) -> str:
@@ -585,6 +621,7 @@ def collect_root_bundle(*, archive_dir, cohort: Sequence[str], backbone: str,
                         reasoning_effort: Optional[str] = None,
                         worker_config: Optional[Mapping[str, Any]] = None,
                         repo_dir=None,
+                        data_dir_name_of: Optional[Mapping[str, str]] = None,
                         root_candidate_id: str = "gen0_seed") -> Dict[str, Any]:
     """Build the §4 root bundle from REAL artifacts.
 
@@ -594,6 +631,10 @@ def collect_root_bundle(*, archive_dir, cohort: Sequence[str], backbone: str,
     different programs hash identically. This version hashes program SOURCE,
     trace CONTENT, the evaluator's data tree, the model/worker configuration and
     the software revision -- the things a reader would need to re-execute.
+
+    `cohort` is the CANONICAL id space (slugs) because that is what the trace
+    files are named; `data_dir_name_of` maps a slug to its DATA-DIRECTORY name,
+    because CO-Bench names those with the display name. See `task_slug`.
 
     Treatment-free by construction: nothing here depends on the reduction mode,
     so both arms produce the SAME hash from the same root.
@@ -622,8 +663,11 @@ def collect_root_bundle(*, archive_dir, cohort: Sequence[str], backbone: str,
         dd = Path(data_dir)
         evaluator["data_dir"] = "relative:" + str(
             dd.name) if dd.is_absolute() else str(dd)
+        # the DATA directory is named with the display name; the cohort key is
+        # the canonical slug (see `task_slug`)
+        name_of = dict(data_dir_name_of or {})
         for t in cohort:
-            td = dd / t
+            td = dd / name_of.get(t, t)
             if td.is_dir():
                 evaluator["tasks"][t] = hash_tree(td)
             else:

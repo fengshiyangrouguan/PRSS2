@@ -63,7 +63,11 @@ def _load_runner():
 
 R = _load_runner()
 PROFILE = load_profile(PR.default_profile_path("sri_primary6"))
-COHORT = list(PROFILE.cohort)
+# The CANONICAL id space (slugs). The fixture deliberately uses the same ids the
+# real artifacts do -- trace filenames and `per_task_scores` keys are slugs, not
+# display names. Using display names here is how the earlier fixture passed
+# green while every real run would have found no material at all.
+COHORT = list(PROFILE.canonical_cohort)
 
 
 def _args(out: Path, **over):
@@ -166,13 +170,13 @@ def _fabricate_seed(out: Path, seed: int) -> dict:
                                           encoding="utf-8")
 
     bundle = PR.collect_root_bundle(
-        archive_dir=archive, cohort=PROFILE.cohort, backbone="gpt-5.5",
+        archive_dir=archive, cohort=COHORT, backbone="gpt-5.5",
         search_seed=seed, temperatures=PROFILE.temperatures,
         max_tokens=PROFILE.max_tokens,
         reasoning_effort=PROFILE.reasoning_effort,
         worker_config={"parallel": 1, "instance_workers": 2})
     rb = PR.root_bundle_sha256(bundle)
-    inherited = sha256_of(PR.root_candidate_digest(archive, PROFILE.cohort))
+    inherited = sha256_of(PR.root_candidate_digest(archive, COHORT))
     (out / "root_bundle.json").write_text(json.dumps(bundle, indent=2,
                                                     sort_keys=True),
                                           encoding="utf-8")
@@ -481,7 +485,7 @@ def test_arm_must_inherit_the_shared_root():
             "inherited_root_sha256"]
         # the clean case
         assert R.assert_root_inherited(R.arm_dir(d, "official"), want,
-                                       PROFILE.cohort,
+                                       COHORT,
                                        label="arm official") == want
         # a REGENERATED root: same filenames, different program source -- which
         # is exactly what a failed `--resume` produces. Every other artifact
@@ -491,7 +495,7 @@ def test_arm_must_inherit_the_shared_root():
             "# regenerated\ndef solve():\n    return 1\n", encoding="utf-8")
         try:
             R.assert_root_inherited(R.arm_dir(d, "official"), want,
-                                    PROFILE.cohort, label="arm official")
+                                    COHORT, label="arm official")
             raise AssertionError("a regenerated root was accepted")
         except R.StageError as e:
             assert "did NOT inherit" in str(e) and "arm official" in str(e)

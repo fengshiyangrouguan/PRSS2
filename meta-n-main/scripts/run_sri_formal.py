@@ -131,12 +131,20 @@ def assert_launch_env(args, profile: SRIProfile) -> Dict[str, Any]:
     from meta_n.rpbe import backends as bk
     problems: List[str] = []
     backend = os.environ.get(bk.BACKEND_ENV, "").strip().lower()
+    # A mock/local backend is the ZERO-COST way to exercise the whole pipeline,
+    # and it was being refused by this very check -- so the offline end-to-end
+    # run that would have caught three missing flags could not be performed. It
+    # builds no transport, needs no key and spends nothing, so it is allowed and
+    # labelled instead of rejected.
+    if backend in (bk.MOCK, bk.LOCAL):
+        return {"backend": backend, "base_url": "", "api_key_present": False,
+                "note": "offline backend: no transport, no key, no spend"}
     spec = bk.PAID_PROVIDERS.get(backend)
     if spec is None:
         problems.append(
             "LLM_BACKEND={!r}: a paid run needs one of {} (e.g. export "
-            "LLM_BACKEND=deepseek)".format(backend,
-                                           sorted(bk.PAID_PROVIDERS)))
+            "LLM_BACKEND=deepseek), or a mock/local run for the offline "
+            "end-to-end check".format(backend, sorted(bk.PAID_PROVIDERS)))
     elif not os.environ.get(spec["key_env"], "").strip():
         problems.append("{} is unset (source the run's .env)".format(
             spec["key_env"]))
@@ -170,7 +178,7 @@ def assert_launch_env(args, profile: SRIProfile) -> Dict[str, Any]:
     if not ep["base_url"] or not ep["api_key"]:
         raise StageError("endpoint resolution failed (base_url/api_key empty)")
     return {"backend": ep["backend"], "base_url": ep["base_url"],
-            "api_key_present": True}
+            "api_key_present": bool(ep["api_key"])}
 
 
 def subprocess_env() -> Dict[str, str]:

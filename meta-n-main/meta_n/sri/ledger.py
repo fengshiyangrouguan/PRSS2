@@ -293,14 +293,23 @@ class SlotLedger:
         return slot_id in self._final
 
     def rows(self) -> List[Dict[str, Any]]:
-        """The folded view: exactly one row per opened slot."""
+        """The folded view: exactly one row per opened slot.
+
+        Only NON-None finalize values override the open record. A finalize that
+        does not speak to a field (e.g. it passes gate_reason=None because the
+        gate outcome needs no reason) must not erase what the pre-dispatch row
+        already established -- that is how a configured value silently became
+        null.
+        """
         out = []
         for sid, op in self._open.items():
             row = dict(op)
-            row.update(self._final.get(sid) or {})
-            if sid not in self._final:
+            fin = self._final.get(sid)
+            if fin is None:
                 row["terminal_status"] = None
                 row["proposal_status"] = "open"
+            else:
+                row.update({k: v for k, v in fin.items() if v is not None})
             out.append(row)
         return sorted(out, key=lambda r: r["slot_id"])
 

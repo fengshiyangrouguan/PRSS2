@@ -493,6 +493,11 @@ class EvolutionaryOrchestrator:
         # round-robin focus path is byte-identical when the guard is OFF.
         self._base_focus_scores: dict[str, float] = {}
         self.rng = random.Random(config.seed)
+        # SRI formal instrumentation. DISABLED by default (a plain attribute, not
+        # a config field, so a non-formal run is byte-identical): every hook is a
+        # no-op until the formal runner assigns a real SRIHooks object.
+        from meta_n.sri.hooks import SRIHooks
+        self.sri = SRIHooks.disabled()
         # Resume-provenance stashes, read getattr-style by RunPersistence:
         # run() sets _run_config_snapshot (checkpoint stamping); the resume
         # branch fills _resume_config_drift when the current config diverges
@@ -786,6 +791,14 @@ class EvolutionaryOrchestrator:
             completed_set: set[str] = set()
 
             if checkpoint is not None:
+                # SRI formal: a crashed process can leave a slot row open. Close
+                # it now (as a visible generation_error) so resume cannot leave a
+                # nominal slot permanently unfinished.
+                _dangling = self.sri.finalize_dangling_on_resume()
+                if _dangling:
+                    logger.warning(
+                        "SRI: closed %d dangling slot(s) left open by a previous "
+                        "process", _dangling)
                 # Subtract 1 because the while loop does `iteration += 1` at the top.
                 # If the checkpoint saved iteration=2 mid-iteration, we need to
                 # re-enter iteration 2 (with completed_set skipping done candidates).
@@ -1088,6 +1101,13 @@ class EvolutionaryOrchestrator:
                         if child_id in completed_set:
                             logger.info("  Skipping already-evaluated candidate: %s", child_id)
                             console.print(f"  [dim]Skipping {child_id} (already evaluated)[/dim]")
+                            # SRI formal: this nominal slot already has a terminal
+                            # row from the previous process. Reference it; a
+                            # re-entered slot must not become a second
+                            # experimental observation (§5).
+                            self.sri.resume_note(iteration=iteration,
+                                                 parent_slot=parent_idx,
+                                                 child_slot=k)
                             continue
 
                         any_new_work = True
@@ -1157,6 +1177,18 @@ class EvolutionaryOrchestrator:
                         focus_task = self._within_task_focus(
                             parent, cons_targets, k
                         )
+                        # SRI formal: the slot row is created BEFORE dispatch, so
+                        # a crash mid-slot is visible as an open row rather than a
+                        # silently smaller denominator (§5). `gate_effective` is
+                        # recorded as EFFECTIVE, not as the configured count.
+                        _sri_slot = self.sri.open(
+                            iteration=iteration, parent_slot=parent_idx,
+                            child_slot=k, parent_id=parent.candidate_id,
+                            parent_structural_depth=parent.depth,
+                            gate_effective=bool(self.config.gate_tasks > 0
+                                                and not focus_task),
+                            proposed_child_id=child_id,
+                            temperature=temperature, focus_task=focus_task)
                         omega_start = time.time()
                         injected, omega_tokens = await self.omega.generate(
                             traces=parent.traces,
@@ -1224,6 +1256,16 @@ class EvolutionaryOrchestrator:
                                     parent.candidate_id, k, child_depth, omega_tokens, omega_time,
                                 )
                                 parent.num_children += 1  # count failed attempts to deprioritize in selection
+                                # SRI formal: an empty Omega injection is a SPENT
+                                # slot (§8) -- it is labelled, never silently
+                                # turned into an extra proposal.
+                                self.sri.close(
+                                    _sri_slot, "empty_injection",
+                                    failure_class="empty_omega",
+                                    failure_message="Omega returned an empty "
+                                                    "injection; slot consumed",
+                                    omega_wall_seconds=omega_time,
+                                    outer_calls=1, prompt_tokens=omega_tokens)
                                 continue
                             # G9: an empty Ω injection in consolidate mode is NOT a
                             # skip — fall through to re-solve the FOCUS task fresh (a
@@ -1352,6 +1394,29 @@ class EvolutionaryOrchestrator:
                                     "  Gate FAILED: %s, depth=%d, tested=%d tasks, time=%.1fs",
                                     child_id, child_depth, gate_n, gate_time,
                                 )
+                                # SRI formal (§5/§8): a gate-rejected child is a
+                                # real terminal slot and MUST enter the canonical
+                                # audit whenever it is executable. Its material is
+                                # written OUTSIDE the archive so persistence can
+                                # never make it a parent or a Final-Score
+                                # candidate.
+                                _mp = self.sri.capture_material(
+                                    slot_id=_sri_slot.slot_id,
+                                    candidate_id=child.candidate_id,
+                                    structural_depth=child_depth,
+                                    task_scripts={
+                                        str(getattr(t, "task_id", "")):
+                                            str(getattr(t, "script", "") or "")
+                                        for t in (child.traces or [])})
+                                self.sri.close(
+                                    _sri_slot, "gate_rejected",
+                                    gate_status="rejected",
+                                    archive_admitted=False,
+                                    archive_rejection_reason="gate",
+                                    material_path=_mp,
+                                    omega_wall_seconds=omega_time,
+                                    gate_wall_seconds=gate_time,
+                                    outer_calls=1)
                                 result.total_tokens += omega_tokens
                                 iter_tokens += omega_tokens
                                 # Reaudit #6: the gate solves are real INNER-LLM
@@ -1462,6 +1527,26 @@ class EvolutionaryOrchestrator:
                             self.archive.add(child)
                         parent.num_children += 1  # only count when child actually added
                         any_added = True
+                        # SRI formal: the child ran and was admitted. `fresh` vs
+                        # `inherited` task ids come from Meta^n's own depth rule
+                        # (a trace is fresh iff its depth equals the candidate's).
+                        _fresh = sorted({
+                            str(getattr(t, "task_id", ""))
+                            for t in (child.traces or [])
+                            if int(getattr(t, "depth", 0) or 0) == child.depth})
+                        _inh = sorted({
+                            str(getattr(t, "task_id", ""))
+                            for t in (child.traces or [])
+                            if int(getattr(t, "depth", 0) or 0) != child.depth})
+                        self.sri.close(
+                            _sri_slot, "evaluated_admitted",
+                            archive_admitted=True,
+                            fresh_task_ids=_fresh, inherited_task_ids=_inh,
+                            omega_wall_seconds=omega_time,
+                            eval_wall_seconds=eval_time,
+                            outer_calls=1, evaluator_calls=len(child.traces or []),
+                            prompt_tokens=omega_tokens,
+                            completion_tokens=child.total_tokens)
                         self._print_candidate(child, child_id)
                         console.print(
                             f"    Eval tokens: {child.total_tokens:,} | "
@@ -1543,6 +1628,15 @@ class EvolutionaryOrchestrator:
                 )
 
                 iter_time = time.time() - iter_start
+                # SRI formal: close anything this iteration left open. The sweep
+                # is the guarantee behind "exactly one terminal row per nominal
+                # slot" -- a branch that forgets to close becomes a VISIBLE
+                # generation_error instead of a silently smaller denominator.
+                _swept = self.sri.sweep_iteration(iteration)
+                if _swept:
+                    logger.warning(
+                        "SRI: swept %d unclosed slot(s) in iteration %d as "
+                        "generation_error", _swept, iteration)
                 console.print(
                     f"  Iteration {iteration} done: tokens={iter_tokens:,}, time={iter_time:.1f}s, "
                     f"cumulative_tokens={result.total_tokens:,}"

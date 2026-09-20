@@ -29,8 +29,8 @@
     ],
     "lambda_calibration": {
       "rule": "r_eff = lambda * ||g_KF|| / ||g_task|| ~ 0.1, measured on theta_0 (calibration-only run, before ANY optimizer/scheduler step), calibrated once on the initial full window (training-only), then frozen for all seeds. GAMMA-scope measurement (R10 rule): r_eff is the gradient-norm ratio on the Gamma parameters only.",
-      "lambda_kf": 0.015071694232552366,
-      "lambda_kf_note": "Qwen3 RECALIBRATED (2026-09-17, theta_0 = merge-stage final checkpoint loaded via --init-from, under the Qwen3 sampling protocol q_L ∝ n_L + replay cap 12): r_eff_gamma(lambda=1)=6.635, derived lambda = 0.1/6.635 = 0.01507.  The Llama value 0.00594 (r_eff=16.84) was NOT reused.  Calibration log: outputs/ccm_qwen3/seed0_qwen3_ours_calib."
+      "lambda_kf": 0.011370957358248798,
+      "lambda_kf_note": "RECALIBRATED on the CORRECTED theta_0 (merge s550, tokenizer-aligned comp-trainable geometry, 2026-09-18): r_eff_gamma(lambda=1)=8.794, derived lambda = 0.1/8.794 = 0.01137.  The bugged-geometry value 0.01507 (r_eff=6.635) is retired."
     },
     "z_v_source": "J_mem(M_v) fixed adapter (TGN identity is its special case); GQA hosts lift the memory from the KV heads (8) with head_dim 128",
     "witness": "none (main experiment)",
@@ -55,8 +55,8 @@
     "cadence": "identical task samples and scheduler cadence across the three arms"
   },
   "training": {
-    "steps": 100,
-    "steps_note": "Stage B (ours) budget = 100 windows (user ruling 2026-09-17; the R10 line capped at 50 — Gamma learns early and plateaus).  Stage A (merge) keeps the official 1000 optimizer steps, see official_protocol.  ours starts FROM the merge checkpoint_step700 (validation-curve best on the deep buckets, user ruling) via --init-from; trainable = LoRA + COMP rows + Gamma (COMP rows STAY trainable in stage 2, task gradients keep refining them; RPBE touches Gamma only).",
+    "steps": 60,
+    "steps_note": "Stage B (ours) budget = 60 windows (user ruling 2026-09-18: comp+RPBE joint fine-tuning from the Stage-A best checkpoint s550).  trainable = LoRA + COMP rows + Gamma (COMP rows STAY trainable in stage 2, task gradients keep refining them; RPBE touches Gamma only).  Sampling = q_L ∝ n_L + replay cap 12 (see sampling section).",
     "official_protocol": {
       "arm": "ccm_merge_official",
       "merge_cadence": "official",

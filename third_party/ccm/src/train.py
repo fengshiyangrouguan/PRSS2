@@ -24,9 +24,13 @@ import hydra
 import torch
 from omegaconf.dictconfig import DictConfig
 from transformers import (
-    is_torch_tpu_available,
     set_seed,
 )
+try:
+    from transformers import is_torch_tpu_available
+except ImportError:  # transformers >= 4.40 dropped the TPU flag
+    def is_torch_tpu_available(check_device=True):
+        return False
 from transformers.trainer_utils import get_last_checkpoint
 from transformers.utils import check_min_version
 from transformers.utils.versions import require_version
@@ -130,8 +134,13 @@ def main(args: DictConfig) -> None:
     )
 
     # ==== START TRAINING and EVALUATION ====
-    if torch.__version__ >= "2" and sys.platform != "win32":
-        model = torch.compile(model)
+    # LOCAL FIX (2026-09-20): torch.compile explodes memory on the CCM
+    # custom attention path (the merge_recur sum-mask matmul keeps every
+    # layer's intermediates resident under the compiled graph: OOM at
+    # 78GB with micro-batch 4 x 2048).  Eager mode peaks around 10GB at
+    # the same config.  The official compile line is disabled below.
+    # if torch.__version__ >= "2" and sys.platform != "win32":
+    #     model = torch.compile(model)
 
     check_model(model, peft=args.training.peft)
     if args.training.do_train:

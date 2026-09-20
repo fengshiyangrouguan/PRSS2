@@ -21,7 +21,7 @@ defaults:
 
 
 wandb:
-  log: true
+  log: false   # LOCAL FIX: no wandb on this host (official default was true)
   entity: ${user}  # Change this to your wandb username.
   project: ccm
   group: ${basename:${data.dataset_name}}/${basename:${model.model_name_or_path}}-${training.comp.comp_type}-ntok${training.comp.num_comp_tokens}

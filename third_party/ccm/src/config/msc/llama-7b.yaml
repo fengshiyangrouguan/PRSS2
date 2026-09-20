@@ -31,7 +31,8 @@ training:
   target_modules: q_proj,k_proj,v_proj,o_proj
 
   logging_steps: 10
-  save_steps: 250
+  save_steps: 50    # keeps checkpoint-250/500/700/750/1000 (each ~15MB, trainable only)
   eval_steps: 250
+  save_total_limit: 0   # keep ALL checkpoints (c*_merge selection needs them)
 
   max_steps: 1000

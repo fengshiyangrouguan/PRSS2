@@ -211,6 +211,7 @@ class SlotLedger:
                  failure_message: Optional[str] = None,
                  archive_admitted: Optional[bool] = None,
                  archive_rejection_reason: Optional[str] = None,
+                 material_path: Optional[str] = None,
                  fresh_task_ids: Sequence[str] = (),
                  inherited_task_ids: Sequence[str] = (),
                  outer_calls: int = 0, inner_calls: int = 0,
@@ -249,6 +250,11 @@ class SlotLedger:
             "failure_class": failure_class, "failure_message": failure_message,
             "archive_admitted": archive_admitted,
             "archive_rejection_reason": archive_rejection_reason,
+            # §5: rejected/failed proposals keep enough immutable material
+            # OUTSIDE the search archive to reconstruct an executable child, so
+            # the canonical audit can still evaluate them. The path is what
+            # makes "not restricted to archive survivors" enforceable.
+            "material_path": material_path,
             "fresh_task_ids": list(fresh_task_ids),
             "inherited_task_ids": list(inherited_task_ids),
             "outer_calls": int(outer_calls), "inner_calls": int(inner_calls),

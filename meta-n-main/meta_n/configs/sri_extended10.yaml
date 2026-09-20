@@ -36,6 +36,16 @@ reasoning_effort: low
 temperatures: [0.5, 0.7, 0.9]
 novelty_alpha: 0.3
 
+# Execution concurrency -- PINNED because it is result-affecting for
+# CO-Bench: a task's dev score is "#instances finishing inside the 10s
+# timeout / #instances", so a different worker count means a different
+# score from the same script (measured: assignment_problem 0.5000 at the
+# search's resolved 8, 0.2500 at a contended setting). 1 keeps every
+# instance unshared and minimises load-driven timeouts.
+# 0 is refused: it would resolve to cpu_count, i.e. machine-dependent.
+parallel: 1
+instance_workers: 1
+
 # consolidate=true SKIPS the gate, so gate_tasks must be 0 (a profile that
 # claims an active gate that can never run is refused at load).
 consolidate: true

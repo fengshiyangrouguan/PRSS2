@@ -366,8 +366,11 @@ def stage_root(args, profile: SRIProfile, out: Path) -> dict:
         max_tokens=profile.max_tokens,
         reasoning_effort=profile.reasoning_effort,
         data_dir_name_of=name_of,
+        # config.json carries the RESOLVED value now (the profile pins it and
+        # the command passes it), not the raw 0 that used to mean cpu_count.
         worker_config={"parallel": cfg.get("parallel"),
-                       "instance_workers": cfg.get("instance_workers")},
+                       "instance_workers": cfg.get("instance_workers"),
+                       "source": "pinned_in_profile"},
         repo_dir=Path(__file__).resolve().parent.parent)
     rb = root_bundle_sha256(bundle)
     (out / "root_bundle.json").write_text(
@@ -998,7 +1001,7 @@ def make_evaluator(args, profile: SRIProfile, *, split: str = "dev"):
         return MockEvaluator(slugs)
     return COBenchEvaluator(
         slugs, name_of=name_of, data_dir=args.data_dir, timeout=args.timeout,
-        instance_workers=args.instance_workers,
+        instance_workers=profile.instance_workers,
         deterministic_cache=(profile.deterministic_evaluator_caches_repeats
                             and split == "dev"),
         dev_repeats=profile.audit_repeats)
@@ -1089,6 +1092,15 @@ def stage_audit(args, profile: SRIProfile, out: Path) -> dict:
                              dev_score_of=lambda c: c.get("mean_score"))
         paths = res.write(out / "audit" / arm)
         res.metrics["evaluator_mode"] = evaluator.mode
+        res.metrics["execution_config"] = {
+            "instance_workers": int(profile.instance_workers),
+            "parallel": int(profile.parallel),
+            "instance_timeout_s": int(args.timeout),
+            "note": "pinned from the profile so the search and the audit score "
+                    "under the same per-instance budget; a CO-Bench dev score "
+                    "is a count of instances finishing inside the timeout, so a "
+                    "different worker count yields a different score",
+        }
         res.metrics["evaluator_calls"] = int(getattr(evaluator, "calls", 0))
         res.metrics["evaluator_fresh_executions"] = int(
             getattr(evaluator, "fresh", 0))
@@ -1362,8 +1374,11 @@ def main() -> int:
                          "its artifacts are stamped and never pooled with real "
                          "ones")
     ap.add_argument("--data-dir", default=DEFAULT_DATA_DIR)
+    # Instance timeout: NOT a CLI flag on the search side either -- it is the
+    # COBenchAdapter default, so 10 is what BOTH sides use. It IS
+    # result-affecting (a task's dev score is a count of instances finishing
+    # inside this budget), so it is recorded in every audit artifact.
     ap.add_argument("--timeout", type=int, default=10)
-    ap.add_argument("--instance-workers", type=int, default=2)
     args = ap.parse_args()
 
     profile = load_profile(default_profile_path(args.profile))

@@ -74,7 +74,7 @@ def _args(out: Path, **over):
     base = dict(profile="sri_primary6", backbone="gpt-5.5", search_seed=0,
                 out=str(out), stage="all", gamma_checkpoint=None,
                 execute=True, allow_inert_pairing=False, evaluator="mock",
-                data_dir="./data/co_bench", timeout=10, instance_workers=2)
+                data_dir="./data/co_bench", timeout=10)
     base.update(over)
     return argparse.Namespace(**base)
 

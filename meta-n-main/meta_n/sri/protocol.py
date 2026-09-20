@@ -196,6 +196,20 @@ class SRIProfile:
     empty_retry_max_tokens: int
     max_retries: int
     reasoning_effort: str
+    # -- execution concurrency, pinned so the SEARCH and the AUDIT agree -----
+    # These are not cosmetic. Leaving `instance_workers` unset made the search
+    # resolve it to min(cpu_count, 8) while the audit defaulted to 2 -- and for
+    # CO-Bench the dev score of a slow task is literally
+    # "#instances finishing inside the 10s timeout / #instances", so the two
+    # sides were scoring under different timeouts-per-instance. Measured on the
+    # real data: `assignment_problem` scored 0.5000 under the search's
+    # configuration and 0.2500 under a contended one, from the SAME
+    # deterministic script (`assign400/700/p3000` -> "Timeout (10s)").
+    #
+    # `0` is refused on purpose: 0 means "resolve to cpu_count", which is a
+    # machine-dependent number and therefore not a reproducible parameter.
+    parallel: int
+    instance_workers: int
     temperatures: Tuple[float, ...]
     novelty_alpha: float
     # -- gate / consolidation knobs (§8) ------------------------------------
@@ -245,6 +259,12 @@ class SRIProfile:
             raise ProtocolError("empty_retry_max_tokens must be >= 0")
         if int(self.max_retries) < 0:
             raise ProtocolError("max_retries must be >= 0")
+        for k in ("parallel", "instance_workers"):
+            if int(getattr(self, k)) < 1:
+                raise ProtocolError(
+                    "{} must be >= 1: 0 means 'resolve to cpu_count', which is "
+                    "machine-dependent and would let the search and the audit "
+                    "score under different configurations".format(k))
         if int(self.gate_tasks) < 0:
             raise ProtocolError("gate_tasks must be >= 0 (0 disables the gate)")
         if self.gate_margin is not None and not isinstance(
@@ -737,6 +757,8 @@ CONFIG_KEY_TO_CLI: Dict[str, str] = {
     "novelty_alpha": "--novelty-alpha",
     "elite_rotation": "--elite-rotation",
     "temperatures": "--temperatures",
+    "parallel": "--parallel",
+    "instance_workers": "--instance-workers",
 }
 
 # Flags that accept an explicit `--no-` form (argparse.BooleanOptionalAction).
@@ -799,6 +821,8 @@ def pinned_run_config(profile: SRIProfile, *, backbone: str, search_seed: int,
         "novelty_alpha": float(profile.novelty_alpha),
         "elite_rotation": bool(profile.elite_rotation),
         "temperatures": [float(t) for t in profile.temperatures],
+        "parallel": int(profile.parallel),
+        "instance_workers": int(profile.instance_workers),
     }
 
 
@@ -943,6 +967,7 @@ def _demo_profile(**over) -> SRIProfile:
         search_seeds=(0, 1, 2, 3, 4), search_eval_repeats=3, audit_repeats=3,
         test_repeats=3, max_tokens=1024, empty_retry_max_tokens=0,
         max_retries=0, reasoning_effort="low",
+        parallel=1, instance_workers=1,
         temperatures=(0.5, 0.7, 0.9), novelty_alpha=0.3, consolidate=True,
         gate_tasks=0, gate_repeats=1, gate_margin=0.0, protect_floor=None,
         regression_guard=True, regression_guard_repeats=3,

@@ -203,6 +203,37 @@ def arm_order_for_seed(search_seed: int) -> Tuple[str, str]:
     return ARMS if int(search_seed) % 2 == 0 else tuple(reversed(ARMS))
 
 
+def assert_root_not_degenerate(dev_scores, log_path=None) -> None:
+    """Refuse a root whose seed scored nothing.
+
+    Observed live: the provider rejected every generation call, meta-n still
+    wrote a candidate plus six trace files, and the seed scored exactly 0.0 on
+    every cohort task. `stage_root` computed the bundle and carried on, so both
+    arms then searched from a root that means nothing -- the whole experiment
+    void, with every stage reporting success.
+
+    A root the arms inherit is the one artefact that cannot be wrong, so this
+    fails closed. All-zero per-task scores are the signature of FAILED GENERATION
+    (every task's solver raised), not of a weak solver.
+    """
+    scores = dict(dev_scores or {})
+    per_task = {k: v for k, v in scores.items() if k != "__macro__"}
+    macro = scores.get("__macro__")
+    numeric = isinstance(macro, (int, float)) and not isinstance(macro, bool)
+    all_zero = bool(per_task) and all(
+        isinstance(v, (int, float)) and float(v) == 0.0
+        for v in per_task.values())
+    if (not numeric or not math.isfinite(float(macro)) or float(macro) <= 0.0
+            or all_zero):
+        raise StageError(
+            "the shared root is DEAD: its seed scored macro={} per-task={}. "
+            "Every cohort task at 0.0 means the GENERATION calls failed, not "
+            "that the solver is weak, and a root both arms inherit cannot be "
+            "meaningless. Look for `model_not_provisioned` / "
+            "`capacity_unavailable` in {}: the provider was not answering.".format(
+                macro, per_task, log_path))
+
+
 class StageError(RuntimeError):
     """A stage refused to run: its inputs changed or a prior stage is missing."""
 
@@ -397,11 +428,15 @@ def build_arm_cmd(args, profile: SRIProfile, out: Path, arm: str,
             + render_pinned_flags(pinned)
             + ["--no-test-eval", "--bench-data-dir", str(args.data_dir),
                "--resume", "--base-url", ep["base_url"],
-               # THE treatment. It lives outside `shared`/`pinned` (it is the one
-               # thing the arms may differ in), so it must be rendered here --
-               # without it main.py falls back to `--reduction-mode official` and
-               # the predictive arm silently runs the official method.
+               # The treatment, which lives outside `shared`/`pinned` (the one
+               # thing the arms may differ in) and so must be rendered here.
+               # Without --reduction-mode, main.py falls back to its `official`
+               # default and the predictive arm silently runs the official
+               # method; without --gamma-checkpoint, main.py's mandatory-Gamma
+               # guard aborts the arm outright. Both flags were missing once.
                "--reduction-mode", arm,
+               *(["--gamma-checkpoint", str(args.gamma_checkpoint)]
+                 if arm == "predictive" and args.gamma_checkpoint else []),
                "--output-dir", str(out / "arms"),
                "--exp-name", arm, "--sri-context", str(context_file)])
 
@@ -523,6 +558,7 @@ def stage_root(args, profile: SRIProfile, out: Path) -> dict:
             "the shared root has no program for cohort task(s) {}; a root "
             "missing cohort material cannot seed a matched comparison".format(
                 missing))
+    assert_root_not_degenerate(bundle["dev_scores"], log)
     inherited = sha256_of(root_candidate_digest(exp / "archive",
                                                 slugs))
     print("root bundle sha256 = {}".format(rb))

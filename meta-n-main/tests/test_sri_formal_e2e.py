@@ -771,6 +771,54 @@ def test_every_command_carries_its_own_reduction_mode():
         assert cmds["root"][cmds["root"].index("--exp-name") + 1] == "phaseH_root"
 
 
+def test_predictive_arm_carries_the_gamma_checkpoint_and_official_does_not():
+    """The Gamma identity belongs to the predictive arm alone.
+
+    It lives outside the profile's `pinned` block (it is a TREATMENT field), and
+    when the runner was rewritten to render its parameters from the profile,
+    nothing rendered `--gamma-checkpoint` either -- so the predictive arm died on
+    main.py's mandatory-Gamma guard, every time.
+    """
+    with tempfile.TemporaryDirectory() as td:
+        out = Path(td)
+        ckpt = out / "gamma.pt"
+        ckpt.write_bytes(b"stub")
+        args = _args(out, gamma_checkpoint=str(ckpt))
+        pre = R.build_arm_cmd(args, PROFILE, out, "predictive", out / "c.json")
+        off = R.build_arm_cmd(args, PROFILE, out, "official", out / "c.json")
+        assert "--gamma-checkpoint" in pre
+        assert pre[pre.index("--gamma-checkpoint") + 1] == str(ckpt)
+        assert "--gamma-checkpoint" not in off, off
+        # ...and a predictive arm with no checkpoint on the runner's CLI is not
+        # silently launched without one: the flag is absent, and stage_arm's own
+        # check refuses it before dispatch.
+        bare = _args(out, gamma_checkpoint=None)
+        assert "--gamma-checkpoint" not in R.build_arm_cmd(
+            bare, PROFILE, out, "predictive", out / "c.json")
+
+
+def test_a_dead_root_is_refused():
+    """A root whose seed scored 0.0 everywhere is FAILED GENERATION, not a weak
+    solver -- and both arms would inherit it."""
+    # the live signature: every cohort task at exactly 0.0
+    dead = {t: 0.0 for t in COHORT}
+    dead["__macro__"] = 0.0
+    try:
+        R.assert_root_not_degenerate(dead, "/tmp/root.log")
+        raise AssertionError("a dead root was accepted")
+    except R.StageError as e:
+        assert "DEAD" in str(e) and "generation" in str(e).lower()
+    # a genuinely weak but EXECUTED root is fine: it ran and scored something
+    R.assert_root_not_degenerate(
+        dict({t: 0.05 for t in COHORT}, __macro__=0.05))
+    # a missing macro (no scores at all) is not fine either
+    try:
+        R.assert_root_not_degenerate({t: None for t in COHORT}, None)
+        raise AssertionError("a root with no scores was accepted")
+    except R.StageError:
+        pass
+
+
 def _main() -> int:
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for fn in fns:

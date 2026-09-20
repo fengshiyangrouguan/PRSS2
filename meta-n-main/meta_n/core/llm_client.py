@@ -30,6 +30,7 @@ from dataclasses import dataclass
 from json import JSONDecodeError
 
 from openai import (
+    BadRequestError,
     APIConnectionError,
     APITimeoutError,
     AsyncAzureOpenAI,
@@ -802,14 +803,26 @@ class LLMClient:
                     )
                 return text, pt, ct, tt
             except (NotFoundError, APIConnectionError, APITimeoutError,
-                    JSONDecodeError, RateLimitError, InternalServerError) as e:
+                    JSONDecodeError, RateLimitError, InternalServerError,
+                    BadRequestError) as e:
+                # A 400 is normally a client error and must NOT be retried. This
+                # relay is the exception: it serves `model_not_provisioned` and
+                # `capacity_unavailable` intermittently for a model that answered
+                # correctly minutes earlier, which killed a several-hour run on a
+                # single flaky response. Only those two bodies are retryable.
+                if isinstance(e, BadRequestError) and not (
+                        "model_not_provisioned" in str(e)
+                        or "capacity_unavailable" in str(e)):
+                    raise
                 async with self._usage_lock:
                     self.cumulative_usage["failed_calls"] += 1
                 last_error = e
                 if attempt < self.config.max_retries:
                     # Use a longer base delay for rate-limit/server errors
                     # since the upstream provider needs time to recover.
-                    is_throttle = isinstance(e, (RateLimitError, InternalServerError))
+                    is_throttle = isinstance(
+                        e, (RateLimitError, InternalServerError)) or (
+                        isinstance(e, BadRequestError))
                     base = max(self.config.retry_base_delay, 15.0) if is_throttle else self.config.retry_base_delay
                     delay = min(base * (2 ** attempt), self.config.retry_max_delay)
                     sleep_time = delay * random.uniform(0.5, 1.5)

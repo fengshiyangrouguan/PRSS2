@@ -185,7 +185,7 @@ class Gemma4DialogueDataset:
         target = list(dialog[-1]) + list(self.eos_token)
         prompt = list(self.bos_token) + prompt
         return {"input_ids": prompt, "output_ids": target,
-                "orig": item["orig"][:len(dialog)], "split": item["split"],
+                "orig": item["orig"][:len(dialog)] if "orig" in item else None, "split": item.get("split"),
                 "act": item["act"][:len(dialog)]
                 if "act" in item else None}
 

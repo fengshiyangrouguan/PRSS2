@@ -210,7 +210,7 @@ class Qwen3DialogueDataset:
             self.tokenizer("<|im_end|>",
                            add_special_tokens=False)["input_ids"]
         return {"input_ids": prompt, "output_ids": target,
-                "orig": item["orig"][:k], "split": item["split"],
+                "orig": item["orig"][:k] if "orig" in item else None, "split": item.get("split"),
                 "act": item["act"][:k] if "act" in item else None}
 
 

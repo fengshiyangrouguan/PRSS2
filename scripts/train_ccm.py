@@ -431,7 +431,7 @@ def build_tokenizer(args):
         added = [f"<COMP{k}>" for k in range(N_TOK)] \
             + [f"<SUM{k}>" for k in range(N_TOK)]
         tok.add_special_tokens({"additional_special_tokens": added})
-        ids = tok.additional_special_tokens_ids[-2 * N_TOK:]
+        ids = [tok.convert_tokens_to_ids(f"<COMP{k}>") for k in range(N_TOK)]  + [tok.convert_tokens_to_ids(f"<SUM{k}>") for k in range(N_TOK)]
         assert ids[0] >= cfg_vocab, \
             "comp ids must exceed config.vocab_size for SeparatedEmbedding"
         tok.comp_token_id = ids[:N_TOK]
@@ -463,7 +463,7 @@ def build_tokenizer(args):
         added = [f"<COMP{k}>" for k in range(N_TOK)] \
             + [f"<SUM{k}>" for k in range(N_TOK)]
         tok.add_special_tokens({"additional_special_tokens": added})
-        ids = tok.additional_special_tokens_ids[-2 * N_TOK:]
+        ids = [tok.convert_tokens_to_ids(f"<COMP{k}>") for k in range(N_TOK)]  + [tok.convert_tokens_to_ids(f"<SUM{k}>") for k in range(N_TOK)]
         assert ids[0] >= cfg_vocab, \
             "comp ids must exceed config.vocab_size (resize route)"
         tok.comp_token_id = ids[:N_TOK]
@@ -481,7 +481,7 @@ def build_tokenizer(args):
     added = [f"<COMP{k}>" for k in range(N_TOK)] \
         + [f"<SUM{k}>" for k in range(N_TOK)]
     tok.add_special_tokens({"additional_special_tokens": added})
-    ids = tok.additional_special_tokens_ids[-2 * N_TOK:]
+    ids = [tok.convert_tokens_to_ids(f"<COMP{k}>") for k in range(N_TOK)]  + [tok.convert_tokens_to_ids(f"<SUM{k}>") for k in range(N_TOK)]
     tok.comp_token_id = ids[:N_TOK]
     tok.sum_token_id = ids[N_TOK:]
     return tok

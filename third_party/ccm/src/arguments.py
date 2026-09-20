@@ -328,7 +328,14 @@ class Arguments:
 
 
 cs = ConfigStore.instance()
-cs.store(name="base_config", node=Arguments)
+try:
+    cs.store(name="base_config", node=Arguments)
+except Exception:
+    # transformers 5.x TrainingArguments fields (trackio_static_space_id
+    # etc.) are not parseable by omegaconf 2.3; the hydra entry point is
+    # retired on the 5.x stack (self-contained training loops instead),
+    # so the config-store registration is best-effort dead code.
+    pass
 
 
 def global_setup(args: DictConfig) -> Arguments:

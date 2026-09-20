@@ -630,11 +630,23 @@ def environment_fingerprint(*, worker_config: Optional[Mapping[str, Any]] = None
     """
     import os
     import platform
+    # Load average is recorded because it is a MEASURED confound, not a
+    # decoration: a CO-Bench dev score counts instances finishing inside the 10s
+    # budget and the generated solvers race a wall-clock deadline, so the same
+    # script scores differently on a busy box (measured 2026-09-20:
+    # assignment_problem 0.5000 idle vs 0.2500 under load, identical code). Two
+    # runs whose fingerprints differ here are not strictly comparable; this is
+    # what makes that visible after the fact.
+    try:
+        loadavg: Any = list(os.getloadavg())        # absent on Windows
+    except (AttributeError, OSError):
+        loadavg = None
     fp: Dict[str, Any] = {
         "python": platform.python_version(),
         "platform": platform.platform(),
         "machine": platform.machine(),
         "cpu_count": os.cpu_count(),
+        "loadavg_1_5_15": loadavg,
         "worker_config": dict(worker_config or {}),
     }
     for mod in ("numpy", "torch", "transformers"):

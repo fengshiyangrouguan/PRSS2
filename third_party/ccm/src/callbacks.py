@@ -9,7 +9,7 @@ try:
 except:
     from transformers import TrainerCallback
     from transformers.integrations import WandbCallback
-from transformers.utils import is_torch_tpu_available, logging
+from transformers.utils import logging
 
 from .arguments import Arguments
 
@@ -63,7 +63,7 @@ class CustomWandbCallback(WandbCallback):
                 self._wandb.define_metric("*", step_metric="train/global_step", step_sync=True)
 
             # keep track of model topology and gradients, unsupported on TPU
-            if not is_torch_tpu_available() and os.getenv("WANDB_WATCH") != "false":
+            if os.getenv("WANDB_WATCH") != "false":
                 self._wandb.watch(
                     model,
                     log=os.getenv("WANDB_WATCH", "gradients"),

@@ -34,12 +34,12 @@ from transformers.trainer_utils import (
     has_length,
     speed_metrics,
 )
-from transformers.utils import is_torch_tpu_available, logging
+from transformers.utils import logging
 from .data.lamp.utils import classification_candidates
 
 logger = logging.get_logger(__name__)
 
-if is_torch_tpu_available(check_device=False):
+if False:
     import torch_xla.core.xla_model as xm  # type: ignore
     import torch_xla.debug.metrics as met
     import torch_xla.distributed.parallel_loader as pl  # type: ignore
@@ -354,7 +354,7 @@ class CompSeq2SeqTrainer(Seq2SeqTrainer):
         # Do this before wrapping.
         eval_dataset = getattr(dataloader, "dataset", None)
 
-        if is_torch_tpu_available():
+        if False:
             dataloader = pl.ParallelLoader(dataloader, [args.device]).per_device_loader(args.device)
 
         if args.past_index >= 0:
@@ -399,7 +399,7 @@ class CompSeq2SeqTrainer(Seq2SeqTrainer):
                 else:
                     inputs_decode = self._prepare_input(inputs["input_ids"])
 
-            if is_torch_tpu_available():
+            if False:
                 xm.mark_step()
 
             # Update containers on host

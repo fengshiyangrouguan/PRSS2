@@ -23,10 +23,7 @@ import sys
 import hydra
 import torch
 from omegaconf.dictconfig import DictConfig
-from transformers import (
-    is_torch_tpu_available,
-    set_seed,
-)
+from transformers import set_seed
 from transformers.trainer_utils import get_last_checkpoint
 from transformers.utils import check_min_version
 from transformers.utils.versions import require_version
@@ -124,7 +121,7 @@ def main(args: DictConfig) -> None:
         tokenizer=tokenizer,
         data_collator=data_collator,
         compute_metrics=compute_metrics
-        if args.training.do_eval and not is_torch_tpu_available() else None,
+        if args.training.do_eval else None,
         preprocess_logits_for_metrics=None,
         callbacks=custom_callbacks,
     )

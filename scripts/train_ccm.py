@@ -2077,6 +2077,54 @@ def main():
                     g_task_gamma = [
                         task_grads.get(id(p), torch.zeros_like(p))
                         for p in gamma_params]
+                    if os.environ.get("CCM_TREEWISE_PROBE") == "1" \
+                            and dirs:
+                        # Audit (review): cos(g_task, g_v) distribution
+                        # on the CURRENT window — answers whether the
+                        # treewise constraint would actually bind.
+                        # Constraint semantics: t = -g_task, row g_j,
+                        # g_j.d >= -kappa||g_j||||t|| i.e.
+                        # cos(g_j, g_task) <= +kappa is the safe side;
+                        # BOTH tails are reported for reviewer judgement.
+                        import numpy as _np
+                        _t_flat = torch.cat(
+                            [x.reshape(-1).float()
+                             for x in g_task_gamma])
+                        _nt = float(_t_flat.norm())
+                        _G = torch.stack(dirs)
+                        _nr = _G.norm(dim=1)
+                        _cos = ((_G @ _t_flat)
+                                / (_nr * _nt).clamp(min=1e-12)).tolist()
+                        _cos = [float(c) for c in _cos]
+                        _a = _np.array(_cos)
+                        _probe = {
+                            "n_dirs": int(len(_cos)),
+                            "cos_mean": float(_a.mean()),
+                            "cos_med": float(_np.median(_a)),
+                            "cos_min": float(_a.min()),
+                            "cos_max": float(_a.max()),
+                            "frac_below_neg_kappa": float(
+                                (_a < -args.rpbe_kappa).mean()),
+                            "frac_above_pos_kappa": float(
+                                (_a > args.rpbe_kappa).mean()),
+                            "kappa": float(args.rpbe_kappa),
+                            "cos_list": _cos,
+                        }
+                        with (out / "treewise_probe.json").open("w") \
+                                as _f:
+                            json.dump(_probe, _f, indent=2)
+                        print("[treewise-probe] n={} mean={:.4f} "
+                              "med={:.4f} frac<-k={:.3f} frac>+k={:.3f} "
+                              "min={:.4f} max={:.4f}".format(
+                                  _probe["n_dirs"], _probe["cos_mean"],
+                                  _probe["cos_med"],
+                                  _probe["frac_below_neg_kappa"],
+                                  _probe["frac_above_pos_kappa"],
+                                  _probe["cos_min"], _probe["cos_max"]),
+                              flush=True)
+                        raise SystemExit(
+                            "CCM_TREEWISE_PROBE: window probed, "
+                            "no optimizer step executed")
                     proj_ok, proj_diag = treewise_feasibility_projection(
                         g_task_gamma, gamma_params,
                         torch.stack(dirs) if dirs else None,

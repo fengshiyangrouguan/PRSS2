@@ -74,24 +74,31 @@ def build_eval_dataset(args, tokenizer, pooled, online, comp_type):
     return dialog, comp_args
 
 
-def build_collator(dialog, tokenizer, comp_args, comp_type, sum_recur):
+def build_collator(dialog, tokenizer, comp_args, comp_type, sum_recur,
+                   ref_mode=False):
     comp_args.comp_type = comp_type
     if getattr(tokenizer, "_qwen3_host", False):
         from src.data.dialogue.qwen3_data import Qwen3DialogueCollator
+        # ref_mode: the RAW backbone's vocab has no comp/sum rows —
+        # injecting those ids trips a CUDA embedding assert.
+        comp_token = [] if ref_mode else tokenizer.comp_token_id
+        sum_token = [] if ref_mode else tokenizer.sum_token_id
         return Qwen3DialogueCollator(
             dataset=dialog, tokenizer=tokenizer, comp_args=comp_args,
-            comp_token=tokenizer.comp_token_id,
-            sum_token=tokenizer.sum_token_id,
+            comp_token=comp_token,
+            sum_token=sum_token,
             pad_token=tokenizer.pad_token_id,
             label_pad_token_id=-100,
             online=comp_type == "online",
             neg_control=comp_type == "neg_control")
     if getattr(tokenizer, "_gemma4_host", False):
         from src.data.dialogue.gemma4_data import Gemma4DialogueCollator
+        comp_token = [] if ref_mode else tokenizer.comp_token_id
+        sum_token = [] if ref_mode else tokenizer.sum_token_id
         return Gemma4DialogueCollator(
-            dialog=dialog, tokenizer=tokenizer, comp_args=comp_args,
-            comp_token=tokenizer.comp_token_id,
-            sum_token=tokenizer.sum_token_id,
+            dataset=dialog, tokenizer=tokenizer, comp_args=comp_args,
+            comp_token=comp_token,
+            sum_token=sum_token,
             pad_token=tokenizer.pad_token_id,
             label_pad_token_id=-100,
             online=comp_type == "online",
@@ -404,7 +411,8 @@ def main():
     dialog_nc, comp_args_nc = build_eval_dataset(
         args, tokenizer, a.pooled, online=False, comp_type="online")
     collator_nc = build_collator(dialog_nc, tokenizer, comp_args_nc,
-                                 comp_type="online", sum_recur=False)
+                                 comp_type="online", sum_recur=False,
+                                 ref_mode=True)
     if args.host in ("qwen3", "gemma4"):
         # Qwen3/Gemma4 dialogue datasets store plain lists
         # ({"dialog": ...} items)

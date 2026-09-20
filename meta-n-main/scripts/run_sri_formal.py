@@ -198,7 +198,8 @@ def artifacts_sha256(arm_path: Path) -> Dict[str, Any]:
     """
     parts: Dict[str, Any] = {}
     for name in ("config.json", "summary.json", "lineage.json",
-                 "convergence.json", "checkpoint.json", LEDGER_NAME):
+                 "convergence.json", "oracle_convergence.json",
+                 "checkpoint.json", LEDGER_NAME):
         p = arm_path / name
         parts[name] = sha256_file(p) if p.is_file() else None
     parts["archive"] = _digest_of_tree(arm_path / "archive")
@@ -207,6 +208,13 @@ def artifacts_sha256(arm_path: Path) -> Dict[str, Any]:
 
 def artifacts_digest(arm_path: Path) -> str:
     return sha256_of(artifacts_sha256(arm_path))
+
+
+def read_jsonl(p: Path) -> List[dict]:
+    if not p.is_file():
+        return []
+    return [json.loads(line) for line in p.read_text(encoding="utf-8").splitlines()
+            if line.strip()]
 
 
 def read_json(p: Path) -> Optional[dict]:
@@ -1241,16 +1249,48 @@ def stage_final(args, profile: SRIProfile, out: Path) -> dict:
         test_result = {"test_scores": per_task, "test_mean_score": macro,
                        "missing_tasks": [t for t, v in per_task.items()
                                          if v is None]}
+        # §11: "iteration-wise archive best" and "calls, evaluations, tokens,
+        # wall-clock". The curve is the run's own convergence history -- index 0
+        # is the state after the SEED (the orchestrator appends once before the
+        # loop and once per iteration, so a T-iteration run has T+1 entries),
+        # and candidate wall-clock is the sum over the frozen slot rows, i.e.
+        # generation + gate + evaluation, NOT the whole run's wall-clock.
+        run_summary = read_json(arm_dir(out, arm) / "summary.json") or {}
+        history = list(run_summary.get("convergence_history") or [])
+        iteration_best = [{"iteration": j, "archive_best_dev": float(v)}
+                          for j, v in enumerate(history)]
+        tu = dict(run_summary.get("token_usage") or {})
+        slots_wall = 0.0
+        for row in read_jsonl(out / "frozen" / "{}.slots.jsonl".format(arm)):
+            try:
+                slots_wall += float(row.get("total_wall_seconds") or 0.0)
+            except (TypeError, ValueError):
+                pass
         pr = per_run_metrics(
             selected=sel, test_result=test_result,
             audit_metrics=read_json(out / "audit" / arm / "metrics.json") or {},
             ledger_counts=read_stage_manifest(out)["freeze"]["outputs"][
                 "ledger_counts"][arm],
-            resource_use={"evaluator_calls": int(getattr(evaluator, "calls", 0)),
-                          "evaluator_fresh_executions": int(
-                              getattr(evaluator, "fresh", 0)),
-                          "test_repeats_declared": int(profile.test_repeats)},
+            resource_use={
+                "outer_calls": int(tu.get("outer_calls") or 0),
+                "inner_calls": int(tu.get("inner_calls") or 0),
+                "outer_tokens_total": int(tu.get("outer_total") or 0),
+                "inner_tokens_total": int(tu.get("inner_total") or 0),
+                "outer_tokens_prompt": int(tu.get("outer_prompt") or 0),
+                "outer_tokens_completion": int(tu.get("outer_completion") or 0),
+                "candidate_wall_seconds": round(slots_wall, 3),
+                "archive_size": int(run_summary.get("archive_size") or 0),
+                "run_status": run_summary.get("run_status"),
+                "evaluator_calls": int(getattr(evaluator, "calls", 0)),
+                "evaluator_fresh_executions": int(
+                    getattr(evaluator, "fresh", 0)),
+                "test_repeats_declared": int(profile.test_repeats),
+                "note": "calls/tokens are the SEARCH's own (summary.json); "
+                        "candidate_wall_seconds sums the frozen slots' "
+                        "generation+gate+evaluation time",
+            },
             archive_candidates=cands,
+            iteration_archive_best=iteration_best,
             dev_score_of=lambda c: c.get("mean_score"))
         pr["evaluator_mode"] = evaluator.mode
         pr["evaluator_cache_hits"] = int(getattr(evaluator, "cache_hits", 0))
@@ -1319,6 +1359,11 @@ def stage_aggregate(args, profile: SRIProfile, out: Path) -> dict:
                 environment_sha256=str(root.get("environment_sha256") or ""),
                 final_macro=fj["final"].get("final_test_macro_score"),
                 per_transition=dict(fj.get("R_valid") or {}),
+                depth_dev_best=dict(fj.get("exact_depth_dev_best") or {}),
+                depth_counts=dict(fj.get("exact_depth_counts") or {}),
+                iteration_best=[float(r.get("archive_best_dev"))
+                                for r in (fj.get("iteration_archive_best") or [])],
+                resources=dict(fj.get("resource_use") or {}),
                 payload={"evaluator_mode": fj.get("evaluator_mode"),
                          "selected": fj["final"].get("selected_candidate_id")}))
     if not runs:

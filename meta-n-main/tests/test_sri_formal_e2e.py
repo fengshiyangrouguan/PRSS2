@@ -122,8 +122,14 @@ def _slot_plan():
     return out
 
 
-def _fabricate_seed(out: Path, seed: int) -> dict:
-    """Write the root, both arms, and the stage records a real search would."""
+def _fabricate_seed(out: Path, seed: int, *, max_depth: int = None) -> dict:
+    """Write the root, both arms, and the stage records a real search would.
+
+    `max_depth` lets a seed be born with less depth coverage, so the cross-seed
+    depth table has to report a missing depth rather than average around it --
+    and it must be done HERE, at generation, not by editing a frozen artifact
+    afterwards (the freeze gate correctly refuses that).
+    """
     out.mkdir(parents=True, exist_ok=True)
     root_exp = R.root_exp_dir(out)
     archive = root_exp / "archive"
@@ -133,6 +139,8 @@ def _fabricate_seed(out: Path, seed: int) -> dict:
     # parents at every depth a slot can start from
     parents = sorted({(s["pd"], s["parent_slot"]) for s in plan})
     cands = [_add_candidate(archive, "gen0_seed", 1, 0.50)]
+    cap = max_depth if max_depth is not None else 99
+    parents = [p for p in parents if p[0] <= cap]
     for depth, ps in parents:
         cands.append(_add_candidate(archive, "p{}_{}".format(depth, ps), depth,
                                     0.50 + 0.01 * depth))
@@ -140,6 +148,8 @@ def _fabricate_seed(out: Path, seed: int) -> dict:
         # the ONE deliberately dropped child (no material anywhere) proves the
         # failure accounting is not silently zero
         if s["slot_id"] == "it2-p1-c1":
+            continue
+        if s["cd"] > cap:
             continue
         cands.append(_add_candidate(archive, "c_" + s["slot_id"], s["cd"],
                                     0.50 + 0.01 * s["cd"]))
@@ -151,8 +161,24 @@ def _fabricate_seed(out: Path, seed: int) -> dict:
          "per_task_best": {t: {"score": 0.99, "candidate_id": "merge_oracle"}
                            for t in COHORT},
          "candidates": cands}, indent=2, sort_keys=True), encoding="utf-8")
-    (root_exp / "summary.json").write_text(json.dumps({"mock": True}),
-                                           encoding="utf-8")
+    # a REAL run's summary.json: §11 takes `iteration_archive_best` from
+    # `convergence_history` and the resource totals from `token_usage`.
+    (root_exp / "summary.json").write_text(json.dumps(
+        {"archive_size": len(cands), "total_iterations": PROFILE.max_iterations,
+         "total_tokens": 1234,
+         "token_usage": {"outer_total": 1234, "outer_prompt": 900,
+                         "outer_completion": 334, "outer_calls": 7,
+                         "inner_total": 55, "inner_prompt": 40,
+                         "inner_completion": 15, "inner_calls": 3},
+         "best_mean_score": 0.99, "best_candidate_id": "merge_oracle",
+         "oracle_mean_score": 0.99, "test_mean_score": 0.0,
+         "chain_test_mean_score": 0.0,
+         "per_task_best_scores": {t: 0.99 for t in COHORT},
+         # T+1 entries: index 0 is the state after the seed, index j after
+         # iteration j (the orchestrator appends once before the loop and
+         # once per iteration)
+         "convergence_history": [0.50, 0.55, 0.57, 0.57, 0.60, 0.61, 0.62],
+         "run_status": "completed"}), encoding="utf-8")
     # the checkpoint the arms resume from: `try_resume` reads
     # `<out_dir>/checkpoint.json` and rebuilds the archive from `<out_dir>/archive`
     (root_exp / "checkpoint.json").write_text(json.dumps(
@@ -217,8 +243,11 @@ def _fabricate_seed(out: Path, seed: int) -> dict:
             else:
                 (ad / "archive").mkdir(parents=True, exist_ok=True)
                 (ad / "archive" / child.name).write_bytes(child.read_bytes())
-        (ad / "summary.json").write_text(json.dumps({"mock": True}),
-                                         encoding="utf-8")
+        # the ARM's own summary.json (a resumed arm runs its own 6 iterations;
+        # §11 reads the iteration curve and the resource totals from HERE)
+        (ad / "summary.json").write_text(
+            (root_exp / "summary.json").read_text(encoding="utf-8"),
+            encoding="utf-8")
         (ad / "checkpoint.json").write_text(
             (root_exp / "checkpoint.json").read_text(encoding="utf-8"),
             encoding="utf-8")
@@ -301,9 +330,9 @@ def _fabricate_seed(out: Path, seed: int) -> dict:
     return {"root_bundle_sha256": rb, "bundle": bundle}
 
 
-def _seed_dir(parent: Path, seed: int) -> Path:
+def _seed_dir(parent: Path, seed: int, **over) -> Path:
     d = parent / "s{}".format(seed)
-    _fabricate_seed(d, seed)
+    _fabricate_seed(d, seed, **over)
     return d
 
 
@@ -580,6 +609,88 @@ def test_cached_repeats_are_marked_and_the_test_split_never_caches():
     for r in range(3):
         ev3.evaluate("T1", "src_A", seed=r)
     assert ev3.cache_hits == 0 and ev3.fresh == 6
+
+
+def test_per_run_records_iteration_best_and_resources():
+    """§11 per-run: "iteration-wise archive best" and "calls, evaluations,
+    tokens, wall-clock and local overhead".
+
+    Both were declared in the design doc and never produced: `stage_final` did
+    not pass `iteration_archive_best` to `per_run_metrics` (so it was always
+    `[]`), and `resource_use` carried only evaluator call counts -- the
+    search's own calls, tokens and candidate-generation wall-clock were absent,
+    which is exactly the cost a paper has to report.
+    """
+    with tempfile.TemporaryDirectory() as td:
+        d = _seed_dir(Path(td), 0)
+        R.stage_freeze(_args(d), PROFILE, d)
+        R.stage_audit(_args(d), PROFILE, d)
+        R.stage_final(_args(d), PROFILE, d)
+        pr = json.loads((d / "final" / "official.json").read_text())
+
+        ib = pr["iteration_archive_best"]
+        assert len(ib) == PROFILE.max_iterations + 1, ib   # seed + T iterations
+        assert [r["iteration"] for r in ib] == list(
+            range(0, PROFILE.max_iterations + 1))
+        assert ib[0]["archive_best_dev"] == 0.50          # after the seed
+        assert ib[-1]["archive_best_dev"] == 0.62         # after iteration 6
+        assert "iteration" in pr["depth_vs_iteration_note"]
+
+        ru = pr["resource_use"]
+        for k in ("outer_calls", "inner_calls", "outer_tokens_total",
+                  "inner_tokens_total", "evaluator_calls"):
+            assert k in ru, (k, sorted(ru))
+        assert ru["outer_calls"] == 7 and ru["inner_calls"] == 3
+        assert ru["outer_tokens_total"] == 1234
+        assert ru["candidate_wall_seconds"] >= 0.0
+        assert "tokens" in pr["resource_use"]["note"]
+
+
+def test_aggregate_pools_depth_and_iteration_series_across_seeds():
+    """§11 cross-seed: the d1-d6 depth table and the iteration curve must come
+    out of the aggregator, with the SEED COUNT per point.
+
+    Silently omitting a depth is the failure mode to avoid: if one seed has no
+    candidate at depth 5, the table must say so rather than average the
+    remaining seeds and look complete.
+    """
+    with tempfile.TemporaryDirectory() as td:
+        parent = Path(td)
+        d0 = _seed_dir(parent, 0)
+        # seed 1 is GENERATED with a shallower archive, so the pooled table has
+        # to state that depth 6 has one seed rather than average around it
+        d1 = _seed_dir(parent, 1, max_depth=5)
+        for d in (d0, d1):
+            R.stage_freeze(_args(d), PROFILE, d)
+            R.stage_audit(_args(d), PROFILE, d)
+            R.stage_final(_args(d), PROFILE, d)
+
+        R.stage_aggregate(_args(parent), PROFILE, parent)
+        agg = json.loads((parent / "aggregate.json").read_text())
+
+        dep = agg["depth_by_arm"]["official"]
+        assert set(dep["dev_best"]) <= {str(x) for x in range(1, 7)}
+        for depth, entry in dep["dev_best"].items():
+            assert set(entry) >= {"mean", "n_seeds", "per_seed"}, entry
+            assert entry["n_seeds"] == len(entry["per_seed"])
+        # depth 6 is present in ONE seed only, and that is stated
+        assert dep["dev_best"]["6"]["n_seeds"] == 1, dep["dev_best"]["6"]
+        assert dep["dev_best"]["5"]["n_seeds"] == 2
+        assert "6" in dep["depth_missing_from_some_seed"], dep
+        assert dep["depth_missing_from_some_seed"]["6"] == [1]
+        assert abs(dep["counts"]["5"]["mean"]
+                   - sum(dep["counts"]["5"]["per_seed"].values())
+                   / len(dep["counts"]["5"]["per_seed"])) < 1e-9
+
+        it = agg["iteration_by_arm"]["official"]
+        assert it["archive_best"]["1"]["n_seeds"] == 2
+        assert abs(it["archive_best"]["6"]["mean"] - 0.62) < 1e-9
+        assert it["n_iterations_per_seed"]["0"] == PROFILE.max_iterations + 1
+
+        res = agg["resources_by_arm"]["official"]
+        assert res["outer_calls"]["per_seed"]["0"] == 7
+        assert res["outer_tokens_total"]["mean"] == 1234
+        assert "wall" in json.dumps(res).lower()
 
 
 def _main() -> int:

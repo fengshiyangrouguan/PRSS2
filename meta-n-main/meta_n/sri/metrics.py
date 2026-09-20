@@ -243,6 +243,13 @@ class SeedRun:
     final_macro: Optional[float] = None
     per_transition: Dict[str, Optional[float]] = field(default_factory=dict)
     payload: Dict[str, Any] = field(default_factory=dict)
+    # §11 per-run series that the cross-seed table is built from. A depth or an
+    # iteration missing from ONE seed must stay visible: averaging the seeds
+    # that happen to have it silently reports a table that looks complete.
+    depth_dev_best: Dict[str, float] = field(default_factory=dict)
+    depth_counts: Dict[str, int] = field(default_factory=dict)
+    iteration_best: List[float] = field(default_factory=list)
+    resources: Dict[str, Any] = field(default_factory=dict)
 
 
 def _assert_homogeneous(runs: Sequence[SeedRun]) -> None:
@@ -358,6 +365,72 @@ def aggregate(runs: Sequence[SeedRun]) -> Dict[str, Any]:
     pooled: Dict[str, Any] = {}
     for tr in sorted({k for r in runs for k in r.per_transition}):
         pooled[tr] = {"per_seed_rates": [r.per_transition.get(tr) for r in runs]}
+    depth_series: Dict[str, Any] = {}
+    iteration_series: Dict[str, Any] = {}
+    resource_series: Dict[str, Any] = {}
+    for arm, rs in sorted(by_arm.items()):
+        rs_sorted = sorted(rs, key=lambda x: x.search_seed)
+        n_seeds = len(rs_sorted)
+
+        # ---- exact-depth dev best / counts, pooled with the SEED COUNT -----
+        depths = sorted({d for r in rs_sorted for d in r.depth_dev_best},
+                        key=lambda x: int(x))
+        dev_best: Dict[str, Any] = {}
+        counts: Dict[str, Any] = {}
+        missing: Dict[str, List[int]] = {}
+        for d in depths:
+            vals = {r.search_seed: r.depth_dev_best[d]
+                    for r in rs_sorted if d in r.depth_dev_best}
+            dev_best[d] = {"mean": statistics.fmean(vals.values()),
+                           "n_seeds": len(vals), "per_seed": vals}
+            cv = {r.search_seed: r.depth_counts.get(d, 0)
+                  for r in rs_sorted if d in r.depth_counts}
+            counts[d] = {"mean": statistics.fmean(cv.values()) if cv else None,
+                         "n_seeds": len(cv), "per_seed": cv}
+            if len(vals) < n_seeds:
+                missing[d] = [r.search_seed for r in rs_sorted
+                              if d not in r.depth_dev_best]
+        depth_series[arm] = {
+            "n_seeds": n_seeds,
+            "dev_best": dev_best,
+            "counts": counts,
+            "depth_missing_from_some_seed": missing,
+            "note": "`n_seeds` per depth is the honest denominator: a depth "
+                    "absent from some seed is listed in "
+                    "`depth_missing_from_some_seed` and never averaged around",
+        }
+
+        # ---- iteration-wise archive best (§2.4) ---------------------------
+        max_len = max((len(r.iteration_best) for r in rs_sorted), default=0)
+        per_iter: Dict[str, Any] = {}
+        for j in range(max_len):
+            vals = {r.search_seed: r.iteration_best[j]
+                    for r in rs_sorted if j < len(r.iteration_best)}
+            per_iter[str(j)] = {"mean": statistics.fmean(vals.values()),
+                                "n_seeds": len(vals), "per_seed": vals}
+        iteration_series[arm] = {
+            "n_iterations_per_seed": {r.search_seed: len(r.iteration_best)
+                                      for r in rs_sorted},
+            "archive_best": per_iter,
+            "note": "iteration 0 is the state after the seed; entry j is the "
+                    "archive best after iteration j. This is a SEPARATE series "
+                    "from the structural depth table and must not be mixed "
+                    "with it (§2.4)",
+        }
+
+        # ---- resources (§11: calls, evaluations, tokens, wall-clock) ------
+        keys = sorted({k for r in rs_sorted for k in r.resources})
+        res: Dict[str, Any] = {}
+        for k in keys:
+            vals = {r.search_seed: r.resources[k]
+                    for r in rs_sorted if k in r.resources}
+            numeric = all(isinstance(v, (int, float)) for v in vals.values())
+            res[k] = {"per_seed": vals,
+                      "mean": (statistics.fmean(vals.values()) if numeric
+                               and vals else None)}
+        res["note"] = "search calls and tokens come from the run's summary.json; "                      "candidate_wall_seconds is the sum of the frozen slot "                      "wall-clock (generation + gate + evaluation), i.e. NOT "                      "the whole run's wall-clock"
+        resource_series[arm] = res
+
     return {
         "schema_version": METRICS_SCHEMA_VERSION,
         "cohort_id": runs[0].cohort_id,
@@ -368,6 +441,9 @@ def aggregate(runs: Sequence[SeedRun]) -> Dict[str, Any]:
         "per_arm": per_arm,
         "paired": paired,
         "pooled_transparency_only": pooled,
+        "depth_by_arm": depth_series,
+        "iteration_by_arm": iteration_series,
+        "resources_by_arm": resource_series,
         "notes": [
             "evaluation repeats are nested inside a seed and are never counted "
             "as independent search seeds (§3.3/§11)",

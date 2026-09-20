@@ -660,7 +660,7 @@ class Qwen3ForCausalLM_CCM(Qwen3PreTrainedModel):
     resize_token_embeddings grows both sides with the COMP/SUM rows.
     """
 
-    _tied_weights_keys = ["lm_head.weight"]
+    _tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}  # dict form required by transformers 5.x
 
     def __init__(self, config: Qwen3Config):
         super().__init__(config)

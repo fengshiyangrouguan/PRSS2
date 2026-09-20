@@ -28,7 +28,7 @@ from peft.tuners import (
     PromptEncoderConfig,
     PromptTuningConfig,
 )
-from peft.utils import PromptLearningConfig
+from peft.config import PromptLearningConfig  # peft>=0.21 location
 
 
 MODEL_TYPE_TO_PEFT_MODEL_MAPPING = {

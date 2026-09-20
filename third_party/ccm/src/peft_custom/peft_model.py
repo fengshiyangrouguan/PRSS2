@@ -36,13 +36,11 @@ from peft.tuners import (
     PromptEncoder,
 )
 from .lora import LoraModel
+from peft.config import (  # peft>=0.21 location
+    PeftConfig, PeftType, PromptLearningConfig, TaskType)
 from peft.utils import (
     TRANSFORMERS_MODELS_TO_PREFIX_TUNING_POSTPROCESS_MAPPING,
     WEIGHTS_NAME,
-    PeftConfig,
-    PeftType,
-    PromptLearningConfig,
-    TaskType,
     _set_adapter,
     _set_trainable,
     get_peft_model_state_dict,

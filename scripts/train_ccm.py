@@ -373,7 +373,7 @@ def enforce_frozen(args):
         raise SystemExit(
             "[frozen] lambda calibration must start from fresh theta_0; "
             "--calibrate-lambda and --resume-from are mutually exclusive")
-    lam = fz["rpbe"]["lambda_calibration"]["lambda_kf"]
+    lam = fz["rpbe"]["lambda_calibration"].get("lambda_kf")
     if args.arm == "ours":
         if lam is None:
             if not args.calibrate_lambda:

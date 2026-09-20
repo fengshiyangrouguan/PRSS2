@@ -628,6 +628,17 @@ def build_parser() -> argparse.ArgumentParser:
         help="Self-debug retries per failing task (0=disabled, default: 0)",
     )
     parser.add_argument(
+        "--llm-max-retries",
+        type=int,
+        default=3,
+        help="TRANSPORT retries inside LLMClient -- connection, timeout, 5xx and "
+             "throttle failures are re-issued up to this many times. Distinct "
+             "from --max-retries, which is the evolutionary path's self-debug "
+             "retry. Both arms must share one value, so the SRI profiles pin it "
+             "and it is recorded in config.json (default: 3, the LLMConfig "
+             "dataclass default it has always effectively been).",
+    )
+    parser.add_argument(
         "--retry-threshold",
         type=float,
         default=0.5,
@@ -1525,6 +1536,13 @@ def build_base_run_config(
         "n_few_shot": args.n_few_shot,
         "max_val": args.max_val,
         "max_retries": args.max_retries,
+        # Transport retries (LLMClient), as distinct from max_retries above.
+        # Recorded so the SRI runner's verify_run_config can prove both arms
+        # ran the same retry policy instead of inheriting a dataclass default.
+        # getattr: same reason as reasoning_effort -- hand-built arg namespaces
+        # (gpt52 drivers, test helpers) predate the flag. Real runs always carry
+        # it, because profile.render_pinned_flags emits it.
+        "llm_max_retries": getattr(args, "llm_max_retries", 3),
         "retry_threshold": args.retry_threshold,
         # F6: bench task selection is provenance recorded in the base config;
         # the evolutionary-only ablation flags are added inside the archive
@@ -1717,6 +1735,9 @@ async def async_main(args: argparse.Namespace):
         max_tokens=args.max_tokens,
         request_timeout=args.request_timeout,
         empty_content_retry_max_tokens=args.empty_retry_max_tokens,
+        # TRANSPORT retries (default 3 = the dataclass default this replaces).
+        # getattr: hand-built arg namespaces predate the flag.
+        max_retries=getattr(args, "llm_max_retries", 3),
         exclude_providers=args.exclude_providers,
         # getattr keeps hand-built arg namespaces valid (test helpers + the
         # gpt52 driver scripts construct a Namespace directly).

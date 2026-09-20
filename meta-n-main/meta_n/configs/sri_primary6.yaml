@@ -36,9 +36,28 @@ audit_repeats: 3             # canonical transition-audit repeats
 test_repeats: 3              # held-out repeats (stochastic evaluators only)
 
 # --- generation knobs (result-affecting; pinned, never inherited) ---------
-max_tokens: 1024
+#
+# 32768, not 1024 (changed 2026-09-21, measured). These Gemini routes count
+# hidden reasoning INSIDE the completion budget: the model reliably spends
+# 13k-27k tokens thinking before it emits a solver. At 1024 every call came
+# back finish_reason='length' and the extractor handed truncated fragments
+# (172-char stubs) downstream as if they were programs. 32768 leaves room for
+# the reasoning AND a few thousand tokens of visible answer.
+max_tokens: 32768
+# Kept 0 deliberately: finish_reason='length' is a HARD FAILURE that is counted
+# rather than silently rescued, so the admission criterion "no length in 18/18"
+# keeps its meaning. An escalation here would turn a failed call into a
+# first-attempt failure + retry success, which has to be reported separately.
 empty_retry_max_tokens: 0
+# Self-debug retries per failing task -- NOT transport retries. Conflating the
+# two is how a run's retry policy silently stops being reproducible; the
+# transport knob is `llm_max_retries` below.
 max_retries: 0
+# Transport retries inside LLMClient (connection / timeout / 5xx / throttle).
+# Pinned here so BOTH arms provably share one value and config.json records it.
+# Before this it was LLMConfig's dataclass default (3) and invisible to
+# verify_run_config, so no result file could prove the two arms matched.
+llm_max_retries: 2
 reasoning_effort: low
 temperatures: [0.5, 0.7, 0.9]
 novelty_alpha: 0.3

@@ -190,7 +190,8 @@ class _RecordingSeedSolver:
     def __init__(self):
         self.seeds: list[tuple[str, int | None]] = []
 
-    async def solve(self, task, seed=None, additional_context=""):
+    async def solve(self, task, seed=None, additional_context="",
+                    _verdict=None):
         self.seeds.append((task.task_id, seed))
         return ("script", "reasoning", 0)
 

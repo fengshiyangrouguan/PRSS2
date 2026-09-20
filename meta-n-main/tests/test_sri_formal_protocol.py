@@ -580,6 +580,12 @@ REAL_CONFIG_JSON_KEYS = [
     "gate_repeats",
     "gate_tasks",
     "instance_workers",
+    # Added with the transport-retry knob (2026-09-21). This fixture is a
+    # snapshot of a real config.json, so a newly RECORDED key belongs here --
+    # main.py writes llm_max_retries next to max_retries. If that write is ever
+    # dropped this test goes red again, which is the point: a key pinned for
+    # verification must exist in a real run's config.
+    "llm_max_retries",
     "max_depth",
     "max_docker",
     "max_iterations",

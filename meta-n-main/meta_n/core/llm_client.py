@@ -495,6 +495,7 @@ class LLMClient:
         max_tokens: int | None = None,
         *,
         seed: int | None = None,
+        _meta: dict | None = None,
     ) -> tuple[str, int]:
         """
         Send a chat completion request.
@@ -520,6 +521,7 @@ class LLMClient:
         """
         text, _, _, total = await self.complete_with_breakdown(
             messages, temperature=temperature, max_tokens=max_tokens, seed=seed,
+            _meta=_meta,
         )
         return text, total
 
@@ -534,6 +536,7 @@ class LLMClient:
         _empty_retry_done: bool = False,
         _logical_call_id: str | None = None,
         _parent_request_id: int | None = None,
+        _meta: dict | None = None,
     ) -> tuple[str, int, int, int]:
         """
         Same as :meth:`complete` but returns the input/output token split.
@@ -543,6 +546,17 @@ class LLMClient:
                 this call. Used by ``llm_helpers.make_llm_func`` to prevent
                 inner-LLM calls from double-logging — the inner path has
                 its own dedicated logger writing to a separate JSONL.
+            _meta: Optional out-parameter. When a dict is passed, it is filled
+                with this call's terminal metadata: ``finish_reason``,
+                ``attempts`` (transport attempts actually issued, so 1 means
+                "succeeded first try"), ``escalated``, ``reasoning_tokens`` and
+                ``reasoning_reported``. Rationale: ``finish_reason`` decides
+                whether a completion is TRUNCATED, and the caller cannot
+                otherwise tell a clean answer from a 172-character stub — the
+                extractors happily return the stub as if it were a program.
+                An out-parameter rather than a 5th return value because both
+                existing return signatures are load-bearing for every caller.
+                None (the default) leaves the call byte-identical.
 
         Returns:
             Tuple of (response_text, prompt_tokens, completion_tokens, total_tokens)
@@ -793,13 +807,34 @@ class LLMClient:
                     # and re-bill the already-successful base request.
                     empty_escalation = (pt, ct, tt, escalate_cap)
                     break
+                if _meta is not None:
+                    _meta.update({
+                        "finish_reason": finish_reason,
+                        "attempts": attempt + 1,
+                        "escalated": bool(_empty_retry_done),
+                        "reasoning_tokens": reasoning,
+                        "reasoning_reported": reasoning_reported,
+                        # The split rides here rather than being a second return
+                        # value, so a caller that only wants ``complete()``'s
+                        # (text, total) can still read it.
+                        "prompt_tokens": pt,
+                        "completion_tokens": ct,
+                        "total_tokens": tt,
+                    })
                 if self.io_logger is not None and not _suppress_io_log:
+                    # finish_reason and attempts are recorded on EVERY call, not
+                    # only interesting ones: a truncated completion is otherwise
+                    # indistinguishable in the audit trail from a clean one, and
+                    # "succeeded after a retry" cannot be reconstructed from the
+                    # token counts alone.
                     self.io_logger.log(
                         messages=messages, response=text,
                         model=self.config.model,
                         prompt_tokens=pt, completion_tokens=ct,
                         total_tokens=tt,
-                        extra={"cached_tokens": cached, "cost_usd": cost} if (cached or cost) else None,
+                        extra={"cached_tokens": cached, "cost_usd": cost,
+                               "finish_reason": finish_reason,
+                               "attempts": attempt + 1},
                     )
                 return text, pt, ct, tt
             except (NotFoundError, APIConnectionError, APITimeoutError,
@@ -852,6 +887,11 @@ class LLMClient:
             # propagates to the caller (it does NOT re-arm the parent loop /
             # re-bill the base request).
             pt, ct, tt, escalate_cap = empty_escalation
+            # The escalation is a SEPARATE round-trip on the same logical call,
+            # so its metadata is collected separately and merged below — the
+            # caller must be able to see that this call only succeeded after an
+            # escalation, not treat it as a clean first-try success.
+            esc_meta: dict = {}
             text2, pt2, ct2, tt2 = await self.complete_with_breakdown(
                 messages,
                 temperature=temperature,
@@ -862,6 +902,10 @@ class LLMClient:
                 # Same logical call, chained to the request it is escalating.
                 _logical_call_id=_logical_call_id,
                 _parent_request_id=_primary_request_id,
+                _meta=esc_meta,
             )
+            if _meta is not None:
+                _meta.update(esc_meta)
+                _meta["escalated"] = True
             return text2, pt + pt2, ct + ct2, tt + tt2
         raise last_error  # type: ignore[misc]

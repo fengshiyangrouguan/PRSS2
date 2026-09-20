@@ -40,9 +40,12 @@ audit_repeats: 1             # canonical transition-audit repeats
 test_repeats: 1              # held-out repeats (stochastic evaluators only)
 
 # --- generation knobs (result-affecting; pinned, never inherited) ---------
-max_tokens: 1024
+# 32768 / llm_max_retries 2 -- same rationale as sri_primary6.yaml (see there):
+# reasoning is billed inside the completion budget, 1024 truncated every call.
+max_tokens: 32768
 empty_retry_max_tokens: 0
 max_retries: 0
+llm_max_retries: 2
 reasoning_effort: low
 temperatures: [0.5, 0.7, 0.9]
 novelty_alpha: 0.3

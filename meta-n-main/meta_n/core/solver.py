@@ -14,6 +14,7 @@ from meta_n.core.prompts import (
     SOLVER_PROMPT_OPENEVOLVE,
     SOLVER_PROMPT_PYTHON,
 )
+from meta_n.core.solver_output import validate_solver_output
 
 logger = logging.getLogger(__name__)
 
@@ -127,6 +128,7 @@ class Layer1Solver:
         temperature: float | None = None,
         *,
         seed: int | None = None,
+        _verdict: dict | None = None,
     ) -> tuple[str, str, int]:
         """
         Generate a script to solve the task.
@@ -139,6 +141,11 @@ class Layer1Solver:
                 ``llm_client.complete``; a no-op unless the backend honours a
                 per-request seed. ``None`` (default) ⇒ existing behaviour
                 unchanged.
+            _verdict: Optional out-parameter filled with this call's validity
+                verdict -- ``ok``, ``reason`` (see ``solver_output``),
+                ``finish_reason`` and ``attempts``. The return type is unchanged
+                because four call sites unpack the 3-tuple; callers that must
+                act on an invalid program pass a dict and check ``ok``.
 
         Returns:
             Tuple of (script, reasoning, tokens_used)
@@ -185,10 +192,16 @@ class Layer1Solver:
             len(additional_context) if additional_context else 0,
         )
 
+        meta: dict = {}
+        # complete() rather than complete_with_breakdown(): the wire call is the
+        # same code, and the prompt/completion/reasoning split arrives through
+        # ``meta`` (see LLMClient(_meta=...)), so the call site stays exactly the
+        # one the seed-threading tests pin.
         response, tokens = await self.llm_client.complete(
             messages=[{"role": "user", "content": prompt}],
             temperature=0.3 if temperature is None else temperature,
             seed=seed,
+            _meta=meta,
         )
 
         if lang == "classify":
@@ -198,16 +211,50 @@ class Layer1Solver:
         else:
             script = self._extract_bash_script(response)
 
+        ok, reason = validate_solver_output(
+            script, lang, meta.get("finish_reason"))
+
         if not script.strip():
             logger.warning(
                 "Empty script extracted for task=%s (response_len=%d)",
                 task.task_id, len(response),
+            )
+        elif not ok:
+            # Not DEBUG: this is the difference between "the model produced a
+            # weak solution" and "the model produced no solution", and the two
+            # were previously indistinguishable here.
+            logger.warning(
+                "Invalid solver output for task=%s: %s "
+                "(response_len=%d script_len=%d finish_reason=%s attempts=%s)",
+                task.task_id, reason, len(response), len(script),
+                meta.get("finish_reason"), meta.get("attempts"),
             )
         else:
             logger.debug(
                 "Solved task=%s tokens=%d script_len=%d",
                 task.task_id, tokens, len(script),
             )
+
+        if _verdict is not None:
+            _verdict.update({
+                "ok": ok,
+                "reason": reason,
+                "finish_reason": meta.get("finish_reason"),
+                # attempts == 1 means the call succeeded on its FIRST wire
+                # attempt; anything higher means a transport retry rescued it.
+                # Kept here so "raw first-attempt success" can be reported
+                # separately from "succeeded after retry" instead of the retry
+                # being invisible.
+                "attempts": meta.get("attempts"),
+                "escalated": meta.get("escalated"),
+                "prompt_tokens": meta.get("prompt_tokens"),
+                "completion_tokens": meta.get("completion_tokens"),
+                "reasoning_tokens": meta.get("reasoning_tokens"),
+                "reasoning_reported": meta.get("reasoning_reported"),
+                "total_tokens": tokens,
+                "response_len": len(response),
+                "script_len": len(script),
+            })
         return script, response, tokens
 
     def _extract_bash_script(self, response: str) -> str:

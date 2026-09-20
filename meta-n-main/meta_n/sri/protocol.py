@@ -199,6 +199,13 @@ class SRIProfile:
     max_tokens: int
     empty_retry_max_tokens: int
     max_retries: int
+    # Transport retries inside LLMClient (connection / timeout / 5xx / throttle),
+    # as distinct from `max_retries` above, which is the evolutionary path's
+    # self-debug retry count. They are different mechanisms and were conflated:
+    # before this field the transport value was LLMConfig's dataclass default and
+    # never reached config.json, so no result file could show that both arms ran
+    # the same retry policy -- an unreproducible-vs-reproducible gap, not a knob.
+    llm_max_retries: int
     reasoning_effort: str
     # -- execution concurrency, pinned so the SEARCH and the AUDIT agree -----
     # These are not cosmetic. Leaving `instance_workers` unset made the search
@@ -270,6 +277,8 @@ class SRIProfile:
             raise ProtocolError("empty_retry_max_tokens must be >= 0")
         if int(self.max_retries) < 0:
             raise ProtocolError("max_retries must be >= 0")
+        if int(self.llm_max_retries) < 0:
+            raise ProtocolError("llm_max_retries must be >= 0 (transport retries)")
         for k in ("parallel", "instance_workers", "max_backend_requests"):
             if int(getattr(self, k)) < 1:
                 raise ProtocolError(
@@ -756,6 +765,7 @@ CONFIG_KEY_TO_CLI: Dict[str, str] = {
     "empty_retry_max_tokens": "--empty-retry-max-tokens",
     "max_depth": "--max-depth",
     "max_retries": "--max-retries",
+    "llm_max_retries": "--llm-max-retries",
     "reasoning_effort": "--reasoning-effort",
     "seed": "--seed",
     "benchmark": "--benchmark",
@@ -830,6 +840,7 @@ def pinned_run_config(profile: SRIProfile, *, backbone: str, search_seed: int,
         "empty_retry_max_tokens": int(profile.empty_retry_max_tokens),
         "max_depth": int(profile.max_depth),
         "max_retries": int(profile.max_retries),
+        "llm_max_retries": int(profile.llm_max_retries),
         "reasoning_effort": str(profile.reasoning_effort),
         "seed": int(search_seed),
         "benchmark": benchmark,
@@ -1017,8 +1028,8 @@ def _demo_profile(**over) -> SRIProfile:
         name="sri_primary6", cohort=PRIMARY6, beam_width=2, beam_candidates=2,
         max_iterations=6, max_depth=6, no_early_stop=True,
         search_seeds=(0, 1, 2, 3, 4), search_eval_repeats=3, audit_repeats=3,
-        test_repeats=3, max_tokens=1024, empty_retry_max_tokens=0,
-        max_retries=0, reasoning_effort="low",
+        test_repeats=3, max_tokens=32768, empty_retry_max_tokens=0,
+        max_retries=0, llm_max_retries=2, reasoning_effort="low",
         parallel=1, instance_workers=8, max_backend_requests=400,
         temperatures=(0.5, 0.7, 0.9), novelty_alpha=0.3, consolidate=True,
         gate_tasks=0, gate_repeats=1, gate_margin=0.0, protect_floor=None,

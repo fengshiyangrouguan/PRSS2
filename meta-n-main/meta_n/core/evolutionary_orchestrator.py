@@ -2592,8 +2592,38 @@ class EvolutionaryOrchestrator:
         ):
             return await solver.execute(task)
         start = time.time()
-        script, reasoning, tokens = await solver.solve(task, seed=seed)
-        trace = await self.executor.execute(script, task)
+        verdict: dict = {}
+        script, reasoning, tokens = await solver.solve(
+            task, seed=seed, _verdict=verdict)
+        if not verdict.get("ok", True):
+            # Reject BEFORE execution. A truncated ('length') or unparseable
+            # program is a model/provider failure, not task difficulty: running
+            # it anyway made the executor record a SyntaxError-driven 0.0, which
+            # the audit then reads as "the solver could not solve this task" --
+            # attributing a provider budget failure to the benchmark.
+            reason = verdict.get("reason") or "invalid"
+            logger.warning(
+                "Rejecting invalid solver output for %s before execution: %s "
+                "(finish_reason=%s attempts=%s response_len=%s script_len=%s)",
+                task.task_id, reason, verdict.get("finish_reason"),
+                verdict.get("attempts"), verdict.get("response_len"),
+                verdict.get("script_len"))
+            trace = Trace(
+                task_id=task.task_id,
+                script=script,
+                stdout="",
+                stderr=reason,
+                exit_code=-1,
+                success=False,
+                score=0.0,
+                error_summary="solver output invalid: {}".format(reason),
+                # A distinct class so the audit can count these separately from
+                # genuine execution failures instead of pooling them.
+                failure_class="solver_output_invalid",
+                duration_s=time.time() - start,
+            )
+        else:
+            trace = await self.executor.execute(script, task)
         trace.depth = 1
         trace.reasoning = reasoning
         trace.duration_s = time.time() - start

@@ -146,6 +146,22 @@ def assert_launch_env(args, profile: SRIProfile) -> Dict[str, Any]:
     return {"base_url": ep["base_url"], "api_key_present": True}
 
 
+def subprocess_env() -> Dict[str, str]:
+    """The environment an arm is launched with: the key, and ONLY in the env.
+
+    `--api-key` was used here first and it leaked: the smoke run's own process
+    listing showed the relay key to `ps`, i.e. to every other tenant on the
+    shared box, and command logs keep a copy. `OPENROUTER_API_KEY` is what the
+    client reads when no flag is passed, so the relay key is mapped onto it and
+    never appears in argv.
+    """
+    env = dict(os.environ)
+    key = os.environ.get("RELAY_API_KEY", "").strip()
+    if key:
+        env["OPENROUTER_API_KEY"] = key
+    return env
+
+
 def run_id_for(profile: SRIProfile, backbone: str, search_seed: int) -> str:
     """The run identity shared by the context file and the ledger reader.
 
@@ -328,7 +344,7 @@ def build_root_cmd(args, profile: SRIProfile, out: Path) -> List[str]:
     ep = launch_endpoint()
     return ([sys.executable, "-m", "meta_n.main"] + render_pinned_flags(pinned)
             + ["--no-test-eval", "--bench-data-dir", str(args.data_dir),
-               "--base-url", ep["base_url"], "--api-key", ep["api_key"],
+               "--base-url", ep["base_url"],
                "--output-dir", str(out / "root"),
                "--exp-name", "phaseH_root"])
 
@@ -351,7 +367,6 @@ def build_arm_cmd(args, profile: SRIProfile, out: Path, arm: str,
             + render_pinned_flags(pinned)
             + ["--no-test-eval", "--bench-data-dir", str(args.data_dir),
                "--resume", "--base-url", ep["base_url"],
-               "--api-key", ep["api_key"],
                "--output-dir", str(out / "arms"),
                "--exp-name", arm, "--sri-context", str(context_file)])
 
@@ -439,7 +454,8 @@ def stage_root(args, profile: SRIProfile, out: Path) -> dict:
             "the whole experiment".format(exp))
     out.mkdir(parents=True, exist_ok=True)
     with log.open("w", encoding="utf-8") as f:
-        rc = subprocess.run(cmd, stdout=f, stderr=subprocess.STDOUT).returncode
+        rc = subprocess.run(cmd, stdout=f, stderr=subprocess.STDOUT,
+                           env=subprocess_env()).returncode
     if rc != 0:
         raise StageError("shared root run failed rc={} (see {})".format(rc, log))
 
@@ -715,7 +731,8 @@ def stage_arm(args, profile: SRIProfile, out: Path, arm: str, *,
                           label="arm {} (pre-flight)".format(arm))
 
     with log.open("w", encoding="utf-8") as f:
-        rc = subprocess.run(cmd, stdout=f, stderr=subprocess.STDOUT).returncode
+        rc = subprocess.run(cmd, stdout=f, stderr=subprocess.STDOUT,
+                           env=subprocess_env()).returncode
     if rc != 0:
         raise StageError("arm {} failed rc={} (see {})".format(arm, rc, log))
 

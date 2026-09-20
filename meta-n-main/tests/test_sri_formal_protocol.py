@@ -534,6 +534,123 @@ def test_20_task_slug_mirrors_the_integration(tmp_path=None):
         assert PR.task_slug(name) == _task_id_from_name(name), name
 
 
+# -- 21 --------------------------------------------------------------------
+#: The KEY SET of a REAL run's config.json (runs/phaseH/phaseH_off, 72 keys).
+#: Key names only -- no values -- so this is safe to keep in the repo, and it is
+#: the cheapest possible guard against the most expensive kind of bug: a pinned
+#: key that meta-n does not actually WRITE, which makes the arm stage raise only
+#: after that arm's paid run has already finished.
+REAL_CONFIG_JSON_KEYS = [
+    "agentic_error_hints",
+    "agentic_max_budget_usd",
+    "agentic_max_turns",
+    "agentic_preamble",
+    "agentic_spend_budget",
+    "agentic_temperature",
+    "agentic_time_limit_s",
+    "agentic_token_budget",
+    "base_solver",
+    "base_url",
+    "beam_candidates",
+    "beam_width",
+    "bench_tasks",
+    "benchmark",
+    "benchmark_config",
+    "benchmark_config_applied",
+    "classify_balanced_json_fallback",
+    "consolidate",
+    "deploy_verified_code",
+    "elite_rotation",
+    "empty_retry_max_tokens",
+    "epsilon",
+    "eval_repeats",
+    "eval_repeats_gate_topup",
+    "exclude_providers",
+    "executor",
+    "focus_current_headroom",
+    "force_code_library_live",
+    "foster_adoption",
+    "gate_margin",
+    "gate_repeats",
+    "gate_tasks",
+    "instance_workers",
+    "max_depth",
+    "max_docker",
+    "max_iterations",
+    "max_retries",
+    "max_test",
+    "max_tokens",
+    "max_val",
+    "model",
+    "n_few_shot",
+    "no_code_library",
+    "no_early_stop",
+    "no_outer_context",
+    "novelty_alpha",
+    "omega_context_budget",
+    "orchestrator",
+    "paired_eval",
+    "parallel",
+    "patience",
+    "protect_floor",
+    "reasoning_effort",
+    "regression_guard",
+    "regression_guard_repeats",
+    "repropagation",
+    "request_timeout",
+    "resume_config_drift",
+    "retry_threshold",
+    "scratch_root",
+    "seed",
+    "seed_code_library",
+    "solver_language",
+    "symmetric_trace_sampling",
+    "tasks_file",
+    "temperatures",
+    "timestamp",
+    "use_agentic",
+    "use_inspiration",
+    "verified_code",
+    "within_layer_refine",
+    "within_task_recursion"
+]
+
+
+def test_21_every_verified_key_exists_in_a_real_config_json(tmp_path=None):
+    """`verify_run_config` may only require keys a real run actually records.
+
+    This caught a live one: `use_archive` was pinned for verification, but
+    meta-n records the archive-orchestrator mode as `orchestrator:
+    "evolutionary"` and never writes `use_archive` at all. The arm stage would
+    have spent its whole budget and THEN refused the config.
+    """
+    prof = _profile()
+    pinned = PR.pinned_run_config(prof, backbone="gpt-5.5", search_seed=0)
+    real = set(REAL_CONFIG_JSON_KEYS)
+
+    verified = [k for k in pinned if k not in PR.RENDER_ONLY_CONFIG_KEYS]
+    missing = sorted(k for k in verified if k not in real)
+    assert not missing, (
+        "pinned for VERIFICATION but absent from a real config.json: {}. "
+        "Either the key is not recorded (move it to RENDER_ONLY_CONFIG_KEYS and "
+        "verify the provenance key that IS written), or the recording side "
+        "changed.".format(missing))
+
+    # the archive mode is verified through its real provenance key
+    assert "orchestrator" in verified
+    assert "use_archive" in PR.RENDER_ONLY_CONFIG_KEYS
+    assert PR.CONFIG_KEY_TO_CLI.get("use_archive") == "--use-archive"
+
+    # ...and the skip is not silent: without the provenance key it refuses
+    cfg = {k: pinned[k] for k in verified if k != "orchestrator"}
+    cfg.pop("orchestrator", None)          # the provenance key is ABSENT
+    try:
+        PR.verify_run_config(cfg, pinned, context="t")
+        raise AssertionError("an unverifiable archive mode was accepted")
+    except PR.ProtocolError as e:
+        assert "UNVERIFIABLE" in str(e)
+
+
 TESTS = [(n, o) for n, o in sorted(globals().items())
          if n.startswith("test_") and callable(o)]
 

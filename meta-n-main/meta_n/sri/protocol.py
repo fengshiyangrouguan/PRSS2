@@ -30,7 +30,7 @@ import hashlib
 import json
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any, Dict, Iterable, Mapping, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 PROFILE_SCHEMA_VERSION = 1
 MANIFEST_SCHEMA_VERSION = 1
@@ -778,6 +778,14 @@ POSITIVE_ONLY_BOOL_CONFIG_KEYS: Tuple[str, ...] = ("no_early_stop",
 # `none` token, so None must render as an omitted flag.
 OMIT_WHEN_NONE_CONFIG_KEYS: Tuple[str, ...] = ("protect_floor",)
 
+# Pinned for RENDERING but not verifiable against config.json, because meta-n
+# records the same fact under a different provenance key. `--use-archive` is the
+# flag; `config.json` carries `orchestrator: "evolutionary"` instead, which is
+# what the verification checks. Verified on a REAL config.json (72 keys, from
+# runs/phaseH): `use_archive` is absent, so requiring it would have failed the
+# arm stage AFTER its paid run had finished.
+RENDER_ONLY_CONFIG_KEYS: Tuple[str, ...] = ("use_archive",)
+
 
 def pinned_run_config(profile: SRIProfile, *, backbone: str, search_seed: int,
                       benchmark: str = "co_bench") -> Dict[str, Any]:
@@ -800,6 +808,8 @@ def pinned_run_config(profile: SRIProfile, *, backbone: str, search_seed: int,
         "benchmark_config": str(profile.benchmark_config),
         "benchmark_config_applied": [],
         "use_archive": True,
+        # the provenance key meta-n actually writes for the archive orchestrator
+        "orchestrator": "evolutionary",
         "beam_width": int(profile.beam_width),
         "beam_candidates": int(profile.beam_candidates),
         "max_iterations": int(profile.max_iterations),
@@ -871,10 +881,22 @@ def verify_run_config(actual: Mapping[str, Any], pinned: Mapping[str, Any],
     otherwise.
     """
     bad: Dict[str, Any] = {}
+    skipped: List[str] = []
     for key, want in sorted(pinned.items()):
+        if key in RENDER_ONLY_CONFIG_KEYS:
+            # pinned as a FLAG; the recorded provenance is another key (see
+            # RENDER_ONLY_CONFIG_KEYS). Skipping it silently would be the same
+            # mistake in the other direction, so it is reported.
+            skipped.append(key)
+            continue
         got = actual.get(key, "<absent>")
         if got != want:
             bad[key] = {"profile": want, "config_json": got}
+    if skipped and not any(k == "orchestrator" for k in actual):
+        raise ProtocolError(
+            "config.json has neither {} nor the provenance key that replaces "
+            "them; the archive-orchestrator mode is UNVERIFIABLE".format(
+                list(skipped)))
     if bad:
         raise ProtocolError(
             "the run's config.json does not match the profile{}: {}".format(

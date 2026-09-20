@@ -819,6 +819,61 @@ def test_a_dead_root_is_refused():
         pass
 
 
+def test_arm_commands_carry_the_full_required_flag_set():
+    """The SYSTEMATIC guard for "an essential flag that nothing renders".
+
+    Three flags were lost the same way in one rewrite -- `--resume`,
+    `--reduction-mode`, `--gamma-checkpoint` -- because each lives OUTSIDE the
+    profile's `pinned` block, so the code path that renders parameters from the
+    profile never saw them:
+
+      * without --resume the arm regenerates its own root (silent),
+      * without --reduction-mode the predictive arm runs the official method
+        (caught only by the consistency check in main.py),
+      * without --gamma-checkpoint the predictive arm aborts (loud).
+
+    One test per bug I happened to hit is how this family keeps coming back. So
+    this asserts the WHOLE required set, and the requirement is written down here
+    rather than implied by the code that happens to exist.
+    """
+    with tempfile.TemporaryDirectory() as td:
+        out = Path(td)
+        ckpt = out / "gamma.pt"
+        ckpt.write_bytes(b"stub")
+        args = _args(out, gamma_checkpoint=str(ckpt))
+
+        # flags the arm must ALWAYS carry, with the value they must carry
+        always = {
+            "--resume": None,                     # value-less
+            "--no-test-eval": None,
+            "--reduction-mode": None,             # per-arm, checked below
+            "--bench-data-dir": str(args.data_dir),
+            # the value is whatever the endpoint resolver produced -- the point
+            # here is that the flag is PRESENT and says the same thing
+            "--base-url": R.launch_endpoint()["base_url"],
+            "--output-dir": str(out / "arms"),
+            "--exp-name": None,                   # per-arm
+            "--sri-context": None,                # per-arm
+            "--gamma-checkpoint": str(ckpt),      # predictive only
+        }
+        per_arm = {"--reduction-mode", "--exp-name", "--sri-context"}
+        for arm in ("official", "predictive"):
+            cmd = R.build_arm_cmd(args, PROFILE, out, arm, out / "c.json")
+            for flag, want in always.items():
+                if flag == "--gamma-checkpoint" and arm != "predictive":
+                    assert flag not in cmd, (arm, flag)
+                    continue
+                assert flag in cmd, "arm {} is missing {}".format(arm, flag)
+                if want is not None and flag in per_arm | {"--exp-name"}:
+                    continue
+                if want is not None:
+                    assert cmd[cmd.index(flag) + 1] == want, (arm, flag, want)
+            assert cmd[cmd.index("--exp-name") + 1] == arm
+            assert cmd[cmd.index("--reduction-mode") + 1] == arm
+            # the key is NEVER on the command line
+            assert "--api-key" not in cmd, cmd
+
+
 def _main() -> int:
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for fn in fns:

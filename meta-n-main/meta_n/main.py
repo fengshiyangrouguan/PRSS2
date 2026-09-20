@@ -173,6 +173,18 @@ def build_parser() -> argparse.ArgumentParser:
              "be given as $META_N_GAMMA_CHECKPOINT.",
     )
     parser.add_argument(
+        "--no-test-eval",
+        action="store_true",
+        help="Never read the held-out TEST split during this run. The SRI formal "
+             "protocol needs this on EVERY stage except the post-freeze `final` "
+             "stage: a search run (or the shared-root run, which has no "
+             "--sri-context and therefore no ledger to carry the setting) would "
+             "otherwise evaluate the per-task oracle AND the best chain against "
+             "test before the fork -- reading test data during the search phase "
+             "and paying for a number the protocol does not use. Default off = "
+             "byte-identical.",
+    )
+    parser.add_argument(
         "--sri-context",
         default=None,
         help="Path to a JSON SRI run context (formal protocol). Its presence "
@@ -2090,6 +2102,12 @@ async def async_main(args: argparse.Namespace):
     # orchestrator keeps SRIHooks.disabled() no matter what the runner believes,
     # so a "formal" run produces no proposal_slots.jsonl at all while the runner
     # records a path to a file that does not exist.
+    #
+    # The no-test-eval switch is set FIRST and independently of the context: the
+    # shared-root stage runs without --sri-context, so relying on the context to
+    # carry it left the root evaluating the held-out test split twice.
+    if getattr(args, "no_test_eval", False):
+        orchestrator.sri_no_test_eval = True
     if getattr(args, "sri_context", None):
         from meta_n.sri.hooks import SRIHooks
         from meta_n.sri.ledger import SlotLedger
@@ -2126,7 +2144,9 @@ async def async_main(args: argparse.Namespace):
             gate_configured=orchestrator.config.gate_tasks,
             gate_reason=_ctx.get("gate_reason", ""),
             reduction_mode=_reduction_mode, cohort=_ctx.get("cohort") or [])
-        orchestrator.sri_no_test_eval = bool(_ctx.get("no_test_eval", True))
+        orchestrator.sri_no_test_eval = bool(
+            getattr(orchestrator, "sri_no_test_eval", False)
+            or _ctx.get("no_test_eval", True))
         # §4/§10: the TREATMENT itself must be recorded in the run's own
         # artifacts. `reduction_mode` and the Gamma identity never reached
         # config.json, so a reader could not tell the two arms apart from the

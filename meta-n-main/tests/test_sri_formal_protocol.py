@@ -13,6 +13,7 @@ the design document so a reviewer can map failures back to requirements.
 from __future__ import annotations
 
 import json
+import re
 import sys
 import tempfile
 from pathlib import Path
@@ -449,6 +450,50 @@ def test_18_aggregator_rejects_mixed_cohorts_and_reproduces_counts(tmp_path=None
 
 
 # --------------------------------------------------------------------------
+
+# -- 19 --------------------------------------------------------------------
+def _orchestrator_source() -> str:
+    p = (Path(__file__).resolve().parent.parent / "meta_n" / "core"
+         / "evolutionary_orchestrator.py")
+    return p.read_text(encoding="utf-8")
+
+
+def test_19_nominal_grid_matches_the_orchestrators_iteration_base(tmp_path=None):
+    """The nominal slot grid must equal the iterations the orchestrator ACTUALLY
+    opens slots for.
+
+    This test exists because the grid was 0-based while the breeding loop is
+    1-based, so `assert_completeness` rejected every real run with
+    `missing=[it0-*] extra=[it6-*]` -- and the offline fixture, also 0-based,
+    passed green. A fixture cannot pin a contract it shares the assumption with,
+    so this one reads the orchestrator's own source instead.
+    """
+    src = _orchestrator_source()
+
+    # (a) the loop increments at the TOP, so the first bred generation is 1
+    m = re.search(r"while\s+iteration\s*<\s*self\.config\.max_iterations[^\n]*:"
+                  r"\s*\n\s*iteration\s*\+=\s*1", src)
+    assert m is not None, (
+        "the breeding loop no longer matches `while iteration < "
+        "self.config.max_iterations: iteration += 1`; if its base changed, "
+        "nominal_slot_ids() must change with it")
+    # (b) the seed sets iteration to 0 BEFORE that loop, so 0 owns no slot
+    assert re.search(r"\n\s+iteration\s*=\s*0\s*\n", src) is not None, (
+        "the seed's `iteration = 0` assignment moved; re-derive the grid base")
+    # (c) the slot is opened with that same 1-based variable
+    assert "iteration=iteration," in src, (
+        "self.sri.open() no longer receives `iteration=iteration`; the slot ids "
+        "would no longer describe the orchestrator's generations")
+
+    # (d) and the grid follows: 1..T, with 0 explicitly absent
+    ids = L.nominal_slot_ids(2, 2, 6)
+    assert ids[0] == "it1-p0-c0", ids[0]
+    assert ids[-1] == "it6-p1-c1", ids[-1]
+    assert not [s for s in ids if s.startswith("it0-")], (
+        "iteration 0 must own no slot: it is the seed, which breeds nothing")
+    # the size is still exactly B*K*T
+    assert len(ids) == 2 * 2 * 6 == len(set(ids))
+
 
 TESTS = [(n, o) for n, o in sorted(globals().items())
          if n.startswith("test_") and callable(o)]

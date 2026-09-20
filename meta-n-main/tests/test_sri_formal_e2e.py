@@ -22,6 +22,12 @@ a gate nobody has tested:
     the inheritance check refuses. Nothing else can see this one: a failed
     `--resume` starts a fresh run whose ledger still fills every nominal slot.
 
+One further test pins a property rather than a gate:
+`test_cached_repeats_are_marked_and_the_test_split_never_caches` covers the
+repeat cache -- that it is verified per task before it is used, that a cached
+repeat SAYS it was cached in the raw row, and that the held-out test split is
+never served from it.
+
 Runs with pytest or as a plain script:
 
     python -m pytest tests/test_sri_formal_e2e.py -q
@@ -36,6 +42,7 @@ import json
 import sys
 import tempfile
 from pathlib import Path
+from typing import Dict
 
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO))
@@ -93,16 +100,18 @@ def _add_candidate(archive: Path, cid: str, depth: int, score: float) -> dict:
 def _slot_plan():
     """24 slots with a depth pattern that produces all four audited transitions.
 
-    `pd`/`cd` are capped at the profile's max_depth, so iterations 4-5 sit at
-    5->6 and fall outside the audited transition set -- which is itself worth
-    having in the fixture: out-of-scope rows must not enter any denominator.
+    Iterations are **1..T** (the orchestrator's breeding loop increments at the
+    top, so iteration 0 is the seed and owns no slot). `pd`/`cd` are capped at
+    the profile's max_depth, so the last two iterations sit at 5->6 and fall
+    outside the audited transition set -- which is itself worth having in the
+    fixture: out-of-scope rows must not enter any denominator.
     """
     out = []
-    for it in range(PROFILE.max_iterations):
+    for it in range(1, PROFILE.max_iterations + 1):
         for ps in range(PROFILE.beam_width):
             for cs in range(PROFILE.beam_candidates):
-                pd = min(1 + it, PROFILE.max_depth - 1)
-                cd = min(2 + it, PROFILE.max_depth)
+                pd = min(it, PROFILE.max_depth - 1)
+                cd = min(it + 1, PROFILE.max_depth)
                 out.append({"slot_id": L.slot_id_for(it, ps, cs), "iteration": it,
                             "parent_slot": ps, "child_slot": cs,
                             "pd": pd, "cd": cd})
@@ -126,7 +135,7 @@ def _fabricate_seed(out: Path, seed: int) -> dict:
     for s in plan:
         # the ONE deliberately dropped child (no material anywhere) proves the
         # failure accounting is not silently zero
-        if s["slot_id"] == "it1-p1-c1":
+        if s["slot_id"] == "it2-p1-c1":
             continue
         cands.append(_add_candidate(archive, "c_" + s["slot_id"], s["cd"],
                                     0.50 + 0.01 * s["cd"]))
@@ -140,6 +149,12 @@ def _fabricate_seed(out: Path, seed: int) -> dict:
          "candidates": cands}, indent=2, sort_keys=True), encoding="utf-8")
     (root_exp / "summary.json").write_text(json.dumps({"mock": True}),
                                            encoding="utf-8")
+    # the checkpoint the arms resume from: `try_resume` reads
+    # `<out_dir>/checkpoint.json` and rebuilds the archive from `<out_dir>/archive`
+    (root_exp / "checkpoint.json").write_text(json.dumps(
+        {"iteration": 0, "patience_counter": 0, "prev_best": 0.5,
+         "total_tokens": 0, "convergence_history": [0.5],
+         "rng_state": [1, [1], None]}), encoding="utf-8")
 
     pinned = PR.pinned_run_config(PROFILE, backbone="gpt-5.5", search_seed=seed)
     cfg = dict(pinned)
@@ -200,6 +215,9 @@ def _fabricate_seed(out: Path, seed: int) -> dict:
                 (ad / "archive" / child.name).write_bytes(child.read_bytes())
         (ad / "summary.json").write_text(json.dumps({"mock": True}),
                                          encoding="utf-8")
+        (ad / "checkpoint.json").write_text(
+            (root_exp / "checkpoint.json").read_text(encoding="utf-8"),
+            encoding="utf-8")
         acfg = dict(pinned)
         # `timestamp` differs between arms in a REAL run (they start at
         # different moments) and is on the §10 operational allowlist, so the
@@ -249,7 +267,7 @@ def _fabricate_seed(out: Path, seed: int) -> dict:
                           reduction_mode=arm,
                           proposed_child_id="c_" + sid,
                           proposed_child_depth=s["cd"])
-            if sid == "it1-p0-c1":
+            if sid == "it2-p0-c1":
                 # a gate-rejected but EXECUTABLE child, material kept OUT of the
                 # archive: §2.2 requires it to be audited anyway
                 rd = ad / R.REJECTED_DIRNAME / sid
@@ -259,7 +277,7 @@ def _fabricate_seed(out: Path, seed: int) -> dict:
                              gate_status="rejected", archive_admitted=False,
                              archive_rejection_reason="quality_gate",
                              material_path=rejected_mp)
-            elif sid == "it2-p0-c1":
+            elif sid == "it5-p0-c1":
                 led.finalize(sid, terminal_status="empty_injection",
                              failure_class="empty_omega")
             else:
@@ -307,7 +325,8 @@ def test_e2e_freeze_audit_final_aggregate():
         aud = R.stage_audit(a, PROFILE, d0)
         off = aud["outputs"]["arms"]["official"]
         assert off["planned"] is False
-        # 4 audited 2->3 slots; 3 produced an edge and one is the deliberately
+        # the 2->3 transition is iteration 2 (1-based grid): 4 slots, 3 edges,
+        # one deliberately unmaterialized
         # unmaterialized child (a drop) -- so the rejected-but-executable child
         # IS audited and the missing one is DISCLOSED rather than ignored
         assert off["R_2to3"] is not None
@@ -316,14 +335,14 @@ def test_e2e_freeze_audit_final_aggregate():
                      encoding="utf-8").splitlines() if l.strip()]
         r23 = [e for e in edges if e["transition"] == "23"]
         assert len(r23) == 3, [e["slot_id"] for e in r23]
-        assert {e["slot_id"] for e in r23} == {"it1-p0-c0", "it1-p0-c1",
-                                              "it1-p1-c0"}
+        assert {e["slot_id"] for e in r23} == {"it2-p0-c0", "it2-p0-c1",
+                                              "it2-p1-c0"}
         assert any(not e["child_was_admitted"] and
                    e["child_terminal_status"] == "gate_rejected" for e in r23)
         metrics = json.loads((d0 / "audit" / "official" / "metrics.json")
                              .read_text(encoding="utf-8"))
         invalid = metrics["invalid_edges"]
-        assert [d["slot_id"] for d in invalid] == ["it1-p1-c1"], invalid
+        assert [d["slot_id"] for d in invalid] == ["it2-p1-c1"], invalid
         assert invalid[0]["transition"] == "23"
         # ...so F is > 0 rather than silently 0
         assert off["drops"] >= 1
@@ -465,6 +484,86 @@ def test_arm_must_inherit_the_shared_root():
         except R.StageError as e:
             assert "did NOT inherit" in str(e) and "arm official" in str(e)
 
+
+
+def _bare_evaluator(*, deterministic_cache=True, dev_repeats=3, scores=None):
+    """A COBenchEvaluator whose execution is stubbed, so `_run`'s caching policy
+    can be tested without the CO-Bench SDK (which needs a POSIX-only import).
+    """
+    ev = R.COBenchEvaluator.__new__(R.COBenchEvaluator)
+    ev.mode = "real"
+    ev.cohort = list(COHORT)
+    ev.data_dir = Path(".")
+    ev._evals = {}
+    ev.deterministic_cache = deterministic_cache
+    ev.dev_repeats = dev_repeats
+    ev._cache, ev._probe, ev._probe_src = {}, {}, {}
+    ev._verified, ev._violated = set(), set()
+    ev.calls = ev.fresh = ev.cache_hits = 0
+    seq = list(scores or [])
+    seen: Dict[str, int] = {}
+
+    def fake_execute(task_id, source, split):
+        ev.calls += 1
+        ev.fresh += 1
+        if seq:
+            i = seen.get(task_id, 0)
+            seen[task_id] = i + 1
+            return R.RawEval(score=float(seq[i % len(seq)]), success=True,
+                             freshly_executed=True,
+                             detail="stub:{}".format(split))
+        return R.RawEval(score=0.5, success=True, freshly_executed=True,
+                         detail="stub:{}".format(split))
+
+    ev._execute = fake_execute
+    return ev, seen
+
+
+def test_cached_repeats_are_marked_and_the_test_split_never_caches():
+    """The repeat cache must be VERIFIED and VISIBLE, and must never serve test.
+
+    The defect this pins: a repeat served from the cache was byte-identical to a
+    fresh execution in the raw artifact -- same `freshly_executed: True`, same
+    detail -- so a reader could not tell three observations from one.
+    """
+    ev, _ = _bare_evaluator(deterministic_cache=True, dev_repeats=3)
+    # candidate A on the dev split: all three repeats EXECUTE (they are the probe)
+    a = [ev.evaluate("T1", "src_A", seed=r) for r in range(3)]
+    assert ev.fresh == 3 and ev.cache_hits == 0, (ev.fresh, ev.cache_hits)
+    assert all("cached" not in x.detail for x in a)
+    # the repeats agreed, so the task is now verified deterministic
+    assert "dev|T1" in ev.determinism_report()["verified_tasks"]
+
+    # candidate B on the same task: one fresh + two CACHED, and each says so
+    b = [ev.evaluate("T1", "src_B", seed=r) for r in range(3)]
+    assert ev.fresh == 4, ev.fresh                 # only the first B call ran
+    assert ev.cache_hits == 2, ev.cache_hits
+    assert "cached" not in b[0].detail
+    assert all("cached_deterministic_repeat" in x.detail for x in b[1:])
+    assert b[1].score == b[0].score
+
+    # the TEST split is never cached, however deterministic the evaluator is
+    t = [ev.evaluate_test("T1", "src_A", seed=r) for r in range(3)]
+    assert ev.cache_hits == 2, ev.cache_hits       # unchanged by the test calls
+    assert all("cached" not in x.detail for x in t)
+    assert ev.determinism_report()["note"].count("test split is never cached")
+
+    # a task whose repeats DISAGREE is never cached, and is reported
+    ev2, _ = _bare_evaluator(deterministic_cache=True, dev_repeats=3,
+                             scores=[0.1, 0.2, 0.3, 0.4])
+    for r in range(3):
+        ev2.evaluate("T1", "src_A", seed=r)
+    assert "dev|T1" in ev2.determinism_report()["violated_tasks"]
+    ev2.evaluate("T1", "src_B", seed=0)
+    assert ev2.cache_hits == 0, "a non-deterministic task must never be cached"
+
+    # with the declaration off, nothing is cached at all
+    ev3, _ = _bare_evaluator(deterministic_cache=False, dev_repeats=3)
+    for r in range(3):
+        ev3.evaluate("T1", "src_A", seed=r)
+    for r in range(3):
+        ev3.evaluate("T1", "src_A", seed=r)
+    assert ev3.cache_hits == 0 and ev3.fresh == 6
 
 
 def _main() -> int:

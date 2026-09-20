@@ -1836,25 +1836,38 @@ class EvolutionaryOrchestrator:
                 )
 
             # Test-set evaluation (oracle per-task best solutions)
-            console.print("\n[bold blue]═══ Test Set Evaluation (oracle per-task best) ═══[/bold blue]")
-            logger.info("Starting test-set evaluation (oracle)")
-            test_start = time.time()
-            test_scores = await self._run_test_evaluation(tasks)
-            test_time = time.time() - test_start
-            if test_scores:
-                result.test_scores = test_scores
-                result.test_mean_score = sum(test_scores.values()) / len(test_scores)
-                console.print(f"  Oracle test mean: {result.test_mean_score:.3f} ({test_time:.1f}s)")
-                logger.info(
-                    "Oracle test evaluation complete: mean=%.3f, tasks=%d, time=%.1fs",
-                    result.test_mean_score, len(test_scores), test_time,
-                )
+            if getattr(self, "sri_no_test_eval", False):
+                # SRI formal: the held-out test belongs to the `final` stage,
+                # which runs AFTER the freeze on ONE dev-selected candidate. A
+                # search (or root) run that evaluates it here reads test data
+                # during the search phase and pays for it. Say so, rather than
+                # printing "not available for this executor", which is a
+                # different and false reason.
+                console.print("\n[cyan]Test Set Evaluation (oracle): SKIPPED by "
+                              "design -- SRI formal reads the held-out test only "
+                              "in the `final` stage[/cyan]")
+                logger.info("SRI formal: test-set evaluation skipped by design")
             else:
-                console.print("  [yellow]Skipped (test evaluation not available for this executor)[/yellow]")
-                logger.info("Test evaluation skipped (no adapter support)")
+                console.print("\n[bold blue]═══ Test Set Evaluation (oracle per-task best) ═══[/bold blue]")
+                logger.info("Starting test-set evaluation (oracle)")
+                test_start = time.time()
+                test_scores = await self._run_test_evaluation(tasks)
+                test_time = time.time() - test_start
+                if test_scores:
+                    result.test_scores = test_scores
+                    result.test_mean_score = sum(test_scores.values()) / len(test_scores)
+                    console.print(f"  Oracle test mean: {result.test_mean_score:.3f} ({test_time:.1f}s)")
+                    logger.info(
+                        "Oracle test evaluation complete: mean=%.3f, tasks=%d, time=%.1fs",
+                        result.test_mean_score, len(test_scores), test_time,
+                    )
+                else:
+                    console.print("  [yellow]Skipped (test evaluation not available for this executor)[/yellow]")
+                    logger.info("Test evaluation skipped (no adapter support)")
 
             # Test-set evaluation (single best chain candidate)
-            if self.archive.best_candidate:
+            if self.archive.best_candidate and not getattr(
+                    self, "sri_no_test_eval", False):
                 console.print("\n[bold blue]═══ Test Set Evaluation (single best chain) ═══[/bold blue]")
                 logger.info("Starting test-set evaluation (chain)")
                 chain_start = time.time()

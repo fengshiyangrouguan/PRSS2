@@ -42,6 +42,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import math
 import statistics
 import subprocess
@@ -52,6 +53,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+logger = logging.getLogger("meta_n.sri.runner")
 from meta_n.sri.protocol import (  # noqa: E402
     OPERATIONAL_ALLOWLIST, ProtocolError, RunManifest, SRIProfile,
     assert_no_protocol_drift, assert_treatment_parity, collect_root_bundle,
@@ -195,7 +197,7 @@ def artifacts_sha256(arm_path: Path) -> Dict[str, Any]:
     """
     parts: Dict[str, Any] = {}
     for name in ("config.json", "summary.json", "lineage.json",
-                 "convergence.json", LEDGER_NAME):
+                 "convergence.json", "checkpoint.json", LEDGER_NAME):
         p = arm_path / name
         parts[name] = sha256_file(p) if p.is_file() else None
     parts["archive"] = _digest_of_tree(arm_path / "archive")
@@ -245,7 +247,8 @@ def build_root_cmd(args, profile: SRIProfile, out: Path) -> List[str]:
     pinned = dict(pinned_for(args, profile))
     pinned["max_iterations"] = 0            # ROOT ONLY: generate, do not breed
     return ([sys.executable, "-m", "meta_n.main"] + render_pinned_flags(pinned)
-            + ["--output-dir", str(out / "root"),
+            + ["--no-test-eval",
+               "--output-dir", str(out / "root"),
                "--exp-name", "phaseH_root"])
 
 
@@ -264,7 +267,7 @@ def build_arm_cmd(args, profile: SRIProfile, out: Path, arm: str,
     pinned = pinned_for(args, profile)
     return ([sys.executable, "-m", "meta_n.main"]
             + render_pinned_flags(pinned)
-            + ["--resume", "--output-dir", str(out / "arms"),
+            + ["--no-test-eval", "--resume", "--output-dir", str(out / "arms"),
                "--exp-name", arm, "--sri-context", str(context_file)])
 
 
@@ -419,6 +422,15 @@ def stage_fork(args, profile: SRIProfile, out: Path, *,
         raise StageError(
             "the shared root is not at {}; run the root stage first (§4)".format(
                 src))
+    # The arms can only continue the shared root through `--resume`, and
+    # `try_resume` reads `<out_dir>/checkpoint.json`. Forking a root with no
+    # checkpoint would leave both arms starting fresh -- so refuse to fork.
+    if not (src / "checkpoint.json").is_file():
+        raise StageError(
+            "the shared root at {} has no checkpoint.json, so the fork could "
+            "never be resumed and BOTH arms would regenerate their own root. "
+            "The root stage must have written one (it persists right after the "
+            "seed is evaluated)".format(src))
 
     arms_out: Dict[str, str] = {}
     for arm in ARMS:
@@ -575,6 +587,28 @@ def stage_arm(args, profile: SRIProfile, out: Path, arm: str, *,
         raise StageError(
             "the predictive arm has no Gamma checkpoint hash; the fork stage "
             "did not receive --gamma-checkpoint (§4)")
+
+    # BEFORE spending: prove the copied fork can actually be resumed. A missing
+    # `checkpoint.json` (or an empty rebuilt archive) makes the arm start a
+    # FRESH run -- which `assert_root_inherited` would catch, but only after the
+    # arm had spent its whole budget on a root nobody asked for.
+    ck = arm_dir(out, arm) / "checkpoint.json"
+    if not ck.is_file():
+        raise StageError(
+            "{} has no checkpoint.json, so `--resume` would silently start a "
+            "fresh run instead of continuing the copied root. The shared-root "
+            "stage must have written one; check that the fork copied it.".format(
+                arm_dir(out, arm)))
+    idx_path = arm_dir(out, arm) / "archive" / "index.json"
+    idx0 = read_json(idx_path)
+    if not idx0 or not (idx0.get("candidates") or []):
+        raise StageError(
+            "{}'s copied archive is empty; `--resume` would start a fresh run"
+            .format(arm_dir(out, arm)))
+    assert_root_inherited(arm_dir(out, arm),
+                          man.shared.get("inherited_root_sha256"),
+                          profile.cohort,
+                          label="arm {} (pre-flight)".format(arm))
 
     with log.open("w", encoding="utf-8") as f:
         rc = subprocess.run(cmd, stdout=f, stderr=subprocess.STDOUT).returncode
@@ -809,17 +843,36 @@ class COBenchEvaluator:
 
     Dev evaluation reads only the task's `dev_map` instances, i.e. the same
     canonical development instances the search used and the test split never
-    touches. `deterministic_cache` mirrors the profile's declared
-    `deterministic_evaluator_caches_repeats`: CO-Bench dev scoring is a
-    deterministic function of the script, so a repeat is recorded as a cached
-    observation rather than re-executed -- and the raw row says so.
+    touches.
+
+    REPEATS AND THE CACHE. The profile may declare
+    `deterministic_evaluator_caches_repeats`, which §3.3 allows ("declaring it
+    there keeps the optimisation visible instead of implicit"). That declaration
+    is now VERIFIED rather than trusted, and the cache is only ever consulted
+    where the verification was free:
+
+      * **dev**: the first candidate seen on a task executes all of its declared
+        repeats fresh. If they agree, the task is marked verified and later
+        candidates' repeats are served from the cache -- and every such row says
+        `cached_deterministic_repeat` in its detail, so the count is auditable
+        instead of invisible. If they disagree, the task is NEVER cached and is
+        reported as a determinism violation.
+      * **test**: never cached. `stage_final` evaluates ONE candidate, so the
+        declared repeats are the entire point, and serving them from a cache
+        would report three observations from one execution.
+
+    Before this, a repeat served from the cache was byte-indistinguishable from a
+    fresh execution in the raw artifact: same `freshly_executed: True`, same
+    detail. The value was right (a deterministic evaluator returns the same
+    number), but the artifact claimed something it had not done.
     """
 
     mode = "real"
 
     def __init__(self, cohort: Sequence[str], *, data_dir=DEFAULT_DATA_DIR,
                  timeout: int = 10, instance_workers: int = 2,
-                 deterministic_cache: bool = False) -> None:
+                 deterministic_cache: bool = False,
+                 dev_repeats: int = 1) -> None:
         from meta_n.integrations.co_bench import _TaskEvaluator
         self.cohort = list(cohort)
         self.data_dir = Path(data_dir)
@@ -828,19 +881,23 @@ class COBenchEvaluator:
             instance_workers=int(instance_workers))
         self._evals: Dict[str, Any] = {}
         self.deterministic_cache = bool(deterministic_cache)
+        self.dev_repeats = max(1, int(dev_repeats))
         self._cache: Dict[Tuple[str, str, str], RawEval] = {}
+        # (split, task) -> the scores the FIRST candidate's repeats produced
+        self._probe: Dict[Tuple[str, str], List[float]] = {}
+        self._probe_src: Dict[Tuple[str, str], str] = {}
+        self._verified: set = set()
+        self._violated: set = set()
         self.calls = 0
         self.fresh = 0
+        self.cache_hits = 0
 
     def _evaluator(self, task_id: str):
         if task_id not in self._evals:
             self._evals[task_id] = self._make(task_id)
         return self._evals[task_id]
 
-    def _run(self, task_id: str, source: str, split: str) -> RawEval:
-        key = (split, task_id, sha256_of(source))
-        if self.deterministic_cache and key in self._cache:
-            return self._cache[key]
+    def _execute(self, task_id: str, source: str, split: str) -> RawEval:
         self.calls += 1
         ev = self._evaluator(task_id)
         try:
@@ -855,15 +912,58 @@ class COBenchEvaluator:
         if s is None:
             fb = out.get(split + "_feedback") or out.get("error") or ""
             return RawEval(score=float("nan"), success=False,
-                           freshly_executed=True,
-                           detail=str(fb)[:300])
+                           freshly_executed=True, detail=str(fb)[:300])
         self.fresh += 1
-        rec = RawEval(score=float(s), success=bool(float(s) > 0),
-                      freshly_executed=True,
-                      detail="cobench:{}".format(split))
-        if self.deterministic_cache:
-            self._cache[key] = rec
-        return rec
+        return RawEval(score=float(s), success=bool(float(s) > 0),
+                       freshly_executed=True,
+                       detail="cobench:{}".format(split))
+
+    def _run(self, task_id: str, source: str, split: str) -> RawEval:
+        # Only DEV is cacheable, and only once its repeats have been OBSERVED to
+        # agree. The test split is never cached (see the class docstring).
+        cacheable = self.deterministic_cache and split == "dev"
+        skey = (split, task_id)
+        src_sha = sha256_of(source)
+        key = (split, task_id, src_sha)
+        if cacheable and skey in self._verified and key in self._cache:
+            self.cache_hits += 1
+            prev = self._cache[key]
+            return RawEval(score=prev.score, success=prev.success,
+                           freshly_executed=True,
+                           detail="{}:cached_deterministic_repeat".format(split))
+        ev = self._execute(task_id, source, split)
+        if not cacheable:
+            return ev
+        base = self._probe_src.get(skey)
+        if base is None:
+            # the first candidate on this task: its repeats are the probe
+            self._probe_src[skey] = src_sha
+            self._probe[skey] = [ev.score]
+        elif src_sha == base:
+            self._probe.setdefault(skey, []).append(ev.score)
+            if len(self._probe[skey]) >= self.dev_repeats and \
+                    skey not in self._verified:
+                vals = self._probe[skey]
+                if all(v == vals[0] for v in vals):
+                    self._verified.add(skey)
+                else:
+                    self._violated.add(skey)
+                    logger.warning(
+                        "task %s: repeats DISAGREE (%s); the deterministic-"
+                        "repeat cache is disabled for it", task_id, vals)
+        self._cache[key] = ev
+        return ev
+
+    def determinism_report(self) -> Dict[str, Any]:
+        return {
+            "declared_deterministic": bool(self.deterministic_cache),
+            "verified_tasks": sorted("{}|{}".format(*k) for k in self._verified),
+            "violated_tasks": sorted("{}|{}".format(*k) for k in self._violated),
+            "cache_hits": int(self.cache_hits),
+            "note": "a repeat served from the cache is marked in the raw row's "
+                    "detail as cached_deterministic_repeat; the test split is "
+                    "never cached",
+        }
 
     def evaluate(self, task_id, source, *, seed) -> RawEval:
         return self._run(task_id, source, "dev")
@@ -878,7 +978,9 @@ def make_evaluator(args, profile: SRIProfile, *, split: str = "dev"):
     return COBenchEvaluator(
         profile.cohort, data_dir=args.data_dir, timeout=args.timeout,
         instance_workers=args.instance_workers,
-        deterministic_cache=profile.deterministic_evaluator_caches_repeats)
+        deterministic_cache=(profile.deterministic_evaluator_caches_repeats
+                            and split == "dev"),
+        dev_repeats=profile.audit_repeats)
 
 
 # --------------------------------------------------------------------------
@@ -948,7 +1050,7 @@ def stage_audit(args, profile: SRIProfile, out: Path) -> dict:
                     encoding="utf-8").splitlines() if l.strip()]
         edges, drops = build_edges(rows, material_lookup(arm_dir(out, arm),
                                                          profile.cohort))
-        evaluator = make_evaluator(args, profile)
+        evaluator = make_evaluator(args, profile, split="dev")
         res = run_canonical_audit(
             edges, cohort=profile.cohort, evaluator=evaluator,
             search_seed=int(args.search_seed),
@@ -968,6 +1070,10 @@ def stage_audit(args, profile: SRIProfile, out: Path) -> dict:
         res.metrics["evaluator_calls"] = int(getattr(evaluator, "calls", 0))
         res.metrics["evaluator_fresh_executions"] = int(
             getattr(evaluator, "fresh", 0))
+        res.metrics["evaluator_cache_hits"] = int(
+            getattr(evaluator, "cache_hits", 0))
+        if hasattr(evaluator, "determinism_report"):
+            res.metrics["determinism"] = evaluator.determinism_report()
         Path(paths["metrics.json"]).write_text(
             json.dumps(res.metrics, indent=2, sort_keys=True),
             encoding="utf-8")
@@ -1040,7 +1146,7 @@ def stage_final(args, profile: SRIProfile, out: Path) -> dict:
                 "arm {}: the selected candidate {} has no material on disk".format(
                     arm, sel.candidate_id))
 
-        evaluator = make_evaluator(args, profile)
+        evaluator = make_evaluator(args, profile, split="test")
         raw: List[Dict[str, Any]] = []
         per_task: Dict[str, Optional[float]] = {}
         for t in profile.cohort:
@@ -1057,6 +1163,7 @@ def stage_final(args, profile: SRIProfile, out: Path) -> dict:
                     raw.append({"task_id": t, "repeat_index": rep, "seed": seed,
                                 "score": None, "success": False,
                                 "freshly_executed": ev.freshly_executed,
+                                "cached_deterministic_repeat": False,
                                 "detail": ev.detail})
                     continue
                 vals.append(float(ev.score))
@@ -1064,9 +1171,12 @@ def stage_final(args, profile: SRIProfile, out: Path) -> dict:
                             "score": float(ev.score),
                             "success": bool(ev.success),
                             "freshly_executed": ev.freshly_executed,
+                            # derived from what the evaluator ACTUALLY did, not
+                            # from `rep > 0`: the test split is never cached, so
+                            # a hardcoded rep>0 flag would claim a cache hit that
+                            # never happened.
                             "cached_deterministic_repeat": bool(
-                                profile.deterministic_evaluator_caches_repeats
-                                and rep > 0),
+                                "cached_deterministic_repeat" in str(ev.detail)),
                             "detail": ev.detail})
             per_task[t] = statistics.median(vals) if vals else None
 
@@ -1088,6 +1198,7 @@ def stage_final(args, profile: SRIProfile, out: Path) -> dict:
             archive_candidates=cands,
             dev_score_of=lambda c: c.get("mean_score"))
         pr["evaluator_mode"] = evaluator.mode
+        pr["evaluator_cache_hits"] = int(getattr(evaluator, "cache_hits", 0))
         pr["selected_material_sha256"] = mat.sha256()
         pr["oracle_upper_bound_dev"] = idx.get("best_mean_score")
         Path(out / "final").mkdir(parents=True, exist_ok=True)

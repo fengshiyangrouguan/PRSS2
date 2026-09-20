@@ -84,12 +84,24 @@ def slot_id_for(iteration: int, parent_slot: int, child_slot: int) -> str:
 def nominal_slot_ids(B: int, K: int, T: int) -> List[str]:
     """Every nominal `(iteration, parent_slot, child_slot)` of one arm.
 
-    `iteration` runs 0..T-1, `parent_slot` 0..B-1, `child_slot` 0..K-1, so the
-    grid size is exactly B*K*T (§3.3). These are per SEED; a second search seed
-    is a second ledger (its own run_id), never extra slots in this one.
+    `iteration` runs **1..T, NOT 0..T-1**. The orchestrator's breeding loop is
+    1-based -- `while iteration < self.config.max_iterations: iteration += 1` --
+    so the first BRED generation is iteration 1 and the last is iteration T.
+    Iteration 0 is the seed: it breeds nothing and therefore owns no slot.
+
+    A 0-based grid here made the freeze's completeness gate reject every REAL run
+    (`missing=[it0-*] extra=[it6-*]`) while the offline fixture, also 0-based,
+    passed green -- the failure mode where the test proves the test. The contract
+    is now pinned against the orchestrator's own source in
+    `tests/test_sri_formal_protocol.py::test_19`.
+
+    `parent_slot` runs 0..B-1 and `child_slot` 0..K-1 (those ARE 0-based: they
+    index the beam), so the grid size is exactly B*K*T (§3.3). These are per
+    SEED; a second search seed is a second ledger (its own run_id), never extra
+    slots in this one.
     """
     out = []
-    for it in range(int(T)):
+    for it in range(1, int(T) + 1):
         for p in range(int(B)):
             for c in range(int(K)):
                 out.append(slot_id_for(it, p, c))
@@ -465,10 +477,14 @@ def self_test() -> int:
         print("OK  fold on read       reload reproduces the same rows/statuses")
 
         # ---- nominal grid + completeness ---------------------------------
+        # 1-based iterations: the orchestrator's `iteration` is 1 at the first
+        # bred generation (its loop increments at the top).
         ids = nominal_slot_ids(2, 2, 6)
         assert len(ids) == 24 and len(set(ids)) == 24
-        assert ids[0] == "it0-p0-c0" and ids[-1] == "it5-p1-c1"
-        print("OK  nominal grid       B*K*T = 2*2*6 = {} distinct slot ids"
+        assert ids[0] == "it1-p0-c0" and ids[-1] == "it6-p1-c1", (ids[0], ids[-1])
+        assert "it0-p0-c0" not in ids, "iteration 0 is the seed, not a slot"
+        print("OK  nominal grid       B*K*T = 2*2*6 = {} distinct slot ids, "
+              "iterations 1..6 (the seed's iteration 0 owns none)"
               .format(len(ids)))
 
         try:

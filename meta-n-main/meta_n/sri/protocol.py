@@ -58,6 +58,10 @@ EXTENDED10: Tuple[str, ...] = PRIMARY6 + (
 PROFILE_COHORTS: Dict[str, Tuple[str, ...]] = {
     "sri_primary6": PRIMARY6,
     "sri_extended10": EXTENDED10,
+    # Not a paper profile: the same protocol at minimum scale (B=K=T=1), used to
+    # run the whole real chain once before any formal spend. It is registered here
+    # so it still cannot carry a cohort that does not match its name.
+    "sri_smoke": PRIMARY6,
 }
 
 # §4: the ONLY fields the two arms may differ in. Anything else differing means

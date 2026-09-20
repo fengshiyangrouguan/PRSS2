@@ -1,0 +1,106 @@
+# SRI SMOKE profile -- the minimum scale that exercises the WHOLE real chain.
+# Same protocol, same pinned parameters; only B/K/T/depth/repeats are cut to 1
+# so the untested segment (the real search through the SRI hooks) can be run
+# end to end for a few tens of thousands of tokens. NOT a paper profile.
+# SRI formal profile -- PRIMARY paper cohort (design 2026-09-20, §3.1/§3.3/§12)
+#
+# The cohort is the frozen six CO-Bench tasks. It may NOT be replaced by the
+# extended cohort after any result is observed (§3.2). The `cohort` list below
+# is validated against `protocol.PRIMARY6` on load, so editing it here without
+# editing the frozen constant is refused rather than silently honoured.
+#
+# `nominal_slots` is DERIVED (B * K * T = 24) and deliberately absent.
+#
+# EVERY result-affecting command parameter lives in this file. The runner
+# renders the CLI from it (protocol.render_pinned_flags) and then verifies the
+# run's real config.json against it field by field, so the shipped
+# benchmark-features YAML cannot move a number behind the profile's back. The
+# first revision omitted half of these flags and the run silently used argparse
+# defaults (max_depth 10 instead of 6, eval_repeats 1 instead of 3).
+name: sri_smoke
+cohort:
+  - Aircraft landing
+  - Assignment problem
+  - Assortment problem
+  - Bin packing - one-dimensional
+  - Capacitated warehouse location
+  - Common due date scheduling
+
+# --- formal search profile (§3.3) -----------------------------------------
+beam_width: 1            # B
+beam_candidates: 1       # K
+max_iterations: 1        # T
+max_depth: 3
+no_early_stop: true
+
+# --- seed families (§3.3): all three are NESTED inside a search seed ------
+search_seeds: [0]
+search_eval_repeats: 3       # denoise a candidate's score during search
+audit_repeats: 1             # canonical transition-audit repeats
+test_repeats: 1              # held-out repeats (stochastic evaluators only)
+
+# --- generation knobs (result-affecting; pinned, never inherited) ---------
+max_tokens: 1024
+empty_retry_max_tokens: 0
+max_retries: 0
+reasoning_effort: low
+temperatures: [0.5, 0.7, 0.9]
+novelty_alpha: 0.3
+
+# Execution concurrency -- PINNED because it is result-affecting for
+# CO-Bench: a task's dev score is "#instances finishing inside the 10s
+# timeout / #instances", so a different worker count means a different
+# score from the same script (measured: assignment_problem 0.5000 at the
+# search's resolved 8, 0.2500 at a contended setting).
+# 0 is refused: it would resolve to cpu_count, i.e. machine-dependent.
+parallel: 1
+# 8, NOT 1: 8 is what the search side has always resolved to
+# (min(cpu_count, 8)) on every box this work has run on, so the audit and the
+# search then score under the SAME per-instance budget -- which is the point.
+# Pinning 1 would reduce contention further, but makes the audit roughly 8x
+# slower AND puts it on a different budget than the search that selected the
+# candidates being audited.
+instance_workers: 8
+
+# Hard ceiling on billed backend requests PER ARM. Insurance against a
+# runaway loop spending someone else's relay quota; generous relative
+# to the work, so it should never fire.
+max_backend_requests: 400
+
+# --- gate / consolidation (§8) --------------------------------------------
+# consolidate=true SKIPS the quality gate, so gate_tasks MUST be 0: a profile
+# claiming an active three-task gate that can never run is refused at load.
+consolidate: true
+gate_tasks: 0
+gate_repeats: 1
+gate_margin: 0.0
+protect_floor: null
+regression_guard: true
+regression_guard_repeats: 3
+within_task_recursion: true
+focus_current_headroom: true
+symmetric_trace_sampling: true
+paired_eval: false
+elite_rotation: false
+
+# Formal runs never read the bundled benchmark-features YAML: its `defaults`
+# block sets result-affecting keys (consolidate / regression_guard /
+# within_task_recursion / focus_current_headroom / symmetric_trace_sampling)
+# that this profile names explicitly instead.
+benchmark_config: none
+
+# --- frozen estimator constant (§2.2) -------------------------------------
+regression_threshold: 0.02
+
+# NOT deterministic, and this is now MEASURED rather than assumed: on the real
+# CO-Bench dev split, 4 of the 6 primary tasks reproduce their recorded score
+# exactly while 2 (aircraft_landing, common_due_date_scheduling -- the two
+# slowest) do not, because the evolved solvers are wall-clock-budgeted anytime
+# heuristics drawing unseeded `random`. Three back-to-back runs of one script on
+# aircraft_landing gave 0.6742 / 0.7229 / 0.6933 (spread 0.0487), more than twice
+# the 0.02 regression threshold.
+#
+# So repeats are REAL repeat measurements, never cacheable shortcuts. The
+# evaluator still verifies determinism per task before caching anything, and
+# reports the tasks that disagreed, but with this false nothing is cached.
+deterministic_evaluator_caches_repeats: false

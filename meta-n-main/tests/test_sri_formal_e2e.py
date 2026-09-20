@@ -12,12 +12,15 @@ The SEARCH itself is played by the fixture: it is the only way to exercise these
 stages offline, and it is also the honest split -- the runner consumes
 artifacts and never generates them.
 
-Three gates get their own negative tests, because a gate that has never fired is
+Four gates get their own negative tests, because a gate that has never fired is
 a gate nobody has tested:
 
   * a frozen artifact edited after the freeze -> the audit refuses;
   * a ledger missing a terminal row            -> the freeze refuses;
-  * a knob differing OUTSIDE the treatment     -> the freeze refuses.
+  * a knob differing OUTSIDE the treatment     -> the freeze refuses;
+  * an arm that REGENERATED its root instead of inheriting the fork (§4) ->
+    the inheritance check refuses. Nothing else can see this one: a failed
+    `--resume` starts a fresh run whose ledger still fills every nominal slot.
 
 Runs with pytest or as a plain script:
 
@@ -154,6 +157,7 @@ def _fabricate_seed(out: Path, seed: int) -> dict:
         reasoning_effort=PROFILE.reasoning_effort,
         worker_config={"parallel": 1, "instance_workers": 2})
     rb = PR.root_bundle_sha256(bundle)
+    inherited = sha256_of(PR.root_candidate_digest(archive, PROFILE.cohort))
     (out / "root_bundle.json").write_text(json.dumps(bundle, indent=2,
                                                     sort_keys=True),
                                           encoding="utf-8")
@@ -171,6 +175,7 @@ def _fabricate_seed(out: Path, seed: int) -> dict:
                    inputs={"profile_sha256": PROFILE.sha256(),
                            "backbone": "gpt-5.5", "search_seed": seed},
                    outputs={"root_dir": str(root_exp), "root_bundle_sha256": rb,
+                            "inherited_root_sha256": inherited,
                             "environment_sha256": sha256_of(
                                 bundle["environment_fingerprint"]),
                             "root_config_sha256": PR.sha256_file(
@@ -196,6 +201,12 @@ def _fabricate_seed(out: Path, seed: int) -> dict:
         (ad / "summary.json").write_text(json.dumps({"mock": True}),
                                          encoding="utf-8")
         acfg = dict(pinned)
+        # `timestamp` differs between arms in a REAL run (they start at
+        # different moments) and is on the §10 operational allowlist, so the
+        # freeze's config-diff gate must tolerate it. Without this the fixture
+        # would pass while every real run was rejected.
+        acfg["timestamp"] = "2026-09-20T00:00:0{}.000000".format(
+            1 if arm == "official" else 9)
         acfg["sri"] = {"run_id": R.run_id_for(PROFILE, "gpt-5.5", seed),
                        "arm": arm, "search_seed": seed,
                        "reduction_mode": arm,
@@ -211,7 +222,8 @@ def _fabricate_seed(out: Path, seed: int) -> dict:
             shared={"profile_sha256": PROFILE.sha256(),
                     "cohort": list(PROFILE.cohort),
                     "root_bundle_sha256": rb, "backbone": "gpt-5.5",
-                    "search_seed": seed, "evaluator_mode": "mock"},
+                    "search_seed": seed, "evaluator_mode": "mock",
+                    "inherited_root_sha256": inherited},
             treatment=({"reduction_mode": arm} if arm == "official" else
                        {"reduction_mode": arm,
                         "gamma_checkpoint_sha256": "G" * 64}))
@@ -429,6 +441,30 @@ def test_aggregate_refuses_to_pool_a_mock_with_a_real_run():
         except R.StageError as e:
             assert "different evaluators" in str(e)
         del a
+
+
+def test_arm_must_inherit_the_shared_root():
+    with tempfile.TemporaryDirectory() as td:
+        d = _seed_dir(Path(td), 0)
+        want = R.read_stage_manifest(d)["root"]["outputs"][
+            "inherited_root_sha256"]
+        # the clean case
+        assert R.assert_root_inherited(R.arm_dir(d, "official"), want,
+                                       PROFILE.cohort,
+                                       label="arm official") == want
+        # a REGENERATED root: same filenames, different program source -- which
+        # is exactly what a failed `--resume` produces. Every other artifact
+        # looks normal, so only this check can see it.
+        bad = R.arm_dir(d, "official") / "archive" / "gen0_seed" / "traces"
+        (bad / (COHORT[0] + ".py")).write_text(
+            "# regenerated\ndef solve():\n    return 1\n", encoding="utf-8")
+        try:
+            R.assert_root_inherited(R.arm_dir(d, "official"), want,
+                                    PROFILE.cohort, label="arm official")
+            raise AssertionError("a regenerated root was accepted")
+        except R.StageError as e:
+            assert "did NOT inherit" in str(e) and "arm official" in str(e)
+
 
 
 def _main() -> int:

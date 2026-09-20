@@ -441,6 +441,58 @@ ROOT_BUNDLE_FIELDS: Tuple[str, ...] = (
     "software_revision", "environment_fingerprint",
 )
 
+ROOT_CANDIDATE_ID = "gen0_seed"
+
+
+def root_candidate_digest(archive_dir, cohort: Sequence[str],
+                          root_candidate_id: str = ROOT_CANDIDATE_ID
+                          ) -> Dict[str, Any]:
+    """The parts of a root that EVERY arm must inherit UNCHANGED (§4).
+
+    Contents only: the root candidate's program SOURCE per cohort task, every
+    file under its `traces/`, and its development scores. Deliberately NOT the
+    whole archive: an arm breeds, so its `index.json` grows and a whole-archive
+    digest could never match after the fork.
+
+    This is the check that catches a silently FRESH arm. `--resume` restores the
+    archive from the copied root, but a failed resume quietly starts a new run
+    (the orchestrator treats it as a fresh run by design), and nothing else in
+    the pipeline would notice: the ledger would still fill 24 slots and the
+    config.json would still name the shared root. Re-hashing the root candidate
+    from the ARM's own directory is what makes "both arms inherited one root" a
+    measurement rather than an assumption.
+    """
+    archive_dir = Path(archive_dir)
+    root_dir = archive_dir / root_candidate_id
+    if not root_dir.is_dir():
+        raise ProtocolError(
+            "root candidate {!r} is not at {}; the shared root has not been "
+            "generated (§4)".format(root_candidate_id, str(root_dir)))
+    traces_dir = root_dir / "traces"
+
+    programs: Dict[str, Optional[str]] = {}
+    for t in [str(x) for x in cohort]:
+        src = None
+        for ext in (".py", ".json", ".md", ""):
+            c = traces_dir / (t + ext)
+            if c.is_file():
+                src = c.read_text(encoding="utf-8", errors="replace")
+                break
+        programs[t] = sha256_of(src) if src is not None else None
+
+    dev_scores: Dict[str, Any] = {}
+    idx_path = archive_dir / "index.json"
+    if idx_path.is_file():
+        idx = json.loads(idx_path.read_text(encoding="utf-8"))
+        for c in idx.get("candidates", []):
+            if str(c.get("candidate_id")) == root_candidate_id:
+                dev_scores = dict(c.get("per_task_scores") or {})
+                dev_scores["__macro__"] = c.get("mean_score")
+    return {"root_candidate_id": root_candidate_id,
+            "task_programs_sha256": programs,
+            "traces_sha256": hash_tree(traces_dir),
+            "dev_scores": dev_scores}
+
 
 def root_bundle_sha256(bundle: Mapping[str, Any]) -> str:
     """Hash a root bundle, refusing one that is missing required material.
@@ -547,40 +599,18 @@ def collect_root_bundle(*, archive_dir, cohort: Sequence[str], backbone: str,
     so both arms produce the SAME hash from the same root.
     """
     archive_dir = Path(archive_dir)
-    root_dir = archive_dir / root_candidate_id
-    if not root_dir.is_dir():
-        raise ProtocolError(
-            "root candidate {!r} is not at {}; the shared root has not been "
-            "generated (§4)".format(root_candidate_id, str(root_dir)))
-
-    traces_dir = root_dir / "traces"
+    inherited = root_candidate_digest(archive_dir, cohort, root_candidate_id)
+    traces_dir = archive_dir / root_candidate_id / "traces"
 
     # -- the programs: SOURCE of every cohort task, not ids ---------------
     cohort = [str(t) for t in cohort]
-    programs: Dict[str, Optional[str]] = {}
-    for t in cohort:
-        cands = [traces_dir / (t + ext) for ext in (".py", ".json", ".md", "")]
-        src = None
-        for c in cands:
-            if c.is_file():
-                src = c.read_text(encoding="utf-8", errors="replace")
-                break
-        programs[t] = sha256_of(src) if src is not None else None
-
-    # -- traces: content of every file under the candidate's traces dir ----
-    traces = hash_tree(traces_dir)
-    dev_scores: Dict[str, Any] = {}
+    dev_scores = dict(inherited["dev_scores"])
     index_sha = None
     candidates_meta: Dict[str, Any] = {}
     idx_path = archive_dir / "index.json"
     if idx_path.is_file():
         index_sha = _sha256_bytes(idx_path.read_bytes())
         idx = json.loads(idx_path.read_text(encoding="utf-8"))
-        for c in idx.get("candidates", []):
-            if str(c.get("candidate_id")) != root_candidate_id:
-                continue
-            dev_scores = dict(c.get("per_task_scores") or {})
-            dev_scores["__macro__"] = c.get("mean_score")
         candidates_meta = {"size": len(idx.get("candidates", [])),
                            "candidate_ids": sorted(
                                str(c.get("candidate_id"))
@@ -603,8 +633,8 @@ def collect_root_bundle(*, archive_dir, cohort: Sequence[str], backbone: str,
         "cohort": cohort,
         "task_order": cohort,
         "root_candidate_id": root_candidate_id,
-        "task_programs_sha256": programs,
-        "traces_sha256": traces,
+        "task_programs_sha256": inherited["task_programs_sha256"],
+        "traces_sha256": inherited["traces_sha256"],
         "dev_scores": dev_scores,
         "archive_metadata": dict(candidates_meta, index_sha256=index_sha),
         # The process RNG is not persisted by meta-n, so the bundle records the

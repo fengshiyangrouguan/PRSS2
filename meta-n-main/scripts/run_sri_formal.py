@@ -53,11 +53,12 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from meta_n.sri.protocol import (  # noqa: E402
-    ProtocolError, RunManifest, SRIProfile, assert_no_protocol_drift,
-    assert_treatment_parity, collect_root_bundle, default_profile_path,
-    format_effective_config_table, load_profile, pinned_run_config,
-    render_pinned_flags, resolve_effective_config, root_bundle_sha256,
-    sha256_file, sha256_of, verify_run_config)
+    OPERATIONAL_ALLOWLIST, ProtocolError, RunManifest, SRIProfile,
+    assert_no_protocol_drift, assert_treatment_parity, collect_root_bundle,
+    default_profile_path, format_effective_config_table, load_profile,
+    pinned_run_config, render_pinned_flags, resolve_effective_config,
+    root_bundle_sha256, root_candidate_digest, sha256_file, sha256_of,
+    verify_run_config)
 from meta_n.sri.pairing import (  # noqa: E402
     assert_formal_pairing, build_record)
 from meta_n.sri.ledger import SlotLedger, assert_completeness  # noqa: E402
@@ -254,12 +255,17 @@ def build_arm_cmd(args, profile: SRIProfile, out: Path, arm: str,
 
     Both arms get the IDENTICAL argument list except for the context file, which
     is where the treatment (reduction mode + Gamma identity) lives.
+
+    `--resume` is NOT a profile parameter -- it is a stage-level requirement, and
+    omitting it was a real defect: without it the orchestrator does not restore
+    the archive from the copied root, so each arm would regenerate its OWN root
+    and the shared-root design would quietly collapse.
     """
     pinned = pinned_for(args, profile)
     return ([sys.executable, "-m", "meta_n.main"]
             + render_pinned_flags(pinned)
-            + ["--output-dir", str(out / "arms"), "--exp-name", arm,
-               "--sri-context", str(context_file)])
+            + ["--resume", "--output-dir", str(out / "arms"),
+               "--exp-name", arm, "--sri-context", str(context_file)])
 
 
 # --------------------------------------------------------------------------
@@ -366,13 +372,17 @@ def stage_root(args, profile: SRIProfile, out: Path) -> dict:
             "the shared root has no program for cohort task(s) {}; a root "
             "missing cohort material cannot seed a matched comparison".format(
                 missing))
+    inherited = sha256_of(root_candidate_digest(exp / "archive",
+                                                profile.cohort))
     print("root bundle sha256 = {}".format(rb))
+    print("inherited root     = {}".format(inherited))
     return record_stage(out, "root",
                         inputs={"profile_sha256": profile.sha256(),
                                 "backbone": args.backbone,
                                 "search_seed": args.search_seed},
                         outputs={"root_dir": str(exp),
                                  "root_bundle_sha256": rb,
+                                 "inherited_root_sha256": inherited,
                                  "environment_sha256": sha256_of(
                                      bundle["environment_fingerprint"]),
                                  "root_config_sha256": sha256_file(
@@ -449,6 +459,10 @@ def build_arm_manifest(args, profile: SRIProfile, out: Path, arm: str, *,
         "profile_sha256": profile.sha256(),
         "cohort": list(profile.cohort),
         "root_bundle_sha256": root["outputs"]["root_bundle_sha256"],
+        # The root candidate's own content digest. `--resume` SHOULD inherit it
+        # from the copied fork; this is what proves the resume actually happened
+        # rather than the arm quietly regenerating its own root.
+        "inherited_root_sha256": root["outputs"].get("inherited_root_sha256"),
         "backbone": args.backbone,
         "search_seed": args.search_seed,
         "evaluator_mode": args.evaluator,
@@ -505,6 +519,30 @@ def write_sri_context(args, profile: SRIProfile, out: Path, arm: str,
     return p
 
 
+def assert_root_inherited(arm_path: Path, want: Optional[str],
+                          cohort: Sequence[str], *, label: str = "") -> str:
+    """§4: the arm must have INHERITED the shared root, not regenerated one.
+
+    A failed `--resume` silently starts a FRESH run (the orchestrator treats an
+    unrecoverable checkpoint as a new run by design). Nothing else in the
+    pipeline would notice: the ledger still fills every nominal slot and
+    config.json still names the shared root, so the two arms would look clean
+    while being generated from different roots -- which is the single thing the
+    shared-root design exists to prevent.
+
+    Returns the digest it measured, so the caller can record it.
+    """
+    got = sha256_of(root_candidate_digest(arm_path / "archive", cohort))
+    if want and got != want:
+        raise StageError(
+            "{} did NOT inherit the shared root: its root candidate hashes to "
+            "{} but the frozen root hashes to {}. The resume did not restore the "
+            "copied root (look for 'fresh run' in the arm log), so this arm "
+            "generated its own root and the two arms are not comparable (§4)"
+            .format(label or str(arm_path), got, want))
+    return got
+
+
 def stage_arm(args, profile: SRIProfile, out: Path, arm: str, *,
               gamma_checkpoint: str | None) -> dict:
     root_sha = read_stage_manifest(out)["root"]["outputs"].get(
@@ -554,6 +592,11 @@ def stage_arm(args, profile: SRIProfile, out: Path, arm: str, *,
     if arm == "predictive" and not sri.get("gamma_checkpoint_sha256"):
         raise StageError(
             "arm predictive recorded no gamma_checkpoint_sha256 in config.json")
+
+    # §4: the arm must have INHERITED the shared root, not regenerated one.
+    assert_root_inherited(arm_dir(out, arm),
+                          man.shared.get("inherited_root_sha256"),
+                          profile.cohort, label="arm {}".format(arm))
     return record_stage(out, arm,
                         inputs={"manifest_sha256": man.sha256(),
                                 "root_bundle_sha256": man.root_bundle_sha256},
@@ -639,12 +682,21 @@ def stage_freeze(args, profile: SRIProfile, out: Path) -> dict:
     assert_treatment_parity(m_off, m_pre)
 
     # 2. the REAL config.json files must agree outside the treatment block.
+    # `timestamp` (and the other §10 operational keys) legitimately differ: the
+    # two arms ran at different moments. Comparing them naively rejected EVERY
+    # real run -- the gate has to exclude the allowlist it already defines for
+    # exactly this reason.
     c_off = read_run_config(arm_dir(out, "official"))
     c_pre = read_run_config(arm_dir(out, "predictive"))
     s_off = dict(c_off.get("sri") or {})
     s_pre = dict(c_pre.get("sri") or {})
-    a = {k: v for k, v in c_off.items() if k != "sri"}
-    b = {k: v for k, v in c_pre.items() if k != "sri"}
+
+    def comparable(cfg: Dict[str, Any]) -> Dict[str, Any]:
+        return {k: v for k, v in cfg.items()
+                if k not in OPERATIONAL_ALLOWLIST and k != "sri"
+                and k != "resume_config_drift"}
+
+    a, b = comparable(c_off), comparable(c_pre)
     diff = {k: {"official": a.get(k), "predictive": b.get(k)}
             for k in sorted(set(a) | set(b)) if a.get(k) != b.get(k)}
     if diff:

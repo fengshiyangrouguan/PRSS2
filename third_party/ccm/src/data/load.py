@@ -165,6 +165,40 @@ def load_dataset_metric_collator(args, model, tokenizer):
         batch = [train_dataset[0], eval_dataset[name][0]]
         test_collator(collator, batch, tokenizer, args.is_llama)
 
+    elif args.data.dataset_name == "msc":
+        # MSC (Multi-Session Chat, review 2026-09-20): same dialogue
+        # host as DailyDialog; the dataset class handles session
+        # boundary markers and cut-window training rows (see
+        # data_msc.py for the frozen protocol).
+        dialog = dialogue.data_msc.DialogueDataset(
+            tokenizer,
+            comp_token=comp_token,
+            online=online,
+            add_comp_token=args.training.comp.add_comp_token,
+            clean_split=args.data.clean_split,
+            eval_source=os.environ.get("EVAL_SOURCE", "val"),
+            max_length=args.data.max_length,
+        )
+        train_dataset = dialog.train_dataset
+        eval_dataset = dialog.eval_dataset
+
+        if args.is_llama:
+            collator = dialogue.collator.DataCollatorForDialogue_LLAMA(
+                dialog,
+                tokenizer,
+                comp_args=args.training.comp,
+                model=model,
+                comp_token=comp_token,
+                sum_token=sum_token,
+                pad_token=pad_token,
+            )
+        else:
+            raise AssertionError("msc only works with llama")
+
+        name = list(eval_dataset.keys())[0]
+        batch = [train_dataset[0], eval_dataset[name][0]]
+        test_collator(collator, batch, tokenizer, args.is_llama)
+
     elif "lamp" in args.data.dataset_name:
         train_dataset, eval_dataset = load_dataset_from_args(args)
 

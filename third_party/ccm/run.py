@@ -251,7 +251,7 @@ if __name__ == "__main__":
     parser.add_argument("--dataset",
                         "-d",
                         default='metaicl',
-                        choices=['unified', 'metaicl', 'dialog', 'soda', 'lamp', 'pretrain'],
+                        choices=['unified', 'metaicl', 'dialog', 'soda', 'lamp', 'msc', 'pretrain'],
                         help="Training/evaluation dataset.")
     parser.add_argument(
         "--train_dataset",

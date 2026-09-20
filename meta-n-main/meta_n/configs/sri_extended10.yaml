@@ -53,4 +53,7 @@ elite_rotation: false
 benchmark_config: none
 
 regression_threshold: 0.02
-deterministic_evaluator_caches_repeats: true
+
+# NOT deterministic -- measured on the real dev split, see sri_primary6.yaml for
+# the numbers. Repeats are real repeat measurements, never cacheable shortcuts.
+deterministic_evaluator_caches_repeats: false

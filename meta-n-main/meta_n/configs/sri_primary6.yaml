@@ -68,6 +68,15 @@ benchmark_config: none
 # --- frozen estimator constant (§2.2) -------------------------------------
 regression_threshold: 0.02
 
-# A deterministic evaluator may cache identical repeats; declaring it here keeps
-# the optimisation visible instead of implicit (§3.3).
-deterministic_evaluator_caches_repeats: true
+# NOT deterministic, and this is now MEASURED rather than assumed: on the real
+# CO-Bench dev split, 4 of the 6 primary tasks reproduce their recorded score
+# exactly while 2 (aircraft_landing, common_due_date_scheduling -- the two
+# slowest) do not, because the evolved solvers are wall-clock-budgeted anytime
+# heuristics drawing unseeded `random`. Three back-to-back runs of one script on
+# aircraft_landing gave 0.6742 / 0.7229 / 0.6933 (spread 0.0487), more than twice
+# the 0.02 regression threshold.
+#
+# So repeats are REAL repeat measurements, never cacheable shortcuts. The
+# evaluator still verifies determinism per task before caching anything, and
+# reports the tasks that disagreed, but with this false nothing is cached.
+deterministic_evaluator_caches_repeats: false

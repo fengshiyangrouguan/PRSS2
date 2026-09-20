@@ -79,7 +79,7 @@ def build_collator(dialog, tokenizer, comp_args, comp_type, sum_recur):
     if getattr(tokenizer, "_qwen3_host", False):
         from src.data.dialogue.qwen3_data import Qwen3DialogueCollator
         return Qwen3DialogueCollator(
-            dialog=dialog, tokenizer=tokenizer, comp_args=comp_args,
+            dataset=dialog, tokenizer=tokenizer, comp_args=comp_args,
             comp_token=tokenizer.comp_token_id,
             sum_token=tokenizer.sum_token_id,
             pad_token=tokenizer.pad_token_id,

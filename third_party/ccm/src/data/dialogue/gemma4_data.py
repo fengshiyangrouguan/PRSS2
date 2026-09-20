@@ -240,7 +240,8 @@ class Gemma4DialogueCollator:
             else None
         model_inputs = pad_inputs("left", model_inputs,
                                   self.label_pad_token_id, self.pad_token)
-        model_inputs = prepare_comp_attn_mask_llama(
-            model_inputs, self.comp_args, self.comp_token, self.sum_token,
-            self.pad_token, sink_token=sink_token)
+        if self.comp_token:
+            model_inputs = prepare_comp_attn_mask_llama(
+                model_inputs, self.comp_args, self.comp_token,
+                self.sum_token, self.pad_token, sink_token=sink_token)
         return dict(model_inputs)

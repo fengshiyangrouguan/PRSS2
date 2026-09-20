@@ -380,7 +380,7 @@ def main():
             full = Gemma4ForConditionalGeneration.from_pretrained(
                 a.model_name_or_path, torch_dtype=torch.bfloat16)
             prefix = "model.language_model."
-            text_sd = {k[len(prefix):]: v
+            text_sd = {"model." + k[len(prefix):]: v
                        for k, v in full.state_dict().items()
                        if k.startswith(prefix)}
             text_sd["lm_head.weight"] = full.lm_head.weight.data

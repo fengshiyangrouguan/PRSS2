@@ -538,7 +538,7 @@ def build_model(args, device):
         text_sd = {}
         for k, v in full.state_dict().items():
             if k.startswith(prefix):
-                text_sd[k[len(prefix):]] = v
+                text_sd["model." + k[len(prefix):]] = v
             elif k == "lm_head.weight":
                 text_sd[k] = v
         del full

@@ -2100,9 +2100,14 @@ def main():
                             # the second cut's backward died on a freed
                             # graph — treewise mode had never run).
                             aux_i.backward(retain_graph=True)
+                            # CPU-side accumulation (OOM fix):
+                            # the dirs matrix is ~n_dirs x n_gamma fp32
+                            # (~4GB for 1098 dirs); keeping the list on
+                            # GPU plus the torch.stack copy doubled the
+                            # peak and blew the 40GB card.
                             dirs.append(torch.cat(
                                 [p.grad.reshape(-1).float()
-                                 for p in gamma_params]))
+                                 for p in gamma_params]).cpu())
                             for p in params:
                                 if id(p) not in gamma_set \
                                         and p.grad is not None:
@@ -2126,7 +2131,7 @@ def main():
                             [x.reshape(-1).float()
                              for x in g_task_gamma])
                         _nt = float(_t_flat.norm())
-                        _G = torch.stack(dirs)
+                        _G = torch.stack(dirs).to(device)
                         _nr = _G.norm(dim=1)
                         _cos = ((_G @ _t_flat)
                                 / (_nr * _nt).clamp(min=1e-12)).tolist()
@@ -2162,7 +2167,8 @@ def main():
                             "no optimizer step executed")
                     proj_ok, proj_diag = treewise_feasibility_projection(
                         g_task_gamma, gamma_params,
-                        torch.stack(dirs) if dirs else None,
+                        (torch.stack(dirs).to(device)
+                         if dirs else None),
                         args.rpbe_kappa, iters=args.proj_iters)
                     cert_fail = bool(proj_diag.get("cert_fail"))
                     if not proj_ok:

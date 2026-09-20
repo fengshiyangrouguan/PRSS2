@@ -211,7 +211,7 @@ def arm_order_for_seed(search_seed: int) -> Tuple[str, str]:
     return ARMS if int(search_seed) % 2 == 0 else tuple(reversed(ARMS))
 
 
-def assert_root_not_degenerate(dev_scores, log_path=None) -> None:
+def assert_root_not_degenerate(dev_scores, log_path=None, *, offline=False) -> None:
     """Refuse a root whose seed scored nothing.
 
     Observed live: the provider rejected every generation call, meta-n still
@@ -223,7 +223,18 @@ def assert_root_not_degenerate(dev_scores, log_path=None) -> None:
     A root the arms inherit is the one artefact that cannot be wrong, so this
     fails closed. All-zero per-task scores are the signature of FAILED GENERATION
     (every task's solver raised), not of a weak solver.
+
+    `offline=True` (a mock/local LLM backend) skips the check: the scores there
+    are produced by a placeholder generator against the REAL evaluator, so 0.0 is
+    the expected shape and says nothing about a provider. The offline run exists
+    to exercise the control flow, and its numbers are placeholders -- so it says
+    so rather than pretending to be a measurement.
     """
+    if offline:
+        print("NOTE: offline backend -- the root's scores are PLACEHOLDERS; the "
+              "degenerate-root gate is skipped because 0.0 here is by "
+              "construction, not evidence of a provider failure")
+        return
     scores = dict(dev_scores or {})
     per_task = {k: v for k, v in scores.items() if k != "__macro__"}
     macro = scores.get("__macro__")
@@ -566,7 +577,10 @@ def stage_root(args, profile: SRIProfile, out: Path) -> dict:
             "the shared root has no program for cohort task(s) {}; a root "
             "missing cohort material cannot seed a matched comparison".format(
                 missing))
-    assert_root_not_degenerate(bundle["dev_scores"], log)
+    assert_root_not_degenerate(
+        bundle["dev_scores"], log,
+        offline=os.environ.get("LLM_BACKEND", "").strip().lower()
+        in ("mock", "local"))
     inherited = sha256_of(root_candidate_digest(exp / "archive",
                                                 slugs))
     print("root bundle sha256 = {}".format(rb))

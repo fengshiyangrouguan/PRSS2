@@ -70,7 +70,13 @@ class Llmmaps(nn.Module):
     """
 
     N_BRANCHES = 4          # review round 8 ensemble size
-    DEPTH_LEVELS = (1, 2, 4, 8, 13)  # L = compressed-history turn count
+    # V11 (review): LOCAL-INTERFACE depth signatures — one bucket per
+    # chain position L_v = v+1 (v = 0..k-3, so L_v in 1..13).  The
+    # previous (1,2,4,8,13) set carried the whole-prefix depth L=k-1;
+    # the modulo fold below silently collapsed distinct chain positions
+    # onto the same signature.  Sampling stratification in train_ccm
+    # keeps its own 5-level DEPTH_LEVELS (frozen spec, untouched).
+    DEPTH_LEVELS = tuple(range(1, 14))  # L_v = local interface depth
 
     def __init__(self, d_chi: int = 64, d_phi: int = 32, m: int = 32,
                  seed: int = 0, repeats: int = 3, n_branches: int = 4):
@@ -239,10 +245,11 @@ class DialogueCutBuilder:
                 chi = chi[0]
             if phi.dim() == 2:
                 phi = phi[0]
-            # Review round 8: depth L = meta.k - 1 (compressed-history
-            # turn count) enters the measurement via the fixed depth
-            # bucket — known AT the cut, no future leakage.
-            p = self.maps.pv(chi, phi, L=int(meta.k) - 1)
+            # V11 (review): local-interface depth L_v = v + 1 — the
+            # measurement now identifies WHICH chain position this cut
+            # is (whole-prefix L = meta.k - 1 carried no position info
+            # and let all 12 cuts of a chain share one signature).
+            p = self.maps.pv(chi, phi, L=int(v) + 1)
             # Review round 8: tree identity = the STABLE original dialogue
             # id, not the per-step stream cursor (which would count every
             # re-sampling of a dialogue as an independent history).

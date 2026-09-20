@@ -901,11 +901,14 @@ def collect_rows(meta, adapter, builder, utter_embed, phi_embed,
     spans = meta["utterance_spans"]
     ids = batch["input_ids"][meta["row"]]
     labs = batch["labels"][meta["row"]]
-    # u_k = the target utterance: valid label tokens minus the EOS
+    # u_k = the target utterance: valid label tokens minus the EOS.
+    # V11 (review): Obs2 future becomes LOCAL — Y_v^(2) = u_{v+3} per
+    # cut, so the second observation tests "M_v -> real continuation ->
+    # M_{v+1} -> next predictive target".  Only the DEEPEST cut
+    # (v = k-3) keeps u_{v+3} = u_k, i.e. the final task target.
     valid_pos = (labs != -100).nonzero(as_tuple=False).flatten()
     uk_pos = valid_pos[:-1] if len(valid_pos) > 1 else valid_pos
-    phi2 = phi_embed(embed_tokens, ids[uk_pos].unsqueeze(0).to(device),
-                     tag=1)
+    u_k_ids = ids[uk_pos].unsqueeze(0).to(device)
     dm = DialogueMeta(sample_id=int(meta["sample_id"]), k=int(meta["k"]),
                       sum_positions=[(p + 2, p + 3) for (p, _s)
                                      in meta["blocks"]],
@@ -915,8 +918,16 @@ def collect_rows(meta, adapter, builder, utter_embed, phi_embed,
     for v in range(n_cuts):
         u_v1 = ids[spans[v + 1][0]:spans[v + 1][1]].unsqueeze(0).to(device)
         u_v2 = ids[spans[v + 2][0]:spans[v + 2][1]].unsqueeze(0).to(device)
+        # V11 local future: u_{v+3} is a prompt turn for v+3 <= k-1,
+        # and the target u_k for the deepest cut (v+3 == k).
+        if v + 3 <= len(spans) - 1:
+            u_v3 = ids[spans[v + 3][0]:spans[v + 3][1]].unsqueeze(0) \
+                .to(device)
+        else:
+            u_v3 = u_k_ids
         chi1 = utter_embed(embed_tokens, u_v1, tag=0)
         phi1 = phi_embed(embed_tokens, u_v2, tag=0)
+        phi2 = phi_embed(embed_tokens, u_v3, tag=1)
         chi2 = utter_embed.combine(embed_tokens, u_v1, u_v2, tag=1)
         rows.extend(builder.build(dm, zs[v], chi1[0], chi2[0],
                                   phi1[0], phi2[0], v=v))
@@ -2037,10 +2048,29 @@ def main():
                     # certificate skips the representation step below.
                     for i, (b, sid) in enumerate(pending):
                         _restore_rng(pass1_rngs[i])   # P0: mask == pass1
+                        # V11 (review): the QP center is the JOINT
+                        # proposal q = t + a_lambda, not the bare task
+                        # proposal t.  Running pass2_one with the real
+                        # lambda accumulates the aggregate RPBE gradient
+                        # ONTO the Gamma task gradient, so the snapshot
+                        # below (g_task_gamma) is exactly the joint
+                        # proposal direction; the projection then trims
+                        # only the components that hurt a local
+                        # interface.  Non-Gamma params keep pure task
+                        # (rpbe_gamma_only structure, unchanged).
                         task_mean, task_raw, n_valid, _aux, _n = pass2_one(
-                            b, cut_records[i], g_by_oid, 0.0)
+                            b, cut_records[i], g_by_oid,
+                            0.0 if args.arm == "gamma_task_only"
+                            else lambda_kf)
                         scaler.scale(
-                            task_mean / float(len(pending))).backward()
+                            task_mean / float(len(pending))).backward(
+                                retain_graph=True)
+                        if _n and args.arm == "ours":
+                            # V11: accumulate the aggregate RPBE gradient
+                            # onto Gamma so the snapshot below is the
+                            # joint proposal q = t + a_lambda (mirrors
+                            # the aggregate branch's aux backward).
+                            scaler.scale(_aux).backward()
                         task_sum += float(task_raw.detach())
                         n_tokens += n_valid
                     task_grads = {id(p): p.grad.detach().clone()

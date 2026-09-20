@@ -370,11 +370,14 @@ class Gemma4CCMTextAttention(nn.Module):
                 shared_kv_states[self.layer_type] = key_states, value_states
 
         # GQA attention: repeat KV heads, additive 4D mask, fp32 softmax.
+        # NOTE (gemma4 delta): native Gemma4 sets self.scaling = 1.0, so
+        # the attention scores are NOT divided by sqrt(head_dim) (the
+        # sqrt scaling only applies when scaling is None in the native
+        # eager path).  Multiplying by 1.0 keeps bit parity (G1 gate).
         key_states_r = repeat_kv(key_states, self.num_key_value_groups)
         value_states_r = repeat_kv(value_states, self.num_key_value_groups)
         attn_weights = torch.matmul(
-            query_states, key_states_r.transpose(2, 3)) / math.sqrt(
-                self.head_dim)
+            query_states, key_states_r.transpose(2, 3)) * self.scaling
 
         if attention_mask is not None:
             attn_weights = attn_weights + attention_mask

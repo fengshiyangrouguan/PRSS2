@@ -44,6 +44,7 @@ import argparse
 import json
 import logging
 import math
+import os
 import statistics
 import subprocess
 import sys
@@ -79,6 +80,70 @@ STAGE_MANIFEST = "sri_stage_manifest.json"
 LEDGER_NAME = "proposal_slots.jsonl"
 REJECTED_DIRNAME = "rejected"
 DEFAULT_DATA_DIR = "./data/co_bench"
+
+
+#: The relay this work uses. `--base-url` DEFAULTS to openrouter.ai and
+#: `--api-key` to OPENROUTER_API_KEY, so an arm that passes neither targets the
+#: wrong provider with no key. `LLM_BACKEND=relay` does not fill either in: for a
+#: paid kind the client takes base_url/api_key straight from LLMConfig (see
+#: meta_n/core/llm_client.py), and meta_n/rpbe/backends only gates the spend.
+RELAY_BASE_URL_DEFAULT = "https://api-key.xyz/api/v1"
+
+
+def launch_endpoint() -> Dict[str, Any]:
+    """The API endpoint an arm will actually be launched against."""
+    return {"base_url": os.environ.get("RELAY_BASE_URL",
+                                       RELAY_BASE_URL_DEFAULT).strip(),
+            "api_key": os.environ.get("RELAY_API_KEY", "").strip()}
+
+
+def assert_launch_env(args, profile: SRIProfile) -> Dict[str, Any]:
+    """Refuse to launch a paid arm unless the environment is the proven one.
+
+    The launch that produced the phaseH runs set every one of these. None is
+    optional and none has a safe default:
+
+      LLM_BACKEND + ALLOW_PAID_API -- the two-key gate in
+          `meta_n/rpbe/backends.assert_paid_allowed`;
+      RELAY_API_KEY                -- the key itself (from the run's .env);
+      META_N_EXTRA_HEADERS_JSON    -- the Accept-Encoding workaround this relay
+          needs; the phaseH script always exported it;
+      CODEBERT_PATH                -- the predictive arm hard-exits without it.
+    """
+    if not args.execute:
+        return {}
+    problems: List[str] = []
+    backend = os.environ.get("LLM_BACKEND", "").strip().lower()
+    if not backend or backend in ("mock", "local"):
+        problems.append("LLM_BACKEND={!r}: a paid run needs a paid backend "
+                        "(export LLM_BACKEND=relay)".format(backend))
+    if not os.environ.get("ALLOW_PAID_API", "").strip():
+        problems.append("ALLOW_PAID_API is unset (export "
+                        "ALLOW_PAID_API=YES_I_ACCEPT_REAL_COST)")
+    if not os.environ.get("RELAY_API_KEY", "").strip():
+        problems.append("RELAY_API_KEY is unset (source the run's .env)")
+    if not os.environ.get("META_N_EXTRA_HEADERS_JSON", "").strip():
+        problems.append("META_N_EXTRA_HEADERS_JSON is unset (this relay needs "
+                        "the Accept-Encoding workaround)")
+    cb = os.environ.get("CODEBERT_PATH", "").strip()
+    if not cb or not Path(cb).is_dir():
+        problems.append("CODEBERT_PATH={!r} is unset or not a directory (the "
+                        "predictive arm needs the frozen encoder)".format(cb))
+    if problems:
+        raise StageError(
+            "refusing to launch: the paid-run environment is incomplete.\n"
+            "  - " + "\n  - ".join(problems) +
+            "\nThe configuration the phaseH runs proved:\n"
+            "    set -a; . /root/autodl-tmp/meta-n-main/.env; set +a\n"
+            "    export LLM_BACKEND=relay ALLOW_PAID_API=YES_I_ACCEPT_REAL_COST\n"
+            '    export META_N_EXTRA_HEADERS_JSON=\'{"Accept-Encoding": '
+            '"identity"}\'\n'
+            "    export RELAY_BASE_URL=" + RELAY_BASE_URL_DEFAULT + "\n"
+            "    export CODEBERT_PATH=/root/autodl-tmp/models/codebert-base")
+    ep = launch_endpoint()
+    if not ep["base_url"] or not ep["api_key"]:
+        raise StageError("endpoint resolution failed (base_url/api_key empty)")
+    return {"base_url": ep["base_url"], "api_key_present": True}
 
 
 def run_id_for(profile: SRIProfile, backbone: str, search_seed: int) -> str:
@@ -255,8 +320,10 @@ def build_root_cmd(args, profile: SRIProfile, out: Path) -> List[str]:
     """
     pinned = dict(pinned_for(args, profile))
     pinned["max_iterations"] = 0            # ROOT ONLY: generate, do not breed
+    ep = launch_endpoint()
     return ([sys.executable, "-m", "meta_n.main"] + render_pinned_flags(pinned)
-            + ["--no-test-eval",
+            + ["--no-test-eval", "--base-url", ep["base_url"],
+               "--api-key", ep["api_key"],
                "--output-dir", str(out / "root"),
                "--exp-name", "phaseH_root"])
 
@@ -274,9 +341,12 @@ def build_arm_cmd(args, profile: SRIProfile, out: Path, arm: str,
     and the shared-root design would quietly collapse.
     """
     pinned = pinned_for(args, profile)
+    ep = launch_endpoint()
     return ([sys.executable, "-m", "meta_n.main"]
             + render_pinned_flags(pinned)
-            + ["--no-test-eval", "--resume", "--output-dir", str(out / "arms"),
+            + ["--no-test-eval", "--resume", "--base-url", ep["base_url"],
+               "--api-key", ep["api_key"],
+               "--output-dir", str(out / "arms"),
                "--exp-name", arm, "--sri-context", str(context_file)])
 
 
@@ -312,6 +382,9 @@ def stage_preflight(args, profile: SRIProfile, out: Path) -> dict:
     for k, v in pairing.manifest_fields().items():
         print("  {:<28} {}".format(k, v))
 
+    launch = assert_launch_env(args, profile)
+    if launch:
+        print("LAUNCH: base_url={} (api key present)".format(launch["base_url"]))
     pinned = pinned_for(args, profile)
     print("PINNED PARAMETERS (§8):")
     for k in sorted(pinned):
@@ -321,7 +394,8 @@ def stage_preflight(args, profile: SRIProfile, out: Path) -> dict:
     print("  {:<28} {}".format("test_repeats", profile.test_repeats))
 
     outputs = {"effective_config": cfg, "pairing": pairing.manifest_fields(),
-               "pinned": pinned, "evaluator_mode": args.evaluator}
+               "pinned": pinned, "evaluator_mode": args.evaluator,
+               "launch": launch}
     return record_stage(out, "preflight",
                         inputs={"profile_sha256": profile.sha256(),
                                 "backbone": args.backbone,
@@ -493,6 +567,7 @@ def build_arm_manifest(args, profile: SRIProfile, out: Path, arm: str, *,
         "backbone": args.backbone,
         "search_seed": args.search_seed,
         "evaluator_mode": args.evaluator,
+        "base_url": launch_endpoint()["base_url"],
         "pinned": pinned,
         "pairing": read_stage_manifest(out).get(
             "preflight", {}).get("outputs", {}).get("pairing"),
@@ -589,6 +664,9 @@ def stage_arm(args, profile: SRIProfile, out: Path, arm: str, *,
 
     fork = require_stage(out, "fork",
                          inputs={"root_bundle_sha256": root_sha})
+    # the endpoint is treatment-EXTERNAL: both arms must use the same one, and it
+    # is recorded in the manifest (the key itself never is)
+    assert_launch_env(args, profile)
     man = build_arm_manifest(args, profile, out, arm,
                              gamma_checkpoint=gamma_checkpoint)
     old = arm_dir(out, arm) / "manifest.json"

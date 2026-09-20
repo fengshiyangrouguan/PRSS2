@@ -47,11 +47,21 @@ novelty_alpha: 0.3
 # CO-Bench: a task's dev score is "#instances finishing inside the 10s
 # timeout / #instances", so a different worker count means a different
 # score from the same script (measured: assignment_problem 0.5000 at the
-# search's resolved 8, 0.2500 at a contended setting). 1 keeps every
-# instance unshared and minimises load-driven timeouts.
+# search's resolved 8, 0.2500 at a contended setting).
 # 0 is refused: it would resolve to cpu_count, i.e. machine-dependent.
 parallel: 1
-instance_workers: 1
+# 8, NOT 1: 8 is what the search side has always resolved to
+# (min(cpu_count, 8)) on every box this work has run on, so the audit and the
+# search then score under the SAME per-instance budget -- which is the point.
+# Pinning 1 would reduce contention further, but makes the audit roughly 8x
+# slower AND puts it on a different budget than the search that selected the
+# candidates being audited.
+instance_workers: 8
+
+# Hard ceiling on billed backend requests PER ARM. Insurance against a
+# runaway loop spending someone else's relay quota; generous relative
+# to the work, so it should never fire.
+max_backend_requests: 400
 
 # --- gate / consolidation (§8) --------------------------------------------
 # consolidate=true SKIPS the quality gate, so gate_tasks MUST be 0: a profile

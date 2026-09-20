@@ -210,6 +210,13 @@ class SRIProfile:
     # machine-dependent number and therefore not a reproducible parameter.
     parallel: int
     instance_workers: int
+    # A hard ceiling on BILLED backend requests PER ARM. Not a cost-optimisation:
+    # it bounds what a runaway generation loop can spend on someone else's relay
+    # quota. The value is generous relative to the work (the phaseH launch used
+    # 120 for a 4-iteration, B=1 run; this profile asks for 24 slots per arm), so
+    # it should never fire on a healthy run -- and if it ever does, the slot ends
+    # as `budget_halt` in the ledger, which the audit counts rather than ignores.
+    max_backend_requests: int
     temperatures: Tuple[float, ...]
     novelty_alpha: float
     # -- gate / consolidation knobs (§8) ------------------------------------
@@ -259,12 +266,13 @@ class SRIProfile:
             raise ProtocolError("empty_retry_max_tokens must be >= 0")
         if int(self.max_retries) < 0:
             raise ProtocolError("max_retries must be >= 0")
-        for k in ("parallel", "instance_workers"):
+        for k in ("parallel", "instance_workers", "max_backend_requests"):
             if int(getattr(self, k)) < 1:
                 raise ProtocolError(
-                    "{} must be >= 1: 0 means 'resolve to cpu_count', which is "
-                    "machine-dependent and would let the search and the audit "
-                    "score under different configurations".format(k))
+                    "{} must be >= 1: 0 means 'no cap' (or 'resolve to "
+                    "cpu_count'), which would let the search and the audit score "
+                    "under different configurations, or leave a runaway loop "
+                    "unbounded on someone else's relay quota".format(k))
         if int(self.gate_tasks) < 0:
             raise ProtocolError("gate_tasks must be >= 0 (0 disables the gate)")
         if self.gate_margin is not None and not isinstance(
@@ -759,6 +767,7 @@ CONFIG_KEY_TO_CLI: Dict[str, str] = {
     "temperatures": "--temperatures",
     "parallel": "--parallel",
     "instance_workers": "--instance-workers",
+    "max_backend_requests": "--max-backend-requests",
 }
 
 # Flags that accept an explicit `--no-` form (argparse.BooleanOptionalAction).
@@ -784,7 +793,11 @@ OMIT_WHEN_NONE_CONFIG_KEYS: Tuple[str, ...] = ("protect_floor",)
 # what the verification checks. Verified on a REAL config.json (72 keys, from
 # runs/phaseH): `use_archive` is absent, so requiring it would have failed the
 # arm stage AFTER its paid run had finished.
-RENDER_ONLY_CONFIG_KEYS: Tuple[str, ...] = ("use_archive",)
+# `max_backend_requests` is in the same category: main.py turns the flag into
+# $META_N_MAX_BACKEND_REQUESTS (main.py:1711) and never writes it into
+# config.json (verified against the real 72-key config.json).
+RENDER_ONLY_CONFIG_KEYS: Tuple[str, ...] = ("use_archive",
+                                           "max_backend_requests")
 
 
 def pinned_run_config(profile: SRIProfile, *, backbone: str, search_seed: int,
@@ -833,6 +846,7 @@ def pinned_run_config(profile: SRIProfile, *, backbone: str, search_seed: int,
         "temperatures": [float(t) for t in profile.temperatures],
         "parallel": int(profile.parallel),
         "instance_workers": int(profile.instance_workers),
+        "max_backend_requests": int(profile.max_backend_requests),
     }
 
 
@@ -989,7 +1003,7 @@ def _demo_profile(**over) -> SRIProfile:
         search_seeds=(0, 1, 2, 3, 4), search_eval_repeats=3, audit_repeats=3,
         test_repeats=3, max_tokens=1024, empty_retry_max_tokens=0,
         max_retries=0, reasoning_effort="low",
-        parallel=1, instance_workers=1,
+        parallel=1, instance_workers=8, max_backend_requests=400,
         temperatures=(0.5, 0.7, 0.9), novelty_alpha=0.3, consolidate=True,
         gate_tasks=0, gate_repeats=1, gate_margin=0.0, protect_floor=None,
         regression_guard=True, regression_guard_repeats=3,

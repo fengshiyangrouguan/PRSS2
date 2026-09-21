@@ -208,7 +208,7 @@ def build_model_merge(args, device):
                         r"^base_model\.model\.model\.layers\.(\d+)\."
                         r"self_attn\.(\w+_proj)\.lora_A\.default\."
                         r"weight$",
-                        r"model.layers..self_attn..weight", k)
+                        r"model.layers.\1.self_attn.\2.weight", k)
                     if base_key == k:
                         continue
                     A = tsd[k].float().to(device)

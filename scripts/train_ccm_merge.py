@@ -226,6 +226,11 @@ def build_model_merge(args, device):
         from src.utils import SeparatedEmbedding
         model.model.embed_tokens = SeparatedEmbedding(
             model.model.embed_tokens, 2 * N_TOK)
+        # The PLE table is looked up by the SAME input_ids — without a
+        # resize its 262144 rows cannot serve the comp ids (device
+        # assert on the lookup).  Grow it to match (zero rows, frozen).
+        model.model.resize_ple_embeddings(
+            text_cfg.vocab_size + 2 * N_TOK)
         model.update_comp_token(
             [text_cfg.vocab_size + k for k in range(N_TOK)],
             [text_cfg.vocab_size + N_TOK + k for k in range(N_TOK)])

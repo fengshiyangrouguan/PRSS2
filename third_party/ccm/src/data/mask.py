@@ -14,7 +14,13 @@ def reverse_cumsum(x: torch.Tensor) -> torch.Tensor:
     Returns:
         A tensor of shape (batch_size, seq_len) where each element is the sum of
         all elements to the right of it.
+
+    5.x compat: torch.sum(bool, dim=, keepdims=) is rejected on the new
+    signature — cast bool inputs to float first (callers pass
+    ``inputs == token`` comparisons directly).
     """
+    if x.dtype == torch.bool:
+        x = x.float()
     return x + torch.sum(x, dim=-1, keepdims=True) - torch.cumsum(x, dim=-1)
 
 

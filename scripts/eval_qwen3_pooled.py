@@ -44,6 +44,12 @@ def main():
     ap.add_argument("--no-gamma", action="store_true",
                     help="ccm_merge-arm checkpoints carry no Gamma params "
                          "(skip attach_gamma)")
+    ap.add_argument("--freeze-host", action="store_true",
+                    help="Stage-2 protocol (review ruling 2026-09-21): "
+                         "the ckpt holds Gamma state ONLY — freeze every "
+                         "non-Gamma param BEFORE the load (load_trainable "
+                         "refuses missing keys among the current "
+                         "trainable params)")
     ap.add_argument("--gpu", type=int, default=0)
     ap.add_argument("--out", default="eval_qwen3_pooled.json")
     ap.add_argument("--limit", type=int, default=0,
@@ -95,6 +101,16 @@ def main():
         .requires_grad_(True)
     if not a.no_gamma:
         tc.attach_gamma(model, hidden=args.gamma_hidden)
+    if a.freeze_host:
+        # Review ruling (2026-09-21): the Stage-2 checkpoint holds the
+        # Gamma state ONLY.  LoRA/COMP must already be frozen here, or
+        # load_trainable treats their missing keys as errors (the exact
+        # official-evaluator bug fixed in eval_ccm_official.py).
+        for _n, _p in model.named_parameters():
+            if "gamma" not in _n and _p.requires_grad:
+                _p.requires_grad_(False)
+        print("[freeze-host] non-Gamma params frozen (Gamma-only load)",
+              flush=True)
     dummy = torch.optim.AdamW(
         [p for p in model.parameters() if p.requires_grad], lr=1e-3)
     if a.ckpt != "INIT":

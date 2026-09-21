@@ -1038,7 +1038,7 @@ def treewise_feasibility_projection(g_task_gamma, gamma_params, G, kappa,
         # Gamma .grad <- the aggregate task gradient alone (d = t), the
         # degenerate / feasible / probe close semantics.
         for gt, p in zip(g_task_gamma, gamma_params):
-            p.grad = gt
+            p.grad = gt.to(p.device)
 
     if G is None or G.numel() == 0:
         diag["note"] = "no_dirs"
@@ -1108,7 +1108,9 @@ def treewise_feasibility_projection(g_task_gamma, gamma_params, G, kappa,
     with torch.no_grad():
         for p, cp, gt in zip(gamma_params, torch.split(corr, sizes),
                              g_task_gamma):
-            p.grad = gt - cp.view_as(p)   # grad = -d* = g_task - sum mu h_j
+            # .to(p.device): the QP runs on CPU (V11 OOM fix — the
+            # G matrix GPU peak was the last 4GB that blew the card).
+            p.grad = (gt - cp.view_as(p)).to(p.device)
     return True, diag
 
 
@@ -2131,7 +2133,7 @@ def main():
                             [x.reshape(-1).float()
                              for x in g_task_gamma])
                         _nt = float(_t_flat.norm())
-                        _G = torch.stack(dirs).to(device)
+                        _G = torch.stack(dirs)
                         _nr = _G.norm(dim=1)
                         _cos = ((_G @ _t_flat)
                                 / (_nr * _nt).clamp(min=1e-12)).tolist()
@@ -2166,8 +2168,9 @@ def main():
                             "CCM_TREEWISE_PROBE: window probed, "
                             "no optimizer step executed")
                     proj_ok, proj_diag = treewise_feasibility_projection(
-                        g_task_gamma, gamma_params,
-                        (torch.stack(dirs).to(device)
+                        [x.detach().cpu() for x in g_task_gamma],
+                        gamma_params,
+                        (torch.stack(dirs)
                          if dirs else None),
                         args.rpbe_kappa, iters=args.proj_iters,
                         # V11 (self-ruled 2026-09-21): the TGN final-spec

@@ -51,7 +51,10 @@ def parse_args():
     p = argparse.ArgumentParser(
         "CCM merge training (official Step-2 protocol, self-contained)")
     p.add_argument("--model-name-or-path", required=True)
-    p.add_argument("--host", default="qwen3", choices=["llama", "qwen3"])
+    p.add_argument("--host", default="qwen3",
+                   choices=["llama", "qwen3", "gemma4"])
+    p.add_argument("--foundation", default="",
+                   help="gemma4 Stage-1 adapter checkpoint to merge into the base before the conditional LoRA (official two-stage)")
     p.add_argument("--dialog-mirror", required=True)
     p.add_argument("--output", required=True)
     p.add_argument("--seed", type=int, default=0)
@@ -118,6 +121,30 @@ def build_tokenizer(args):
         tok.comp_token_id = ids[:N_TOK]
         tok.sum_token_id = ids[N_TOK:]
         return tok
+    if args.host == "gemma4":
+        from transformers import AutoTokenizer
+        from transformers.models.gemma4.configuration_gemma4 import (
+            Gemma4TextConfig)
+        tok = AutoTokenizer.from_pretrained(args.model_name_or_path)
+        if tok.pad_token_id is None:
+            tok.pad_token_id = 0
+            tok.pad_token = "<pad>"
+        tok.padding_side = "left"
+        cfg_vocab = Gemma4TextConfig.from_pretrained(
+            args.model_name_or_path).vocab_size
+        if len(tok) < cfg_vocab:
+            tok.add_tokens(
+                ["<|extra_{}|>".format(i)
+                 for i in range(cfg_vocab - len(tok))])
+        added = [f"<COMP{k}>" for k in range(N_TOK)]             + [f"<SUM{k}>" for k in range(N_TOK)]
+        tok.add_special_tokens({"additional_special_tokens": added})
+        ids = [tok.convert_tokens_to_ids(f"<COMP{k}>")
+               for k in range(N_TOK)] + [tok.convert_tokens_to_ids(
+                   f"<SUM{k}>") for k in range(N_TOK)]
+        assert ids[0] >= cfg_vocab
+        tok.comp_token_id = ids[:N_TOK]
+        tok.sum_token_id = ids[N_TOK:]
+        return tok
     from transformers import LlamaTokenizer
     tok = LlamaTokenizer.from_pretrained(args.model_name_or_path)
     tok.pad_token = tok.eos_token
@@ -139,6 +166,66 @@ def build_model_merge(args, device):
     """Official-host semantics: SeparatedEmbedding with TRAINABLE
     COMP/SUM rows; the lm_head stays at the base vocab (comp tokens have
     no output rows); no resize_token_embeddings."""
+    if args.host == "gemma4":
+        import re as _re
+        from transformers.models.gemma4.configuration_gemma4 import (
+            Gemma4TextConfig)
+        from transformers.models.gemma4.modeling_gemma4 import (
+            Gemma4ForConditionalGeneration)
+        from src.arch.ccm_gemma4 import Gemma4ForCausalLM_CCM
+        text_cfg = Gemma4TextConfig.from_pretrained(
+            args.model_name_or_path)
+        text_cfg.comp_relative_embedding = args.relative_embedding
+        model = Gemma4ForCausalLM_CCM(text_cfg)
+        dtype = torch.bfloat16 if device.type == "cuda" else torch.float32
+        full = Gemma4ForConditionalGeneration.from_pretrained(
+            args.model_name_or_path, torch_dtype=dtype)
+        prefix = "model.language_model."
+        text_sd = {}
+        for k, v in full.state_dict().items():
+            if k.startswith(prefix):
+                text_sd["model." + k[len(prefix):]] = v
+            elif k == "lm_head.weight":
+                text_sd[k] = v
+        del full
+        torch.cuda.empty_cache() if device.type == "cuda" else None
+        missing, unexpected = model.load_state_dict(text_sd, strict=False)
+        if unexpected:
+            raise RuntimeError("unexpected keys: {}".format(
+                unexpected[:8]))
+        model.to(device, dtype)
+        if args.foundation:
+            ck = torch.load(args.foundation, map_location=device,
+                            weights_only=False)
+            tsd = ck.get("trainable_state_dict", ck)
+            n_merged = 0
+            with torch.no_grad():
+                for k in list(tsd):
+                    if ".lora_A." not in k:
+                        continue
+                    b_key = k.replace(".lora_A.", ".lora_B.")
+                    base_key = _re.sub(
+                        r"^base_model\.model\.model\.layers\.(\d+)\."
+                        r"self_attn\.(\w+_proj)\.lora_A\.default\."
+                        r"weight$",
+                        r"model.layers..self_attn..weight", k)
+                    if base_key == k:
+                        continue
+                    A = tsd[k].float().to(device)
+                    B = tsd[b_key].float().to(device)
+                    delta = (B @ A) * (16.0 / 8.0)
+                    tgt = dict(model.named_parameters())[base_key]
+                    tgt.data += delta.to(tgt.dtype)
+                    n_merged += 1
+            print("[merge] foundation merged: {} LoRA modules".format(
+                n_merged), flush=True)
+        model.resize_token_embeddings(
+            text_cfg.vocab_size + 2 * N_TOK, mean_resizing=False)
+        model.update_comp_token(
+            [text_cfg.vocab_size + k for k in range(N_TOK)],
+            [text_cfg.vocab_size + N_TOK + k for k in range(N_TOK)])
+        model._gemma4_merge = True
+        return model.to(device)
     if args.host != "qwen3":
         raise NotImplementedError(
             "train_ccm_merge currently targets the qwen3 host")
@@ -174,8 +261,15 @@ def wrap_lora_merge(model, r, dropout):
     for _n, _p in model.named_parameters():
         if "lora_" in _n:
             _p.requires_grad_(True)
-    model.base_model.model.model.embed_tokens.comp_embeddings.weight \
-        .requires_grad_(True)
+    if getattr(model, "_gemma4_merge", False):
+        # gemma4 resize route: comp rows are the LAST 2*N_TOK rows of the
+        # resized main embedding (resize keeps new rows trainable).
+        emb = model.base_model.model.model.embed_tokens
+        emb.weight.requires_grad_(False)
+        emb.weight[-2 * N_TOK:].requires_grad_(True)
+    else:
+        model.base_model.model.model.embed_tokens.comp_embeddings.weight \
+            .requires_grad_(True)
     n_tr = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print("[merge] trainable params:", n_tr, flush=True)
     return model
@@ -188,6 +282,18 @@ def build_dataset(args, tokenizer):
                                      num_comp_tokens=N_TOK,
                                      add_comp_token=True,
                                      relative_embedding=args.relative_embedding)
+    if args.host == "gemma4":
+        from src.data.dialogue.gemma4_data import (
+            Gemma4DialogueDataset, Gemma4DialogueCollator)
+        dialog = Gemma4DialogueDataset(tokenizer,
+                                       mirror=args.dialog_mirror)
+        collator = Gemma4DialogueCollator(
+            dataset=dialog, tokenizer=tokenizer, comp_args=comp_args,
+            comp_token=tokenizer.comp_token_id,
+            sum_token=tokenizer.sum_token_id,
+            pad_token=tokenizer.pad_token_id,
+            label_pad_token_id=-100)
+        return dialog, collator
     if args.host == "qwen3":
         from src.data.dialogue.qwen3_data import (
             Qwen3DialogueDataset, Qwen3DialogueCollator)

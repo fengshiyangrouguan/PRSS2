@@ -260,20 +260,19 @@ class Qwen3CCMAttention(nn.Module):
                 # in-place write; with the host frozen the K/V tensors
                 # carry no requires_grad and the in-place op silently
                 # DROPS the Gamma residual from the autograd graph.
-                # Single out-of-place index_add over batch-flattened
-                # seq positions: idx order is (b, t, slot); source is
-                # [H, B*T*S, D] via permute(1,0,2,3,4).
+                # Whole-tensor index_add along the SEQ dim (2): source
+                # [B, H, T*S, D] via double permute.
                 _off = torch.arange(bsz, device=key_states.device) \
                     * key_states.shape[2]
                 _idx_k = (sum_row_pos + _off[:, None, None]).reshape(-1)
                 key_states = key_states.index_add(
-                    1, _idx_k,
+                    2, _idx_k,
                     res_all_k.permute(1, 0, 2, 3, 4).reshape(
-                        n_heads, -1, head_dim))
+                        n_heads, bsz, -1, head_dim).permute(1, 0, 2, 3))
                 value_states = value_states.index_add(
-                    1, _idx_k,
+                    2, _idx_k,
                     res_all_v.permute(1, 0, 2, 3, 4).reshape(
-                        n_heads, -1, head_dim))
+                        n_heads, bsz, -1, head_dim).permute(1, 0, 2, 3))
 
             # RPBE: memory extraction (post-merge, pre-attention).
             if self.mem_callback is not None:

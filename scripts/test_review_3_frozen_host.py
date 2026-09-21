@@ -64,6 +64,14 @@ def main():
 
     tokenizer = tc.build_tokenizer(args)
     model = tc.build_model(args, device)
+    # Mirror the training build order: build -> wrap_lora ->
+    # update_comp_token -> attach_gamma -> init-from -> freeze.
+    model = tc.wrap_lora(model, args.lora_r)
+    model.update_comp_token(
+        [tokenizer.comp_token_id[k] for k in range(tc.N_TOK)],
+        [tokenizer.sum_token_id[k] for k in range(tc.N_TOK)])
+    model.base_model.model.model.embed_tokens \
+        .comp_embeddings.weight.requires_grad_(True)
     tc.attach_gamma(model, hidden=args.gamma_hidden)
     # Mirror the training init-from block (the merge ckpt has no Gamma
     # keys; gamma must stay zero-init — load_trainable would refuse).

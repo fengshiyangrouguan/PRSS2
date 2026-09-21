@@ -258,13 +258,13 @@ class Qwen3CCMAttention(nn.Module):
                     # graph; collect then stack along the t axis instead.
                     res_list_k.append(res_t_k)
                     res_list_v.append(res_t_v)
+                # t=0 is the only zero row (res fill covers t=1..t_max-1
+                # via t_i=2..t_max).
                 res_all_k = torch.stack(
-                    [torch.zeros_like(k_base[:, :, 0]),
-                     torch.zeros_like(k_base[:, :, 0])]
+                    [torch.zeros_like(k_base[:, :, 0])]
                     + res_list_k, dim=2)
                 res_all_v = torch.stack(
-                    [torch.zeros_like(v_base[:, :, 0]),
-                     torch.zeros_like(v_base[:, :, 0])]
+                    [torch.zeros_like(v_base[:, :, 0])]
                     + res_list_v, dim=2)
                 # OUT-OF-PLACE index_add (freeze-host fix): the old
                 # per-batch slice assignment `key_states[b] = ...` is an

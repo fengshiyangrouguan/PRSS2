@@ -34,6 +34,7 @@ import json
 import math
 import os
 import random
+import re
 import struct
 import sys
 import time
@@ -519,11 +520,11 @@ def build_model(args, device):
         from transformers.models.gemma4.modeling_gemma4 import (
             Gemma4ForConditionalGeneration)
         from src.arch.ccm_gemma4 import Gemma4ForCausalLM_CCM
-        if args.official_host or args.foundation:
+        if args.official_host:
             raise SystemExit(
-                "[gemma4] --official-host/--foundation are Llama-line "
-                "artifacts; the gemma4 host builds from the released "
-                "Gemma-4-E4B checkpoint directly")
+                "[gemma4] --official-host is a Llama-line artifact; "
+                "the gemma4 host builds from the released "
+                "Gemma-4-E4B checkpoint (+ optional --foundation merge)")
         text_cfg = Gemma4TextConfig.from_pretrained(
             args.model_name_or_path)
         text_cfg.comp_relative_embedding = args.relative_embedding
@@ -555,6 +556,37 @@ def build_model(args, device):
         # state_dict, so they stay fp32 otherwise and shift every embed
         # output by the bf16 rounding of the scale (G1 gate catch).
         model.to(device, torch.bfloat16)
+        if args.foundation:
+            # Stage-1 default-LoRA merge (official two-stage protocol):
+            # the Step-1 artifact is an adapter-only checkpoint from
+            # train_ccm_step1.py ("trainable_state_dict" of plain peft
+            # LoRA keys).  Merge W' = W + B@A * (alpha/r) into the base
+            # BEFORE attaching the conditional LoRA (alpha=16, r=8 from
+            # the Step-1 Table-14 config).
+            ck = torch.load(args.foundation, map_location=device,
+                            weights_only=False)
+            tsd = ck.get("trainable_state_dict", ck)
+            n_merged = 0
+            with torch.no_grad():
+                for k in list(tsd):
+                    if ".lora_A." not in k:
+                        continue
+                    b_key = k.replace(".lora_A.", ".lora_B.")
+                    base_key = re.sub(
+                        r"^base_model\.model\.model\.layers\.(\d+)\."
+                        r"self_attn\.(\w+_proj)\.lora_A\.default\.weight$",
+                        r"model.layers.\1.self_attn.\2.weight", k)
+                    if base_key == k:
+                        continue
+                    A = tsd[k].float().to(device)
+                    B = tsd[b_key].float().to(device)
+                    delta = (B @ A) * (16.0 / 8.0)
+                    with torch.no_grad():
+                        tgt = dict(model.named_parameters())[base_key]
+                        tgt.data += delta.to(tgt.dtype)
+                    n_merged += 1
+            print("[gemma4] foundation merged: {} LoRA modules from {}"
+                  .format(n_merged, args.foundation), flush=True)
         model.resize_token_embeddings(text_cfg.vocab_size + 2 * N_TOK,
                                       mean_resizing=False)
         model.update_comp_token(

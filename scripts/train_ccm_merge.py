@@ -442,6 +442,26 @@ def main():
     pending = []
     total_tokens = 0
     total_loss = 0.0
+
+    if args.resume_from:
+        ck = torch.load(args.resume_from, map_location="cpu",
+                        weights_only=False)
+        model.load_state_dict(
+            {k: v.to(device) for k, v in ck["model"].items()},
+            strict=False)
+        step = int(ck["step"])
+        optimizer.load_state_dict(ck["optimizer_state"])
+        scheduler.load_state_dict(ck["scheduler_state"])
+        shuf_order = ck["shuf_order"]
+        epoch_pos = int(ck["epoch_pos"])
+        n_epochs = int(ck["n_epochs"])
+        random.setstate(ck["py_rng"])
+        np.random.set_state(ck["np_rng"])
+        torch.random.set_rng_state(ck["torch_rng"])
+        total_loss = float(ck["total_loss"])
+        total_tokens = int(ck["total_tokens"])
+        print("[resume] step={} epoch={} pos={} restored".format(
+            step, n_epochs, epoch_pos), flush=True)
     model.train()
 
     while step < args.max_steps:
@@ -487,7 +507,17 @@ def main():
                           time.time() - t_start, n_epochs), flush=True)
             if step % args.checkpoint_every == 0:
                 save_trainable(out / f"checkpoint_step{step}.pt", model,
-                               step=step)
+                               step=step,
+                               optimizer_state=optimizer.state_dict(),
+                               scheduler_state=scheduler.state_dict(),
+                               shuf_order=shuf_order,
+                               epoch_pos=epoch_pos,
+                               n_epochs=n_epochs,
+                               py_rng=random.getstate(),
+                               np_rng=np.random.get_state(),
+                               torch_rng=torch.random.get_rng_state(),
+                               total_loss=total_loss,
+                               total_tokens=total_tokens)
                 print("[ckpt] saved step {}".format(step), flush=True)
 
     save_trainable(out / "final.pt", model, step=step)

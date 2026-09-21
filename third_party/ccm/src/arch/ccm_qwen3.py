@@ -238,10 +238,10 @@ class Qwen3CCMAttention(nn.Module):
                                          dtype=key_states.dtype,
                                          device=key_states.device)
                 res_prev_v = torch.zeros_like(res_prev_k)
-                res_all_k = torch.zeros_like(k_base)
-                res_all_v = torch.zeros_like(v_base)
                 valid = sum_row_valid.to(key_states.dtype).unsqueeze(1)
                 valid = valid.unsqueeze(-1)  # [B, 1, T, n_slots, 1]
+                res_list_k = []
+                res_list_v = []
                 for t_i in range(2, t_max + 1):
                     tt = torch.full((bsz, 1), t_i, dtype=torch.float32,
                                     device=key_states.device)
@@ -253,8 +253,19 @@ class Qwen3CCMAttention(nn.Module):
                         v_cur[:, :, t_i - 1], tt) * valid[:, :, t_i - 1]
                     res_prev_k = res_t_k
                     res_prev_v = res_t_v
-                    res_all_k[:, :, t_i - 1] = res_t_k
-                    res_all_v[:, :, t_i - 1] = res_t_v
+                    # freeze-host fix 2: the old in-place fill into a
+                    # no-grad zeros tensor silently dropped the Gamma
+                    # graph; collect then stack along the t axis instead.
+                    res_list_k.append(res_t_k)
+                    res_list_v.append(res_t_v)
+                res_all_k = torch.stack(
+                    [torch.zeros_like(k_base[:, :, 0]),
+                     torch.zeros_like(k_base[:, :, 0])]
+                    + res_list_k, dim=2)
+                res_all_v = torch.stack(
+                    [torch.zeros_like(v_base[:, :, 0]),
+                     torch.zeros_like(v_base[:, :, 0])]
+                    + res_list_v, dim=2)
                 # OUT-OF-PLACE index_add (freeze-host fix): the old
                 # per-batch slice assignment `key_states[b] = ...` is an
                 # in-place write; with the host frozen the K/V tensors

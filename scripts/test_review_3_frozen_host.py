@@ -145,11 +145,16 @@ def main():
         tc.run_forward(model, batch, device, grad_enabled=False)
     for g, fwd in saved_fwd:
         g.forward = fwd
-    assert len(counts) == 36 * 3, (len(counts), "expected 36 x 3 calls")
-    assert sorted(counts) == [1, 2, 3] * 36, (
-        sorted(counts)[:12], "each layer must see t = 1, 2, 3")
-    print("check 3 PASS: {} Gamma calls = 36 layers x t=1,2,3 "
-          "(L=3 sample)".format(len(counts)), flush=True)
+    # The module is SHARED across the K and V merges, so each turn calls
+    # it twice (once per stream): 36 layers x 3 turns x {K, V} = 216.
+    from collections import Counter
+    c = Counter(counts)
+    assert len(counts) == 36 * 3 * 2, (len(counts),
+                                       "expected 36 x 3 turns x {K, V}")
+    assert c[1] == c[2] == c[3] == 36 * 2, (
+        dict(c), "each layer must see t = 1, 2, 3 (K and V streams)")
+    print("check 3 PASS: {} Gamma calls = 36 layers x t=1,2,3 x "
+          "{{K, V}} (L=3 sample)".format(len(counts)), flush=True)
 
     print("test 3 PASS: frozen host is Gamma-only, step-0 identical to "
           "CCM-merge, Gamma covers every layer")

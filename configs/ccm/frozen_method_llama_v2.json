@@ -49,7 +49,7 @@
   },
   "sampling": {
     "depth_levels": [1, 2, 4, 8, 13],
-    "k_of_L": "L + 2",
+    "n_turns_of_L": "L + 2 TURNS (fixed prefix length in turns per depth; NOT meta.k = len(blocks)+1 = L + 1)",
     "rule": "R10 depth-stratified protocol (inverse-sqrt weights + 3x cap, one dialogue per window) — unchanged for the llama line"
   }
 }

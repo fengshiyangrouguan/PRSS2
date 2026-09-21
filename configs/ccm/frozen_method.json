@@ -72,7 +72,7 @@
       8,
       13
     ],
-    "k_of_L": "L + 2 (fixed prefix length per depth)",
+    "n_turns_of_L": "L + 2 TURNS (fixed prefix length in turns per depth; NOT meta.k = len(blocks)+1 = L + 1)",
     "rule": "depth-stratified legal cuts: q_L ~ 1/sqrt(n_L) with 3x-uniform oversampling cap; ONE original dialogue per window (tree_id = stable original dialogue id, not the stream cursor); turn-14/L=13 uses only long-enough dialogues with the target FIXED at the 15th turn and a 13-turn compressed history; L=1 dialogues carry task CE only (v = k - 3 >= 1 requires L >= 2).",
     "paired_report": "scripts/eval_ccm_paired.py: paired d_i = NLL_task,i - NLL_ours,i; BCa bootstrap (20k), Huber location, paired randomization test, LOO stability, single-dialogue share <= 20%, branch direction agreement >= 3/4."
   }

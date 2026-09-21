@@ -1,0 +1,79 @@
+{
+ "_comment": "Qwen3-line LEGACY-sampling ablation frozen (2026-09-18, user ruling): identical to frozen_method_qwen3.json EXCEPT the sampling section keeps the R10 inverse-sqrt rule with NO replay cap — the parallel ablation arm vs the natural-frequency arm.",
+ "frozen_source": "copy of frozen_method_qwen3.json with the sampling section reverted to the R10 legacy rule",
+ "backbone": {
+  "model": "Qwen3-4B-Instruct-2507 (aligned instruct backbone: official Step-1 default-LoRA pretraining is SKIPPED per the CCM README rule)",
+  "hf_identifier": "Qwen/Qwen3-4B-Instruct-2507",
+  "revision": "cdbee75f17c01a7cc42f958dc650907174af0554",
+  "transformers": "4.56.2",
+  "vendored_commit": "a89dd08e2c9587ec9c6c3ad339bb154c33e6b41a",
+  "attn_type": "merge_recur",
+  "n_tok_lock": 2,
+  "torch_compile": "disabled on all three arms",
+  "dtype": "bf16"
+ },
+ "adapter": {
+  "lora_r": 8,
+  "lora_alpha": 16,
+  "lora_dropout": 0.0,
+  "lora_r_note": "r=8 q/k/v/o conditional LoRA"
+ },
+ "rpbe": {
+  "ridge_eps": 0.001,
+  "sketch_dim_m": 32,
+  "rpbe_map_seed": 0,
+  "z_v_dim": 128,
+  "horizon_weights": [
+   0.5,
+   0.5
+  ],
+  "lambda_calibration": {
+   "rule": "r_eff ~ 0.1 on theta_0 (GAMMA-scope)",
+   "lambda_kf_note": "V11: deleted for recalibration on the new local-closure supervision (Y2=u_{v+3}, b_{v+1}); derived_lambda will be committed after the calibration-only run."
+  },
+  "z_v_source": "J_mem(M_v) fixed adapter; GQA hosts lift the memory from the KV heads (8) with head_dim 128",
+  "witness": "none (main experiment)",
+  "sketch_ensemble_n_branches": 4,
+  "oas_shrinkage": {
+   "enabled": true,
+   "rule": "paired OAS covariance shrinkage per branch"
+  }
+ },
+ "gamma": {
+  "placement": "one module per layer, shared across the K/V merges and the two COMP/SUM slots",
+  "hidden": 64,
+  "time_dim": 16,
+  "init_scale": 0.02,
+  "zero_init": "U0=0 zero-output projection init; step 0 residual is bit-for-bit zero",
+  "parameter_budget": "36 layers (Qwen3-4B) x ~25.7k = ~925k < 1M"
+ },
+ "window": {
+  "min_effective_cuts": 128,
+  "collection": "adaptive by effective cut count (dialogues with k>=4)",
+  "cadence": "identical task samples and scheduler cadence across the three arms"
+ },
+ "training": {
+  "steps": 60,
+  "steps_note": "V11 arms: 60 windows (user ruling 2026-09-21).",
+  "grad_clip": 1.0,
+  "merge_cadence": "window-matched",
+  "two_pass_replay": "pass1 no-grad statistics forward, pass2 grad replay forward (RPBE arms only)",
+  "rpbe_gamma_only": true,
+  "rpbe_lr": 5e-05,
+  "seeds": 1,
+  "checkpoint_every": 10,
+  "schedule_total_steps": 1000,
+  "schedule_note": "original 1000-step warmup/cosine schedule kept"
+ },
+ "sampling": {
+  "depth_levels": [
+   1,
+   2,
+   4,
+   8,
+   13
+  ],
+  "n_turns_of_L": "L + 2 TURNS (fixed prefix length in turns per depth; NOT meta.k = len(blocks)+1 = L + 1)",
+  "rule": "LEGACY R10 sampling (ablation arm): q_L ~ 1/sqrt(n_L) with 3x-uniform oversampling cap, NO per-dialogue replay cap; one original dialogue per window."
+ }
+}

@@ -710,16 +710,25 @@ def build_dataset(args, tokenizer):
 # Review round 8 (turn-14 legal-cut scarcity): depth-stratified candidate
 # pools.  Depth L = compressed-history turn count; a dialogue contributes
 # to pool L iff its ORIGINAL length >= L + 2 (L history turns + 1
-# immediate context + 1 target).  k_L = L + 2 is the fixed prefix length,
-# so the cut is the memory after exactly L compressions and the target is
-# always the (L+2)-th turn — strictly legal by construction (same
-# dialogue, contiguous, complete utterances, no EOS/padding/truncation
-# crossing, never the trailing suffix, and the memory state is real).
+# immediate context + 1 target).  N_TURNS_OF_L[L] = L + 2 is the fixed
+# prefix length measured in TURNS, so the cut is the memory after exactly
+# L compressions and the target is always the (L+2)-th turn — strictly
+# legal by construction (same dialogue, contiguous, complete utterances,
+# no EOS/padding/truncation crossing, never the trailing suffix, and the
+# memory state is real).
 # Turn-14/L=13 requires the original dialogue to be long enough, and its
 # target is FIXED at the 15th turn with a 13-turn compressed history.
+#
+# NAMING (audit fix 2026-09-21): this quantity is a TURN COUNT (L + 2).
+# It is NOT the CCM "k" of parse_meta / data_flow.jsonl, which counts
+# context turns as len(blocks) + 1 (= L + 1).  The two conventions differ
+# by exactly 1, so calling both "k" is precisely the off-by-one depth
+# misreading an audit is meant to catch (audit #1 fell into that class).
+# Every turn-count use below is spelled n_turns_*; every block-count use
+# stays meta["k"].  Do not reintroduce a bare "k" for either.
 # ---------------------------------------------------------------------
 DEPTH_LEVELS = (1, 2, 4, 8, 13)          # L = compressed-history turns
-K_OF_L = {L: L + 2 for L in DEPTH_LEVELS}  # fixed prefix length per depth
+N_TURNS_OF_L = {L: L + 2 for L in DEPTH_LEVELS}  # TURN COUNT per depth
 DEPTH_CAP = 3.0 / len(DEPTH_LEVELS)      # max oversampling vs uniform
 
 
@@ -734,7 +743,7 @@ def build_depth_pools(train_items):
     for i, item in enumerate(train_items):
         n = len(item["dialog"])
         for L in DEPTH_LEVELS:
-            if n >= K_OF_L[L]:
+            if n >= N_TURNS_OF_L[L]:
                 pools[L].append(i)
     return pools
 
@@ -1495,16 +1504,23 @@ def main():
                             "q": float(depth_probs[i])}
                    for i, L in enumerate(DEPTH_LEVELS)},
         "n_items": n_items,
-        "k_of_L": {str(L): K_OF_L[L] for L in DEPTH_LEVELS},
+        "n_turns_of_L": {str(L): N_TURNS_OF_L[L] for L in DEPTH_LEVELS},
+        "n_turns_of_L_units": "TURNS (prefix length in dialogue turns). "
+                              "NOT meta['k']: meta.k = len(blocks) + 1 "
+                              "= L + 1 counts context turns and is the "
+                              "convention data_flow.jsonl records. The two "
+                              "differ by exactly 1 by construction.",
         "rule": ("q_L ~ 1/sqrt(n_L), 3x-uniform oversampling cap" if
                  q_alpha is None else
                  "q_L ~ n_L^{} (natural frequency) with per-dialogue "
                  "replay cap {}".format(q_alpha, max_replays))
-        + "; one original dialogue per window; fixed k_L = L + 2",
+        + "; one original dialogue per window; fixed prefix = "
+          "n_turns_of_L[L] = L + 2 turns",
         "note_L1": "depth L=1 dialogues (3 turns) carry task CE only: "
-                   "the cut formula v = k - 3 >= 1 requires L >= 2, so "
-                   "L=1 contributes no RPBE row (legacy protocol "
-                   "semantics, unchanged by round 8)",
+                   "with meta.k = len(blocks) + 1 = L + 1 the cut index "
+                   "v = meta.k - 3 = L - 2 is negative at L=1, so L=1 "
+                   "emits no RPBE row (legacy protocol semantics, "
+                   "unchanged by round 8)",
     })
 
     def next_batch():
@@ -1512,7 +1528,8 @@ def main():
         # q_L (legacy 1/sqrt(n_L) capped, or the Qwen3-line natural
         # frequency), then one dialogue from pool L that has NOT appeared
         # in this window (one dialogue per window), and collate it at the
-        # FIXED prefix k_L = L + 2.  The same RNG stream drives both arms
+        # FIXED prefix N_TURNS_OF_L[L] = L + 2 turns (turn count, not the
+        # meta.k = L + 1 block convention).  The same RNG stream drives both arms
         # (seed_all), so task-only and ours see the identical sampling
         # stream.
         # Qwen3-line replay cap: a dialogue leaves its pool after
@@ -1556,7 +1573,7 @@ def main():
             replay_count[orig_id] = replay_count.get(orig_id, 0) + 1
             seen_dialogs.add(orig_id)
             item = dict(train_items[orig_id])
-            item["dialog"] = list(item["dialog"])[:K_OF_L[L]]
+            item["dialog"] = list(item["dialog"])[:N_TURNS_OF_L[L]]
             item["fixed_depth"] = True
             items.append(item)
             orig_ids.append(orig_id)

@@ -219,12 +219,16 @@ def build_model_merge(args, device):
                     n_merged += 1
             print("[merge] foundation merged: {} LoRA modules".format(
                 n_merged), flush=True)
-        model.resize_token_embeddings(
-            text_cfg.vocab_size + 2 * N_TOK, mean_resizing=False)
+        # SeparatedEmbedding (official-host semantics, same as qwen3):
+        # the COMP/SUM rows live in a TRAINABLE separate table routed by
+        # id >= vocab_size; the lm_head keeps the base vocab (comp
+        # tokens have no output rows).  No resize on gemma either.
+        from src.utils import SeparatedEmbedding
+        model.model.embed_tokens = SeparatedEmbedding(
+            model.model.embed_tokens, 2 * N_TOK)
         model.update_comp_token(
             [text_cfg.vocab_size + k for k in range(N_TOK)],
             [text_cfg.vocab_size + N_TOK + k for k in range(N_TOK)])
-        model._gemma4_merge = True
         return model.to(device)
     if args.host != "qwen3":
         raise NotImplementedError(
@@ -261,15 +265,11 @@ def wrap_lora_merge(model, r, dropout):
     for _n, _p in model.named_parameters():
         if "lora_" in _n:
             _p.requires_grad_(True)
-    if getattr(model, "_gemma4_merge", False):
-        # gemma4 resize route: comp rows are the LAST 2*N_TOK rows of the
-        # resized main embedding (resize keeps new rows trainable).
-        emb = model.base_model.model.model.embed_tokens
-        emb.weight.requires_grad_(False)
-        emb.weight[-2 * N_TOK:].requires_grad_(True)
-    else:
-        model.base_model.model.model.embed_tokens.comp_embeddings.weight \
-            .requires_grad_(True)
+    # Unified path: both qwen3 and gemma4 use SeparatedEmbedding (the
+    # gemma slice hack was invalid — nn.Parameter requires_grad is
+    # tensor-level, a row slice assignment does nothing).
+    model.base_model.model.model.embed_tokens.comp_embeddings.weight \
+        .requires_grad_(True)
     n_tr = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print("[merge] trainable params:", n_tr, flush=True)
     return model

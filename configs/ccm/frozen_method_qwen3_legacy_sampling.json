@@ -53,7 +53,8 @@
   "scope": "backbone + conditional LoRA + COMP/SUM embeddings all frozen (train Gamma ONLY); optimizer holds only the Gamma group",
   "mode": "host model.eval() + Gamma modules train() — the official conditional LoRA dropout (0.05) must not perturb the frozen host forward; gradients still flow through the host to Gamma",
   "checkpoint": "Stage-2 checkpoints save the Gamma state only (trainable_state_dict = requires_grad params)",
-  "eval_reconstruction": "build_official_host -> attach_gamma -> load Gamma-only checkpoint -> freeze non-Gamma -> eval; same construction as training"
+  "eval_reconstruction": "build_official_host -> attach_gamma -> load Gamma-only checkpoint -> freeze non-Gamma -> eval; same construction as training",
+  "enabled": true
  },
  "window": {
   "min_effective_cuts": 128,

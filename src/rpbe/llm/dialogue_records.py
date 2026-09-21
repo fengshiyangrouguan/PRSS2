@@ -36,8 +36,8 @@ HORIZON_WEIGHTS = (0.5, 0.5)
 # Review ruling (2026-09-21): the candidate pool spans endpoint depths
 # L in {1, 2, 4, 8, 13} (L = compressed-history turn count, T = L + 2
 # turns).  L = 1 yields the terminal cut t = 1 = L with (c, y) — a legal
-# single-row cut.  MIN_K keeps the legacy k >= 3 read (k = L + 1).
-MIN_K = 3  # k >= 3 gives L >= 1 (one compressed turn suffices)
+# single-row cut.  (MIN_K deleted 2026-09-21: the old k >= 3 read invited
+# k-based cut derivations; the builder judges on L < 1 directly.)
 
 
 def _fixed_binary(shape, seed):

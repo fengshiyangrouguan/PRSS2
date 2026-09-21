@@ -55,6 +55,28 @@ def main(args) -> None:
     args.training.do_train = False
     args.training.do_eval = True
 
+    # Review ruling (2026-09-21): three FIXED evaluator modes — the
+    # pooled val+test protocol is a CCM-reproduction report only and
+    # never selects a checkpoint (checkpoint selection is validation
+    # only).  Anything else fails fast instead of silently running the
+    # pooled default.
+    mode = os.environ.get("EVAL_MODE", "selection")
+    if mode == "selection":
+        args.data.clean_split = True
+        os.environ["EVAL_SOURCE"] = "val"
+    elif mode == "final_test":
+        args.data.clean_split = True
+        os.environ["EVAL_SOURCE"] = "test"
+    elif mode == "reproduction_report":
+        args.data.clean_split = False
+        os.environ["EVAL_SOURCE"] = "val"
+    else:
+        raise SystemExit(
+            "EVAL_MODE must be one of selection | final_test | "
+            "reproduction_report (got {})".format(mode))
+    print("[eval-mode] {} (clean_split={})".format(
+        mode, args.data.clean_split), flush=True)
+
     from src.model import load_model, load_pretrained
     # The official foundation adapter (llama-7b-no, Step-1 default LoRA)
     # is a MERGED model: it goes through training.load_path, which the
@@ -103,6 +125,16 @@ def main(args) -> None:
         # dtype mismatch.  Cast them explicitly.
         for _g in _gammas:
             _g.half()
+        # Review ruling (2026-09-21): FREEZE FIRST, then load.  The
+        # Stage-2 checkpoint holds the Gamma state only; load_trainable
+        # refuses missing keys among the CURRENT trainable params, so
+        # LoRA/COMP must already be frozen here (the reverse order made
+        # the Gamma-only checkpoint unloadable).
+        n_frozen = 0
+        for n, p in model.named_parameters():
+            if "gamma" not in n and p.requires_grad:
+                p.requires_grad_(False)
+                n_frozen += 1
         dummy = torch.optim.AdamW(
             [p for p in model.parameters() if p.requires_grad], lr=1e-3)
         if our_ckpt == "INIT":
@@ -115,13 +147,6 @@ def main(args) -> None:
             payload = tc.load_trainable(our_ckpt, model, dummy, device)
             print("our checkpoint loaded (build mode): {}".format(our_ckpt),
                   flush=True)
-        # Freeze the ENTIRE host (LoRA + COMP/SUM + backbone) — the
-        # Stage-2 checkpoint only ever trained Gamma.
-        n_frozen = 0
-        for n, p in model.named_parameters():
-            if "gamma" not in n and p.requires_grad:
-                p.requires_grad_(False)
-                n_frozen += 1
         model.eval()
         print("[frozen-host] frozen {} non-Gamma params "
               "(Gamma-only evaluation host)".format(n_frozen), flush=True)

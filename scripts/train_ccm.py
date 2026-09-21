@@ -372,6 +372,22 @@ def enforce_frozen(args):
             "[frozen] arm {} must run with the frozen window-matched "
             "cadence; --merge-cadence official is reserved for "
             "ccm_merge_official".format(args.arm))
+    # Review ruling (2026-09-21): the freeze-host protocol is MANDATORY
+    # for the main RPBE arms — a forgotten --freeze-host silently reverts
+    # to LoRA+COMP+Gamma joint training (the exact confound the
+    # freeze-host design removes).  Same for --official-host where the
+    # spec pins the official build (legacy resize host retired).
+    for _key, _flag in (("freeze_host", "freeze_host"),
+                        ("official_host", "official_host")):
+        _section = fz.get(_key)
+        if not isinstance(_section, dict) or not _section.get("enabled"):
+            continue
+        if args.arm in ("ours", "gamma_task_only") \
+                and not getattr(args, _flag, False):
+            raise SystemExit(
+                "[frozen] {}.enabled=true in the frozen spec: the {} "
+                "arm MUST pass --{}".format(_key, args.arm,
+                                            _flag.replace("_", "-")))
     # Lambda authority: the calibration-only run writes the derived
     # lambda into the frozen spec; afterwards the number overrides any
     # CLI value and re-calibration is refused.
@@ -1580,7 +1596,7 @@ def main():
     # the dedup set and per-window counters reset with the window.
     depth_diag_path = out / "depth_diag.jsonl"
 
-    def close_depth_window(n_mb, step_val, n_cuts):
+    def close_depth_window(n_mb, step_val, n_cuts, n_rows=None):
         uniq = len(seen_dialogs)
         with depth_diag_path.open("a") as f:
             f.write(json.dumps({
@@ -1590,9 +1606,12 @@ def main():
                 "unique_dialogs": int(uniq),
                 "dup_rate": float(1.0 - uniq / max(int(n_mb), 1)),
                 "n_cuts": int(n_cuts),
-                # rows w=0.5: ESS=2*n_cuts (L=1 microbatches carry no
-                # RPBE row: v = k - 3 >= 1 requires depth L >= 2)
-                "ess_rows": float(2 * n_cuts),
+                # Review ruling (2026-09-21): rows per cut are 2 for
+                # t < L and 1 for the terminal cut (L=1 emits its
+                # terminal row) — pass the exact count from cut_records
+                # when available (RPBE arms), else the 2*n_cuts bound.
+                "ess_rows": float(n_rows if n_rows is not None
+                                  else 2 * n_cuts),
                 "L13_cover": float(depth_win[13] / max(int(n_mb), 1)),
             }) + "\n")
         seen_dialogs.clear()
@@ -2384,7 +2403,10 @@ def main():
                 boundary_records.append(
                     "w{}:{}:{}{}".format(
                         kf_closed, len(pending), n_cut_win, _skip_tag))
-                close_depth_window(len(pending), step, n_cut_win)
+                _n_rows = sum(
+                    2 if int(v) != int(meta["L"]) - 1 else 1
+                    for _rec in cut_records for meta, _oid, v in _rec)
+                close_depth_window(len(pending), step, n_cut_win, _n_rows)
                 pending = []
                 cut_records = []
                 pass1_rngs = []

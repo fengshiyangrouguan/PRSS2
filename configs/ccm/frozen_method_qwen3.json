@@ -1,103 +1,108 @@
 {
-  "_comment": "Qwen3 line frozen method (feature_QWEN, 2026-09-17). Same machine-readable freeze contract as frozen_method.json, separate file so the Llama line (R8-R10) stays untouched. Sources: CCM paper two-stage protocol (skip Step-1 for aligned instruct backbones, official README rule), RPBE hyper-params carried from the Llama line EXCEPT lambda_kf which must be recalibrated on the Qwen3 geometry (constants are never reused across hosts).",
-  "frozen_source": "CCM official dialog protocol (max_steps 1000, lr 3e-4, accum-equivalent 128 effective cuts per window) + Llama-line RPBE structure (chain-wise multi-cut, gamma-only, window-matched cadence)",
-  "backbone": {
-    "model": "Qwen3-4B-Instruct-2507 (aligned instruct backbone: official Step-1 default-LoRA pretraining is SKIPPED per the CCM README rule)",
-    "hf_identifier": "Qwen/Qwen3-4B-Instruct-2507",
-    "revision": "cdbee75f17c01a7cc42f958dc650907174af0554",
-    "transformers": "4.56.2",
-    "vendored_commit": "a89dd08e2c9587ec9c6c3ad339bb154c33e6b41a",
-    "attn_type": "merge_recur",
-    "n_tok_lock": 2,
-    "torch_compile": "disabled on all three arms",
-    "dtype": "bf16"
+ "_comment": "Qwen3 line frozen method (feature_QWEN, 2026-09-17). Same machine-readable freeze contract as frozen_method.json, separate file so the Llama line (R8-R10) stays untouched. Sources: CCM paper two-stage protocol (skip Step-1 for aligned instruct backbones, official README rule), RPBE hyper-params carried from the Llama line EXCEPT lambda_kf which must be recalibrated on the Qwen3 geometry (constants are never reused across hosts).",
+ "frozen_source": "CCM official dialog protocol (max_steps 1000, lr 3e-4, accum-equivalent 128 effective cuts per window) + Llama-line RPBE structure (chain-wise multi-cut, gamma-only, window-matched cadence)",
+ "backbone": {
+  "model": "Qwen3-4B-Instruct-2507 (aligned instruct backbone: official Step-1 default-LoRA pretraining is SKIPPED per the CCM README rule)",
+  "hf_identifier": "Qwen/Qwen3-4B-Instruct-2507",
+  "revision": "cdbee75f17c01a7cc42f958dc650907174af0554",
+  "transformers": "4.56.2",
+  "vendored_commit": "a89dd08e2c9587ec9c6c3ad339bb154c33e6b41a",
+  "attn_type": "merge_recur",
+  "n_tok_lock": 2,
+  "torch_compile": "disabled on all three arms",
+  "dtype": "bf16"
+ },
+ "adapter": {
+  "lora_r": 8,
+  "lora_alpha": 16,
+  "lora_dropout": 0.0,
+  "lora_r_note": "r=8 q/k/v/o conditional LoRA (trainable count 5,898,240, matches the port spec allowlist bit-for-bit; verified in the 4B smoke)"
+ },
+ "rpbe": {
+  "ridge_eps": 0.001,
+  "sketch_dim_m": 32,
+  "rpbe_map_seed": 0,
+  "z_v_dim": 128,
+  "horizon_weights": [
+   0.5,
+   0.5
+  ],
+  "lambda_calibration": {
+   "rule": "r_eff = lambda * ||g_KF|| / ||g_task|| ~ 0.1, measured on theta_0 (calibration-only run, before ANY optimizer/scheduler step), calibrated once on the initial full window (training-only), then frozen for all seeds. GAMMA-scope measurement (R10 rule): r_eff is the gradient-norm ratio on the Gamma parameters only.",
+   "lambda_kf": 0.011370957358248798,
+   "lambda_kf_note": "RECALIBRATED on the CORRECTED theta_0 (merge s550, tokenizer-aligned comp-trainable geometry, 2026-09-18): r_eff_gamma(lambda=1)=8.794, derived lambda = 0.1/8.794 = 0.01137.  The bugged-geometry value 0.01507 (r_eff=6.635) is retired."
   },
-  "adapter": {
-    "lora_r": 8,
-    "lora_alpha": 16,
-    "lora_dropout": 0.0,
-    "lora_r_note": "r=8 q/k/v/o conditional LoRA (trainable count 5,898,240, matches the port spec allowlist bit-for-bit; verified in the 4B smoke)"
-  },
-  "rpbe": {
-    "ridge_eps": 0.001,
-    "sketch_dim_m": 32,
-    "rpbe_map_seed": 0,
-    "z_v_dim": 128,
-    "horizon_weights": [
-      0.5,
-      0.5
-    ],
-    "lambda_calibration": {
-      "rule": "r_eff = lambda * ||g_KF|| / ||g_task|| ~ 0.1, measured on theta_0 (calibration-only run, before ANY optimizer/scheduler step), calibrated once on the initial full window (training-only), then frozen for all seeds. GAMMA-scope measurement (R10 rule): r_eff is the gradient-norm ratio on the Gamma parameters only.",
-      "lambda_kf": 0.011370957358248798,
-      "lambda_kf_note": "RECALIBRATED on the CORRECTED theta_0 (merge s550, tokenizer-aligned comp-trainable geometry, 2026-09-18): r_eff_gamma(lambda=1)=8.794, derived lambda = 0.1/8.794 = 0.01137.  The bugged-geometry value 0.01507 (r_eff=6.635) is retired."
-    },
-    "z_v_source": "J_mem(M_v) fixed adapter (TGN identity is its special case); GQA hosts lift the memory from the KV heads (8) with head_dim 128",
-    "witness": "none (main experiment)",
-    "sketch_ensemble_n_branches": 4,
-    "sketch_ensemble_note": "Four independent 32-dim branches (J_ens = mean_r J_r); depth bucket b(L_v) modulates the future signature phi_r.",
-    "oas_shrinkage": {
-      "enabled": true,
-      "rule": "paired OAS covariance shrinkage per branch; the fixed ridge keeps only its numerical-safety role."
-    }
-  },
-  "gamma": {
-    "placement": "one module per layer, shared across the K/V merges and the two COMP/SUM slots",
-    "hidden": 64,
-    "time_dim": 16,
-    "init_scale": 0.02,
-    "zero_init": "U0=0 zero-output projection init: R = U tanh(V [prev;cur;time(t)]) with U.weight exactly 0 and V small random. Step 0 residual is bit-for-bit zero (verified: max|dlogit|=0.0 on the 4B smoke).",
-    "parameter_budget": "36 layers (Qwen3-4B) x ~25.7k = ~925k < 1M"
-  },
-  "window": {
-    "min_effective_cuts": 128,
-    "collection": "adaptive by effective cut count (dialogues with k>=4), not a mechanical microbatch count",
-    "cadence": "identical task samples and scheduler cadence across the three arms"
-  },
-  "training": {
-    "steps": 60,
-    "steps_note": "Stage B (ours) budget = 60 windows (user ruling 2026-09-18: comp+RPBE joint fine-tuning from the Stage-A best checkpoint s550).  trainable = LoRA + COMP rows + Gamma (COMP rows STAY trainable in stage 2, task gradients keep refining them; RPBE touches Gamma only).  Sampling = q_L ∝ n_L + replay cap 12 (see sampling section).",
-    "official_protocol": {
-      "arm": "ccm_merge_official",
-      "merge_cadence": "official",
-      "grad_accum": 128,
-      "random_k": true,
-      "data_stream": "shuffled epoch loop (each dialogue exactly once per epoch)",
-      "thresholds": "train max_len_total 400, val/test 600 (official data.py)",
-      "micro_batch": 4,
-      "micro_batch_note": "equal-weight-per-dialogue normalization preserved bit-for-bit (row-wise mean CE / dialogue count); batch>1 is kernel-efficiency only"
-    },
-    "grad_clip": 1.0,
-    "grad_clip_source": "official HF Trainer default (max_grad_norm)",
-    "merge_cadence": "window-matched",
-    "merge_cadence_note": "window-matched applies to the RPBE-line arms (ours / gamma_task_only / ccm_merge under the depth protocol); the Stage-A official merge run uses the official fixed cadence via the ccm_merge_official arm",
-    "two_pass_replay": "pass1 no-grad statistics forward, pass2 grad replay forward (RPBE arms only)",
-    "rpbe_gamma_only": true,
-    "rpbe_gamma_only_note": "R10 structure: the RPBE surrogate updates GAMMA ONLY — task CE keeps training LoRA/COMP/Gamma, the auxiliary gradient on non-Gamma params is discarded (dual backward, retain_graph).",
-    "rpbe_lr": 0.00005,
-    "rpbe_lr_note": "independent AdamW base lr for the Gamma group (R10 formal config 5e-5); the shared cosine scheduler scales both groups by the same factor.",
-    "seeds": 1,
-    "seeds_note": "Qwen3 line starts with seed 0 only (user ruling, same as the R10 v5 line)",
-    "eval": "matched-cohort depth curves on the clean test split (protocol C); primary metric = per-token NLL difference, EOS excluded",
-    "checkpoint_every": 10,
-    "checkpoint_every_note": "Stage B 100-window budget -> 10 checkpoints (s10..s100) + final, fine evaluation curve (user ruling 2026-09-17)",
-    "schedule_total_steps": 1000,
-    "schedule_note": "warmup/cosine over 1000 steps (warmup ratio 0.03): the 100-window Stage B runs inside the warmup-to-peak region of the original 1000-step schedule (same convention as the Llama line, where the e50 pilot kept the 1000-step schedule while stopping at 500)."
-  },
-  "sampling": {
-    "depth_levels": [
-      1,
-      2,
-      4,
-      8,
-      13
-    ],
-    "k_of_L": "L + 2 (fixed prefix length per depth)",
-    "q_alpha": 1.0,
-    "q_alpha_note": "q_L ∝ n_L^q_alpha.  q_alpha=1 (natural frequency) RETIRES the R10 inverse-sqrt upweighting (which gave the L=13 pool ~60% of the stream and replayed its 573 dialogues 52-120x each — turn_15 overfitting, diagnosed 2026-09-17).  With the replay cap, every depth pool exhausts its n_L x K budget at the SAME time, so the depth mix stays stable over the whole budget.",
-    "max_replays": 12,
-    "max_replays_note": "per-dialogue exposure cap = official 12-epoch semantics (128k samples / 10546 dialogues).  A dialogue leaves its pool after K samples; exhausted depth layers drop out of the draw (q renormalizes over the remaining layers); when all layers are exhausted the counters reset for the next replay cycle.",
-    "rule": "depth-stratified legal cuts with natural-frequency depth weights + per-dialogue replay cap; ONE original dialogue per window (tree_id = stable original dialogue id); L=1 dialogues carry task CE only.",
-    "paired_report": "scripts/eval_ccm_paired.py (Llama line; Qwen3 line uses protocol C + protocol B curves)"
+  "z_v_source": "J_mem(M_v) fixed adapter (TGN identity is its special case); GQA hosts lift the memory from the KV heads (8) with head_dim 128",
+  "witness": "none (main experiment)",
+  "sketch_ensemble_n_branches": 4,
+  "sketch_ensemble_note": "Four independent 32-dim branches (J_ens = mean_r J_r); depth bucket b(L_v) modulates the future signature phi_r.",
+  "oas_shrinkage": {
+   "enabled": true,
+   "rule": "paired OAS covariance shrinkage per branch; the fixed ridge keeps only its numerical-safety role."
   }
+ },
+ "gamma": {
+  "placement": "one module per layer, shared across the K/V merges and the two COMP/SUM slots",
+  "hidden": 64,
+  "time_dim": 16,
+  "init_scale": 0.02,
+  "zero_init": "U0=0 zero-output projection init: R = U tanh(V [prev;cur;time(t)]) with U.weight exactly 0 and V small random. Step 0 residual is bit-for-bit zero (verified: max|dlogit|=0.0 on the 4B smoke).",
+  "parameter_budget": "36 layers (Qwen3-4B) x ~25.7k = ~925k < 1M"
+ },
+ "window": {
+  "min_effective_cuts": 128,
+  "collection": "adaptive by effective cut count (dialogues with k>=4), not a mechanical microbatch count",
+  "cadence": "identical task samples and scheduler cadence across the three arms"
+ },
+ "training": {
+  "steps": 60,
+  "steps_note": "Stage B (ours) budget = 60 windows (user ruling 2026-09-18: comp+RPBE joint fine-tuning from the Stage-A best checkpoint s550).  trainable = LoRA + COMP rows + Gamma (COMP rows STAY trainable in stage 2, task gradients keep refining them; RPBE touches Gamma only).  Sampling = q_L ∝ n_L + replay cap 12 (see sampling section).",
+  "official_protocol": {
+   "arm": "ccm_merge_official",
+   "merge_cadence": "official",
+   "grad_accum": 128,
+   "random_k": true,
+   "data_stream": "shuffled epoch loop (each dialogue exactly once per epoch)",
+   "thresholds": "train max_len_total 400, val/test 600 (official data.py)",
+   "micro_batch": 4,
+   "micro_batch_note": "equal-weight-per-dialogue normalization preserved bit-for-bit (row-wise mean CE / dialogue count); batch>1 is kernel-efficiency only"
+  },
+  "grad_clip": 1.0,
+  "grad_clip_source": "official HF Trainer default (max_grad_norm)",
+  "merge_cadence": "window-matched",
+  "merge_cadence_note": "window-matched applies to the RPBE-line arms (ours / gamma_task_only / ccm_merge under the depth protocol); the Stage-A official merge run uses the official fixed cadence via the ccm_merge_official arm",
+  "two_pass_replay": "pass1 no-grad statistics forward, pass2 grad replay forward (RPBE arms only)",
+  "rpbe_gamma_only": true,
+  "rpbe_gamma_only_note": "R10 structure: the RPBE surrogate updates GAMMA ONLY — task CE keeps training LoRA/COMP/Gamma, the auxiliary gradient on non-Gamma params is discarded (dual backward, retain_graph).",
+  "rpbe_lr": 5e-05,
+  "rpbe_lr_note": "independent AdamW base lr for the Gamma group (R10 formal config 5e-5); the shared cosine scheduler scales both groups by the same factor.",
+  "seeds": 1,
+  "seeds_note": "Qwen3 line starts with seed 0 only (user ruling, same as the R10 v5 line)",
+  "eval": "matched-cohort depth curves on the clean test split (protocol C); primary metric = per-token NLL difference, EOS excluded",
+  "checkpoint_every": 10,
+  "checkpoint_every_note": "Stage B 100-window budget -> 10 checkpoints (s10..s100) + final, fine evaluation curve (user ruling 2026-09-17)",
+  "schedule_total_steps": 1000,
+  "schedule_note": "warmup/cosine over 1000 steps (warmup ratio 0.03): the 100-window Stage B runs inside the warmup-to-peak region of the original 1000-step schedule (same convention as the Llama line, where the e50 pilot kept the 1000-step schedule while stopping at 500)."
+ },
+ "sampling": {
+  "depth_levels": [
+   1,
+   2,
+   4,
+   8,
+   13
+  ],
+  "k_of_L": "L + 2 (fixed prefix length per depth)",
+  "q_alpha": 1.0,
+  "q_alpha_note": "q_L ∝ n_L^q_alpha.  q_alpha=1 (natural frequency) RETIRES the R10 inverse-sqrt upweighting (which gave the L=13 pool ~60% of the stream and replayed its 573 dialogues 52-120x each — turn_15 overfitting, diagnosed 2026-09-17).  With the replay cap, every depth pool exhausts its n_L x K budget at the SAME time, so the depth mix stays stable over the whole budget.",
+  "max_replays": 12,
+  "max_replays_note": "per-dialogue exposure cap = official 12-epoch semantics (128k samples / 10546 dialogues).  A dialogue leaves its pool after K samples; exhausted depth layers drop out of the draw (q renormalizes over the remaining layers); when all layers are exhausted the counters reset for the next replay cycle.",
+  "rule": "depth-stratified legal cuts with natural-frequency depth weights + per-dialogue replay cap; ONE original dialogue per window (tree_id = stable original dialogue id); L=1 dialogues carry task CE only.",
+  "paired_report": "scripts/eval_ccm_paired.py (Llama line; Qwen3 line uses protocol C + protocol B curves)"
+ },
+ "freeze_host": {
+  "enabled": true,
+  "scope": "backbone + conditional LoRA + COMP/SUM embeddings all frozen (train Gamma ONLY); the trainer refuses the ours / gamma_task_only arms without --freeze-host",
+  "mode": "host model.eval() + Gamma modules train()"
+ }
 }

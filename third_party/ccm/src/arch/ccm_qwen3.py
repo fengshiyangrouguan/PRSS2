@@ -273,17 +273,24 @@ class Qwen3CCMAttention(nn.Module):
                 # DROPS the Gamma residual from the autograd graph.
                 # Whole-tensor index_add along the SEQ dim (2): source
                 # [B, H, T*S, D] via double permute.
-                _off = torch.arange(bsz, device=key_states.device) \
-                    * key_states.shape[2]
-                _idx_k = (sum_row_pos + _off[:, None, None]).reshape(-1)
-                key_states = key_states.index_add(
-                    2, _idx_k,
-                    res_all_k.permute(1, 0, 2, 3, 4).reshape(
-                        n_heads, bsz, -1, head_dim).permute(1, 0, 2, 3))
-                value_states = value_states.index_add(
-                    2, _idx_k,
-                    res_all_v.permute(1, 0, 2, 3, 4).reshape(
-                        n_heads, bsz, -1, head_dim).permute(1, 0, 2, 3))
+                # OUT-OF-PLACE index_add (freeze-host fix): the old
+                # per-batch slice assignment `key_states[b] = ...` is an
+                # in-place write; with the host frozen the K/V tensors
+                # carry no requires_grad and the in-place op silently
+                # DROPS the Gamma residual from the autograd graph.
+                # Per-batch index_add (index_add itself is out-of-place)
+                # then stack — semantically identical to the original
+                # loop, but the graph survives.
+                _k_list = [key_states[b].index_add(
+                    1, sum_row_pos[b].reshape(-1),
+                    res_all_k[b].reshape(n_heads, -1, head_dim))
+                    for b in range(bsz)]
+                _v_list = [value_states[b].index_add(
+                    1, sum_row_pos[b].reshape(-1),
+                    res_all_v[b].reshape(n_heads, -1, head_dim))
+                    for b in range(bsz)]
+                key_states = torch.stack(_k_list, dim=0)
+                value_states = torch.stack(_v_list, dim=0)
 
             # RPBE: memory extraction (post-merge, pre-attention).
             if self.mem_callback is not None:

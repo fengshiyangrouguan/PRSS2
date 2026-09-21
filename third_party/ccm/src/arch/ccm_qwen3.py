@@ -255,13 +255,21 @@ class Qwen3CCMAttention(nn.Module):
                     res_prev_v = res_t_v
                     res_all_k[:, :, t_i - 1] = res_t_k
                     res_all_v[:, :, t_i - 1] = res_t_v
-                for b in range(bsz):
-                    key_states[b] = key_states[b].index_add(
-                        1, sum_row_pos[b].reshape(-1),
-                        res_all_k[b].reshape(n_heads, -1, head_dim))
-                    value_states[b] = value_states[b].index_add(
-                        1, sum_row_pos[b].reshape(-1),
-                        res_all_v[b].reshape(n_heads, -1, head_dim))
+                # OUT-OF-PLACE index_add (freeze-host fix): the old
+                # per-batch slice assignment `key_states[b] = ...` is an
+                # in-place write; with the host frozen the K/V tensors
+                # carry no requires_grad and the in-place op silently
+                # DROPS the Gamma residual from the autograd graph
+                # (backward dies with "element 0 does not require
+                # grad").  A single out-of-place index_add over the
+                # batch-flattened index keeps the graph.
+                _off = torch.arange(bsz, device=key_states.device) \
+                    * key_states.shape[2]
+                _idx_k = (sum_row_pos + _off[:, None, None]).reshape(-1)
+                key_states = key_states.index_add(
+                    1, _idx_k, res_all_k.reshape(-1, n_heads, head_dim))
+                value_states = value_states.index_add(
+                    1, _idx_k, res_all_v.reshape(-1, n_heads, head_dim))
 
             # RPBE: memory extraction (post-merge, pre-attention).
             if self.mem_callback is not None:

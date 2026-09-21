@@ -2115,9 +2115,15 @@ def main():
                             b, cut_records[i], g_by_oid,
                             0.0 if args.arm == "gamma_task_only"
                             else lambda_kf)
-                        scaler.scale(
-                            task_mean / float(len(pending))).backward(
-                                retain_graph=True)
+                        if task_mean.requires_grad:
+                            # freeze-host fix: k<3 batches carry no
+                            # COMP/SUM rows, so Gamma never touches the
+                            # output and task_mean has no graph.  Skip
+                            # their (zero) backward instead of dying.
+                            scaler.scale(
+                                task_mean
+                                / float(len(pending))).backward(
+                                    retain_graph=True)
                         if _n and args.arm == "ours":
                             # V11: accumulate the aggregate RPBE gradient
                             # onto Gamma so the snapshot below is the
@@ -2290,9 +2296,12 @@ def main():
                             # r_eff=0.1 does not mean Gamma received 10%
                             # of the RPBE signal when LoRA/COMP absorb
                             # most of it).
-                            scaler.scale(
-                                task_mean / float(len(pending))).backward(
-                                    retain_graph=True)
+                            if task_mean.requires_grad:
+                                # freeze-host fix (see treewise branch).
+                                scaler.scale(
+                                    task_mean
+                                    / float(len(pending))).backward(
+                                        retain_graph=True)
                             task_snap = {id(p): p.grad.detach().clone()
                                          for p in params
                                          if p.grad is not None

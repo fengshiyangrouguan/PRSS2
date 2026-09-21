@@ -2124,11 +2124,13 @@ def main():
                                 task_mean
                                 / float(len(pending))).backward(
                                     retain_graph=True)
-                        if _n and args.arm == "ours":
+                        if _n and args.arm == "ours" and _aux.requires_grad:
                             # V11: accumulate the aggregate RPBE gradient
                             # onto Gamma so the snapshot below is the
                             # joint proposal q = t + a_lambda (mirrors
                             # the aggregate branch's aux backward).
+                            # freeze-host fix: _n>0 but a graph-less _aux
+                            # (all oids filtered out) has nothing to add.
                             scaler.scale(_aux).backward()
                         task_sum += float(task_raw.detach())
                         n_tokens += n_valid
@@ -2310,7 +2312,10 @@ def main():
                                 task_snap_all = {
                                     id(p): p.grad.detach().clone()
                                     for p in params if p.grad is not None}
-                            scaler.scale(aux).backward()
+                            if aux.requires_grad:
+                                # freeze-host fix: same graph-less case as
+                                # the else branch below — nothing to add.
+                                scaler.scale(aux).backward()
                             if os.environ.get("CCM_GRAD_GROUP") == "1":
                                 # per-group r_eff (review 2026-09-16):
                                 # task vs RPBE gradient norms for
@@ -2356,7 +2361,16 @@ def main():
                         else:
                             loss = task_mean / float(len(pending)) + aux
                             _t = time.perf_counter()
-                            scaler.scale(loss).backward()
+                            if loss.requires_grad:
+                                # freeze-host fix (see treewise branch):
+                                # a k<3 batch carries no COMP/SUM rows, so
+                                # Gamma never touches its output and the
+                                # task term is graph-less; with no cuts
+                                # aux is the detached zero from
+                                # pass2_one.  The whole loss is then
+                                # graph-less and there is nothing to
+                                # backprop for this microbatch.
+                                scaler.scale(loss).backward()
                             _pf("pass2_bwd", _t)
                         if os.environ.get("CCM_AUX_DIAG") == "1":
                             named = [(n, p)

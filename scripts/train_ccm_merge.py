@@ -446,22 +446,65 @@ def main():
     if args.resume_from:
         ck = torch.load(args.resume_from, map_location="cpu",
                         weights_only=False)
-        model.load_state_dict(
+        incompat = model.load_state_dict(
             {k: v.to(device) for k, v in ck["model"].items()},
             strict=False)
+        # Graceful degradation: checkpoints written before the resume
+        # state was folded into save_trainable carry only
+        # {"model", "step"}.  Restore everything present and report
+        # loudly on what is not, so a resume never dies on a KeyError.
         step = int(ck["step"])
-        optimizer.load_state_dict(ck["optimizer_state"])
-        scheduler.load_state_dict(ck["scheduler_state"])
-        shuf_order = ck["shuf_order"]
-        epoch_pos = int(ck["epoch_pos"])
-        n_epochs = int(ck["n_epochs"])
-        random.setstate(ck["py_rng"])
-        np.random.set_state(ck["np_rng"])
-        torch.random.set_rng_state(ck["torch_rng"])
-        total_loss = float(ck["total_loss"])
-        total_tokens = int(ck["total_tokens"])
-        print("[resume] step={} epoch={} pos={} restored".format(
-            step, n_epochs, epoch_pos), flush=True)
+        restored = ["model({} tensors)".format(len(ck["model"]))]
+        degraded = []
+        if ck.get("optimizer_state") is not None:
+            optimizer.load_state_dict(ck["optimizer_state"])
+            restored.append("optimizer")
+        else:
+            degraded.append("Adam moments restart from zero "
+                            "(weights and step counter unaffected)")
+        if ck.get("scheduler_state") is not None:
+            scheduler.load_state_dict(ck["scheduler_state"])
+            restored.append("scheduler")
+        else:
+            # Fast-forward the warmup+cosine schedule instead of
+            # re-entering warmup at 0.  Pin last_epoch so the next
+            # scheduler.step() lands on step+1, and set the live group
+            # LR to lambda(step) for the first resumed update.
+            scheduler.last_epoch = step
+            lr_now = args.lr * float(scheduler.lr_lambdas[0](step))
+            for _g in optimizer.param_groups:
+                _g["lr"] = lr_now
+            restored.append("scheduler fast-forwarded to step {} "
+                            "(lr={:.3e})".format(step, lr_now))
+        if ck.get("shuf_order") is not None:
+            shuf_order = ck["shuf_order"]
+            epoch_pos = int(ck["epoch_pos"])
+            n_epochs = int(ck["n_epochs"])
+            restored.append("data cursor epoch={} pos={}".format(
+                n_epochs, epoch_pos))
+        else:
+            degraded.append("data cursor restarts at epoch 0 pos 0")
+        for _key, _setter in (("py_rng", random.setstate),
+                              ("np_rng", np.random.set_state),
+                              ("torch_rng", torch.random.set_rng_state)):
+            if ck.get(_key) is not None:
+                _setter(ck[_key])
+            else:
+                degraded.append("{} not restored".format(_key))
+        total_loss = float(ck.get("total_loss", 0.0))
+        total_tokens = int(ck.get("total_tokens", 0))
+        print("[resume] from {} -> step={}".format(
+            args.resume_from, step), flush=True)
+        print("[resume]   restored: " + "; ".join(restored), flush=True)
+        if degraded:
+            print("[resume]   DEGRADED: " + "; ".join(degraded),
+                  flush=True)
+        print("[resume]   {} backbone tensors absent (expected: "
+              "trainable-only save)".format(len(incompat.missing_keys)),
+              flush=True)
+        if incompat.unexpected_keys:
+            print("[resume]   WARNING unexpected keys: {}".format(
+                list(incompat.unexpected_keys)[:5]), flush=True)
     model.train()
 
     while step < args.max_steps:

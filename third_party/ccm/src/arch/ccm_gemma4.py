@@ -861,11 +861,14 @@ class Gemma4CCMTextModel(Gemma4PreTrainedModel):
             raise RuntimeError("PLE not enabled in this config")
         # fp32 GEMM (CUBLAS fix): the 2560->10752 bf16 GEMM trips
         # CUBLAS_STATUS_NOT_SUPPORTED on the training shapes (A100
-        # cublasGemmEx bf16 path); a single-layer fp32 upcast is cheap
-        # and numerically safe.
-        per_layer_projection = (
-            self.per_layer_model_projection(inputs_embeds.float())
-            * self.per_layer_model_projection_scale)
+        # cublasGemmEx bf16 path); autocast would re-cast fp32 inputs
+        # back to bf16, so the weight must be upcast explicitly too.
+        # A single-layer fp32 GEMM is cheap and numerically safe.
+        _proj = self.per_layer_model_projection
+        per_layer_projection = F.linear(
+            inputs_embeds.float(), _proj.weight.float(),
+            _proj.bias.float() if _proj.bias is not None else None) \
+            * self.per_layer_model_projection_scale
         per_layer_projection = per_layer_projection.to(inputs_embeds.dtype)
         per_layer_projection = per_layer_projection.reshape(
             *inputs_embeds.shape[:-1],

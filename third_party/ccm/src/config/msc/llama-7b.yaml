@@ -17,7 +17,7 @@ training:
   per_device_train_batch_size: 4
   gradient_accumulation_steps: 32
 
-  per_device_eval_batch_size: 4
+  per_device_eval_batch_size: 1   # eval B>1 OOMs on merge_recur mask matmuls (5-session rows ~3.1k tokens)
   generation_max_length: 3072  # this includes the prompt length
 
   learning_rate: 3.0e-4

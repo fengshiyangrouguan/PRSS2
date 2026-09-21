@@ -193,7 +193,7 @@ def main(args: DictConfig) -> None:
                     update_eval_metrics(metrics, all_eval_metrics, to_eval, eval_name, args)
 
         # The default trainer conduct evaluation
-        elif args.data.dataset_name in ["dialog", "soda"]:
+        elif args.data.dataset_name in ["dialog", "soda", "msc"]:
             for eval_name, to_eval in eval_dataset.items():
                 logger.info(f"*** Evaluate {eval_name} ***")
 

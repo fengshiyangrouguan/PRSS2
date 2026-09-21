@@ -104,6 +104,18 @@ def parse_args():
     p.add_argument("--eval-batch", type=int, default=4)
     p.add_argument("--eval-ckpt", default="",
                    help="Stage-2 checkpoint for the ours arm")
+    p.add_argument("--opening-only", action="store_true",
+                   help="eval only the session-opening exchanges "
+                        "(canonical primary metric; used for c*_merge "
+                        "selection — all-response PPL is computed later "
+                        "on the selected checkpoint only)")
+    p.add_argument("--eval-sessions", default="2,3,4,5",
+                   help="session ids to evaluate (c*_merge selection "
+                        "uses 2,3,4 — S5 is held out)")
+    p.add_argument("--max-episodes", type=int, default=0,
+                   help="evaluate a FIXED random subset of episodes "
+                        "(seed 1234); selection-only speedup — the "
+                        "official table always runs the full split")
     return p.parse_args()
 
 
@@ -365,6 +377,59 @@ def train(args):
         resume_rng = _rng_state()
         _restore_rng(window_start_state["rng"])
 
+        if args.calibrate_lambda and step == 0:
+            # r_eff calibration at theta_0 (frozen spec, llama-line rule):
+            # task and RPBE gradient norms on the GAMMA group, measured
+            # on the FIRST window before any optimizer step;
+            # lambda = 0.1 / r_eff is then committed for the real run.
+            def _gamma_norm():
+                tot = 0.0
+                for p in gamma_params:
+                    if p.grad is not None:
+                        tot += float((p.grad.detach().float() ** 2).sum())
+                return tot ** 0.5
+            optimizer.zero_grad(set_to_none=True)
+            _restore_rng(window_start_state["rng"])
+            for i, (b, _metas) in enumerate(pending):
+                _restore_rng(pass1_rngs[i])
+                out_f = run_forward(model, b, device, grad_enabled=True)
+                task_s, n_valid = task_ce_shifted(out_f, b["labels"], device)
+                (task_s / max(n_valid, 1)
+                 / float(len(pending))).backward()
+            g_task = _gamma_norm()
+            optimizer.zero_grad(set_to_none=True)
+            _restore_rng(window_start_state["rng"])
+            for i, (b, _metas) in enumerate(pending):
+                _restore_rng(pass1_rngs[i])
+                out_f = run_forward(model, b, device, grad_enabled=True)
+                z_by_oid = {}
+                batch_terms = []
+                for meta, oid, v in cut_records[i]:
+                    g = g_by_oid.get(oid)
+                    if g is not None:
+                        z_by_oid[oid] = collect_replay_z(meta, adapter,
+                                                         device, v=v)
+                        batch_terms.append((oid, g))
+                adapter.clear()
+                aux, n_aux = batch_surrogate(z_by_oid, batch_terms,
+                                             1.0, device)
+                if n_aux:
+                    aux.backward()
+            g_kf = _gamma_norm()
+            r_eff = g_kf / max(g_task, 1e-30)
+            derived = 0.1 / max(r_eff, 1e-30)
+            save_json(out / "calibration.json", {
+                "g_task_gamma": g_task, "g_kf_gamma": g_kf,
+                "r_eff_gamma": r_eff, "derived_lambda": derived,
+                "rule": "lambda = 0.1 / r_eff on the Gamma group at "
+                        "theta_0 (first window)"})
+            print(json.dumps({"g_task_gamma": g_task,
+                              "g_kf_gamma": g_kf,
+                              "r_eff_gamma": r_eff,
+                              "derived_lambda": derived}, indent=2),
+                  flush=True)
+            return
+
         optimizer.zero_grad(set_to_none=True)
         aux_before = aux_terms
         task_sum = 0.0
@@ -487,6 +552,7 @@ def eval_full_collate(tok, rows, ds_full):
 
 def eval(args):
     seed_all(args.seed)
+    Path(args.output).mkdir(parents=True, exist_ok=True)
     device = torch.device(
         "cuda:{}".format(args.gpu) if torch.cuda.is_available() else "cpu")
     tok = build_tokenizer(args)
@@ -497,9 +563,20 @@ def eval(args):
                    msc_dir=MSC_DATA_DIR)
     collator = build_collator(ds, tok, device)
     split = "valid" if args.eval_split == "val" else "test"
-    instances = list(ds.exchange_instances(split))
-    print("[msc-eval] {} exchanges on {}".format(len(instances), split),
-          flush=True)
+    sessions = tuple(int(s) for s in args.eval_sessions.split(","))
+    instances = list(ds.exchange_instances(split, sessions=sessions))
+    if args.opening_only:
+        instances = [r for r in instances if r["is_opening"]]
+    if args.max_episodes > 0:
+        rng = random.Random(1234)          # fixed subset across ckpts
+        eids = sorted({r["orig_id"] for r in instances})
+        keep = set(rng.sample(
+            eids, min(args.max_episodes, len(eids))))
+        instances = [r for r in instances if r["orig_id"] in keep]
+    print("[msc-eval] {} exchanges on {} (opening_only={} "
+          "sessions={} max_episodes={})".format(
+              len(instances), split, args.opening_only,
+              sessions, args.max_episodes), flush=True)
 
     arms = (["full", "merge", "ours"] if args.eval_arm == "all"
             else [args.eval_arm])

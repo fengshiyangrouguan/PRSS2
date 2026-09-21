@@ -248,7 +248,8 @@ class DialogueDataset:
                 if s > ep["n_sessions"]:
                     continue
                 i0 = ep["sess_utt_end"][s - 1]
-                i1 = ep["sess_utt_end"][s]
+                i1 = (ep["sess_utt_end"][s]
+                      if s < ep["n_sessions"] else ep["n_utt"])
                 n_ex = (i1 - i0) // 2        # exchanges in session s
                 for e in range(n_ex):
                     last = ep["utt_turn_idx"][i0 + 2 * e + 1]

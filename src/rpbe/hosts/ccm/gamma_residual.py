@@ -12,8 +12,11 @@ Gamma attaches a small learned residual on top of that mean:
 with R_theta(x) = U tanh(V [prev; cur; time(t)]).  Zero-output projection
 init (Review round 7, user ruling 2026-09-07): U starts at exactly zero
 (no scalar gate), so the merged memory starts as the exact official
-arithmetic mean bit-for-bit (step0 identity gate PASS) while every U/V
-parameter still receives gradient from the first optimizer step.
+arithmetic mean bit-for-bit (step0 identity gate PASS).  Gradient note
+(review ruling 2026-09-21): with U_0 = 0 the FIRST step updates only U —
+dR/dV = U^T (tanh' ...) vanishes at U = 0, so V receives gradient only
+after U has left zero.  The calibration run therefore measures the
+initially actionable U subspace; V joins as soon as U != 0.
 
 The time encoding is a fixed log-spaced sinusoid with no learned
 parameters, so the recurrence supports any turn count k (training random
@@ -53,10 +56,11 @@ class GammaResidual(nn.Module):
     """R_theta(prev, cur, t) = U tanh(V [prev; cur; time(t)]).
 
     Review round 7: ZERO-OUTPUT projection init — U starts at exactly
-    zero, so step 0 reproduces the official merge bit-for-bit AND every
-    parameter of U/V receives gradient from the very first step (the
-    old scalar gate s=0 left U/V with zero gradient at step 0 and only
-    ~32 trainable scalars moving early on).
+    zero, so step 0 reproduces the official merge bit-for-bit.  The old
+    scalar gate s=0 left U/V with zero gradient at step 0 and only
+    ~32 trainable scalars moving early on; the zero-output U gives U a
+    gradient from the first step while V (whose gradient passes through
+    U^T) starts learning once U != 0 (review ruling 2026-09-21).
 
     One instance is shared across the K and V merges and across the two
     COMP/SUM slots of its layer.  With head_dim=128, hidden=64,

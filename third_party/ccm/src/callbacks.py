@@ -9,7 +9,12 @@ try:
 except:
     from transformers import TrainerCallback
     from transformers.integrations import WandbCallback
-from transformers.utils import is_torch_tpu_available, logging
+try:
+    from transformers.utils import is_torch_tpu_available
+except ImportError:  # transformers >= 4.40 dropped the TPU flag
+    def is_torch_tpu_available(check_device=True):
+        return False
+from transformers.utils import logging
 
 from .arguments import Arguments
 

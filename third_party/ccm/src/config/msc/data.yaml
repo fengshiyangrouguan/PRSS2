@@ -1,0 +1,9 @@
+# @package _global_
+
+data:
+  dataset_name: msc
+  max_length: 2048   # MSC cut-window budget (official 1024 would drop 4-session prefixes)
+
+wandb:
+  group: msc
+  name: ${basename:${model.model_name_or_path}}-${training.comp.comp_type}

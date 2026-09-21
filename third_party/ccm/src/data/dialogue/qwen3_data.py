@@ -123,10 +123,14 @@ class Qwen3DialogueDataset:
             # official clean_split=False protocol: val + test merged
             # (protocol B, same as the Llama-line pooled evaluation)
             self.valset = self.valset + self.testset
+        # Review ruling (2026-09-21): OFFICIAL Protocol B bucket keys.
+        # The turn_14 bucket is the 15-turn truncation (paper t=12 <->
+        # official turn_14 bucket <-> T=15 <-> L=13) — never spell it
+        # "turn_15" (the old key collided three conventions).
         self.eval_dataset = {
-            "turn_{}".format(k):
-                self._subsample(self.valset, n_turn=k)
-            for k in (3, 4, 6, 10, 15)
+            "turn_{}".format(k): self._subsample(
+                self.valset, n_turn=15 if k == 14 else k)
+            for k in (3, 4, 6, 10, 14)
         }
         print("[qwen3-dialog] train {} / val {} / test {}{}".format(
             len(self.trainset), len(self.valset), len(self.testset),
@@ -134,8 +138,8 @@ class Qwen3DialogueDataset:
 
     def _subsample(self, items, n_turn):
         """Official bucket semantics: keep dialogues with >= n_turn turns
-        truncated to the first n_turn (turn_14 bucket uses 15, same as
-        the official _subsample)."""
+        truncated to the first n_turn (the turn_14 bucket passes n_turn=15
+        — the official _subsample reading; see eval_dataset)."""
         out = []
         for item in items:
             if len(item["dialog"]) >= n_turn:
@@ -210,7 +214,7 @@ class Qwen3DialogueDataset:
             self.tokenizer("<|im_end|>",
                            add_special_tokens=False)["input_ids"]
         return {"input_ids": prompt, "output_ids": target,
-                "orig": item["orig"][:k], "split": item["split"],
+                "orig": item["orig"][:k] if "orig" in item else None, "split": item.get("split"),
                 "act": item["act"][:k] if "act" in item else None}
 
 
@@ -264,7 +268,8 @@ class Qwen3DialogueCollator:
             else None
         model_inputs = pad_inputs("left", model_inputs,
                                   self.label_pad_token_id, self.pad_token)
-        model_inputs = prepare_comp_attn_mask_llama(
-            model_inputs, self.comp_args, self.comp_token, self.sum_token,
-            self.pad_token, sink_token=sink_token)
+        if self.comp_token:
+            model_inputs = prepare_comp_attn_mask_llama(
+                model_inputs, self.comp_args, self.comp_token,
+                self.sum_token, self.pad_token, sink_token=sink_token)
         return dict(model_inputs)

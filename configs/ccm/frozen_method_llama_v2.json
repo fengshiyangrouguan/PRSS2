@@ -36,8 +36,8 @@
     "collection": "adaptive by effective cut count"
   },
   "training": {
-    "steps": 60,
-    "steps_note": "60 windows (user ruling 2026-09-17): RPBE + comp joint training from the official merged start.",
+    "steps": 100,
+    "steps_note": "Extended to 100 windows (user ruling 2026-09-18): resume from the s60 checkpoint of the RPBE+comp joint run (checkpoint_step60.pt carries optimizer/scheduler state).",
     "grad_clip": 1.0,
     "merge_cadence": "window-matched",
     "rpbe_gamma_only": true,

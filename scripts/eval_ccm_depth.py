@@ -62,6 +62,8 @@ def build_eval_dataset(args, tokenizer, pooled, online, comp_type):
         dialog = Qwen3DialogueDataset(
             tokenizer, mirror=args.dialog_mirror)
         return dialog, comp_args
+    if getattr(args, "host", "llama") == "gemma4":
+        raise SystemExit("gemma4 host lives on the feature_GEMMA line")
     from src.data.dialogue.data import DialogueDataset
     dialog = DialogueDataset(tokenizer, comp_token=tokenizer.comp_token_id,
                              online=online, add_comp_token=True,
@@ -69,18 +71,25 @@ def build_eval_dataset(args, tokenizer, pooled, online, comp_type):
     return dialog, comp_args
 
 
-def build_collator(dialog, tokenizer, comp_args, comp_type, sum_recur):
+def build_collator(dialog, tokenizer, comp_args, comp_type, sum_recur,
+                   ref_mode=False):
     comp_args.comp_type = comp_type
     if getattr(tokenizer, "_qwen3_host", False):
         from src.data.dialogue.qwen3_data import Qwen3DialogueCollator
+        # ref_mode: the RAW backbone's vocab has no comp/sum rows —
+        # injecting those ids trips a CUDA embedding assert.
+        comp_token = [] if ref_mode else tokenizer.comp_token_id
+        sum_token = [] if ref_mode else tokenizer.sum_token_id
         return Qwen3DialogueCollator(
-            dialog=dialog, tokenizer=tokenizer, comp_args=comp_args,
-            comp_token=tokenizer.comp_token_id,
-            sum_token=tokenizer.sum_token_id,
+            dataset=dialog, tokenizer=tokenizer, comp_args=comp_args,
+            comp_token=comp_token,
+            sum_token=sum_token,
             pad_token=tokenizer.pad_token_id,
             label_pad_token_id=-100,
             online=comp_type == "online",
             neg_control=comp_type == "neg_control")
+    if getattr(tokenizer, "_gemma4_host", False):
+        raise SystemExit("gemma4 host lives on the feature_GEMMA line")
     from src.data.dialogue.collator import DataCollatorForDialogue_LLAMA
     return DataCollatorForDialogue_LLAMA(
         dialog=dialog, tokenizer=tokenizer, comp_args=comp_args,
@@ -272,7 +281,8 @@ def main():
                     default="/root/autodl-tmp/llama-7b-hf")
     ap.add_argument("--dialog-mirror",
                     default="/root/autodl-tmp/dailydialog_mirror/ijcnlp_dailydialog")
-    ap.add_argument("--host", default="llama", choices=["llama", "qwen3"])
+    ap.add_argument("--host", default="llama",
+                    choices=["llama", "qwen3"])
     ap.add_argument("--gpu", type=int, default=0)
     ap.add_argument("--limit", type=int, default=0)
     ap.add_argument("--pooled", action="store_true",
@@ -306,7 +316,7 @@ def main():
             args, tokenizer, a.pooled, online=True, comp_type="online")
         collator = build_collator(dialog, tokenizer, comp_args,
                                   comp_type="online", sum_recur=True)
-        if args.host == "qwen3":
+        if args.host in ("qwen3",):
             eval_dialogs = [d["dialog"] for d in (
                 dialog.valset if a.pooled else dialog.testset)]
         else:
@@ -352,6 +362,8 @@ def main():
                 torch_dtype=torch.bfloat16).to(device)
             model.eval()
             print("ref arms use RAW pretrained Qwen3", flush=True)
+        elif a.host == "gemma4":
+            raise SystemExit("gemma4 host lives on the feature_GEMMA line")
         else:
             from transformers.models.llama.modeling_llama import \
                 LlamaForCausalLM
@@ -365,9 +377,11 @@ def main():
     dialog_nc, comp_args_nc = build_eval_dataset(
         args, tokenizer, a.pooled, online=False, comp_type="online")
     collator_nc = build_collator(dialog_nc, tokenizer, comp_args_nc,
-                                 comp_type="online", sum_recur=False)
-    if args.host == "qwen3":
-        # Qwen3DialogueDataset stores plain lists ({"dialog": ...} items)
+                                 comp_type="online", sum_recur=False,
+                                 ref_mode=True)
+    if args.host in ("qwen3",):
+        # Qwen3 dialogue dataset stores plain lists
+        # ({"dialog": ...} items)
         eval_dialogs = [d["dialog"] for d in (
             dialog_nc.valset if a.pooled else dialog_nc.testset)]
     else:

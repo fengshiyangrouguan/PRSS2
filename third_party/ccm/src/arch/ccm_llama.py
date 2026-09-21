@@ -332,40 +332,50 @@ class LlamaAttention(nn.Module):
 
             #####################################################
             ##### RPBE modification (L2): Gamma recurrence scan ######
-            # M_t = mean(h_1..h_t) + R_theta(M_{t-1}, h_t, t).  The
-            # per-turn loop runs on the gathered SUM rows only (one
-            # [B, H, n_slots, D] call per turn per layer), carrying the
-            # previous turn's residual in a register; turn-1 rows keep
-            # the pure mean.  Eager mode; torch.compile disabled on all
-            # three arms (plan L2).  Dialog recur only (t_max >= 2);
+            # M_t = mean(h_1..h_t) + R_theta(M_{t-1}, h_t, t) for EVERY
+            # t = 1..t_max with M_0 = 0 (review ruling 2026-09-21: the
+            # first compression layer is inside the method too, so L=1
+            # gets a genuine Gamma interface; zero-init keeps step-0
+            # bit-identical to the pure mean).  The per-turn loop runs on
+            # the gathered SUM rows only (one [B, H, n_slots, D] call per
+            # turn per layer), carrying the previous turn's residual in a
+            # register.  Eager mode; torch.compile disabled on all
+            # three arms (plan L2).  Dialog recur only (t_max >= 1);
             # the LaMP one-shot merge applies its residual in the fast
             # path (L2).
             if self.gamma is not None and sum_row_pos is not None \
-                    and int(sum_row_pos.shape[1]) >= 2:
+                    and int(sum_row_pos.shape[1]) >= 1:
                 n_slots = int(sum_row_pos.shape[2])
                 res_prev_k = torch.zeros(bsz, n_heads, n_slots, head_dim,
                                          dtype=key_states.dtype,
                                          device=key_states.device)
                 res_prev_v = torch.zeros_like(res_prev_k)
-                res_all_k = torch.zeros_like(k_base)
-                res_all_v = torch.zeros_like(v_base)
+                res_list_k = []
+                res_list_v = []
                 valid = sum_row_valid.to(key_states.dtype).unsqueeze(1)
                 valid = valid.unsqueeze(-1)  # [B, 1, T, n_slots, 1]
-                for t_i in range(2, t_max + 1):
+                for t_i in range(1, t_max + 1):
                     tt = torch.full((bsz, 1), t_i, dtype=torch.float32,
                                     device=key_states.device)
-                    # M_{t-1} = base of the PREVIOUS turn (index t_i-2)
-                    # plus that turn's residual register.
+                    if t_i == 1:
+                        # M_0 = 0 by definition.
+                        prev_k = torch.zeros_like(k_base[:, :, 0])
+                        prev_v = torch.zeros_like(v_base[:, :, 0])
+                    else:
+                        # M_{t-1} = base of the PREVIOUS turn (index
+                        # t_i-2) plus that turn's residual register.
+                        prev_k = k_base[:, :, t_i - 2] + res_prev_k
+                        prev_v = v_base[:, :, t_i - 2] + res_prev_v
                     res_t_k = self.gamma(
-                        k_base[:, :, t_i - 2] + res_prev_k,
-                        k_cur[:, :, t_i - 1], tt) * valid[:, :, t_i - 1]
+                        prev_k, k_cur[:, :, t_i - 1], tt) \
+                        * valid[:, :, t_i - 1]
                     res_t_v = self.gamma(
-                        v_base[:, :, t_i - 2] + res_prev_v,
-                        v_cur[:, :, t_i - 1], tt) * valid[:, :, t_i - 1]
+                        prev_v, v_cur[:, :, t_i - 1], tt) \
+                        * valid[:, :, t_i - 1]
                     if _CCM_AUDIT_GAMMA:
-                        kb = k_base[0, :, t_i - 2]   # [H, n_slots, D]
-                        vb = v_base[0, :, t_i - 2]
-                        rk = res_t_k[0]              # [H, n_slots, D]
+                        kb = prev_k[0]              # [H, n_slots, D]
+                        vb = prev_v[0]
+                        rk = res_t_k[0]             # [H, n_slots, D]
                         rv = res_t_v[0]
                         for _h in range(n_heads):
                             for _s in range(n_slots):
@@ -379,18 +389,27 @@ class LlamaAttention(nn.Module):
                                 })
                     res_prev_k = res_t_k
                     res_prev_v = res_t_v
-                    res_all_k[:, :, t_i - 1] = res_t_k
-                    res_all_v[:, :, t_i - 1] = res_t_v
+                    # freeze-host safe assembly: stack (never in-place
+                    # fill into a no-grad zeros tensor) so the Gamma
+                    # graph survives a frozen host.
+                    res_list_k.append(res_t_k)
+                    res_list_v.append(res_t_v)
+                # One residual row per compression layer t = 1..t_max.
+                res_all_k = torch.stack(res_list_k, dim=2)
+                res_all_v = torch.stack(res_list_v, dim=2)
                 # Scatter the per-turn residuals back onto the SUM rows
-                # (invalid positions add exactly zero at row 0; per-batch
-                # because index_add's 1-D index cannot vary per batch).
-                for b in range(bsz):
-                    key_states[b] = key_states[b].index_add(
-                        1, sum_row_pos[b].reshape(-1),
-                        res_all_k[b].reshape(n_heads, -1, head_dim))
-                    value_states[b] = value_states[b].index_add(
-                        1, sum_row_pos[b].reshape(-1),
-                        res_all_v[b].reshape(n_heads, -1, head_dim))
+                # OUT-OF-PLACE (freeze-host safe; invalid positions add
+                # exactly zero at row 0).
+                _k_list = [key_states[b].index_add(
+                    1, sum_row_pos[b].reshape(-1),
+                    res_all_k[b].reshape(n_heads, -1, head_dim))
+                    for b in range(bsz)]
+                _v_list = [value_states[b].index_add(
+                    1, sum_row_pos[b].reshape(-1),
+                    res_all_v[b].reshape(n_heads, -1, head_dim))
+                    for b in range(bsz)]
+                key_states = torch.stack(_k_list, dim=0)
+                value_states = torch.stack(_v_list, dim=0)
             #####################################################
 
             #####################################################

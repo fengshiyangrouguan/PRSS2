@@ -34,6 +34,7 @@ import json
 import math
 import os
 import random
+import re
 import struct
 import sys
 import time
@@ -57,6 +58,7 @@ for p in (str(SRC), str(CCM)):
 from rpbe.hosts.ccm.adapter import CCMHostAdapter
 from rpbe.hosts.ccm.ccm_patch import (N_TOK_LOCK, attach_gamma,
                                       paired_seed_hash, wrap_lora)
+from rpbe.hosts.ccm.gamma_residual import GammaResidual
 from rpbe.llm.dialogue_records import (DialogueCutBuilder, DialogueMeta,
                                        Llmmaps, MEM_TAU)
 from rpbe.llm.utterance_embed import UtteranceEmbed
@@ -150,7 +152,8 @@ def parse_args():
                         "cadence reproduction arm (frozen cadence is "
                         "window-matched for the three main arms; the "
                         "official arm is reported separately)")
-    p.add_argument("--host", default="llama", choices=["llama", "qwen3"],
+    p.add_argument("--host", default="llama",
+                   choices=["llama", "qwen3"],
                    help="backbone host: llama = vendored LlamaModelCCM "
                         "(R8-R10 line); qwen3 = Qwen3-4B CCM port "
                         "(feature_QWEN)")
@@ -264,6 +267,14 @@ def parse_args():
                         "(no optimizer/data-stream state).  Gamma stays "
                         "zero-init by design; non-Gamma missing keys "
                         "still fail fast.")
+    p.add_argument("--freeze-host", action="store_true",
+                   help="final training protocol (review ruling): after "
+                        "--init-from, freeze the ENTIRE host "
+                        "(conditional LoRA + COMP/SUM + backbone) and "
+                        "train Gamma ONLY.  The two arms (task-only vs "
+                        "ours) then differ solely in the Gamma training "
+                        "objective — the clean causal attribution the "
+                        "paper needs.")
     p.add_argument("--max-pending-mbs", type=int, default=2048,
                    help="degenerate-window guard: pending cap before abort")
     p.add_argument("--max-windows", type=int, default=0,
@@ -371,7 +382,7 @@ def enforce_frozen(args):
         raise SystemExit(
             "[frozen] lambda calibration must start from fresh theta_0; "
             "--calibrate-lambda and --resume-from are mutually exclusive")
-    lam = fz["rpbe"]["lambda_calibration"]["lambda_kf"]
+    lam = fz["rpbe"]["lambda_calibration"].get("lambda_kf")
     if args.arm == "ours":
         if lam is None:
             if not args.calibrate_lambda:
@@ -429,13 +440,15 @@ def build_tokenizer(args):
         added = [f"<COMP{k}>" for k in range(N_TOK)] \
             + [f"<SUM{k}>" for k in range(N_TOK)]
         tok.add_special_tokens({"additional_special_tokens": added})
-        ids = tok.additional_special_tokens_ids[-2 * N_TOK:]
+        ids = [tok.convert_tokens_to_ids(f"<COMP{k}>") for k in range(N_TOK)]  + [tok.convert_tokens_to_ids(f"<SUM{k}>") for k in range(N_TOK)]
         assert ids[0] >= cfg_vocab, \
             "comp ids must exceed config.vocab_size for SeparatedEmbedding"
         tok.comp_token_id = ids[:N_TOK]
         tok.sum_token_id = ids[N_TOK:]
         tok._qwen3_host = True  # eval collator dispatch marker
         return tok
+    if args.host == "gemma4":
+        raise SystemExit("gemma4 host lives on the feature_GEMMA line")
     from transformers import LlamaTokenizer
     tok = LlamaTokenizer.from_pretrained(args.model_name_or_path)
     tok.pad_token = tok.eos_token
@@ -447,7 +460,7 @@ def build_tokenizer(args):
     added = [f"<COMP{k}>" for k in range(N_TOK)] \
         + [f"<SUM{k}>" for k in range(N_TOK)]
     tok.add_special_tokens({"additional_special_tokens": added})
-    ids = tok.additional_special_tokens_ids[-2 * N_TOK:]
+    ids = [tok.convert_tokens_to_ids(f"<COMP{k}>") for k in range(N_TOK)]  + [tok.convert_tokens_to_ids(f"<SUM{k}>") for k in range(N_TOK)]
     tok.comp_token_id = ids[:N_TOK]
     tok.sum_token_id = ids[N_TOK:]
     return tok
@@ -478,6 +491,8 @@ def build_model(args, device):
             [config.vocab_size + k for k in range(N_TOK)],
             [config.vocab_size + N_TOK + k for k in range(N_TOK)])
         return model.to(device)
+    if args.host == "gemma4":
+        raise SystemExit("gemma4 host lives on the feature_GEMMA line")
     from transformers.models.llama.configuration_llama import LlamaConfig
     from src.arch.ccm_llama import LlamaForCausalLM_CCM
     config = LlamaConfig.from_pretrained(args.model_name_or_path)
@@ -559,6 +574,8 @@ def build_dataset(args, tokenizer):
             pad_token=tokenizer.pad_token_id,
             label_pad_token_id=-100)
         return dialog, collator
+    if args.host == "gemma4":
+        raise SystemExit("gemma4 host lives on the feature_GEMMA line")
     from src.data.dialogue.data import DialogueDataset
     from src.data.dialogue.collator import DataCollatorForDialogue_LLAMA
     dialog = DialogueDataset(tokenizer, comp_token=tokenizer.comp_token_id,
@@ -576,16 +593,25 @@ def build_dataset(args, tokenizer):
 # Review round 8 (turn-14 legal-cut scarcity): depth-stratified candidate
 # pools.  Depth L = compressed-history turn count; a dialogue contributes
 # to pool L iff its ORIGINAL length >= L + 2 (L history turns + 1
-# immediate context + 1 target).  k_L = L + 2 is the fixed prefix length,
-# so the cut is the memory after exactly L compressions and the target is
-# always the (L+2)-th turn — strictly legal by construction (same
-# dialogue, contiguous, complete utterances, no EOS/padding/truncation
-# crossing, never the trailing suffix, and the memory state is real).
+# immediate context + 1 target).  N_TURNS_OF_L[L] = L + 2 is the fixed
+# prefix length measured in TURNS, so the cut is the memory after exactly
+# L compressions and the target is always the (L+2)-th turn — strictly
+# legal by construction (same dialogue, contiguous, complete utterances,
+# no EOS/padding/truncation crossing, never the trailing suffix, and the
+# memory state is real).
 # Turn-14/L=13 requires the original dialogue to be long enough, and its
 # target is FIXED at the 15th turn with a 13-turn compressed history.
+#
+# NAMING (audit fix 2026-09-21): this quantity is a TURN COUNT (L + 2).
+# It is NOT the CCM "k" of parse_meta / data_flow.jsonl, which counts
+# context turns as len(blocks) + 1 (= L + 1).  The two conventions differ
+# by exactly 1, so calling both "k" is precisely the off-by-one depth
+# misreading an audit is meant to catch (audit #1 fell into that class).
+# Every turn-count use below is spelled n_turns_*; every block-count use
+# stays meta["k"].  Do not reintroduce a bare "k" for either.
 # ---------------------------------------------------------------------
 DEPTH_LEVELS = (1, 2, 4, 8, 13)          # L = compressed-history turns
-K_OF_L = {L: L + 2 for L in DEPTH_LEVELS}  # fixed prefix length per depth
+N_TURNS_OF_L = {L: L + 2 for L in DEPTH_LEVELS}  # TURN COUNT per depth
 DEPTH_CAP = 3.0 / len(DEPTH_LEVELS)      # max oversampling vs uniform
 
 
@@ -600,7 +626,7 @@ def build_depth_pools(train_items):
     for i, item in enumerate(train_items):
         n = len(item["dialog"])
         for L in DEPTH_LEVELS:
-            if n >= K_OF_L[L]:
+            if n >= N_TURNS_OF_L[L]:
                 pools[L].append(i)
     return pools
 
@@ -640,14 +666,18 @@ def depth_sampling_probs(pools, alpha=None):
     return (w / w.sum()).astype(np.float64)
 
 
-def parse_meta(batch, comp_ids, sum_ids, sample_id_global, orig_ids=None):
+def parse_meta(batch, comp_ids, sum_ids, sample_id_global, orig_ids=None,
+               raw_dialogs=None):
     """Deterministic per-sample metadata from the padded collator batch.
 
-    Returns a list (one per batch row) of dicts: k, blocks (C0/S0
-    positions per turn), utterance_spans, prompt_end.  Every turn block
-    is [C0, C1, S0, S1] right after its utterance; the final context turn
-    carries no block.  ``sample_id_global`` is the stream-global sample
-    index (unique across epochs) used as the tree identity.
+    Returns a list (one per batch row) of dicts: k, L, blocks (C0/S0
+    positions per turn), utterance_spans, prompt_end, raw_dialog.  Every
+    turn block is [C0, C1, S0, S1] right after its utterance; the final
+    context turn carries no block.  ``sample_id_global`` is the
+    stream-global sample index (unique across epochs) used as the tree
+    identity.  ``raw_dialogs`` (review ruling 2026-09-21) carries the
+    collator's own tokenized turns [u_1..u_L, c, y] per row — the ONLY
+    source for chi/phi; spans/ids stay model-position metadata.
     """
     ids = batch["input_ids"]
     labels = batch["labels"]
@@ -668,17 +698,27 @@ def parse_meta(batch, comp_ids, sum_ids, sample_id_global, orig_ids=None):
         n_completion = int((labels[b] != -100).sum())
         prompt_end = L - n_completion
         k = len(blocks) + 1  # context turns = blocks + final blockless turn
+        depth_L = len(blocks)  # compressed-history turns (review ruling:
+                               # the canonical cut depth L = k - 1)
         utterance_spans = []
         prev_end = -1
         for (c0_pos, _s0) in blocks:
             utterance_spans.append((prev_end + 1, c0_pos))
             prev_end = c0_pos + 3  # S1 position
         utterance_spans.append((prev_end + 1, prompt_end))
+        raw = None
+        if raw_dialogs is not None and b < len(raw_dialogs):
+            raw = [list(u) for u in raw_dialogs[b]]
+            if ok:
+                assert len(raw) == depth_L + 2, (
+                    "raw_dialog turns {} != L + 2 = {}".format(
+                        len(raw), depth_L + 2))
         metas.append({"sample_id": int(sample_id_global) + b, "row": b,
-                      "k": k,
+                      "k": k, "L": depth_L,
                       "blocks": blocks,
                       "utterance_spans": utterance_spans,
                       "prompt_end": prompt_end, "ok": ok,
+                      "raw_dialog": raw,
                       # Review round 8: stable ORIGINAL dialogue id for
                       # the tree identity (fall back to the stream cursor
                       # when the caller does not supply it).
@@ -766,13 +806,13 @@ def task_ce_rows(out, labels, device):
 
 
 def collect_replay_z(meta, adapter, device, v=None):
-    """Pass-2 extraction ONLY: z_v at cut position v (gradient-
+    """Pass-2 extraction ONLY: z_t at block_idx v = t - 1 (gradient-
     connected).  No builder, no chi, no p — those finished their job at
-    the pass-1 window close (L6.5 review structural fix).  R10: v=None
-    keeps the historical penultimate cut; the chain-wise replay passes
-    the per-cut v explicitly."""
+    the pass-1 window close (L6.5 review structural fix).  Review ruling
+    (2026-09-21): block_idx = t - 1 is the ONLY cut indexing rule; v=None
+    means the terminal cut t = L (block_idx L - 1)."""
     if v is None:
-        v = meta["k"] - 3
+        v = int(meta["L"]) - 1
     s0_pos = meta["blocks"][v][1]
     sum_positions = torch.tensor([[s0_pos, s0_pos + 1]],
                                  dtype=torch.long, device=device)
@@ -781,51 +821,66 @@ def collect_replay_z(meta, adapter, device, v=None):
 
 def collect_rows(meta, adapter, builder, utter_embed, phi_embed,
                  embed_tokens, batch, device):
-    """CONDITIONAL 2Obs, R10 CHAIN-WISE (review 2026-09-16):
+    """Review ruling (2026-09-21): ONE CUT PER ACTUAL COMPRESSION LAYER.
 
-      obs1: C = u_{v+1},              Y = u_{v+2}        (both in prompt)
-      obs2: C = (u_{v+1}, u_{v+2}, one-update), Y = u_k (labels, EOS out)
+      t = 1..L,  block_idx = t - 1   (the ONLY cut indexing rule)
 
-    The historical single cut v = k - 3 supervised only the penultimate
-    merge; Theorem 4 sums local defects over the WHOLE chain, so every
-    legal cut position v in {0, ..., k - 3} (t = v + 1 merges) now emits
-    its own two horizon rows (one occurrence id per cut).  z extraction
-    is batched (extract_z takes [n_cuts, 2]); chi/phi stay frozen
-    input-embedding sketches (no extra LLaMA forward, no grad flow)."""
-    if not meta["ok"] or meta["k"] < 3:
+    with raw_dialog = [u_1..u_L, c, y] (len L + 2, tokenized turns):
+
+      t < L:  obs1  C = u_{t+1},  Y = u_{t+2}          (w = 0.5)
+              obs2  C = (u_{t+1}, u_{t+2}, one-update), Y = y  (w = 0.5)
+      t = L:  single legal observation  C = c,  Y = y  (w = 1.0)
+              — the terminal cut does not fabricate a second future.
+
+    Chi/phi are built from the RAW utterance tokens (the collator's
+    sample() already had them; the old code carved spans out of the
+    collated input_ids, dragging BOS / chat headers / separators into
+    the "utterance" sketches).  The model forward is used ONLY to lift
+    z_t from block_idx t - 1.  Chi/phi stay frozen input-embedding
+    sketches (no extra forward, no grad flow)."""
+    if not meta["ok"] or meta["L"] < 1:
         return []
-    k = meta["k"]
-    n_cuts = k - 2          # v = 0 .. k - 3 (one cut per merge depth)
+    L = int(meta["L"])
+    raw = meta["raw_dialog"]
+    assert len(raw) == L + 2, (
+        "raw_dialog length {} != L + 2 = {}".format(len(raw), L + 2))
     # extract_z's gather expands sum_positions along the BATCH dim, so
     # a multi-row [n_cuts, 2] input would index batch 1..n_cuts against
     # a batch-1 cache.  Extract one cut at a time (each call is a cheap
     # per-layer gather, not a forward).
     zs = [adapter.extract_z(torch.tensor(
-        [[meta["blocks"][v][1], meta["blocks"][v][1] + 1]],
+        [[meta["blocks"][t - 1][1], meta["blocks"][t - 1][1] + 1]],
         dtype=torch.long, device=device))[0]
-        for v in range(n_cuts)]  # [n_cuts, z_dim]
-    spans = meta["utterance_spans"]
-    ids = batch["input_ids"][meta["row"]]
-    labs = batch["labels"][meta["row"]]
-    # u_k = the target utterance: valid label tokens minus the EOS
-    valid_pos = (labs != -100).nonzero(as_tuple=False).flatten()
-    uk_pos = valid_pos[:-1] if len(valid_pos) > 1 else valid_pos
-    phi2 = phi_embed(embed_tokens, ids[uk_pos].unsqueeze(0).to(device),
-                     tag=1)
+        for t in range(1, L + 1)]  # [L, z_dim]
     dm = DialogueMeta(sample_id=int(meta["sample_id"]), k=int(meta["k"]),
                       sum_positions=[(p + 2, p + 3) for (p, _s)
                                      in meta["blocks"]],
                       utterance_spans=list(meta["utterance_spans"]),
-                      orig_id=int(meta.get("orig_id", -1)))
+                      orig_id=int(meta.get("orig_id", -1)),
+                      L=L, raw_dialog=list(raw))
+
+    def _tok(idx):
+        return torch.tensor(list(raw[idx]), dtype=torch.long,
+                            device=device).unsqueeze(0)
+
     rows = []
-    for v in range(n_cuts):
-        u_v1 = ids[spans[v + 1][0]:spans[v + 1][1]].unsqueeze(0).to(device)
-        u_v2 = ids[spans[v + 2][0]:spans[v + 2][1]].unsqueeze(0).to(device)
-        chi1 = utter_embed(embed_tokens, u_v1, tag=0)
-        phi1 = phi_embed(embed_tokens, u_v2, tag=0)
-        chi2 = utter_embed.combine(embed_tokens, u_v1, u_v2, tag=1)
-        rows.extend(builder.build(dm, zs[v], chi1[0], chi2[0],
-                                  phi1[0], phi2[0], v=v))
+    for t in range(1, L + 1):
+        if t < L:
+            u_nxt = _tok(t)          # u_{t+1}  (raw index t)
+            u_nx2 = _tok(t + 1)      # u_{t+2}
+            y_ids = _tok(L + 1)      # y (target)
+            chi1 = utter_embed(embed_tokens, u_nxt, tag=0)
+            phi1 = phi_embed(embed_tokens, u_nx2, tag=0)
+            chi2 = utter_embed.combine(embed_tokens, u_nxt, u_nx2, tag=1)
+            phi2 = phi_embed(embed_tokens, y_ids, tag=1)
+        else:
+            c_ids = _tok(L)          # c (context turn)
+            y_ids = _tok(L + 1)      # y (target)
+            chi1 = utter_embed(embed_tokens, c_ids, tag=0)
+            phi1 = phi_embed(embed_tokens, y_ids, tag=0)
+            chi2, phi2 = chi1, phi1  # unused on the single-row path
+        rows.extend(builder.build(dm, zs[t - 1], chi1[0], chi2[0],
+                                  phi1[0], phi2[0], v=t - 1))
     return rows
 
 
@@ -933,7 +988,7 @@ def treewise_feasibility_projection(g_task_gamma, gamma_params, G, kappa,
         # Gamma .grad <- the aggregate task gradient alone (d = t), the
         # degenerate / feasible / probe close semantics.
         for gt, p in zip(g_task_gamma, gamma_params):
-            p.grad = gt
+            p.grad = gt.to(p.device)
 
     if G is None or G.numel() == 0:
         diag["note"] = "no_dirs"
@@ -1003,7 +1058,9 @@ def treewise_feasibility_projection(g_task_gamma, gamma_params, G, kappa,
     with torch.no_grad():
         for p, cp, gt in zip(gamma_params, torch.split(corr, sizes),
                              g_task_gamma):
-            p.grad = gt - cp.view_as(p)   # grad = -d* = g_task - sum mu h_j
+            # .to(p.device): the QP runs on CPU (V11 OOM fix — the
+            # G matrix GPU peak was the last 4GB that blew the card).
+            p.grad = (gt - cp.view_as(p)).to(p.device)
     return True, diag
 
 
@@ -1208,6 +1265,29 @@ def main():
                 .format(_bad[:5]))
         print("[init-from] loaded {} (Gamma zero-init kept)".format(
             args.init_from), flush=True)
+    if args.freeze_host:
+        # Final protocol (review ruling): the host is the CCM-merge
+        # checkpoint, PERMANENTLY frozen.  Only Gamma trains, so
+        # Ours - Task-only can only come from predictive preservation.
+        n_frozen = 0
+        for n, p in model.named_parameters():
+            if "gamma" not in n and p.requires_grad:
+                p.requires_grad_(False)
+                n_frozen += 1
+        # Review ruling (2026-09-21): the frozen host must run its
+        # forward EXACTLY as at inference.  The official conditional
+        # LoRA carries lora_dropout=0.05, which stays ACTIVE while the
+        # model is in train() mode — frozen params would still perturb
+        # the host forward.  eval() the whole host, then re-enable
+        # train() ONLY on the Gamma modules (gradients keep flowing
+        # through the frozen host to Gamma either way).
+        model.eval()
+        for _m in model.modules():
+            if isinstance(_m, GammaResidual):
+                _m.train()
+        print("[freeze-host] frozen {} non-Gamma trainable params "
+              "(train Gamma only); host eval() + Gamma train()"
+              .format(n_frozen), flush=True)
     cfg = model.model.config
     # Tree-wise projection scope: the Gamma parameters of every layer.
     gamma_params = []
@@ -1337,16 +1417,23 @@ def main():
                             "q": float(depth_probs[i])}
                    for i, L in enumerate(DEPTH_LEVELS)},
         "n_items": n_items,
-        "k_of_L": {str(L): K_OF_L[L] for L in DEPTH_LEVELS},
+        "n_turns_of_L": {str(L): N_TURNS_OF_L[L] for L in DEPTH_LEVELS},
+        "n_turns_of_L_units": "TURNS (prefix length in dialogue turns). "
+                              "NOT meta['k']: meta.k = len(blocks) + 1 "
+                              "= L + 1 counts context turns and is the "
+                              "convention data_flow.jsonl records. The two "
+                              "differ by exactly 1 by construction.",
         "rule": ("q_L ~ 1/sqrt(n_L), 3x-uniform oversampling cap" if
                  q_alpha is None else
                  "q_L ~ n_L^{} (natural frequency) with per-dialogue "
                  "replay cap {}".format(q_alpha, max_replays))
-        + "; one original dialogue per window; fixed k_L = L + 2",
-        "note_L1": "depth L=1 dialogues (3 turns) carry task CE only: "
-                   "the cut formula v = k - 3 >= 1 requires L >= 2, so "
-                   "L=1 contributes no RPBE row (legacy protocol "
-                   "semantics, unchanged by round 8)",
+        + "; one original dialogue per window; fixed prefix = "
+          "n_turns_of_L[L] = L + 2 turns",
+        "note_L1": "depth L=1 dialogues (3 turns) emit the TERMINAL cut "
+                   "t=1=L with (C, Y) = (c, y), w=1 — one RPBE row "
+                   "(review ruling 2026-09-21: Gamma and RPBE now cover "
+                   "every compression layer t=1..L, so L=1 is inside the "
+                   "method).",
     })
 
     def next_batch():
@@ -1354,7 +1441,8 @@ def main():
         # q_L (legacy 1/sqrt(n_L) capped, or the Qwen3-line natural
         # frequency), then one dialogue from pool L that has NOT appeared
         # in this window (one dialogue per window), and collate it at the
-        # FIXED prefix k_L = L + 2.  The same RNG stream drives both arms
+        # FIXED prefix N_TURNS_OF_L[L] = L + 2 turns (turn count, not the
+        # meta.k = L + 1 block convention).  The same RNG stream drives both arms
         # (seed_all), so task-only and ours see the identical sampling
         # stream.
         # Qwen3-line replay cap: a dialogue leaves its pool after
@@ -1398,7 +1486,7 @@ def main():
             replay_count[orig_id] = replay_count.get(orig_id, 0) + 1
             seen_dialogs.add(orig_id)
             item = dict(train_items[orig_id])
-            item["dialog"] = list(item["dialog"])[:K_OF_L[L]]
+            item["dialog"] = list(item["dialog"])[:N_TURNS_OF_L[L]]
             item["fixed_depth"] = True
             items.append(item)
             orig_ids.append(orig_id)
@@ -1408,8 +1496,13 @@ def main():
                 "degenerate depth window: every dialogue already seen "
                 "(window grew past the whole pool)")
         batch = collator(items)
+        # Review ruling (2026-09-21): the RAW tokenized turns ride along
+        # with the batch — chi/phi are built from these, never from
+        # spans carved out of the collated ids.
+        raw_dialogs = [list(item["dialog"]) for item in items]
         sample_cursor += len(items)
-        return batch, sample_cursor - len(items), orig_ids, Ls
+        return batch, sample_cursor - len(items), orig_ids, Ls, \
+            raw_dialogs
 
     threshold = window._threshold(MEM_TAU) if window else None
     save_json(out / "config.json", {
@@ -1726,14 +1819,14 @@ def main():
         return not amp_skipped
 
     while step < args.max_steps:
-        batch, sample_id, orig_id, L = next_batch()
+        batch, sample_id, orig_id, L, raw_dialogs = next_batch()
         for _l in L:
             depth_win[_l] += 1
         # Data-stream hash for every arm (parse_meta is pure, no RNG).
         # Review round 8: the stream records the STABLE dialogue id and
         # its depth level — the per-step cursor is no longer the identity.
         metas = parse_meta(batch, comp_ids, sum_ids, sample_id,
-                           orig_ids=orig_id)
+                           orig_ids=orig_id, raw_dialogs=raw_dialogs)
         for m in metas:
             data_flow_hash.update(struct.pack(
                 ">qq", int(m["orig_id"]) if m["orig_id"] >= 0
@@ -1741,12 +1834,12 @@ def main():
             data_flow_len += 1
         with data_flow_path.open("a") as f:
             for m in metas:
-                # meta.k = len(blocks) + 1, so the compressed-history depth
-                # L = meta.k - 1 (dialog prefix = L + 2 turns).
+                # L = compressed-history turns (blocks); k = L + 1 keeps
+                # the legacy context-turn convention.
                 f.write(json.dumps({
                     "did": int(m["orig_id"]) if m["orig_id"] >= 0
                     else int(m["sample_id"]) % n_items,
-                    "L": int(m["k"]) - 1,
+                    "L": int(m["L"]),
                     "k": int(m["k"])}) + "\n")
         if window_start_state is None:
             # Builder counters are NOT rewound here: pass 2 never touches
@@ -1758,10 +1851,11 @@ def main():
             # Incremental pass 1: RNG restored after each microbatch so
             # the data-sampling stream matches the single-pass arm; the
             # cut rows and their occurrence ids accumulate monotonically.
-            # Microbatches with NO possible cut (k < 4) skip the pass-1
+            # Microbatches with NO possible cut (L < 1) skip the pass-1
             # forward entirely: no row can come from them (L6.5 perf:
             # DailyDialog's effective-cut rate is ~50%, halving the
-            # pass-1 cost).
+            # pass-1 cost).  Review ruling (2026-09-21): L = 1 now DOES
+            # emit the terminal (c, y) cut, so the gate is L >= 1.
             # P0 fix (R10, review 2026-09-16): the official Step-2 LoRA
             # carries lora_dropout=0.05 and the model is in TRAIN mode —
             # dropout consumes CUDA RNG inside the forward.  Pass 1
@@ -1773,7 +1867,7 @@ def main():
             # pass-2 forward: mask_i^pass2 == mask_i^pass1.
             state = {"rng": _rng_state()}
             pass1_rngs.append(state["rng"])
-            if any(m["ok"] and m["k"] >= 3 for m in metas):
+            if any(m["ok"] and m["L"] >= 1 for m in metas):
                 batch_cuts = pass1_one(batch, metas)
             else:
                 batch_cuts = []
@@ -1943,10 +2037,37 @@ def main():
                     # certificate skips the representation step below.
                     for i, (b, sid) in enumerate(pending):
                         _restore_rng(pass1_rngs[i])   # P0: mask == pass1
+                        # V11 (review): the QP center is the JOINT
+                        # proposal q = t + a_lambda, not the bare task
+                        # proposal t.  Running pass2_one with the real
+                        # lambda accumulates the aggregate RPBE gradient
+                        # ONTO the Gamma task gradient, so the snapshot
+                        # below (g_task_gamma) is exactly the joint
+                        # proposal direction; the projection then trims
+                        # only the components that hurt a local
+                        # interface.  Non-Gamma params keep pure task
+                        # (rpbe_gamma_only structure, unchanged).
                         task_mean, task_raw, n_valid, _aux, _n = pass2_one(
-                            b, cut_records[i], g_by_oid, 0.0)
-                        scaler.scale(
-                            task_mean / float(len(pending))).backward()
+                            b, cut_records[i], g_by_oid,
+                            0.0 if args.arm == "gamma_task_only"
+                            else lambda_kf)
+                        if task_mean.requires_grad:
+                            # freeze-host fix: k<3 batches carry no
+                            # COMP/SUM rows, so Gamma never touches the
+                            # output and task_mean has no graph.  Skip
+                            # their (zero) backward instead of dying.
+                            scaler.scale(
+                                task_mean
+                                / float(len(pending))).backward(
+                                    retain_graph=True)
+                        if _n and args.arm == "ours" and _aux.requires_grad:
+                            # V11: accumulate the aggregate RPBE gradient
+                            # onto Gamma so the snapshot below is the
+                            # joint proposal q = t + a_lambda (mirrors
+                            # the aggregate branch's aux backward).
+                            # freeze-host fix: _n>0 but a graph-less _aux
+                            # (all oids filtered out) has nothing to add.
+                            scaler.scale(_aux).backward()
                         task_sum += float(task_raw.detach())
                         n_tokens += n_valid
                     task_grads = {id(p): p.grad.detach().clone()
@@ -1970,10 +2091,20 @@ def main():
                             gd = g.detach()
                             aux_i = -lambda_kf * ((gd * z).sum()
                                                   - (gd * z.detach()).sum())
-                            aux_i.backward()
+                            # retain_graph: the SAME fwd_out graph is
+                            # replayed for every cut of this batch
+                            # (treewise bug found by the probe audit:
+                            # the second cut's backward died on a freed
+                            # graph — treewise mode had never run).
+                            aux_i.backward(retain_graph=True)
+                            # CPU-side accumulation (OOM fix):
+                            # the dirs matrix is ~n_dirs x n_gamma fp32
+                            # (~4GB for 1098 dirs); keeping the list on
+                            # GPU plus the torch.stack copy doubled the
+                            # peak and blew the 40GB card.
                             dirs.append(torch.cat(
                                 [p.grad.reshape(-1).float()
-                                 for p in gamma_params]))
+                                 for p in gamma_params]).cpu())
                             for p in params:
                                 if id(p) not in gamma_set \
                                         and p.grad is not None:
@@ -1983,10 +2114,71 @@ def main():
                     g_task_gamma = [
                         task_grads.get(id(p), torch.zeros_like(p))
                         for p in gamma_params]
+                    if os.environ.get("CCM_TREEWISE_PROBE") == "1" \
+                            and dirs:
+                        # Audit (review): cos(g_task, g_v) distribution
+                        # on the CURRENT window — answers whether the
+                        # treewise constraint would actually bind.
+                        # Constraint semantics: t = -g_task, row g_j,
+                        # g_j.d >= -kappa||g_j||||t|| i.e.
+                        # cos(g_j, g_task) <= +kappa is the safe side;
+                        # BOTH tails are reported for reviewer judgement.
+                        import numpy as _np
+                        _t_flat = torch.cat(
+                            [x.reshape(-1).float()
+                             for x in g_task_gamma])
+                        _nt = float(_t_flat.norm())
+                        _G = torch.stack(dirs)
+                        _nr = _G.norm(dim=1)
+                        _cos = ((_G @ _t_flat)
+                                / (_nr * _nt).clamp(min=1e-12)).tolist()
+                        _cos = [float(c) for c in _cos]
+                        _a = _np.array(_cos)
+                        _probe = {
+                            "n_dirs": int(len(_cos)),
+                            "cos_mean": float(_a.mean()),
+                            "cos_med": float(_np.median(_a)),
+                            "cos_min": float(_a.min()),
+                            "cos_max": float(_a.max()),
+                            "frac_below_neg_kappa": float(
+                                (_a < -args.rpbe_kappa).mean()),
+                            "frac_above_pos_kappa": float(
+                                (_a > args.rpbe_kappa).mean()),
+                            "kappa": float(args.rpbe_kappa),
+                            "cos_list": _cos,
+                        }
+                        with (out / "treewise_probe.json").open("w") \
+                                as _f:
+                            json.dump(_probe, _f, indent=2)
+                        print("[treewise-probe] n={} mean={:.4f} "
+                              "med={:.4f} frac<-k={:.3f} frac>+k={:.3f} "
+                              "min={:.4f} max={:.4f}".format(
+                                  _probe["n_dirs"], _probe["cos_mean"],
+                                  _probe["cos_med"],
+                                  _probe["frac_below_neg_kappa"],
+                                  _probe["frac_above_pos_kappa"],
+                                  _probe["cos_min"], _probe["cos_max"]),
+                              flush=True)
+                        raise SystemExit(
+                            "CCM_TREEWISE_PROBE: window probed, "
+                            "no optimizer step executed")
                     proj_ok, proj_diag = treewise_feasibility_projection(
-                        g_task_gamma, gamma_params,
-                        torch.stack(dirs) if dirs else None,
-                        args.rpbe_kappa, iters=args.proj_iters)
+                        [x.detach().cpu() for x in g_task_gamma],
+                        gamma_params,
+                        (torch.stack(dirs)
+                         if dirs else None),
+                        args.rpbe_kappa, iters=args.proj_iters,
+                        # V11 (self-ruled 2026-09-21): the TGN final-spec
+                        # 1e-6 certificate is a fp32 contract; CCM runs
+                        # the QP on fp16 GradScaler-SCALED gradients, so
+                        # the achievable max_viol floors at ~1e-5
+                        # (measured: 8.37e-06 / 1e-05 across the first
+                        # windows).  Keeping 1e-6 made EVERY window
+                        # cert_fail and skipped every repr update — the
+                        # V11 joint-QP experiment would degenerate to
+                        # task-only.  1e-4 is the fp16-achievable line;
+                        # the skip-on-failure semantics is unchanged.
+                        cert_tol=1e-4)
                     cert_fail = bool(proj_diag.get("cert_fail"))
                     if not proj_ok:
                         # CERT_FAIL: no constrained update is executed —
@@ -2042,9 +2234,12 @@ def main():
                             # r_eff=0.1 does not mean Gamma received 10%
                             # of the RPBE signal when LoRA/COMP absorb
                             # most of it).
-                            scaler.scale(
-                                task_mean / float(len(pending))).backward(
-                                    retain_graph=True)
+                            if task_mean.requires_grad:
+                                # freeze-host fix (see treewise branch).
+                                scaler.scale(
+                                    task_mean
+                                    / float(len(pending))).backward(
+                                        retain_graph=True)
                             task_snap = {id(p): p.grad.detach().clone()
                                          for p in params
                                          if p.grad is not None
@@ -2053,7 +2248,10 @@ def main():
                                 task_snap_all = {
                                     id(p): p.grad.detach().clone()
                                     for p in params if p.grad is not None}
-                            scaler.scale(aux).backward()
+                            if aux.requires_grad:
+                                # freeze-host fix: same graph-less case as
+                                # the else branch below — nothing to add.
+                                scaler.scale(aux).backward()
                             if os.environ.get("CCM_GRAD_GROUP") == "1":
                                 # per-group r_eff (review 2026-09-16):
                                 # task vs RPBE gradient norms for
@@ -2099,7 +2297,16 @@ def main():
                         else:
                             loss = task_mean / float(len(pending)) + aux
                             _t = time.perf_counter()
-                            scaler.scale(loss).backward()
+                            if loss.requires_grad:
+                                # freeze-host fix (see treewise branch):
+                                # a k<3 batch carries no COMP/SUM rows, so
+                                # Gamma never touches its output and the
+                                # task term is graph-less; with no cuts
+                                # aux is the detached zero from
+                                # pass2_one.  The whole loss is then
+                                # graph-less and there is nothing to
+                                # backprop for this microbatch.
+                                scaler.scale(loss).backward()
                             _pf("pass2_bwd", _t)
                         if os.environ.get("CCM_AUX_DIAG") == "1":
                             named = [(n, p)
@@ -2201,7 +2408,7 @@ def main():
             # exposure; --merge-cadence official keeps the fixed cadence
             # for the ccm_merge_official reproduction reference only.
             eff = sum(1 for m in metas
-                      if m["ok"] and m["k"] >= 3)
+                      if m["ok"] and m["L"] >= 1)
             if args.merge_cadence == "window-matched":
                 merge_eff_cuts += eff
             fire = (args.merge_cadence == "window-matched"

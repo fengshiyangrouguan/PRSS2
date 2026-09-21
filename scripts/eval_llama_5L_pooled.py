@@ -102,6 +102,9 @@ def main():
         len(cohort)), flush=True)
 
     model = build_official_host(device)
+    # joint-training checkpoints carry Gamma params: attach the Gamma
+    # structure before loading (same as the R8 official-host eval path)
+    tc.attach_gamma(model, hidden=64)
     if a.ckpt != "NONE":
         payload = torch.load(a.ckpt, map_location=device, weights_only=False)
         missing, unexpected = model.load_state_dict(payload["model"],

@@ -1,0 +1,89 @@
+{
+ "_comment": "Qwen3-line LEGACY-sampling ablation frozen (2026-09-18, user ruling): identical to frozen_method_qwen3.json EXCEPT the sampling section keeps the R10 inverse-sqrt rule with NO replay cap — the parallel ablation arm vs the natural-frequency arm.",
+ "frozen_source": "copy of frozen_method_qwen3.json with the sampling section reverted to the R10 legacy rule",
+ "backbone": {
+  "model": "Qwen3-4B-Instruct-2507 (aligned instruct backbone: official Step-1 default-LoRA pretraining is SKIPPED per the CCM README rule)",
+  "hf_identifier": "Qwen/Qwen3-4B-Instruct-2507",
+  "revision": "cdbee75f17c01a7cc42f958dc650907174af0554",
+  "transformers": "4.56.2",
+  "vendored_commit": "a89dd08e2c9587ec9c6c3ad339bb154c33e6b41a",
+  "attn_type": "merge_recur",
+  "n_tok_lock": 2,
+  "torch_compile": "disabled on all three arms",
+  "dtype": "bf16"
+ },
+ "adapter": {
+  "lora_r": 8,
+  "lora_alpha": 16,
+  "lora_dropout": 0.0,
+  "lora_r_note": "r=8 q/k/v/o conditional LoRA"
+ },
+ "rpbe": {
+  "ridge_eps": 0.001,
+  "sketch_dim_m": 32,
+  "rpbe_map_seed": 0,
+  "z_v_dim": 128,
+  "horizon_weights": [
+   0.5,
+   0.5
+  ],
+  "lambda_calibration": {
+   "rule": "R10 gamma-scope calibration (review 2026-09-16): lambda = 0.1 / r_eff measured on the GAMMA group only at theta_0, chain-wise window",
+   "lambda_kf": null,
+   "lambda_kf_note": "SUPERSEDED by the 2026-09-21 review ruling: the cut collector, Gamma placement and trainable scope all changed (cuts t=1..L, Gamma at every layer incl. t=1 with M_0=0, host fully frozen + eval mode), so the V11 value 0.0048453 (old Y2=u_{v+3}/b_{v+1} supervision, old cut set, trainable LoRA/COMP) is RETIRED.  Recalibrate ONCE on the fixed code (theta_0 = merge checkpoint_step550, frozen host, first full window, before any optimizer step) and commit the derived lambda here.  The trainer refuses the ours arm while this field is null."
+  },
+  "z_v_source": "J_mem(M_t) fixed adapter at block_idx = t - 1 for t = 1..L (one cut per actual compression layer; review ruling 2026-09-21); GQA hosts lift the memory from the KV heads (8) with head_dim 128",
+  "cut_supervision": "t < L: obs1 (C=u_{t+1}, Y=u_{t+2}, w=0.5) + obs2 (C=(u_{t+1}, u_{t+2}, one-update), Y=y, w=0.5); t = L: single row (C=c, Y=y, w=1.0).  chi/phi are built from the RAW tokenized turns, never from spans of the collated ids.",
+  "witness": "none (main experiment)",
+  "sketch_ensemble_n_branches": 4,
+  "oas_shrinkage": {
+   "enabled": true,
+   "rule": "paired OAS covariance shrinkage per branch"
+  }
+ },
+ "gamma": {
+  "placement": "one module per layer, shared across the K/V merges and the two COMP/SUM slots; recurrence M_t = mean(h_1..h_t) + R_Gamma(M_{t-1}, h_t, t) for EVERY t = 1..L with M_0 = 0 (review ruling 2026-09-21: the first compression layer is inside the method, L=1 included)",
+  "hidden": 64,
+  "time_dim": 16,
+  "init_scale": 0.02,
+  "zero_init": "U0=0 zero-output projection init; step 0 residual is bit-for-bit zero.  Gradient note: with U_0 = 0 the first step updates only U (dR/dV vanishes at U = 0).",
+  "parameter_budget": "36 layers (Qwen3-4B) x ~25.7k = ~925k < 1M"
+ },
+ "freeze_host": {
+  "scope": "backbone + conditional LoRA + COMP/SUM embeddings all frozen (train Gamma ONLY); optimizer holds only the Gamma group",
+  "mode": "host model.eval() + Gamma modules train() — the official conditional LoRA dropout (0.05) must not perturb the frozen host forward; gradients still flow through the host to Gamma",
+  "checkpoint": "Stage-2 checkpoints save the Gamma state only (trainable_state_dict = requires_grad params)",
+  "eval_reconstruction": "build_official_host -> attach_gamma -> load Gamma-only checkpoint -> freeze non-Gamma -> eval; same construction as training"
+ },
+ "window": {
+  "min_effective_cuts": 128,
+  "collection": "adaptive by effective cut count (dialogues with L>=1; review ruling 2026-09-21: L=1 emits the terminal cut)",
+  "cadence": "identical task samples and scheduler cadence across the three arms"
+ },
+ "training": {
+  "steps": 60,
+  "steps_note": "Review-fix rerun (2026-09-21): 60 windows, task-only / ours from the SAME theta_0 (merge checkpoint_step550, frozen host, zero-init Gamma).  The V11 numbers (trainable LoRA/COMP scope, old cut set, old lambda) are retired as diagnostic records only.",
+  "grad_clip": 1.0,
+  "merge_cadence": "window-matched",
+  "two_pass_replay": "pass1 no-grad statistics forward, pass2 grad replay forward (RPBE arms only)",
+  "rpbe_gamma_only": true,
+  "rpbe_lr": 5e-05,
+  "seeds": 1,
+  "checkpoint_every": 10,
+  "schedule_total_steps": 1000,
+  "schedule_note": "original 1000-step warmup/cosine schedule kept",
+  "checkpoint_selection": "validation only (the official val+test pooled protocol remains a CCM-reproduction report, never a checkpoint selector)"
+ },
+ "sampling": {
+  "depth_levels": [
+   1,
+   2,
+   4,
+   8,
+   13
+  ],
+  "n_turns_of_L": "L + 2 TURNS (fixed prefix length in turns per depth; NOT meta.k = len(blocks)+1 = L + 1)",
+  "cut_depths": "every sample at endpoint L contributes cuts at LOCAL depths t = 1..L (maps.pv depth = t; Llmmaps registers local depths 1..13, out-of-range values fail fast — no modulo fold)",
+  "rule": "LEGACY R10 sampling (ablation arm): q_L ~ 1/sqrt(n_L) with 3x-uniform oversampling cap, NO per-dialogue replay cap; one original dialogue per window."
+ }
+}

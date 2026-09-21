@@ -196,10 +196,13 @@ class Qwen3CCMAttention(nn.Module):
             no_sum_mask = (1 - sum_mask).to(key_states.dtype).unsqueeze(1) \
                 .unsqueeze(-1)
 
-            # RPBE: Gamma recurrence scan (t_max >= 2), same math as the
+            # RPBE: Gamma recurrence scan (t_max >= 1), same math as the
             # Llama host (see ccm_llama.py for the full derivation).
+            # Review ruling (2026-09-21): Gamma applies at EVERY actual
+            # compression layer t = 1..L with M_0 = 0, so L=1 (turn_3)
+            # is genuinely inside the method.
             if self.gamma is not None and sum_row_pos is not None \
-                    and int(sum_row_pos.shape[1]) >= 2:
+                    and int(sum_row_pos.shape[1]) >= 1:
                 n_heads = key_states.shape[1]
                 head_dim = key_states.shape[3]
                 n_slots = int(sum_row_pos.shape[2])
@@ -228,8 +231,12 @@ class Qwen3CCMAttention(nn.Module):
             value_states = no_sum_mask * value_states + value_comp_avg
 
             # RPBE: per-turn residual recurrence over the SUM rows.
+            # Review ruling: M_t = mean(h_1..h_t) + R_Gamma(M_{t-1}, h_t, t)
+            # for EVERY t = 1..t_max, with M_0 = 0 (t=1 feeds zeros as
+            # the previous memory, so the zero-init Gamma keeps step-0
+            # bit-identical to the pure CCM-merge host).
             if self.gamma is not None and sum_row_pos is not None \
-                    and int(sum_row_pos.shape[1]) >= 2:
+                    and int(sum_row_pos.shape[1]) >= 1:
                 n_heads = key_states.shape[1]
                 head_dim = key_states.shape[3]
                 n_slots = int(sum_row_pos.shape[2])
@@ -238,30 +245,63 @@ class Qwen3CCMAttention(nn.Module):
                                          dtype=key_states.dtype,
                                          device=key_states.device)
                 res_prev_v = torch.zeros_like(res_prev_k)
-                res_all_k = torch.zeros_like(k_base)
-                res_all_v = torch.zeros_like(v_base)
                 valid = sum_row_valid.to(key_states.dtype).unsqueeze(1)
                 valid = valid.unsqueeze(-1)  # [B, 1, T, n_slots, 1]
-                for t_i in range(2, t_max + 1):
+                res_list_k = []
+                res_list_v = []
+                for t_i in range(1, t_max + 1):
                     tt = torch.full((bsz, 1), t_i, dtype=torch.float32,
                                     device=key_states.device)
+                    if t_i == 1:
+                        # M_0 = 0 by definition.
+                        prev_k = torch.zeros_like(k_base[:, :, 0])
+                        prev_v = torch.zeros_like(v_base[:, :, 0])
+                    else:
+                        # M_{t-1} = base of the PREVIOUS turn (index
+                        # t_i-2) plus that turn's residual register.
+                        prev_k = k_base[:, :, t_i - 2] + res_prev_k
+                        prev_v = v_base[:, :, t_i - 2] + res_prev_v
                     res_t_k = self.gamma(
-                        k_base[:, :, t_i - 2] + res_prev_k,
-                        k_cur[:, :, t_i - 1], tt) * valid[:, :, t_i - 1]
+                        prev_k, k_cur[:, :, t_i - 1], tt) \
+                        * valid[:, :, t_i - 1]
                     res_t_v = self.gamma(
-                        v_base[:, :, t_i - 2] + res_prev_v,
-                        v_cur[:, :, t_i - 1], tt) * valid[:, :, t_i - 1]
+                        prev_v, v_cur[:, :, t_i - 1], tt) \
+                        * valid[:, :, t_i - 1]
                     res_prev_k = res_t_k
                     res_prev_v = res_t_v
-                    res_all_k[:, :, t_i - 1] = res_t_k
-                    res_all_v[:, :, t_i - 1] = res_t_v
-                for b in range(bsz):
-                    key_states[b] = key_states[b].index_add(
-                        1, sum_row_pos[b].reshape(-1),
-                        res_all_k[b].reshape(n_heads, -1, head_dim))
-                    value_states[b] = value_states[b].index_add(
-                        1, sum_row_pos[b].reshape(-1),
-                        res_all_v[b].reshape(n_heads, -1, head_dim))
+                    # freeze-host fix 2: the old in-place fill into a
+                    # no-grad zeros tensor silently dropped the Gamma
+                    # graph; collect then stack along the t axis instead.
+                    res_list_k.append(res_t_k)
+                    res_list_v.append(res_t_v)
+                # One residual row per compression layer t = 1..t_max.
+                res_all_k = torch.stack(res_list_k, dim=2)
+                res_all_v = torch.stack(res_list_v, dim=2)
+                # OUT-OF-PLACE index_add (freeze-host fix): the old
+                # per-batch slice assignment `key_states[b] = ...` is an
+                # in-place write; with the host frozen the K/V tensors
+                # carry no requires_grad and the in-place op silently
+                # DROPS the Gamma residual from the autograd graph.
+                # Whole-tensor index_add along the SEQ dim (2): source
+                # [B, H, T*S, D] via double permute.
+                # OUT-OF-PLACE index_add (freeze-host fix): the old
+                # per-batch slice assignment `key_states[b] = ...` is an
+                # in-place write; with the host frozen the K/V tensors
+                # carry no requires_grad and the in-place op silently
+                # DROPS the Gamma residual from the autograd graph.
+                # Per-batch index_add (index_add itself is out-of-place)
+                # then stack — semantically identical to the original
+                # loop, but the graph survives.
+                _k_list = [key_states[b].index_add(
+                    1, sum_row_pos[b].reshape(-1),
+                    res_all_k[b].reshape(n_heads, -1, head_dim))
+                    for b in range(bsz)]
+                _v_list = [value_states[b].index_add(
+                    1, sum_row_pos[b].reshape(-1),
+                    res_all_v[b].reshape(n_heads, -1, head_dim))
+                    for b in range(bsz)]
+                key_states = torch.stack(_k_list, dim=0)
+                value_states = torch.stack(_v_list, dim=0)
 
             # RPBE: memory extraction (post-merge, pre-attention).
             if self.mem_callback is not None:
@@ -660,7 +700,7 @@ class Qwen3ForCausalLM_CCM(Qwen3PreTrainedModel):
     resize_token_embeddings grows both sides with the COMP/SUM rows.
     """
 
-    _tied_weights_keys = ["lm_head.weight"]
+    _tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}  # dict form required by transformers 5.x
 
     def __init__(self, config: Qwen3Config):
         super().__init__(config)

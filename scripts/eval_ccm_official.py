@@ -73,6 +73,12 @@ def main(args) -> None:
         # training (same arch/config/conditional-LoRA/Gamma pipeline)
         # and hand it to the OFFICIAL data+collator+metric.  The
         # official load_model result is discarded.
+        # Review ruling (2026-09-21): the Stage-2 evaluation host is the
+        # SAME frozen build as training —
+        #   build_official_host -> attach_gamma -> load Gamma only
+        # -> freeze every non-Gamma param -> eval.  The legacy
+        # build_model() + wrap_lora() path (trainable LoRA/COMP) no
+        # longer matches the Stage-2 protocol and is removed.
         import types
         del model
         torch.cuda.empty_cache()
@@ -81,21 +87,15 @@ def main(args) -> None:
             model_name_or_path=args.model.model_name_or_path,
             relative_embedding="skip",
             lora_r=8, gamma_hidden=64,
-            foundation=os.environ.get("FOUNDATION", ""))
+            official_host=True,
+            foundation=os.environ.get("FOUNDATION", ""),
+            official_adapter=os.environ.get("OFFICIAL_ADAPTER", ""))
+        if not our_args.official_adapter:
+            raise SystemExit(
+                "frozen-host eval requires OFFICIAL_ADAPTER (released "
+                "Step-2 compression adapter dir)")
         device = torch.device("cuda", 0)
-        model = tc.build_model(our_args, device)
-        if our_args.foundation:
-            # two-stage protocol arms: the official Step-1 default LoRA
-            # (llama-7b-no) was MERGED into the base weights before
-            # training; the trainable checkpoint does not contain it.
-            from src.model import load_lora_weight
-            load_lora_weight(our_args.foundation, model, merge=True)
-            print("[foundation] merged {}".format(our_args.foundation),
-                  flush=True)
-        model = tc.wrap_lora(model, our_args.lora_r)
-        model.update_comp_token(
-            [32000 + k for k in range(tc.N_TOK)],
-            [32000 + tc.N_TOK + k for k in range(tc.N_TOK)])
+        model = tc.build_official_host(our_args, device)
         _gammas = tc.attach_gamma(model, hidden=our_args.gamma_hidden)
         # Gamma modules are plain attribute assignments (not registered
         # submodules), so model.to(fp16) does NOT traverse them and the
@@ -113,28 +113,18 @@ def main(args) -> None:
                   flush=True)
         else:
             payload = tc.load_trainable(our_ckpt, model, dummy, device)
-            # Review ruling 2026-09-05 (exact model reconstruction):
-            # restore the frozen COMP/SUM rows if the checkpoint carries
-            # them (post-fix checkpoints do; pre-fix ones only have
-            # LoRA+Gamma and their rows cannot be recovered exactly).
-            if "new_token_rows" in payload:
-                n = 2 * tc.N_TOK
-                model.get_input_embeddings().weight[-n:] = \
-                    payload["new_token_rows"]["input_embed_rows"].to(device)
-                model.lm_head.weight[-n:] = \
-                    payload["new_token_rows"]["lm_head_rows"].to(device)
-                print("[eval] new_token_rows restored", flush=True)
-            else:
-                # review 2026-09-05: refuse pre-fix checkpoints outright —
-                # their COMP/SUM rows were never saved, so the rebuilt
-                # model differs from the trained one and any PPL from it
-                # is not trustworthy for selection.
-                raise RuntimeError(
-                    "checkpoint predates new_token_rows save; exact model "
-                    "reconstruction impossible — retrain with the fixed "
-                    "save path (review ruling)")
             print("our checkpoint loaded (build mode): {}".format(our_ckpt),
                   flush=True)
+        # Freeze the ENTIRE host (LoRA + COMP/SUM + backbone) — the
+        # Stage-2 checkpoint only ever trained Gamma.
+        n_frozen = 0
+        for n, p in model.named_parameters():
+            if "gamma" not in n and p.requires_grad:
+                p.requires_grad_(False)
+                n_frozen += 1
+        model.eval()
+        print("[frozen-host] frozen {} non-Gamma params "
+              "(Gamma-only evaluation host)".format(n_frozen), flush=True)
 
     from src.data.load import load_dataset_metric_collator
     _, eval_dataset, _, collator = load_dataset_metric_collator(

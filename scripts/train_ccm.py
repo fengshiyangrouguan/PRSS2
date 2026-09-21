@@ -267,6 +267,14 @@ def parse_args():
                         "(no optimizer/data-stream state).  Gamma stays "
                         "zero-init by design; non-Gamma missing keys "
                         "still fail fast.")
+    p.add_argument("--freeze-host", action="store_true",
+                   help="final training protocol (review ruling): after "
+                        "--init-from, freeze the ENTIRE host "
+                        "(conditional LoRA + COMP/SUM + backbone) and "
+                        "train Gamma ONLY.  The two arms (task-only vs "
+                        "ours) then differ solely in the Gamma training "
+                        "objective — the clean causal attribution the "
+                        "paper needs.")
     p.add_argument("--max-pending-mbs", type=int, default=2048,
                    help="degenerate-window guard: pending cap before abort")
     p.add_argument("--max-windows", type=int, default=0,
@@ -1347,6 +1355,17 @@ def main():
                 .format(_bad[:5]))
         print("[init-from] loaded {} (Gamma zero-init kept)".format(
             args.init_from), flush=True)
+    if args.freeze_host:
+        # Final protocol (review ruling): the host is the CCM-merge
+        # checkpoint, PERMANENTLY frozen.  Only Gamma trains, so
+        # Ours - Task-only can only come from predictive preservation.
+        n_frozen = 0
+        for n, p in model.named_parameters():
+            if "gamma" not in n and p.requires_grad:
+                p.requires_grad_(False)
+                n_frozen += 1
+        print("[freeze-host] frozen {} non-Gamma trainable params "
+              "(train Gamma only)".format(n_frozen), flush=True)
     cfg = model.model.config
     # Tree-wise projection scope: the Gamma parameters of every layer.
     gamma_params = []

@@ -292,6 +292,20 @@ def parse_args():
                         "cut supervises the final target y with the "
                         "remaining suffix (u_{t+1}..u_L, c) as context "
                         "(single row per cut, w=1.0)")
+    p.add_argument("--s4-supervisor", action="store_true",
+                   help="FORMAL S4 supervisor (review 2026-09-23, "
+                        "frozen candidate): keep the original 2Obs "
+                        "topology, replace the CountSketch/Ky-Fan "
+                        "scoring of every observation with the "
+                        "real-token NLL gap "
+                        "Delta_{t,h} = l_comp - sg(l_full), where "
+                        "l_comp = -log p(Y | M_t, C) and l_full = "
+                        "-log p_ref(Y | U_t, C) share the SAME future "
+                        "conditioning C (only the compression of the "
+                        "history differs; the full reference is a "
+                        "1-turn merge = lossless).  RAW gap — no hinge, "
+                        "no epsilon (margin gating is a later ablation)."
+                        "  Native actuation only.")
     # monitoring
     p.add_argument("--log-every", type=int, default=10)
     p.add_argument("--checkpoint-every", type=int, default=250)
@@ -471,6 +485,12 @@ def enforce_frozen(args):
             "actuation.mode is '{}' — native flag + gamma spec (or a "
             "stale spec) would silently train the wrong parameter "
             "block".format(act_mode))
+    if getattr(args, "s4_supervisor", False) and (
+            args.arm != "ours"
+            or not getattr(args, "rpbe_native_compression", False)):
+        raise SystemExit(
+            "[s4] --s4-supervisor is the native-ours formal supervisor "
+            "(--arm ours --rpbe-native-compression required)")
     # Lambda authority: the calibration-only run writes the derived
     # lambda into the frozen spec; afterwards the number overrides any
     # CLI value and re-calibration is refused.
@@ -1003,6 +1023,36 @@ def collect_rows(meta, adapter, builder, utter_embed, phi_embed,
         rows.extend(builder.build(dm, zs[t - 1], chi1[0], chi2[0],
                                   phi1[0], phi2[0], v=t - 1))
     return rows
+
+
+def s4_obs_list(meta, v):
+    """(h, comp_dlg, full_dlg, w) per observation of cut v (S4 formal
+    supervisor, review 2026-09-23).
+
+    Both dialogues share the SAME future conditioning (C, Y); only the
+    history's information source differs: comp compresses u_1..u_t into
+    M_t (t-turn merge), full gives u_1..u_t as ONE lossless context
+    turn (a 1-turn merge is the identity).  Weights follow the original
+    2Obs topology (0.5/0.5 below the terminal, single w=1 at t=L).
+    """
+    _t = int(v) + 1
+    _raw = meta["raw_dialog"]
+    _L = int(meta["L"])
+    _hist = [list(_raw[_x]) for _x in range(_t)]
+    _hist_full = [tok for _x in range(_t) for tok in _raw[_x]]
+    if _t < _L:
+        _ctx2 = [tok for _x in range(_t, _t + 2) for tok in _raw[_x]]
+        return [
+            (1, _hist + [list(_raw[_t])] + [list(_raw[_t + 1])],
+             [_hist_full] + [list(_raw[_t])] + [list(_raw[_t + 1])],
+             0.5),
+            (2, _hist + [_ctx2] + [list(_raw[_L + 1])],
+             [_hist_full] + [_ctx2] + [list(_raw[_L + 1])],
+             0.5),
+        ]
+    return [(1, _hist + [list(_raw[_L])] + [list(_raw[_L + 1])],
+             [_hist_full] + [list(_raw[_L])] + [list(_raw[_L + 1])],
+             1.0)]
 
 
 def batch_surrogate(z_rows_by_oid, batch_terms, lam, device):
@@ -2367,15 +2417,21 @@ def main():
                             _restore_rng(pass1_rngs[i])  # P0: mask==pass1
                             task_mean, task_raw, n_valid, _aux, _n = \
                                 pass2_one(b, cut_records[i], g_by_oid,
-                                          lambda_kf)
+                                          (0.0 if args.s4_supervisor
+                                           else lambda_kf))
                             _before = {
                                 id(p): p.grad.detach().clone()
                                 for p in params if p.grad is not None}
                             if task_mean.requires_grad:
+                                # S4 supervisor (review 2026-09-23):
+                                # NO retain — the S4 loop runs its OWN
+                                # per-observation forwards, so the
+                                # sketch surrogate graph is not needed.
                                 scaler.scale(
                                     task_mean
                                     / float(len(pending))).backward(
-                                        retain_graph=True)
+                                        retain_graph=(
+                                            not args.s4_supervisor))
                             for p in params:
                                 if p.grad is None:
                                     continue
@@ -2387,14 +2443,16 @@ def main():
                                     pure_acc[id(p)].add_(_inc)
                                 else:
                                     pure_acc[id(p)] = _inc.clone()
-                            if _n and _aux.requires_grad:
+                            if _n and _aux.requires_grad \
+                                    and not args.s4_supervisor:
                                 scaler.scale(_aux).backward()  # frees graph
                             task_sum += float(task_raw.detach())
                             n_tokens += n_valid
                         task_grads_pure = pure_acc
-                        task_grads = {
-                            id(p): p.grad.detach().clone()
-                            for p in params if p.grad is not None}
+                        if not args.s4_supervisor:
+                            task_grads = {
+                                id(p): p.grad.detach().clone()
+                                for p in params if p.grad is not None}
                     else:
                         for i, (b, sid) in enumerate(pending):
                             _restore_rng(pass1_rngs[i])   # P0: mask == pass1
@@ -2447,57 +2505,143 @@ def main():
                     native_g_joint = None   # true-value g_joint for the
                     native_amp_skip = False  # native proposal write-back
                     dirs = []
-                    for i, (b, sid) in enumerate(pending):
-                        _restore_rng(pass1_rngs[i])  # P0: mask == pass1
-                        fwd_out = run_forward(model, b, device,
-                                              grad_enabled=True)
-                        # OOM fix (review 2026-09-22): retain_graph on
-                        # EVERY cut kept this batch's full graph alive
-                        # for the whole window — with the LoRA trainable
-                        # (native), all 36 layers' activations carry
-                        # grad, so 128 trees of retained graphs blew the
-                        # 40GB card.  Retain only until the batch's LAST
-                        # cut; its backward frees the graph.  Gradient
-                        # VALUES are unchanged (retain only controls
-                        # graph lifetime).
-                        _cuts = [(meta, oid, v) for meta, oid, v
-                                 in cut_records[i]
-                                 if g_by_oid.get(oid) is not None]
-                        for _j, (meta, oid, v) in enumerate(_cuts):
-                            g = g_by_oid.get(oid)
-                            optimizer.zero_grad(set_to_none=True)
-                            z = collect_replay_z(meta, adapter, device,
-                                                 v=v)
-                            gd = g.detach()
-                            aux_i = -lambda_kf * ((gd * z).sum()
-                                                  - (gd * z.detach()).sum())
-                            # retain_graph: the SAME fwd_out graph is
-                            # replayed for every cut of this batch
-                            # (treewise bug found by the probe audit:
-                            # the second cut's backward died on a freed
-                            # graph — treewise mode had never run).
-                            aux_i.backward(
-                                retain_graph=(_j < len(_cuts) - 1))
-                            # CPU-side accumulation (OOM fix):
-                            # the dirs matrix is ~n_dirs x n_gamma fp32
-                            # (~4GB for 1098 dirs); keeping the list on
-                            # GPU plus the torch.stack copy doubled the
-                            # peak and blew the 40GB card.  Structural
-                            # zeros (native): the last layer's q/o LoRA
-                            # has NO path in z's graph -> grad None,
-                            # pad with zeros (review 2026-09-22).
-                            dirs.append(torch.cat(
-                                [p.grad.reshape(-1).float()
-                                 if p.grad is not None else
-                                 torch.zeros(p.numel(),
-                                             dtype=torch.float32,
-                                             device=p.device)
-                                 for p in repr_params]).cpu())
-                            for p in params:
-                                if id(p) not in repr_set \
-                                        and p.grad is not None:
-                                    aux_other[id(p)].add_(p.grad.detach())
-                        adapter.clear()
+                    s4_pred_acc = {}
+                    if args.rpbe_native_compression \
+                            and args.s4_supervisor:
+                        # S4 formal supervisor (review 2026-09-23
+                        # frozen candidate): the treewise directions are
+                        # the per-observation real-token NLL gap
+                        # gradients q_{t,h} = grad_theta w_h * Delta,
+                        # Delta = l_comp - sg(l_full).  Each observation
+                        # runs its OWN comp-dialogue forward (grad) and
+                        # full-dialogue forward (no_grad, detach) with
+                        # the SAME future conditioning — only the
+                        # history compression differs.  The per-obs
+                        # backward also accumulates the lambda-weighted
+                        # aggregate predictive gradient (the joint
+                        # proposal center d_0).
+                        for i, (b, sid) in enumerate(pending):
+                            for meta, oid, v in cut_records[i]:
+                                if g_by_oid.get(oid) is None:
+                                    continue
+                                for _h, _cdlg, _fdlg, _w in s4_obs_list(
+                                        meta, int(v)):
+                                    optimizer.zero_grad(set_to_none=True)
+                                    _b2 = collator([{"dialog": _cdlg,
+                                                     "fixed_depth": True}])
+                                    _b2 = {kk: vv.to(device)
+                                           for kk, vv in _b2.items()}
+                                    _f2 = run_forward(model, _b2, device,
+                                                      grad_enabled=True)
+                                    _sh2 = _f2.logits[..., :-1, :] \
+                                        .contiguous()
+                                    _sl2 = _b2["labels"][..., 1:] \
+                                        .contiguous()
+                                    _mask2 = _sl2 != -100
+                                    _ce_c = F.cross_entropy(
+                                        _sh2[_mask2], _sl2[_mask2])
+                                    with torch.no_grad():
+                                        _b3 = collator(
+                                            [{"dialog": _fdlg,
+                                              "fixed_depth": True}])
+                                        _b3 = {kk: vv.to(device)
+                                               for kk, vv in _b3.items()}
+                                        _f3 = run_forward(
+                                            model, _b3, device,
+                                            grad_enabled=False)
+                                        _sh3 = _f3.logits[..., :-1, :] \
+                                            .contiguous()
+                                        _sl3 = _b3["labels"][..., 1:] \
+                                            .contiguous()
+                                        _mask3 = _sl3 != -100
+                                        _ce_f = F.cross_entropy(
+                                            _sh3[_mask3], _sl3[_mask3])
+                                    # raw gap, stop-grad full reference
+                                    _loss_h = scaler.scale(
+                                        lambda_kf * _w
+                                        * (_ce_c - _ce_f.detach()))
+                                    _loss_h.backward()
+                                    dirs.append(torch.cat(
+                                        [p.grad.reshape(-1).float()
+                                         if p.grad is not None else
+                                         torch.zeros(p.numel(),
+                                                     dtype=torch.float32,
+                                                     device=p.device)
+                                         for p in repr_params]).cpu())
+                                    for p in params:
+                                        if p.grad is None:
+                                            continue
+                                        if id(p) in s4_pred_acc:
+                                            s4_pred_acc[id(p)].add_(
+                                                p.grad.detach())
+                                        else:
+                                            s4_pred_acc[id(p)] = (
+                                                p.grad.detach().clone())
+                                adapter.clear()
+                        # joint (scaled space) = pure task + lambda-w-
+                        # eighted aggregate S4 gradient.
+                        task_grads = {}
+                        for p in params:
+                            _v = task_grads_pure.get(id(p))
+                            _v = (_v.clone() if _v is not None
+                                  else torch.zeros_like(p))
+                            _e = s4_pred_acc.get(id(p))
+                            if _e is not None:
+                                _v = _v + _e
+                            task_grads[id(p)] = _v
+                    else:
+                        for i, (b, sid) in enumerate(pending):
+                            _restore_rng(pass1_rngs[i])  # P0: mask==pass1
+                            fwd_out = run_forward(model, b, device,
+                                                  grad_enabled=True)
+                            # OOM fix (review 2026-09-22): retain_graph on
+                            # EVERY cut kept this batch's full graph alive
+                            # for the whole window — with the LoRA trainable
+                            # (native), all 36 layers' activations carry
+                            # grad, so 128 trees of retained graphs blew the
+                            # 40GB card.  Retain only until the batch's LAST
+                            # cut; its backward frees the graph.  Gradient
+                            # VALUES are unchanged (retain only controls
+                            # graph lifetime).
+                            _cuts = [(meta, oid, v) for meta, oid, v
+                                     in cut_records[i]
+                                     if g_by_oid.get(oid) is not None]
+                            for _j, (meta, oid, v) in enumerate(_cuts):
+                                g = g_by_oid.get(oid)
+                                optimizer.zero_grad(set_to_none=True)
+                                z = collect_replay_z(meta, adapter, device,
+                                                     v=v)
+                                gd = g.detach()
+                                aux_i = -lambda_kf * ((gd * z).sum()
+                                                      - (gd * z.detach()).sum())
+                                # retain_graph: the SAME fwd_out graph is
+                                # replayed for every cut of this batch
+                                # (treewise bug found by the probe audit:
+                                # the second cut's backward died on a freed
+                                # graph — treewise mode had never run).
+                                aux_i.backward(
+                                    retain_graph=(_j < len(_cuts) - 1))
+                                # CPU-side accumulation (OOM fix):
+                                # the dirs matrix is ~n_dirs x n_gamma fp32
+                                # (~4GB for 1098 dirs); keeping the list on
+                                # GPU plus the torch.stack copy doubled the
+                                # peak and blew the 40GB card.  Structural
+                                # zeros (native): the last layer's q/o LoRA
+                                # has NO path in z's graph -> grad None,
+                                # pad with zeros (review 2026-09-22).
+                                dirs.append(torch.cat(
+                                    [p.grad.reshape(-1).float()
+                                     if p.grad is not None else
+                                     torch.zeros(p.numel(),
+                                                 dtype=torch.float32,
+                                                 device=p.device)
+                                     for p in repr_params]).cpu())
+                                for p in params:
+                                    if id(p) not in repr_set \
+                                            and p.grad is not None:
+                                        aux_other[id(p)].add_(
+                                            p.grad.detach())
+                            adapter.clear()
                     optimizer.zero_grad(set_to_none=True)
                     g_task_repr = [
                         task_grads.get(id(p), torch.zeros_like(p))

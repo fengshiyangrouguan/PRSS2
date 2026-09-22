@@ -50,6 +50,12 @@ def main():
                          "non-Gamma param BEFORE the load (load_trainable "
                          "refuses missing keys among the current "
                          "trainable params)")
+    ap.add_argument("--init-from", default="",
+                    help="Stage-2 HOST source: the CCM-merge checkpoint "
+                         "(LoRA + COMP rows) loaded BEFORE the Gamma-only "
+                         "Stage-2 ckpt and before freezing.  WITHOUT it "
+                         "the frozen host keeps RANDOM LoRA/COMP weights "
+                         "and the PPL is garbage (~20x the baseline).")
     ap.add_argument("--gpu", type=int, default=0)
     ap.add_argument("--out", default="eval_qwen3_pooled.json")
     ap.add_argument("--limit", type=int, default=0,
@@ -102,10 +108,28 @@ def main():
     if not a.no_gamma:
         tc.attach_gamma(model, hidden=args.gamma_hidden)
     if a.freeze_host:
-        # Review ruling (2026-09-21): the Stage-2 checkpoint holds the
-        # Gamma state ONLY.  LoRA/COMP must already be frozen here, or
-        # load_trainable treats their missing keys as errors (the exact
-        # official-evaluator bug fixed in eval_ccm_official.py).
+        if not a.init_from:
+            raise SystemExit(
+                "--freeze-host requires --init-from (the CCM-merge "
+                "checkpoint): the frozen host is merge-LoRA/COMP + "
+                "Stage-2 Gamma; skipping it evaluates RANDOM host "
+                "weights")
+        # Step 1: load the HOST weights (LoRA + COMP rows) from the
+        # merge checkpoint.  Gamma keys are allowed missing (zero-init
+        # kept until step 2 loads the Stage-2 state).
+        _payload = torch.load(a.init_from, map_location=device,
+                              weights_only=False)
+        _missing, _unexpected = model.load_state_dict(_payload["model"],
+                                                      strict=False)
+        assert not _unexpected, sorted(_unexpected)[:5]
+        _trainable = {n for n, p in model.named_parameters()
+                      if p.requires_grad}
+        _bad = [k for k in sorted(set(_missing) & _trainable)
+                if "gamma" not in k]
+        assert not _bad, _bad[:5]
+        print("[init-from] merge host loaded: {} missing (Gamma kept "
+              "zero-init)".format(len(_missing)), flush=True)
+        # Step 2: freeze everything non-Gamma BEFORE the Stage-2 load.
         for _n, _p in model.named_parameters():
             if "gamma" not in _n and _p.requires_grad:
                 _p.requires_grad_(False)

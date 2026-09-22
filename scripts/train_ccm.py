@@ -1353,21 +1353,37 @@ def treewise_feasibility_projection(g_task_repr, repr_params, G, kappa,
         _write_task_only()
         return True, diag
     # ---- full-set QP: K = H H^T, c = b - H t (streaming exact sums) ---
-    K = torch.zeros(n_valid, n_valid)
-    c_vec = -kappa * nb * torch.ones(n_valid)
-    for _blk, _c0 in _blocks():
+    # K[i,j] = h_i . h_j pairs exist ACROSS blocks, so the Gram needs a
+    # two-level block loop (each row pair computed exactly once); the
+    # single-level block-diagonal sum silently dropped every cross-block
+    # entry (caught by the multi-block equivalence test, 2026-09-23).
+    _blk_list = list(range(0, n_rows, _CH))
+
+    def _blk_H(_c0):
+        _blk = _G_rows[_c0:_c0 + _CH]
         _Gc = torch.stack(_blk).float()
         _ngc = _Gc.norm(dim=1).clamp(min=min_norm)
         _m = _ngc > min_norm
         if not bool(_m.any()):
-            del _Gc
-            continue
+            return None, None
         _Hv = _Gc[_m] / _ngc[_m, None]
-        K += _Hv @ _Hv.t()
         _pos = [_pos_of[_c0 + _k] for _k in range(len(_m))
                 if bool(_m[_k])]
-        c_vec[_pos] -= _Hv @ t
-        del _Gc, _Hv
+        return _Hv, torch.tensor(_pos)
+
+    K = torch.zeros(n_valid, n_valid)
+    c_vec = -kappa * nb * torch.ones(n_valid)
+    for _c0 in _blk_list:
+        _H0, _p0 = _blk_H(_c0)
+        if _H0 is None:
+            continue
+        c_vec[_p0] -= _H0 @ t
+        for _c1 in _blk_list:
+            _H1, _p1 = _blk_H(_c1)
+            if _H1 is None:
+                continue
+            K[_p0.unsqueeze(1), _p1.unsqueeze(0)] += _H0 @ _H1.t()
+        del _H0
     mu = _fista_nonneg(K, c_vec, iters)
     # ---- corr = H^T mu (streaming) -----------------------------------
     corr = torch.zeros(t.numel())

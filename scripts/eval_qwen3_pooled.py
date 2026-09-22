@@ -42,8 +42,16 @@ def main():
     ap.add_argument("--ckpt", required=True,
                     help="checkpoint.pt (or INIT for the step-0 baseline)")
     ap.add_argument("--no-gamma", action="store_true",
-                    help="ccm_merge-arm checkpoints carry no Gamma params "
-                         "(skip attach_gamma)")
+                    help="ccm_merge-arm and NATIVE-arm checkpoints carry "
+                         "no Gamma params (skip attach_gamma).  A native "
+                         "actuation ckpt (conditional LoRA + COMP rows, "
+                         "review 2026-09-22) is evaluated with exactly "
+                         "this flag: --ckpt X --no-gamma, WITHOUT "
+                         "--init-from/--freeze-host.")
+    ap.add_argument("--lora-r", type=int, default=8,
+                    help="LoRA rank of the training run (native ckpts "
+                         "carry lora_A/lora_B keys whose shape depends "
+                         "on r; a mismatch silently misloads)")
     ap.add_argument("--freeze-host", action="store_true",
                     help="Stage-2 protocol (review ruling 2026-09-21): "
                          "the ckpt holds Gamma state ONLY — freeze every "
@@ -61,6 +69,12 @@ def main():
     ap.add_argument("--limit", type=int, default=0,
                     help="per-bucket dialogue cap (debug)")
     a = ap.parse_args()
+    if a.no_gamma and a.freeze_host:
+        raise SystemExit(
+            "--no-gamma (native/merge ckpt: LoRA + COMP rows) and "
+            "--freeze-host (Gamma-only Stage-2 ckpt) are mutually "
+            "exclusive — without Gamma, --freeze-host would freeze "
+            "every parameter and leave an empty AdamW param list")
 
     import os
     os.environ["DIALOG_MIRROR"] = a.dialog_mirror
@@ -70,9 +84,9 @@ def main():
     args = types.SimpleNamespace(
         arm="ours", model_name_or_path=a.model_name_or_path,
         dialog_mirror=a.dialog_mirror, relative_embedding="skip",
-        lora_r=8, z_dim=128, rpbe_seed=0, sketch_dim=64, gamma_hidden=64,
-        host="qwen3", official_host=False, foundation="",
-        official_adapter="", micro_batch=1)
+        lora_r=a.lora_r, z_dim=128, rpbe_seed=0, sketch_dim=64,
+        gamma_hidden=64, host="qwen3", official_host=False,
+        foundation="", official_adapter="", micro_batch=1)
 
     tokenizer = tc.build_tokenizer(args)
     eos_id = int(tokenizer.eos_token_id)

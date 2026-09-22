@@ -1,0 +1,122 @@
+{
+ "_comment": "Qwen3 NATIVE-ACTUATION frozen method (COMP-RPBE revision, review 2026-09-22). The RPBE recursion node is the native CCM merge step (M_{t-1}, u_t) -> M_t with depth D=L and Z_t = M_t; the actuated parameters are the NATIVE compression params (conditional LoRA q/k/v/o r=8 + COMP/SUM comp-embedding rows), the backbone is frozen, and NO Gamma module exists. Native-Ours runs the treewise feasibility projection in ADAMW PROPOSAL space (d_0 = joint proposal, d* = Proj_F(d_0), theta <- theta + d* written back directly). Native-task-only = ordinary AdamW step on the same data stream. The gamma section is kept for the enforce_frozen binding (gamma.hidden) but is NOT attached in native mode.",
+ "frozen_source": "CCM official dialog protocol (max_steps 1000, lr 3e-4, accum-equivalent 128 effective cuts per window) + Llama-line RPBE structure (chain-wise multi-cut, window-matched cadence), actuation point moved from post-merge Gamma residual to the native compression parameters",
+ "actuation": {
+  "mode": "native",
+  "scope": "conditional LoRA q/k/v/o r=8 + COMP/SUM comp_embeddings rows (the native CCM compression parameters); recursion node = native merge step (M_{t-1}, u_t) -> M_t, depth D=L; Z_t = M_t via JMemLift unchanged",
+  "theta0": "frozen Qwen3 instruct backbone (Step-1 SKIPPED per the CCM README rule for aligned backbones) + FRESH conditional LoRA (PEFT default init, B=0 zero branch) + FRESH COMP/SUM rows (deterministic row-mean init)",
+  "projection_space": "AdamW proposal space (review 2026-09-22): d_0 = shadow-AdamW joint proposal from g_task + lambda*g_pred; d* = argmin 1/2||d-d_0||^2 s.t. q_i^T d >= -kappa*||q_i||*||d_task|| (lower bound in UPDATE space); theta <- theta + d* written back directly, optimizer moments updated with the true-value joint gradient",
+  "lambda_fact": "lambda does NOT affect the pure half-space feasibility region (cancels on both sides); lambda is meaningful only through the joint proposal center d_0"
+ },
+ "backbone": {
+  "model": "Qwen3-4B-Instruct-2507 (aligned instruct backbone: official Step-1 default-LoRA pretraining is SKIPPED per the CCM README rule)",
+  "hf_identifier": "Qwen/Qwen3-4B-Instruct-2507",
+  "revision": "cdbee75f17c01a7cc42f958dc650907174af0554",
+  "transformers": "4.56.2",
+  "vendored_commit": "a89dd08e2c9587ec9c6c3ad339bb154c33e6b41a",
+  "attn_type": "merge_recur",
+  "n_tok_lock": 2,
+  "torch_compile": "disabled on all three arms",
+  "dtype": "bf16"
+ },
+ "adapter": {
+  "lora_r": 8,
+  "lora_alpha": 16,
+  "lora_dropout": 0.0,
+  "lora_r_note": "r=8 q/k/v/o conditional LoRA — the ONLY trainable parameters together with the COMP/SUM rows (trainable count 5,898,240 + 4 comp rows). lora_dropout pinned to 0.0 for the two-pass replay identity; lora_A's first-step gradient is exactly zero (B=0 zero branch at theta_0), mirroring the gamma-line U/V note."
+ },
+ "rpbe": {
+  "ridge_eps": 0.001,
+  "sketch_dim_m": 32,
+  "rpbe_map_seed": 0,
+  "z_v_dim": 128,
+  "horizon_weights": [
+   0.5,
+   0.5
+  ],
+  "lambda_calibration": {
+   "rule": "r_eff = lambda * ||d_pred|| / ||d_task|| ~ 0.1, measured on theta_0 (calibration-only run, before ANY optimizer/scheduler step), calibrated once on the initial full window (training-only), then frozen for all seeds. NATIVE-scope measurement (review 2026-09-22): r_eff is the AdamW PROPOSAL-norm ratio on the native compression params (at theta_0 the optimizer state is empty -> first bias-correction step).",
+   "lambda_kf": null,
+   "lambda_kf_note": "NULL until the native calibration run commits it.  The gamma-line value 0.0061413 was measured on the Gamma scope and is NOT reused (constants are never reused across actuation geometries)."
+  },
+  "z_v_source": "J_mem(M_v) fixed adapter (TGN identity is its special case); GQA hosts lift the memory from the KV heads (8) with head_dim 128; native mode lifts the PURE CCM mean (no Gamma residual exists)",
+  "witness": "none (main experiment)",
+  "sketch_ensemble_n_branches": 4,
+  "sketch_ensemble_note": "Four independent 32-dim branches (J_ens = mean_r J_r); depth bucket b(L_v) modulates the future signature phi_r.",
+  "oas_shrinkage": {
+   "enabled": true,
+   "rule": "paired OAS covariance shrinkage per branch; the fixed ridge keeps only its numerical-safety role."
+  }
+ },
+ "gamma": {
+  "placement": "one module per layer, shared across the K/V merges and the two COMP/SUM slots — NOT ATTACHED in native mode (kept for the enforce_frozen gamma.hidden binding)",
+  "hidden": 64,
+  "time_dim": 16,
+  "init_scale": 0.02,
+  "zero_init": "U0=0 zero-output projection init: R = U tanh(V [prev;cur;time(t)]) with U.weight exactly 0 and V small random. Step 0 residual is bit-for-bit zero (verified: max|dlogit|=0.0 on the 4B smoke).",
+  "parameter_budget": "36 layers (Qwen3-4B) x ~25.7k = ~925k < 1M (gamma line only)"
+ },
+ "window": {
+  "min_effective_cuts": 128,
+  "collection": "adaptive by effective cut count (dialogues with k>=4), not a mechanical microbatch count",
+  "cadence": "identical task samples and scheduler cadence across the two native arms"
+ },
+ "training": {
+  "steps": 60,
+  "steps_note": "Native Stage B budget = 60 windows (same budget convention as the gamma line).  trainable = conditional LoRA + COMP rows (backbone frozen, NO Gamma).  Native-ours = proposal-space treewise joint feasibility projection; Native-task-only = ordinary AdamW step (arm gamma_task_only + flag).  Sampling = q_L ∝ n_L + replay cap 12 (see sampling section).",
+  "official_protocol": {
+   "arm": "ccm_merge_official",
+   "merge_cadence": "official",
+   "grad_accum": 128,
+   "random_k": true,
+   "data_stream": "shuffled epoch loop (each dialogue exactly once per epoch)",
+   "thresholds": "train max_len_total 400, val/test 600 (official data.py)",
+   "micro_batch": 4,
+   "micro_batch_note": "equal-weight-per-dialogue normalization preserved bit-for-bit (row-wise mean CE / dialogue count); batch>1 is kernel-efficiency only"
+  },
+  "grad_clip": 1.0,
+  "grad_clip_source": "official HF Trainer default (max_grad_norm)",
+  "merge_cadence": "window-matched",
+  "merge_cadence_note": "window-matched applies to the RPBE-line arms (ours / gamma_task_only under the depth protocol); the Stage-A official merge run uses the official fixed cadence via the ccm_merge_official arm",
+  "two_pass_replay": "pass1 no-grad statistics forward, pass2 grad replay forward (RPBE arms only)",
+  "rpbe_gamma_only": false,
+  "rpbe_gamma_only_note": "NOT applicable in native mode (the repr scope IS the full trainable set; the flag is refused by the actuation guard)",
+  "rpbe_lr": null,
+  "rpbe_lr_note": "NOT applicable in native mode (single unified AdamW group; the flag is refused by the actuation guard)",
+  "proposal_space": {
+   "center": "d_0 = shadow AdamW proposal of g_joint = g_task + lambda*g_pred (moments read from the CURRENT optimizer state, never stepped)",
+   "constraint_norm": "||d_task|| = shadow AdamW proposal norm of the PURE task gradient (snapshotted before the aux accumulation)",
+   "half_spaces": "q_i^T d* >= -kappa*||q_i||*||d_task|| (lower bound in update space; feasibility: the update must not turn too far AGAINST a predictive direction)",
+   "write_back": "theta <- theta + d*; optimizer moments updated with the true-value clipped joint gradient; scheduler/scaler cadence identical to the task-only arm",
+   "cert_fail": "whole-window skip including the task update (inherited gamma-line semantics), cert_skip_steps recorded"
+  },
+  "seeds": 1,
+  "seeds_note": "Qwen3 line starts with seed 0 only (user ruling, same as the R10 v5 line)",
+  "eval": "native ckpt holds LoRA + COMP rows only -> eval_qwen3_pooled.py --ckpt X --no-gamma (pure CCM-merge forward, unchanged test-time computation); matched-cohort depth curves, primary metric = per-token NLL difference, EOS excluded",
+  "checkpoint_every": 10,
+  "checkpoint_every_note": "60-window budget -> checkpoints s10..s60 + final",
+  "schedule_total_steps": 1000,
+  "schedule_note": "warmup/cosine over 1000 steps (warmup ratio 0.03): the 60-window native Stage B runs inside the warmup-to-peak region of the original 1000-step schedule (same convention as the gamma line)."
+ },
+ "sampling": {
+  "depth_levels": [
+   1,
+   2,
+   4,
+   8,
+   13
+  ],
+  "k_of_L": "L + 2 (fixed prefix length per depth)",
+  "q_alpha": 1.0,
+  "q_alpha_note": "q_L ∝ n_L^q_alpha.  q_alpha=1 (natural frequency) RETIRES the R10 inverse-sqrt upweighting (which gave the L=13 pool ~60% of the stream and replayed its 573 dialogues 52-120x each — turn_15 overfitting, diagnosed 2026-09-17).  With the replay cap, every depth pool exhausts its n_L x K budget at the SAME time, so the depth mix stays stable over the whole budget.",
+  "max_replays": 12,
+  "max_replays_note": "per-dialogue exposure cap = official 12-epoch semantics (128k samples / 10546 dialogues).  A dialogue leaves its pool after K samples; exhausted depth layers drop out of the draw (q renormalizes over the remaining layers); when all layers are exhausted the counters reset for the next replay cycle.",
+  "rule": "depth-stratified legal cuts with natural-frequency depth weights + per-dialogue replay cap; ONE original dialogue per window (tree_id = stable original dialogue id); L=1 dialogues carry task CE only.",
+  "paired_report": "scripts/eval_ccm_paired.py (Llama line; Qwen3 line uses protocol C + protocol B curves)"
+ },
+ "freeze_host": {
+  "enabled": false,
+  "scope": "NOT the gamma-line freeze-host protocol.  Native mode freezes the BACKBONE only: trainable = conditional LoRA + COMP/SUM rows; the trainer refuses --freeze-host / --rpbe-gamma-only / --rpbe-lr under native actuation (bidirectional actuation guard)",
+  "mode": "model.train() throughout (lora_dropout pinned 0.0 keeps the two-pass replay identity)"
+ }
+}

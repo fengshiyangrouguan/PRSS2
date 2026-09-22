@@ -14,6 +14,18 @@ Three arms, identical task samples / seed / cadence:
                   exact surrogate (numerically zero, gradient = window
                   J).  One optimizer step per closed window.
 
+Native actuation (--rpbe-native-compression, review 2026-09-22): the
+RPBE recursion node is the native CCM merge step (M_{t-1}, u_t) -> M_t
+with depth D=L and Z_t = M_t; the actuated params are the conditional
+LoRA + COMP/SUM comp-embedding rows (the backbone is frozen, no Gamma
+module).  ``ours`` + flag = Native-Ours: the treewise QP runs in ADAMW
+PROPOSAL space — d_0 = joint proposal (g_task + lambda*g_pred through
+the shadow AdamW state), d* = Proj_F(d_0) with half-spaces
+q_i^T d >= -kappa*||q_i||*||d_task||, and theta <- theta + d* is
+written back directly.  ``gamma_task_only`` + flag = Native-task-only:
+the ordinary AdamW step on the same data stream.  The gamma line keeps
+the V11 gradient-space treewise implementation unchanged.
+
 RNG protocol (plan L5): each microbatch's pass-1 forward runs under a
 saved RNG state that is restored right after (builder counters are NOT
 restored — cut ids stay monotonic), so the data-sampling stream matches
@@ -24,7 +36,8 @@ asserted at startup (L6 test 3).  Pass 2 restores the window-start state
 
 Lambda follows the r_eff calibration rule (plan L5); --calibrate-lambda
 measures r_eff = ||g_KF|| / ||g_task|| on the first closed window and
-exits with the derived lambda.
+exits with the derived lambda (gradient space on the gamma line,
+proposal space on the native line).
 """
 
 import argparse
@@ -255,6 +268,20 @@ def parse_args():
                         "auxiliary gradient on non-Gamma params is "
                         "discarded.  The global lambda calibration no "
                         "longer dilutes r_eff across LoRA/COMP.")
+    p.add_argument("--rpbe-native-compression", action="store_true",
+                   help="COMP-RPBE native actuation (review 2026-09-22): "
+                        "the RPBE recursion node is the native CCM merge "
+                        "step (M_{t-1}, u_t) -> M_t with depth D=L and "
+                        "Z_t = M_t; the actuated parameters are the "
+                        "native compression params (conditional LoRA + "
+                        "COMP/SUM comp-embedding rows) instead of a "
+                        "post-merge Gamma residual.  Skips attach_gamma, "
+                        "freezes the backbone, and runs the "
+                        "proposal-space treewise projection (ours).  "
+                        "Requires the native actuation spec "
+                        "(frozen_method_qwen3_native.json); mutually "
+                        "exclusive with --freeze-host / "
+                        "--rpbe-gamma-only / --rpbe-lr.")
     # monitoring
     p.add_argument("--log-every", type=int, default=10)
     p.add_argument("--checkpoint-every", type=int, default=250)
@@ -306,9 +333,14 @@ FROZEN_PATH = Path(__file__).resolve().parents[1] / "configs" / "ccm" \
 
 def _frozen_path(args):
     """Per-host frozen spec.  --frozen overrides everything (used by the
-    llama v2 comp-trainable experiment)."""
+    llama v2 comp-trainable experiment).  The native-compression flag
+    selects the native actuation spec automatically (review 2026-09-22)
+    unless an explicit --frozen is given."""
     if getattr(args, "frozen", ""):
         return Path(args.frozen)
+    if getattr(args, "rpbe_native_compression", False):
+        return Path(__file__).resolve().parents[1] / "configs" / "ccm" \
+            / "frozen_method_qwen3_native.json"
     name = "frozen_method_qwen3.json" if getattr(args, "host", "llama") \
         == "qwen3" else "frozen_method.json"
     return Path(__file__).resolve().parents[1] / "configs" / "ccm" / name
@@ -388,6 +420,47 @@ def enforce_frozen(args):
                 "[frozen] {}.enabled=true in the frozen spec: the {} "
                 "arm MUST pass --{}".format(_key, args.arm,
                                             _flag.replace("_", "-")))
+    # Actuation guard (review 2026-09-22, COMP-RPBE native design): the
+    # spec's actuation.mode pins WHICH parameter block the RPBE
+    # recursion actuates.  mode=native (conditional LoRA + COMP/SUM rows,
+    # proposal-space treewise) and the gamma flag must agree with the
+    # spec in BOTH directions — a native spec without the flag would
+    # silently train the old post-merge Gamma, and the flag with a gamma
+    # spec would silently attach no Gamma while the spec still binds
+    # gamma.hidden.
+    act_mode = fz.get("actuation", {}).get("mode", "gamma")
+    native_flag = bool(getattr(args, "rpbe_native_compression", False))
+    if act_mode == "native":
+        _why = []
+        if args.arm not in ("ours", "gamma_task_only"):
+            _why.append("arm {} is not an RPBE arm".format(args.arm))
+        if not native_flag:
+            _why.append("missing --rpbe-native-compression")
+        if getattr(args, "freeze_host", False):
+            _why.append("--freeze-host is the Gamma-only protocol")
+        if getattr(args, "rpbe_gamma_only", False):
+            _why.append("--rpbe-gamma-only has no scope under native "
+                        "actuation")
+        if getattr(args, "rpbe_lr", None) is not None:
+            _why.append("--rpbe-lr would silently route ALL native "
+                        "params into the rpbe_lr group")
+        if getattr(args, "host", "llama") != "qwen3":
+            _why.append("native actuation v1 is Qwen3-only")
+        if args.arm == "ours" \
+                and getattr(args, "rpbe_constrain_mode", "") != "treewise":
+            _why.append("native ours requires --rpbe-constrain-mode "
+                        "treewise (the aggregate branch would add the "
+                        "raw RPBE gradient onto the LoRA directly)")
+        if _why:
+            raise SystemExit(
+                "[frozen] actuation.mode=native in the frozen spec: "
+                + "; ".join(_why))
+    elif native_flag:
+        raise SystemExit(
+            "[frozen] --rpbe-native-compression given but the spec's "
+            "actuation.mode is '{}' — native flag + gamma spec (or a "
+            "stale spec) would silently train the wrong parameter "
+            "block".format(act_mode))
     # Lambda authority: the calibration-only run writes the derived
     # lambda into the frozen spec; afterwards the number overrides any
     # CLI value and re-calibration is refused.
@@ -955,15 +1028,80 @@ def _json_safe(obj):
     return obj
 
 
-def treewise_feasibility_projection(g_task_gamma, gamma_params, G, kappa,
-                                    iters=400, cert_tol=1e-6, min_norm=1e-9):
+def adamw_proposal(optimizer, params, grads, step_count):
+    """SHADOW AdamW proposal WITHOUT stepping (review 2026-09-22,
+    proposal-space treewise projection).
+
+    Feeds ``grads`` through the optimizer's CURRENT first/second
+    moments (exp_avg / exp_avg_sq, read but NOT written) and returns the
+    AdamW update vector
+
+        d = -lr * (m_hat / (sqrt(v_hat) + eps) + wd * theta)
+
+    with m_hat/v_hat bias-corrected by ``step_count`` (the step the
+    optimizer WOULD take).  beta1/beta2/eps/lr are read from the
+    param_groups; theta is detached.  This is the proposal vector the
+    QP projects in the native actuation line: because AdamW carries
+    momentum, second moments and coordinate-wise preconditioning,
+
+        g -> Proj(g) -> AdamW   !=   g -> AdamW(g) -> Proj(d)
+
+    and the frozen method definition (paper logic) is the
+    proposal-space projection — project the AdamW proposal, then write
+    the projected vector back as the parameter update.
+    """
+    out = []
+    for p, g in zip(params, grads):
+        _pg = optimizer.param_groups[0]
+        for _grp in optimizer.param_groups:
+            if any(pp is p for pp in _grp["params"]):
+                _pg = _grp
+                break
+        grp = optimizer.param_groups[0]
+        betas = tuple(grp["betas"])
+        eps = float(grp.get("eps", 1e-8))
+        lr = float(_pg["lr"])
+        wd = float(_pg.get("weight_decay", 0.0))
+        st = optimizer.state.get(p, {})
+        m = st.get("exp_avg", torch.zeros_like(p))
+        v = st.get("exp_avg_sq", torch.zeros_like(p))
+        b1, b2 = betas
+        m_new = b1 * m + (1.0 - b1) * g
+        v_new = b2 * v + (1.0 - b2) * g * g
+        bc1 = 1.0 - b1 ** max(int(step_count), 1)
+        bc2 = 1.0 - b2 ** max(int(step_count), 1)
+        m_hat = m_new / bc1
+        v_hat = v_new / bc2
+        step_dir = m_hat / (v_hat.sqrt() + eps)
+        if wd:
+            step_dir = step_dir + wd * p.detach()
+        out.append(-lr * step_dir.to(p.dtype))
+    return out
+
+
+def proposal_norm(optimizer, params, step_count):
+    """L2 norm of the shadow AdamW proposal for the params' CURRENT
+    .grad (calibration: r_eff measured in proposal space on the native
+    line; the gamma line keeps the plain gradient-norm calibration)."""
+    grads = [p.grad.detach().float() if p.grad is not None
+             else torch.zeros_like(p, dtype=torch.float32)
+             for p in params]
+    props = adamw_proposal(optimizer, params, grads, step_count)
+    return float(
+        torch.cat([d.reshape(-1) for d in props]).double().norm())
+
+
+def treewise_feasibility_projection(g_task_repr, repr_params, G, kappa,
+                                    iters=400, cert_tol=1e-6, min_norm=1e-9,
+                                    b_norm=None):
     """Tree-wise RPBE Feasibility Projection — TGN final-spec alignment
     (2026-09-15, ported from tgb_link_loop._cstr_group_close_treewise,
     the b523cf3 lineage; the Cimmino refinement there is kappa=0-only and
     is NOT needed on the kappa>0 path CCM runs).
 
-    One global task direction t = -g_task; every per-oid RPBE direction
-    g_j stays SEPARATE and contributes one half-space
+    One global center direction t (whose MEANING is given by the
+    caller's vector space); every per-oid RPBE direction g_j stays
+    SEPARATE and contributes one half-space
     g_j.d >= -kappa*||g_j||*||t||.  Solve
 
         d* = argmin_d 1/2||d - t||^2   s.t.  H d >= b,  b_j = -kappa*||t||
@@ -972,11 +1110,26 @@ def treewise_feasibility_projection(g_task_gamma, gamma_params, G, kappa,
     normalization — the same constraint set, a far better-conditioned
     dual), through the N x N dual (mu >= 0): d* = t + H^T mu.  After
     solving, EVERY row is certified against the 1e-6 tolerance (the
-    final-spec full certificate).  On success writes ONLY Gamma:
-    p.grad = g_task - sum_j mu_j g_j.  On certificate FAILURE returns
-    ok=False WITHOUT writing anything — the caller must SKIP the
-    representation step (reviewer requirement: no constrained update is
-    executed on an uncertified solution).
+    final-spec full certificate).  On success writes ONLY the
+    representation params: p.grad = g_task - sum_j mu_j g_j.  On
+    certificate FAILURE returns ok=False WITHOUT writing anything — the
+    caller must SKIP the representation step (reviewer requirement: no
+    constrained update is executed on an uncertified solution).
+
+    VECTOR SPACE of t / G is the CALLER's choice (review 2026-09-22):
+    the gamma line passes the GRADIENT-space joint proposal
+    (t = -g_task_repr); the native line passes the AdamW
+    PROPOSAL-space center (t = d_0 from adamw_proposal, with
+    b_j = -kappa*||g_j||*||d_task||).  The QP math is identical — the
+    frozen method definition is the proposal-space projection, because
+    g -> Proj(g) -> AdamW != g -> AdamW(g) -> Proj(d).
+
+    Method fact (review 2026-09-22): lambda does NOT affect the pure
+    half-space feasibility region (q_i -> lambda q_i cancels on both
+    sides of the inequality).  Lambda is meaningful only through the
+    JOINT proposal center d_0 = d_joint(lambda), which is why the
+    method is joint-proposal + feasibility (scheme B), not pure
+    feasibility (scheme A).
 
     CCM scale note: the window keeps N ~ 1-3 hundred directions, far
     below the TGN 2000+ regime, so the ACTIVE SET is the full row set
@@ -984,8 +1137,8 @@ def treewise_feasibility_projection(g_task_gamma, gamma_params, G, kappa,
     device for large N and would only add rounds here).  The projection
     runs on SCALED (fp16 GradScaler) gradients — the QP is invariant to
     a uniform positive rescaling of t and G, so the math is unaffected."""
-    sizes = [p.numel() for p in gamma_params]
-    t = torch.cat([-x.flatten().float() for x in g_task_gamma])
+    sizes = [p.numel() for p in repr_params]
+    t = torch.cat([-x.flatten().float() for x in g_task_repr])
     nt = float(t.norm())
     diag = {"n_dirs": int(G.shape[0]) if G is not None else 0,
             "task_norm": nt, "cos_mean": None, "cos_med": None,
@@ -1003,7 +1156,7 @@ def treewise_feasibility_projection(g_task_gamma, gamma_params, G, kappa,
     def _write_task_only():
         # Gamma .grad <- the aggregate task gradient alone (d = t), the
         # degenerate / feasible / probe close semantics.
-        for gt, p in zip(g_task_gamma, gamma_params):
+        for gt, p in zip(g_task_repr, repr_params):
             p.grad = gt.to(p.device)
 
     if G is None or G.numel() == 0:
@@ -1013,6 +1166,14 @@ def treewise_feasibility_projection(g_task_gamma, gamma_params, G, kappa,
         diag["note"] = "zero_task"
         _write_task_only()
         return True, diag
+    # b_norm (native proposal-space line, review 2026-09-22): the
+    # half-space bound is -kappa*||q_j||*||d_task|| — the TASK proposal
+    # norm, NOT the joint-center norm ||t|| = ||d_0||.  The gamma line
+    # passes b_norm=None and keeps b_j = -kappa*||t|| (V11 semantics
+    # unchanged).
+    nb = float(b_norm) if b_norm is not None else nt
+    diag["b_norm"] = nb
+    k_eff = kappa * (nb / max(nt, 1e-30))
     Gf = G.flatten(1).float()
     ng = Gf.norm(dim=1)
     valid = ng > min_norm
@@ -1032,14 +1193,14 @@ def treewise_feasibility_projection(g_task_gamma, gamma_params, G, kappa,
     diag["cos_p5"] = float(np.percentile(cos_np, 5.0))
     diag["cos_min"] = float(np.min(cos_np))
     diag["proj_cos_min"] = float(np.min(cos_np))
-    diag["frac_below"] = float(np.mean(cos_np < -kappa))
+    diag["frac_below"] = float(np.mean(cos_np < -k_eff))
     diag["frac_below_grid"] = {
         ("%.2f" % kk): float(np.mean(cos_np < -kk))
         for kk in (0.0, 0.02, 0.05, 0.1, 0.15, 0.2, 0.3)}
-    diag["feasible_d0"] = bool(np.all(cos_np >= -kappa))
+    diag["feasible_d0"] = bool(np.all(cos_np >= -k_eff))
     diag["proj_max_viol_before"] = float(
-        np.clip(-cos_np - kappa, 0.0, None).max())
-    viol0 = np.flatnonzero(cos_np < -kappa)
+        np.clip(-cos_np - k_eff, 0.0, None).max())
+    viol0 = np.flatnonzero(cos_np < -k_eff)
     diag["proj_n_active_init"] = int(len(viol0))
     if len(viol0) == 0:
         # d0 = t is already feasible: task-only close (final-spec path)
@@ -1047,15 +1208,15 @@ def treewise_feasibility_projection(g_task_gamma, gamma_params, G, kappa,
         diag["max_viol"] = 0.0
         _write_task_only()
         return True, diag
-    # ---- full-set QP: K = H H^T, c = b - H t, b_j = -kappa*||t|| -------
-    b = -kappa * nt * torch.ones(n_valid, device=t.device)
+    # ---- full-set QP: K = H H^T, c = b - H t, b_j = -kappa*b_norm ------
+    b = -kappa * nb * torch.ones(n_valid, device=t.device)
     K = H @ H.t()
     c = b - (H @ t)
     mu = _fista_nonneg(K, c, iters)
     corr = H.t() @ mu              # = sum_j mu_j h_j  (= d* - t)
     d = t + corr
-    # ---- full certificate: every row must satisfy h_j d >= -kappa*||t||
-    viol = (-kappa * nt - (H @ d)) / (nt + 1e-30)
+    # ---- full certificate: every row must satisfy h_j d >= -kappa*b_norm
+    viol = (-kappa * nb - (H @ d)) / (nt + 1e-30)
     max_viol = float(viol.max()) if viol.numel() else 0.0
     diag["active"] = int((mu > 1e-8).sum())
     diag["proj_n_mu_pos"] = int((mu > 1e-8).sum())
@@ -1072,8 +1233,8 @@ def treewise_feasibility_projection(g_task_gamma, gamma_params, G, kappa,
         diag["cert_fail"] = True
         return False, diag
     with torch.no_grad():
-        for p, cp, gt in zip(gamma_params, torch.split(corr, sizes),
-                             g_task_gamma):
+        for p, cp, gt in zip(repr_params, torch.split(corr, sizes),
+                             g_task_repr):
             # .to(p.device): the QP runs on CPU (V11 OOM fix — the
             # G matrix GPU peak was the last 4GB that blew the card).
             p.grad = (gt - cp.view_as(p)).to(p.device)
@@ -1257,8 +1418,40 @@ def main():
             "[micro-batch] RPBE arms require --micro-batch 1 (the "
             "two-pass replay and window machinery are batch=1 "
             "protocols); batch>1 is currently a task-only option")
-    if use_rpbe:
+    if use_rpbe and not args.rpbe_native_compression:
         attach_gamma(model, hidden=args.gamma_hidden)
+    if args.rpbe_native_compression and use_rpbe:
+        # Native actuation (review 2026-09-22): the RPBE recursion node
+        # is the native CCM merge step (M_{t-1}, u_t) -> M_t; the
+        # actuated parameters are the native compression params —
+        # conditional LoRA + COMP/SUM comp-embedding rows.  Everything
+        # else (the backbone) is frozen, so task and RPBE gradients only
+        # move the compression params.  No Gamma module is attached, so
+        # the SUM-block K/V states lifted by extract_z ARE the pure
+        # CCM mean M_t (Z_t = M_t by construction).
+        n_frozen = 0
+        for _n, _p in model.named_parameters():
+            if "lora_" in _n or "comp_embeddings" in _n:
+                continue
+            if _p.requires_grad:
+                _p.requires_grad_(False)
+                n_frozen += 1
+        _base = model
+        while not hasattr(_base, "layers") and hasattr(_base, "model"):
+            _base = _base.model
+        assert not getattr(_base, "_gamma_attached", False), \
+            "native actuation must not carry an attached Gamma"
+        for _layer in _base.layers:
+            assert getattr(_layer.self_attn, "gamma", None) is None, \
+                "native actuation: found a layer-attached Gamma"
+        # The LoRA stays train() (dropout pinned to 0.0 in wrap_lora),
+        # so pass-1/pass-2 replay remains bit-identical (the RNG
+        # protocol precondition).
+        model.train()
+        print("[native-compression] frozen {} backbone params; "
+              "trainable = conditional LoRA + COMP/SUM rows (pure "
+              "CCM-merge forward, Z_t = M_t)".format(n_frozen),
+              flush=True)
     if args.init_from:
         # Two-stage init: the merge checkpoint carries LoRA + COMP rows
         # (trainable in stage 2) but NO Gamma — Gamma keeps its zero
@@ -1305,17 +1498,25 @@ def main():
               "(train Gamma only); host eval() + Gamma train()"
               .format(n_frozen), flush=True)
     cfg = model.model.config
-    # Tree-wise projection scope: the Gamma parameters of every layer.
-    gamma_params = []
+    # Projection scope: the RPBE-actuated representation parameters.
+    # gamma line: the Gamma residual of every layer (post-merge
+    # correction).  native line (review 2026-09-22): the native
+    # compression params — conditional LoRA + COMP/SUM rows — which
+    # equals the full trainable set after the backbone freeze.
+    repr_params = []
     if use_rpbe:
-        _base = model
-        while not hasattr(_base, "layers") and hasattr(_base, "model"):
-            _base = _base.model
-        for _layer in _base.layers:
-            _g = getattr(_layer.self_attn, "gamma", None)
-            if _g is not None:
-                gamma_params.extend(list(_g.parameters()))
-    gamma_set = {id(p) for p in gamma_params}
+        if args.rpbe_native_compression:
+            repr_params = [p for p in model.parameters()
+                           if p.requires_grad]
+        else:
+            _base = model
+            while not hasattr(_base, "layers") and hasattr(_base, "model"):
+                _base = _base.model
+            for _layer in _base.layers:
+                _g = getattr(_layer.self_attn, "gamma", None)
+                if _g is not None:
+                    repr_params.extend(list(_g.parameters()))
+    repr_set = {id(p) for p in repr_params}
 
     # RNG protocol precondition: zero dropout everywhere (pass-1/pass-2
     # replay must be identical; LLaMA ships with dropout 0).
@@ -1373,12 +1574,12 @@ def main():
     # --rpbe-lr (R9 add, 2026-09-16): an independent base lr for the
     # Gamma group; the single scheduler multiplies BOTH groups by the
     # same warmup/cosine factor, so the group ratio is preserved.
-    if args.rpbe_lr is not None and gamma_params:
-        gamma_ids = {id(p) for p in gamma_params}
+    if args.rpbe_lr is not None and repr_params:
+        repr_ids = {id(p) for p in repr_params}
         optimizer = torch.optim.AdamW(
-            [{"params": [p for p in params if id(p) in gamma_ids],
+            [{"params": [p for p in params if id(p) in repr_ids],
               "lr": args.rpbe_lr},
-             {"params": [p for p in params if id(p) not in gamma_ids],
+             {"params": [p for p in params if id(p) not in repr_ids],
               "lr": args.lr}],
             lr=args.lr, weight_decay=0.0)
     else:
@@ -1525,6 +1726,9 @@ def main():
         "arm": args.arm, "seed": args.seed, "cli": vars(args),
         "paired_seed_hash": paired_seed_hash(args.seed, model)
         if use_rpbe else "n/a",
+        "actuation": "native" if args.rpbe_native_compression else "gamma",
+        "theta0_digest": params_digest(params),
+        "n_repr_params": len(repr_params),
         "threshold": threshold,
     })
     print("arm={} seed={} threshold={} n_train={}".format(
@@ -1973,6 +2177,12 @@ def main():
                     # g_task uses the real training scale (per-microbatch
                     # MEAN divided by len(pending)); g_kf uses the real
                     # pass-2 scale (aux NOT divided — review P0-3).
+                    # Native line (review 2026-09-22): r_eff is measured
+                    # in PROPOSAL space via the shadow AdamW proposal —
+                    # lambda scales the predictive proposal inside the
+                    # joint center d_0, so the ratio must be the
+                    # proposal-norm ratio.  At theta_0 the optimizer
+                    # state is empty (first bias-correction step).
                     optimizer.zero_grad(set_to_none=True)
                     _restore_rng(window_start_state["rng"])
                     for b, sid in pending:
@@ -1982,7 +2192,10 @@ def main():
                             fwd_out, b["labels"], device)
                         (task_sum_m / max(n_valid_m, 1)
                          / float(len(pending))).backward()
-                    g_task = repr_grad_norm(gamma_params)
+                    if args.rpbe_native_compression:
+                        g_task = proposal_norm(optimizer, repr_params, 1)
+                    else:
+                        g_task = repr_grad_norm(repr_params)
                     g_task_all = repr_grad_norm(params)
                     optimizer.zero_grad(set_to_none=True)
                     _restore_rng(window_start_state["rng"])
@@ -2007,7 +2220,10 @@ def main():
                         if n_aux:
                             aux.backward()
                     _restore_rng(resume_rng)
-                    g_kf = repr_grad_norm(gamma_params)
+                    if args.rpbe_native_compression:
+                        g_kf = proposal_norm(optimizer, repr_params, 1)
+                    else:
+                        g_kf = repr_grad_norm(repr_params)
                     g_kf_all = repr_grad_norm(params)
                     if params_digest(params) != digest0:
                         raise RuntimeError(
@@ -2017,21 +2233,37 @@ def main():
                     r_eff_all = g_kf_all / max(g_task_all, 1e-30)
                     derived = 0.1 / max(r_eff, 1e-30)
                     save_json(out / "calibration.json", {
-                        "g_task_gamma": g_task, "g_kf_gamma": g_kf,
+                        "g_task_repr": g_task, "g_kf_gamma": g_kf,
                         "r_eff_gamma": r_eff,
                         "g_task_all": g_task_all, "g_kf_all": g_kf_all,
                         "r_eff_all": r_eff_all,
                         "derived_lambda": derived,
                         "optimizer_steps": 0, "scheduler_steps": 0,
-                        "rule": "R10 gamma-scope calibration "
-                                "(review 2026-09-16): lambda = 0.1 / "
-                                "r_eff measured on the GAMMA group only "
-                                "at theta_0, chain-wise window"})
-                    print(json.dumps({"g_task_gamma": g_task,
+                        "scope": "native" if args.rpbe_native_compression
+                        else "gamma",
+                        "space": "proposal" if args.rpbe_native_compression
+                        else "gradient",
+                        "rule": (
+                            "native-scope calibration (review "
+                            "2026-09-22): lambda = 0.1 / r_eff measured "
+                            "in PROPOSAL space on the native compression "
+                            "params at theta_0"
+                            if args.rpbe_native_compression else
+                            "R10 gamma-scope calibration (review "
+                            "2026-09-16): lambda = 0.1 / r_eff measured "
+                            "on the GAMMA group only at theta_0, "
+                            "chain-wise window")})
+                    print(json.dumps({"g_task_repr": g_task,
                                       "g_kf_gamma": g_kf,
                                       "r_eff_gamma": r_eff,
                                       "r_eff_all": r_eff_all,
                                       "derived_lambda": derived,
+                                      "scope": "native"
+                                      if args.rpbe_native_compression
+                                      else "gamma",
+                                      "space": "proposal"
+                                      if args.rpbe_native_compression
+                                      else "gradient",
                                       "theta0_verified": True},
                                      indent=2), flush=True)
                     return
@@ -2054,47 +2286,90 @@ def main():
                     # into the intersection of the per-tree half-spaces
                     # and certifies EVERY row at 1e-6; a failed
                     # certificate skips the representation step below.
-                    for i, (b, sid) in enumerate(pending):
-                        _restore_rng(pass1_rngs[i])   # P0: mask == pass1
-                        # V11 (review): the QP center is the JOINT
-                        # proposal q = t + a_lambda, not the bare task
-                        # proposal t.  Running pass2_one with the real
-                        # lambda accumulates the aggregate RPBE gradient
-                        # ONTO the Gamma task gradient, so the snapshot
-                        # below (g_task_gamma) is exactly the joint
-                        # proposal direction; the projection then trims
-                        # only the components that hurt a local
-                        # interface.  Non-Gamma params keep pure task
-                        # (rpbe_gamma_only structure, unchanged).
-                        task_mean, task_raw, n_valid, _aux, _n = pass2_one(
-                            b, cut_records[i], g_by_oid,
-                            0.0 if args.arm == "gamma_task_only"
-                            else lambda_kf)
-                        if task_mean.requires_grad:
-                            # freeze-host fix: k<3 batches carry no
-                            # COMP/SUM rows, so Gamma never touches the
-                            # output and task_mean has no graph.  Skip
-                            # their (zero) backward instead of dying.
-                            scaler.scale(
-                                task_mean
-                                / float(len(pending))).backward(
-                                    retain_graph=True)
-                        if _n and args.arm == "ours" and _aux.requires_grad:
-                            # V11: accumulate the aggregate RPBE gradient
-                            # onto Gamma so the snapshot below is the
-                            # joint proposal q = t + a_lambda (mirrors
-                            # the aggregate branch's aux backward).
-                            # freeze-host fix: _n>0 but a graph-less _aux
-                            # (all oids filtered out) has nothing to add.
-                            scaler.scale(_aux).backward()
-                        task_sum += float(task_raw.detach())
-                        n_tokens += n_valid
-                    task_grads = {id(p): p.grad.detach().clone()
-                                  for p in params if p.grad is not None}
+                    if args.rpbe_native_compression:
+                        # Native proposal-space line (review 2026-09-22):
+                        # the QP needs BOTH the pure task proposal
+                        # (constraint norm ||d_task||) and the joint
+                        # proposal (center d_0).  The pass-2 forward is
+                        # split: 1a = task CE alone (snapshot the PURE
+                        # g_task BEFORE any aux accumulation), 1b = the
+                        # aggregate lambda-scaled RPBE gradient onto the
+                        # same grads -> g_joint.  retain_graph keeps
+                        # every fwd graph alive across the split.
+                        aux_pending = []
+                        for i, (b, sid) in enumerate(pending):
+                            _restore_rng(pass1_rngs[i])  # P0: mask==pass1
+                            task_mean, task_raw, n_valid, _aux, _n = \
+                                pass2_one(b, cut_records[i], g_by_oid,
+                                          lambda_kf)
+                            if task_mean.requires_grad:
+                                scaler.scale(
+                                    task_mean
+                                    / float(len(pending))).backward(
+                                        retain_graph=True)
+                            aux_pending.append((_aux, _n))
+                            task_sum += float(task_raw.detach())
+                            n_tokens += n_valid
+                        task_grads_pure = {
+                            id(p): p.grad.detach().clone()
+                            for p in params if p.grad is not None}
+                        for _aux, _n in aux_pending:
+                            if _n and _aux.requires_grad:
+                                scaler.scale(_aux).backward()
+                        task_grads = {
+                            id(p): p.grad.detach().clone()
+                            for p in params if p.grad is not None}
+                    else:
+                        for i, (b, sid) in enumerate(pending):
+                            _restore_rng(pass1_rngs[i])   # P0: mask == pass1
+                            # V11 (review): the QP center is the JOINT
+                            # proposal q = t + a_lambda, not the bare
+                            # task proposal t.  Running pass2_one with
+                            # the real lambda accumulates the aggregate
+                            # RPBE gradient ONTO the Gamma task
+                            # gradient, so the snapshot below
+                            # (g_task_repr) is exactly the joint
+                            # proposal direction; the projection then
+                            # trims only the components that hurt a
+                            # local interface.  Non-Gamma params keep
+                            # pure task (rpbe_gamma_only structure,
+                            # unchanged).
+                            task_mean, task_raw, n_valid, _aux, _n = \
+                                pass2_one(
+                                    b, cut_records[i], g_by_oid,
+                                    0.0 if args.arm == "gamma_task_only"
+                                    else lambda_kf)
+                            if task_mean.requires_grad:
+                                # freeze-host fix: k<3 batches carry no
+                                # COMP/SUM rows, so Gamma never touches
+                                # the output and task_mean has no graph.
+                                # Skip their (zero) backward instead of
+                                # dying.
+                                scaler.scale(
+                                    task_mean
+                                    / float(len(pending))).backward(
+                                        retain_graph=True)
+                            if _n and args.arm == "ours" \
+                                    and _aux.requires_grad:
+                                # V11: accumulate the aggregate RPBE
+                                # gradient onto Gamma so the snapshot
+                                # below is the joint proposal
+                                # q = t + a_lambda (mirrors the aggregate
+                                # branch's aux backward).  freeze-host
+                                # fix: _n>0 but a graph-less _aux (all
+                                # oids filtered out) has nothing to add.
+                                scaler.scale(_aux).backward()
+                            task_sum += float(task_raw.detach())
+                            n_tokens += n_valid
+                        task_grads = {
+                            id(p): p.grad.detach().clone()
+                            for p in params if p.grad is not None}
                     optimizer.zero_grad(set_to_none=True)
                     aux_other = {id(p): torch.zeros_like(p)
                                  for p in params
-                                 if id(p) not in gamma_set}
+                                 if id(p) not in repr_set}
+                    native_g_joint = None   # true-value g_joint for the
+                    native_amp_skip = False  # native proposal write-back
                     dirs = []
                     for i, (b, sid) in enumerate(pending):
                         _restore_rng(pass1_rngs[i])  # P0: mask == pass1
@@ -2123,16 +2398,16 @@ def main():
                             # peak and blew the 40GB card.
                             dirs.append(torch.cat(
                                 [p.grad.reshape(-1).float()
-                                 for p in gamma_params]).cpu())
+                                 for p in repr_params]).cpu())
                             for p in params:
-                                if id(p) not in gamma_set \
+                                if id(p) not in repr_set \
                                         and p.grad is not None:
                                     aux_other[id(p)].add_(p.grad.detach())
                         adapter.clear()
                     optimizer.zero_grad(set_to_none=True)
-                    g_task_gamma = [
+                    g_task_repr = [
                         task_grads.get(id(p), torch.zeros_like(p))
-                        for p in gamma_params]
+                        for p in repr_params]
                     if os.environ.get("CCM_TREEWISE_PROBE") == "1" \
                             and dirs:
                         # Audit (review): cos(g_task, g_v) distribution
@@ -2145,7 +2420,7 @@ def main():
                         import numpy as _np
                         _t_flat = torch.cat(
                             [x.reshape(-1).float()
-                             for x in g_task_gamma])
+                             for x in g_task_repr])
                         _nt = float(_t_flat.norm())
                         _G = torch.stack(dirs)
                         _nr = _G.norm(dim=1)
@@ -2181,45 +2456,135 @@ def main():
                         raise SystemExit(
                             "CCM_TREEWISE_PROBE: window probed, "
                             "no optimizer step executed")
-                    proj_ok, proj_diag = treewise_feasibility_projection(
-                        [x.detach().cpu() for x in g_task_gamma],
-                        gamma_params,
-                        (torch.stack(dirs)
-                         if dirs else None),
-                        args.rpbe_kappa, iters=args.proj_iters,
-                        # V11 (self-ruled 2026-09-21): the TGN final-spec
-                        # 1e-6 certificate is a fp32 contract; CCM runs
-                        # the QP on fp16 GradScaler-SCALED gradients, so
-                        # the achievable max_viol floors at ~1e-5
-                        # (measured: 8.37e-06 / 1e-05 across the first
-                        # windows).  Keeping 1e-6 made EVERY window
-                        # cert_fail and skipped every repr update — the
-                        # V11 joint-QP experiment would degenerate to
-                        # task-only.  1e-4 is the fp16-achievable line;
-                        # the skip-on-failure semantics is unchanged.
-                        cert_tol=1e-4)
-                    cert_fail = bool(proj_diag.get("cert_fail"))
-                    if not proj_ok:
-                        # CERT_FAIL: no constrained update is executed —
-                        # zero the non-Gamma grads too and skip the
-                        # representation step (final-spec reviewer
-                        # requirement; TGN: "skipping repr step").
-                        for p in params:
-                            if id(p) in gamma_set:
+                    if args.rpbe_native_compression:
+                        # Native proposal-space projection (review
+                        # 2026-09-22).  The QP needs TRUE-value
+                        # gradients for the shadow AdamW proposals, so
+                        # unscale + clip FIRST (the gamma line runs the
+                        # QP on scaled gradients and keeps grad_step
+                        # unchanged — V11 numbers stay valid).
+                        scale_f = float(scaler.get_scale())
+                        scaler.unscale_(optimizer)
+                        _inf = any(
+                            p.grad is not None
+                            and not bool(
+                                torch.isfinite(p.grad.detach()).all())
+                            for p in params)
+                        if _inf:
+                            # AMP overflow: no proposal / no QP / no
+                            # update.  scaler backs off; the window
+                            # closes like a normal skip.
+                            proj_ok, proj_diag = True, {
+                                "note": "amp_skip", "cert_fail": False,
+                                "amp_skip": True, "n_dirs": 0,
+                                "task_norm": 0.0, "b_norm": 0.0}
+                            cert_fail = False
+                            native_amp_skip = True
+                            for p in params:
                                 p.grad = None
+                        else:
+                            native_amp_skip = False
+                            torch.nn.utils.clip_grad_norm_(
+                                params, args.grad_clip)
+                            g_joint_true = [
+                                p.grad.detach().clone()
+                                for p in repr_params]
+                            native_g_joint = g_joint_true
+                            g_task_true = [
+                                (task_grads_pure.get(
+                                    id(p), torch.zeros_like(p)).detach()
+                                 / scale_f)
+                                for p in repr_params]
+                            _bc = optimizer_steps_executed + 1
+                            d0 = adamw_proposal(
+                                optimizer, repr_params, g_joint_true,
+                                _bc)
+                            d_task = adamw_proposal(
+                                optimizer, repr_params, g_task_true,
+                                _bc)
+                            d_task_norm = float(
+                                torch.cat([x.reshape(-1) for x in d_task])
+                                .double().norm())
+                            _G = torch.stack(dirs) if dirs else None
+                            if _G is not None:
+                                # Constraint sign flip: the frozen
+                                # definition is a LOWER bound in the
+                                # UPDATE space, q_i^T d* >=
+                                # -kappa*||q_i||*||d_task||.  The QP
+                                # variable d is the NEGATIVE update
+                                # (t = -center), so the row direction is
+                                # negated to encode the same half-space
+                                # (feasibility: the update must not
+                                # turn too far AGAINST the predictive
+                                # direction).
+                                _G = -_G
+                            proj_ok, proj_diag = \
+                                treewise_feasibility_projection(
+                                    [x.detach().cpu() for x in d0],
+                                    repr_params, _G,
+                                    args.rpbe_kappa,
+                                    iters=args.proj_iters,
+                                    cert_tol=1e-4,
+                                    b_norm=d_task_norm)
+                            proj_diag["space"] = "proposal"
+                            proj_diag["d_task_norm"] = d_task_norm
+                            cert_fail = bool(
+                                proj_diag.get("cert_fail"))
+                            if not proj_ok:
+                                for p in params:
+                                    p.grad = None
                             else:
-                                p.grad = torch.zeros_like(p)
+                                # The QP wrote p.grad = the projected
+                                # proposal d* for every repr param
+                                # (repr_set == all trainable params
+                                # under native actuation).
+                                pass
                     else:
-                        for p in params:
-                            if id(p) in gamma_set:
-                                continue  # projection already wrote .grad
-                            p.grad = task_grads.get(
-                                id(p), torch.zeros_like(p))
-                            if not args.rpbe_gamma_only:
-                                # R10 structure: discard the non-Gamma
-                                # auxiliary gradient (review 2026-09-16)
-                                p.grad = (p.grad + aux_other.get(
-                                    id(p), torch.zeros_like(p)))
+                        proj_ok, proj_diag = treewise_feasibility_projection(
+                            [x.detach().cpu() for x in g_task_repr],
+                            repr_params,
+                            (torch.stack(dirs)
+                             if dirs else None),
+                            args.rpbe_kappa, iters=args.proj_iters,
+                            # V11 (self-ruled 2026-09-21): the TGN
+                            # final-spec 1e-6 certificate is a fp32
+                            # contract; CCM runs the QP on fp16
+                            # GradScaler-SCALED gradients, so the
+                            # achievable max_viol floors at ~1e-5
+                            # (measured: 8.37e-06 / 1e-05 across the
+                            # first windows).  Keeping 1e-6 made EVERY
+                            # window cert_fail and skipped every repr
+                            # update — the V11 joint-QP experiment
+                            # would degenerate to task-only.  1e-4 is
+                            # the fp16-achievable line; the
+                            # skip-on-failure semantics is unchanged.
+                            cert_tol=1e-4)
+                        cert_fail = bool(proj_diag.get("cert_fail"))
+                        if not proj_ok:
+                            # CERT_FAIL: no constrained update is
+                            # executed — zero the non-Gamma grads too
+                            # and skip the representation step
+                            # (final-spec reviewer requirement; TGN:
+                            # "skipping repr step").
+                            for p in params:
+                                if id(p) in repr_set:
+                                    p.grad = None
+                                else:
+                                    p.grad = torch.zeros_like(p)
+                        else:
+                            for p in params:
+                                if id(p) in repr_set:
+                                    continue  # projection already
+                                              # wrote .grad
+                                p.grad = task_grads.get(
+                                    id(p), torch.zeros_like(p))
+                                if not args.rpbe_gamma_only:
+                                    # R10 structure: discard the
+                                    # non-Gamma auxiliary gradient
+                                    # (review 2026-09-16)
+                                    p.grad = (p.grad + aux_other.get(
+                                        id(p),
+                                        torch.zeros_like(p)))
                     with (out / "window_diag.jsonl").open("a") as _f:
                         _f.write(json.dumps(_json_safe(
                             {"step": int(step), "event": "treewise_proj",
@@ -2262,7 +2627,7 @@ def main():
                             task_snap = {id(p): p.grad.detach().clone()
                                          for p in params
                                          if p.grad is not None
-                                         and id(p) not in gamma_set}
+                                         and id(p) not in repr_set}
                             if os.environ.get("CCM_GRAD_GROUP") == "1":
                                 task_snap_all = {
                                     id(p): p.grad.detach().clone()
@@ -2281,7 +2646,7 @@ def main():
                                           "comp": [], "other": []}
                                 for n, p in model.named_parameters():
                                     if p.requires_grad and p.grad is not None:
-                                        if id(p) in gamma_set:
+                                        if id(p) in repr_set:
                                             groups["gamma"].append((n, p))
                                         elif "lora_" in n:
                                             groups["lora"].append((n, p))
@@ -2311,7 +2676,7 @@ def main():
                                               _na / max(_nt, 1e-30)),
                                           flush=True)
                             for p in params:
-                                if id(p) not in gamma_set:
+                                if id(p) not in repr_set:
                                     p.grad = task_snap.get(id(p))
                         else:
                             loss = task_mean / float(len(pending)) + aux
@@ -2362,6 +2727,57 @@ def main():
                     # boundary records and checkpoint cadence advance
                     # identically to a successful close.
                     cert_skip_steps += 1
+                elif treewise and args.rpbe_native_compression:
+                    # Native proposal-space write-back (review
+                    # 2026-09-22): the QP wrote the projected proposal
+                    # d* into p.grad for every repr param (== all
+                    # trainable params).  theta <- theta + d* directly;
+                    # the optimizer moments are updated with the
+                    # true-value JOINT gradient g_joint so the next
+                    # window's proposal starts from a consistent AdamW
+                    # state.  No scaler.step() — the parameter update
+                    # is the projected proposal itself.
+                    if native_amp_skip:
+                        # AMP overflow detected at unscale: back the
+                        # scale off and discard the update (mirrors
+                        # grad_step's skip semantics).
+                        scaler.update()
+                        optimizer_steps_executed += 1
+                        amp_skipped_steps += 1
+                    else:
+                        with torch.no_grad():
+                            b1, b2 = tuple(
+                                optimizer.param_groups[0]["betas"])
+                            for p, g in zip(repr_params,
+                                            native_g_joint):
+                                st = optimizer.state[p]
+                                if "exp_avg" in st:
+                                    st["exp_avg"].mul_(b1).add_(
+                                        g, alpha=1.0 - b1)
+                                else:
+                                    st["exp_avg"] = (
+                                        (1.0 - b1) * g).clone()
+                                if "exp_avg_sq" in st:
+                                    st["exp_avg_sq"].mul_(b2).addcmul_(
+                                        g, g, value=1.0 - b2)
+                                else:
+                                    st["exp_avg_sq"] = (
+                                        (1.0 - b2) * g * g).clone()
+                            for p in repr_params:
+                                # theta <- theta + d* (QP wrote the
+                                # projected proposal; fp32 -> param
+                                # dtype for the in-place add).
+                                p.data.add_(p.grad.to(p.dtype))
+                        scaler.update()
+                        optimizer_steps_executed += 1
+                        scheduler.step()
+                        scheduler_steps += 1
+                    assert optimizer_steps_executed \
+                        == scheduler_steps + amp_skipped_steps, (
+                            "step counters diverged: executed={} "
+                            "sched={} skips={}".format(
+                                optimizer_steps_executed, scheduler_steps,
+                                amp_skipped_steps))
                 else:
                     grad_step()  # counters live inside grad_step (nonlocal)
                 _pf("grad_step", _t)

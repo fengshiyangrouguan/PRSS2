@@ -58,6 +58,7 @@ for _k in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS"):
 
 import numpy as np
 import torch
+from torch.nn import functional as F
 
 torch.set_num_threads(int(os.environ["OMP_NUM_THREADS"]))
 
@@ -75,6 +76,7 @@ from rpbe.hosts.ccm.gamma_residual import GammaResidual
 from rpbe.llm.dialogue_records import (DialogueCutBuilder, DialogueMeta,
                                        Llmmaps, MEM_TAU)
 from rpbe.llm.utterance_embed import UtteranceEmbed
+from rpbe.llm.mem_lift import JMemLift
 from rpbe.loss import KFMomentWindow
 from rpbe.training.checkpoint import _restore_rng, _rng_state
 
@@ -282,6 +284,14 @@ def parse_args():
                         "(frozen_method_qwen3_native.json); mutually "
                         "exclusive with --freeze-host / "
                         "--rpbe-gamma-only / --rpbe-lr.")
+    p.add_argument("--supervisor-mode", default="current",
+                   choices=["current", "root_only"],
+                   help="predictive supervisor variant (sweep, review "
+                        "2026-09-23): current = 2Obs (local u_{t+1}->"
+                        "u_{t+2} + short-suffix->y); root_only = every "
+                        "cut supervises the final target y with the "
+                        "remaining suffix (u_{t+1}..u_L, c) as context "
+                        "(single row per cut, w=1.0)")
     # monitoring
     p.add_argument("--log-every", type=int, default=10)
     p.add_argument("--checkpoint-every", type=int, default=250)
@@ -909,7 +919,8 @@ def collect_replay_z(meta, adapter, device, v=None):
 
 
 def collect_rows(meta, adapter, builder, utter_embed, phi_embed,
-                 embed_tokens, batch, device):
+                 embed_tokens, batch, device,
+                 supervisor_mode="current"):
     """Review ruling (2026-09-21): ONE CUT PER ACTUAL COMPRESSION LAYER.
 
       t = 1..L,  block_idx = t - 1   (the ONLY cut indexing rule)
@@ -920,6 +931,12 @@ def collect_rows(meta, adapter, builder, utter_embed, phi_embed,
               obs2  C = (u_{t+1}, u_{t+2}, one-update), Y = y  (w = 0.5)
       t = L:  single legal observation  C = c,  Y = y  (w = 1.0)
               — the terminal cut does not fabricate a second future.
+
+    supervisor_mode="root_only" (supervisor sweep, review 2026-09-23):
+    EVERY t supervises the final root target y with the remaining
+    suffix as the context — (M_t, C_t^{suffix}) -> y with
+    C_t = (u_{t+1}..u_L, c), a single row per cut at w = 1.0.  No
+    surrogate local target u_{t+2}.
 
     Chi/phi are built from the RAW utterance tokens (the collator's
     sample() already had them; the old code carved spans out of the
@@ -954,6 +971,21 @@ def collect_rows(meta, adapter, builder, utter_embed, phi_embed,
 
     rows = []
     for t in range(1, L + 1):
+        if supervisor_mode == "root_only":
+            # (M_t, suffix) -> y for EVERY t: the suffix is the
+            # remaining future dialogue (u_{t+1}..u_L, c); the terminal
+            # cut's suffix is just c (same as the current design).
+            suffix_ids = torch.tensor(
+                [tok for idx in range(t, L + 1) for tok in raw[idx]],
+                dtype=torch.long, device=device).unsqueeze(0)
+            y_ids = _tok(L + 1)
+            chi1 = utter_embed(embed_tokens, suffix_ids, tag=0)
+            phi1 = phi_embed(embed_tokens, y_ids, tag=0)
+            chi2, phi2 = chi1, phi1  # unused (single row)
+            rows.extend(builder.build(dm, zs[t - 1], chi1[0], chi2[0],
+                                      phi1[0], phi2[0], v=t - 1,
+                                      single=True))
+            continue
         if t < L:
             u_nxt = _tok(t)          # u_{t+1}  (raw index t)
             u_nx2 = _tok(t + 1)      # u_{t+2}
@@ -1939,7 +1971,8 @@ def main():
                 _t = time.perf_counter()
                 rows = collect_rows(meta, adapter, builder, utter_embed,
                                      phi_embed,
-                                    embed_tokens, batch, device)
+                                    embed_tokens, batch, device,
+                                    supervisor_mode=args.supervisor_mode)
                 _pf("collect_rows", _t)
                 if rows:
                     _t = time.perf_counter()
@@ -2518,15 +2551,13 @@ def main():
                             "CCM_TREEWISE_PROBE: window probed, "
                             "no optimizer step executed")
                     if args.rpbe_native_compression:
-                        # Native proposal-space projection (review
-                        # 2026-09-22).  P0 fix (2026-09-22 review): the
-                        # dirs-collection loop ends with
-                        # zero_grad(set_to_none=True), so NO live p.grad
-                        # exists here — the pure/joint snapshots taken
-                        # BEFORE the dirs loop are the only gradient
-                        # source.  They were recorded in SCALED space:
-                        # divide by the current scale to recover the
-                        # true values (no scaler.unscale_ needed).
+                        # Shared pre-projection block (P0 fix +
+                        # interface probe share): NO live p.grad exists
+                        # here — the pure/joint snapshots taken BEFORE
+                        # the dirs loop are the only gradient source.
+                        # They were recorded in SCALED space: divide by
+                        # the current scale to recover the true values
+                        # (no scaler.unscale_ needed).
                         scale_f = float(scaler.get_scale())
                         g_joint_true = [
                             (task_grads.get(id(p), torch.zeros_like(p))
@@ -2540,6 +2571,340 @@ def main():
                         _inf = any(
                             not bool(torch.isfinite(g).all())
                             for g in g_joint_true)
+                    if args.rpbe_native_compression \
+                            and os.environ.get("CCM_INTERFACE_PROBE") == "1":
+                        # Interface-space probe (review 2026-09-23):
+                        # compare the predictive adjoint lifted BACK to
+                        # memory space, r_pred = J_mem^T a_i, with the
+                        # CE gradient AT the memory, r_task =
+                        # grad_{M_i} L_task — BEFORE either is pulled
+                        # through the LoRA Jacobian.  cos ~ 0 here =>
+                        # the phi/J predictive notion itself is
+                        # task-orthogonal (supervision geometry);
+                        # cos clearly negative here but ~0 in parameter
+                        # space => actuation/Jacobian support.
+                        _lift = adapter.j_mem
+                        cos_if = []
+                        for i, (b, sid) in enumerate(pending):
+                            _restore_rng(pass1_rngs[i])
+                            optimizer.zero_grad(set_to_none=True)
+                            fwd_out = run_forward(model, b, device,
+                                                  grad_enabled=True)
+                            for _entry in adapter._cache:
+                                if _entry is not None:
+                                    _entry[0].retain_grad()
+                                    _entry[1].retain_grad()
+                            _tsm, _nvm = task_ce_shifted(
+                                fwd_out, b["labels"], device)
+                            (_tsm / max(_nvm, 1)
+                             / float(len(pending))).backward()
+                            for meta, oid, v in cut_records[i]:
+                                _a = g_by_oid.get(oid)
+                                if _a is None:
+                                    continue
+                                _pos = torch.tensor(
+                                    [[meta["blocks"][v][1],
+                                      meta["blocks"][v][1] + 1]],
+                                    dtype=torch.long, device=device)
+                                _kp, _vp = [], []
+                                for _entry in adapter._cache:
+                                    _k, _v = _entry[0], _entry[1]
+                                    _idx = _pos.unsqueeze(1).expand(
+                                        -1, _k.shape[1], -1)
+                                    _idx = _idx.unsqueeze(-1).expand(
+                                        -1, -1, -1, _k.shape[-1])
+                                    _kp.append(torch.gather(_k.grad, 2,
+                                                            _idx))
+                                    _vp.append(torch.gather(_v.grad, 2,
+                                                            _idx))
+                                _r_task = JMemLift.pack_sum_mem(
+                                    _kp, _vp)[0]        # [full_dim]
+                                _r_pred = _lift.transpose(
+                                    _a.unsqueeze(0))[0]  # [full_dim]
+                                # dtype align: K/V grads are bf16, the
+                                # adjoint is float32.
+                                _rt = _r_task.float()
+                                _rp = _r_pred.float()
+                                _den = (_rt.norm()
+                                        * _rp.norm()).clamp(
+                                            min=1e-12)
+                                cos_if.append(
+                                    float((_rt @ _rp) / _den))
+                            adapter.clear()
+                        cos_if = [float(c) for c in cos_if]
+                        _ci = np.array(cos_if)
+                        # Block-wise support overlap (review 2026-09-23):
+                        # split the flat repr dims by (layer, proj) and
+                        # measure per-block energy shares and the
+                        # block-level cos(q_i^block, g_task^block).
+                        _gt_flat = torch.cat(
+                            [g.reshape(-1).float().cpu()
+                             for g in g_task_true])
+                        _G = torch.stack(dirs)
+                        _blocks = []
+                        _off = 0
+                        for _n, _p in model.named_parameters():
+                            if not _p.requires_grad:
+                                continue
+                            _num = _p.numel()
+                            _blocks.append((_n, _off, _off + _num))
+                            _off += _num
+                        _bnorm_ratio_q = {}
+                        _bnorm_ratio_t = {}
+                        _bcos = {}
+                        _beta_b = {}
+                        _gnorms = _G.norm(dim=1).clamp(min=1e-12)
+                        for _n, _s, _e in _blocks:
+                            _qb = _G[:, _s:_e]
+                            _gb = _gt_flat[_s:_e]
+                            _bnorm_ratio_q[_n] = float(
+                                (_qb.norm(dim=1) / _gnorms).mean())
+                            _bnorm_ratio_t[_n] = float(
+                                _gb.norm() / _gt_flat.norm().clamp(
+                                    min=1e-12))
+                            _bcos[_n] = float(
+                                ((_qb @ _gb) / (
+                                    _qb.norm(dim=1).clamp(min=1e-12)
+                                    * _gb.norm().clamp(min=1e-12)))
+                                .mean())
+                            # eta_b (review 2026-09-23): the block's
+                            # TRUE contribution to the global alignment
+                            # q^T d / (||q|| ||d||) — a large local cos
+                            # on a tiny-energy block contributes ~0.
+                            _beta_b[_n] = float(
+                                ((_qb @ _gb) / (
+                                    _gnorms
+                                    * _gt_flat.norm().clamp(
+                                        min=1e-12))).mean())
+                        _probe = {
+                            "interface_cos_mean": float(_ci.mean()),
+                            "interface_cos_med": float(np.median(_ci)),
+                            "interface_cos_p5": float(
+                                np.percentile(_ci, 5.0)),
+                            "interface_cos_min": float(_ci.min()),
+                            "interface_cos_max": float(_ci.max()),
+                            "n_cuts": int(len(cos_if)),
+                            "block_norm_ratio_q": _bnorm_ratio_q,
+                            "block_norm_ratio_t": _bnorm_ratio_t,
+                            "block_cos": _bcos,
+                            "block_eta": _beta_b,
+                        }
+                        with (out / "interface_probe.json").open("w") \
+                                as _f:
+                            json.dump(_probe, _f, indent=1)
+                        _top_q = sorted(
+                            _bnorm_ratio_q.items(),
+                            key=lambda kv: -kv[1])[:4]
+                        _top_t = sorted(
+                            _bnorm_ratio_t.items(),
+                            key=lambda kv: -kv[1])[:4]
+                        print("[interface-probe] n_cuts={} cos: "
+                              "mean={:.4f} med={:.4f} p5={:.4f} "
+                              "min={:.4f} max={:.4f}".format(
+                                  len(cos_if), _probe["interface_cos_mean"],
+                                  _probe["interface_cos_med"],
+                                  _probe["interface_cos_p5"],
+                                  _probe["interface_cos_min"],
+                                  _probe["interface_cos_max"]),
+                              flush=True)
+                        print("[interface-probe] top energy q: {} | "
+                              "top energy t: {}".format(
+                                  _top_q, _top_t), flush=True)
+                        optimizer.zero_grad(set_to_none=True)
+                    if args.rpbe_native_compression \
+                            and os.environ.get("CCM_S3_PROBE") == "1":
+                        # S3 probe (review 2026-09-23): full-context
+                        # teacher vs compressed prediction at EVERY cut.
+                        # The recursive interface stays Z_t = M_t; what
+                        # changes is the future predictive test:
+                        #   pi_full_j = p(·| u_{1:L}, c, y_{<j})   (frozen
+                        #       teacher, the standard CCM forward at y)
+                        #   pi_comp_j = p(·| M_t, u_{t+1:L}, c, y_{<j})
+                        #       — a REORGANIZED dialogue: u_1..u_t
+                        #       compressed into M_t, the remaining
+                        #       suffix as the context turn, y as target
+                        #   D_t = mean_j KL(pi_full_j || pi_comp_j)
+                        #   a^S3 = grad_{M_t} D_t  (memory space),
+                        #   q^S3 = grad_theta D_t (parameter space)
+                        # Four numbers vs the CE task direction.
+                        _gt_flat = torch.cat(
+                            [g.reshape(-1).float().cpu()
+                             for g in g_task_true])
+                        r_task_cache = {}
+                        teacher_cache = {}
+                        for i, (b, sid) in enumerate(pending):
+                            _restore_rng(pass1_rngs[i])
+                            optimizer.zero_grad(set_to_none=True)
+                            fwd_out = run_forward(model, b, device,
+                                                  grad_enabled=True)
+                            _lg = fwd_out.logits
+                            _lb = b["labels"]
+                            _sh = _lg[..., :-1, :].contiguous()
+                            _sl = _lb[..., 1:].contiguous()
+                            _mask = _sl != -100
+                            _t_logits = _sh[_mask].detach()
+                            for _entry in adapter._cache:
+                                if _entry is not None:
+                                    _entry[0].retain_grad()
+                                    _entry[1].retain_grad()
+                            _tsm, _nvm = task_ce_shifted(
+                                fwd_out, b["labels"], device)
+                            (_tsm / max(_nvm, 1)
+                             / float(len(pending))).backward()
+                            for meta, oid, v in cut_records[i]:
+                                _pos = torch.tensor(
+                                    [[meta["blocks"][v][1],
+                                      meta["blocks"][v][1] + 1]],
+                                    dtype=torch.long, device=device)
+                                _kp, _vp = [], []
+                                for _entry in adapter._cache:
+                                    _k, _v = _entry[0], _entry[1]
+                                    _idx = _pos.unsqueeze(1).expand(
+                                        -1, _k.shape[1], -1)
+                                    _idx = _idx.unsqueeze(-1).expand(
+                                        -1, -1, -1, _k.shape[-1])
+                                    _kp.append(torch.gather(_k.grad, 2,
+                                                            _idx))
+                                    _vp.append(torch.gather(_v.grad, 2,
+                                                            _idx))
+                                r_task_cache[oid] = JMemLift.pack_sum_mem(
+                                    _kp, _vp)[0].float()
+                            teacher_cache[i] = (_t_logits,
+                                               int(_mask.sum()))
+                            adapter.clear()
+                        cos_mem_s3 = []
+                        cos_par_s3 = []
+                        q_agg = None
+                        for i, (b, sid) in enumerate(pending):
+                            for meta, oid, v in cut_records[i]:
+                                if g_by_oid.get(oid) is None:
+                                    continue
+                                _t = int(v) + 1
+                                _raw = meta["raw_dialog"]
+                                _L = int(meta["L"])
+                                _suffix = [tok for _x in
+                                           range(_t, _L + 1)
+                                           for tok in _raw[_x]]
+                                _new_dialog = ([list(_raw[_x])
+                                                for _x in range(_t)]
+                                               + [_suffix]
+                                               + [list(_raw[_L + 1])])
+                                _item = {"dialog": _new_dialog,
+                                         "fixed_depth": True}
+                                _b2 = collator([_item])
+                                _b2 = {kk: vv.to(device)
+                                       for kk, vv in _b2.items()}
+                                optimizer.zero_grad(set_to_none=True)
+                                _f2 = run_forward(model, _b2, device,
+                                                  grad_enabled=True)
+                                for _entry in adapter._cache:
+                                    if _entry is not None:
+                                        _entry[0].retain_grad()
+                                        _entry[1].retain_grad()
+                                _lg2 = _f2.logits
+                                _lb2 = _b2["labels"]
+                                _sh2 = _lg2[..., :-1, :].contiguous()
+                                _sl2 = _lb2[..., 1:].contiguous()
+                                _mask2 = _sl2 != -100
+                                _s_logits = _sh2[_mask2]
+                                _t_logits, _n_tok = teacher_cache[i]
+                                _n_s = int(_mask2.sum())
+                                _n_min = min(_n_tok, _n_s)
+                                _kl = F.kl_div(
+                                    torch.log_softmax(
+                                        _s_logits[:_n_min], dim=-1),
+                                    torch.softmax(
+                                        _t_logits[:_n_min], dim=-1),
+                                    reduction="none").sum(-1)
+                                _D = _kl.mean()
+                                _D.backward()
+                                _meta2 = parse_meta(_b2, comp_ids,
+                                                    sum_ids, sid)[0]
+                                _pos2 = torch.tensor(
+                                    [[_meta2["blocks"][_t - 1][1],
+                                      _meta2["blocks"][_t - 1][1] + 1]],
+                                    dtype=torch.long, device=device)
+                                _kp2, _vp2 = [], []
+                                for _entry in adapter._cache:
+                                    _k, _v = _entry[0], _entry[1]
+                                    _idx = _pos2.unsqueeze(1).expand(
+                                        -1, _k.shape[1], -1)
+                                    _idx = _idx.unsqueeze(-1).expand(
+                                        -1, -1, -1, _k.shape[-1])
+                                    _kp2.append(torch.gather(_k.grad, 2,
+                                                             _idx))
+                                    _vp2.append(torch.gather(_v.grad, 2,
+                                                             _idx))
+                                _a_s3 = JMemLift.pack_sum_mem(
+                                    _kp2, _vp2)[0].float()
+                                _r_task = r_task_cache[oid]
+                                _den_m = (_a_s3.norm()
+                                          * _r_task.norm()).clamp(
+                                              min=1e-12)
+                                cos_mem_s3.append(
+                                    float((_a_s3 @ _r_task) / _den_m))
+                                _q_flat = torch.cat(
+                                    [p.grad.reshape(-1).float()
+                                     if p.grad is not None else
+                                     torch.zeros(p.numel(),
+                                                 dtype=torch.float32,
+                                                 device=p.device)
+                                     for p in repr_params]).cpu()
+                                _den_p = (_q_flat.norm()
+                                          * _gt_flat.norm()).clamp(
+                                              min=1e-12)
+                                cos_par_s3.append(
+                                    float((_q_flat @ _gt_flat)
+                                          / _den_p))
+                                q_agg = (_q_flat if q_agg is None
+                                         else q_agg + _q_flat)
+                            adapter.clear()
+                        cos_mem_s3 = [float(c) for c in cos_mem_s3]
+                        cos_par_s3 = [float(c) for c in cos_par_s3]
+                        _cm = np.array(cos_mem_s3)
+                        _cp = np.array(cos_par_s3)
+                        _agg_cos_s3 = float(
+                            ((q_agg @ _gt_flat)
+                             / (q_agg.norm()
+                                * _gt_flat.norm()).clamp(
+                                    min=1e-12))) if q_agg is not None \
+                            else 0.0
+                        _s3 = {
+                            "n_cuts": int(len(cos_mem_s3)),
+                            "cos_mem_mean": float(_cm.mean()),
+                            "cos_mem_med": float(np.median(_cm)),
+                            "cos_mem_p5": float(np.percentile(_cm, 5.0)),
+                            "cos_mem_min": float(_cm.min()),
+                            "cos_mem_max": float(_cm.max()),
+                            "cos_par_mean": float(_cp.mean()),
+                            "cos_par_med": float(np.median(_cp)),
+                            "cos_par_p5": float(np.percentile(_cp, 5.0)),
+                            "cos_par_min": float(_cp.min()),
+                            "frac_par_neg_kappa": float(
+                                np.mean(_cp < -args.rpbe_kappa)),
+                            "cos_agg": _agg_cos_s3,
+                        }
+                        with (out / "s3_probe.json").open("w") as _f:
+                            json.dump(_s3, _f, indent=1)
+                        print("[s3-probe] n={} mem_cos: mean={:.4f} "
+                              "p5={:.4f} min={:.4f} | par_cos: "
+                              "mean={:.4f} p5={:.4f} min={:.4f} "
+                              "Pr<-k={:.4f} | AGG={:.4f}".format(
+                                  _s3["n_cuts"],
+                                  _s3["cos_mem_mean"], _s3["cos_mem_p5"],
+                                  _s3["cos_mem_min"],
+                                  _s3["cos_par_mean"], _s3["cos_par_p5"],
+                                  _s3["cos_par_min"],
+                                  _s3["frac_par_neg_kappa"],
+                                  _s3["cos_agg"]), flush=True)
+                        optimizer.zero_grad(set_to_none=True)
+                    if args.rpbe_native_compression:
+                        # Native proposal-space projection (review
+                        # 2026-09-22).  P0 fix (2026-09-22 review): the
+                        # dirs-collection loop ends with
+                        # zero_grad(set_to_none=True), so NO live p.grad
+                        # exists here — computed in the shared
+                        # pre-projection block above.
                         if _inf:
                             # AMP overflow: no proposal / no QP / no
                             # update.  scaler backs off; the window
@@ -2630,6 +2995,20 @@ def main():
                                               min=1e-12)
                                 _c = ((_Graw @ _dt_flat)
                                       / _denom).numpy()
+                                # Aggregate predictive direction vs the
+                                # task proposal (supervisor sweep,
+                                # review 2026-09-23): distinguishes
+                                # "treewise normalization eats the
+                                # signal" from "the supervisor itself
+                                # produces a task-orthogonal direction".
+                                # (dirs are scaled-space gradients; the
+                                # cosine is scale-invariant.)
+                                _agg = _Graw.sum(0)
+                                _agg_cos = float(
+                                    ((_agg @ _dt_flat)
+                                     / (_agg.norm()
+                                        * _dt_flat.norm()).clamp(
+                                            min=1e-12)))
                                 proj_diag.update({
                                     "conflict_cos_mean":
                                         float(_c.mean()),
@@ -2642,6 +3021,8 @@ def main():
                                     "conflict_frac_neg_kappa":
                                         float(np.mean(
                                             _c < -args.rpbe_kappa)),
+                                    "conflict_agg_cos":
+                                        _agg_cos,
                                 })
                             cert_fail = bool(
                                 proj_diag.get("cert_fail"))

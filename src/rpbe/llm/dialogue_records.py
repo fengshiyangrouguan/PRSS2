@@ -221,7 +221,8 @@ class DialogueCutBuilder:
               phi_1: torch.Tensor, phi_2: torch.Tensor,
               stats: Optional[dict] = None,
               v: Optional[int] = None,
-              skip_context_obs: bool = True) -> List[CutRecord]:
+              skip_context_obs: bool = True,
+              single: bool = False) -> List[CutRecord]:
         """One cut -> two horizon rows sharing the cut_id.
 
         Review ruling (2026-09-21): cuts are t = 1..L with
@@ -230,6 +231,11 @@ class DialogueCutBuilder:
         t = L (v = L - 1) has only (c, y) left in its future and emits
         the single legal observation with full weight 1.0 — no fabricated
         second future.
+
+        ``single=True`` (supervisor sweep, review 2026-09-23): EVERY cut
+        emits exactly one (chi_1, phi_1) row at weight 1.0 — the
+        root-only supervision variant where every t supervises the final
+        target y with the remaining suffix as the context.
 
         ``z_v`` keeps its graph (pass 2 replays the exact gradient);
         ``chi_1/2`` are constants (the UtteranceEmbed path is no_grad).
@@ -253,7 +259,12 @@ class DialogueCutBuilder:
         # the context turn is not compressed and predicting it serves the
         # final target in no causal way).  Skip obs1 there and give the
         # single obs2 row the full cut weight 1.0.
-        horizons = (2,) if (v == L - 1 and skip_context_obs) else (1, 2)
+        if single:
+            horizons = (1,)
+        elif v == L - 1 and skip_context_obs:
+            horizons = (2,)
+        else:
+            horizons = (1, 2)
         for horizon in horizons:
             chi = chi_1 if horizon == 1 else chi_2
             phi = phi_1 if horizon == 1 else phi_2

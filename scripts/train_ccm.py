@@ -1201,7 +1201,7 @@ def proposal_norm(optimizer, params, step_count, lr_override=None):
 
 def treewise_feasibility_projection(g_task_repr, repr_params, G, kappa,
                                     iters=400, cert_tol=1e-6, min_norm=1e-9,
-                                    b_norm=None):
+                                    b_norm=None, device=None):
     """Tree-wise RPBE Feasibility Projection — TGN final-spec alignment
     (2026-09-15, ported from tgb_link_loop._cstr_group_close_treewise,
     the b523cf3 lineage; the Cimmino refinement there is kappa=0-only and
@@ -1299,6 +1299,15 @@ def treewise_feasibility_projection(g_task_repr, repr_params, G, kappa,
     diag["b_norm"] = nb
     k_eff = kappa * (nb / max(nt, 1e-30))
     _CH = 64
+    # GPU offload (2026-09-23): the two-level block Gram is the per-
+    # window CPU bottleneck (~4-6 min).  With device set, each block is
+    # uploaded (64 x 5.9M x 4B ~ 1.5GB per transfer, ~10s total over
+    # PCIe for all 100 pairs) and the matmuls run on the GPU in
+    # milliseconds; the n x n results come back to the CPU (FISTA stays
+    # CPU, 600x600 is small).  None keeps the pure-CPU path (tests,
+    # gamma line).
+    _dev = device
+    _t_q = t.to(_dev) if _dev is not None else t
 
     def _blocks():
         for _c0 in range(0, n_rows, _CH):
@@ -1326,9 +1335,10 @@ def treewise_feasibility_projection(g_task_repr, repr_params, G, kappa,
         _Gc = torch.stack(_blk).float()
         _ngc = _Gc.norm(dim=1).clamp(min=min_norm)
         _Hc = _Gc / _ngc[:, None]
-        cos_parts.append(_Hc @ t)
+        cos_parts.append((_Hc.to(_dev) if _dev is not None else _Hc)
+                         @ _t_q)
         del _Gc, _Hc
-    cos = torch.cat(cos_parts) / nt
+    cos = torch.cat([_p.cpu() for _p in cos_parts]) / nt
     cos_valid = cos[valid]
     cos_np = cos_valid.detach().cpu().numpy()
     diag["proj_n_valid"] = n_valid
@@ -1367,9 +1377,11 @@ def treewise_feasibility_projection(g_task_repr, repr_params, G, kappa,
         if not bool(_m.any()):
             return None, None
         _Hv = _Gc[_m] / _ngc[_m, None]
+        if _dev is not None:
+            _Hv = _Hv.to(_dev)
         _pos = [_pos_of[_c0 + _k] for _k in range(len(_m))
                 if bool(_m[_k])]
-        return _Hv, torch.tensor(_pos)
+        return _Hv, _pos
 
     K = torch.zeros(n_valid, n_valid)
     c_vec = -kappa * nb * torch.ones(n_valid)
@@ -1377,12 +1389,14 @@ def treewise_feasibility_projection(g_task_repr, repr_params, G, kappa,
         _H0, _p0 = _blk_H(_c0)
         if _H0 is None:
             continue
-        c_vec[_p0] -= _H0 @ t
+        c_vec[_p0] -= (_H0 @ _t_q).cpu()
         for _c1 in _blk_list:
             _H1, _p1 = _blk_H(_c1)
             if _H1 is None:
                 continue
-            K[_p0.unsqueeze(1), _p1.unsqueeze(0)] += _H0 @ _H1.t()
+            _k_sub = (_H0 @ _H1.t()).cpu()
+            K[torch.tensor(_p0).unsqueeze(1),
+              torch.tensor(_p1).unsqueeze(0)] += _k_sub
         del _H0
     mu = _fista_nonneg(K, c_vec, iters)
     # ---- corr = H^T mu (streaming) -----------------------------------
@@ -1397,7 +1411,11 @@ def treewise_feasibility_projection(g_task_repr, repr_params, G, kappa,
         _Hv = _Gc[_m] / _ngc[_m, None]
         _pos = [_pos_of[_c0 + _k] for _k in range(len(_m))
                 if bool(_m[_k])]
-        corr += _Hv.t() @ mu[_pos]
+        if _dev is not None:
+            corr += (_Hv.to(_dev).t()
+                     @ mu[_pos].to(_dev)).cpu()
+        else:
+            corr += _Hv.t() @ mu[_pos]
         del _Gc, _Hv
     d = t + corr
     # ---- full certificate (streaming H @ d) --------------------------
@@ -1406,7 +1424,10 @@ def treewise_feasibility_projection(g_task_repr, repr_params, G, kappa,
         _Gc = torch.stack(_blk).float()
         _ngc = _Gc.norm(dim=1).clamp(min=min_norm)
         _Hc = _Gc / _ngc[:, None]
-        viol_parts.append(_Hc @ d)
+        if _dev is not None:
+            viol_parts.append((_Hc.to(_dev) @ d.to(_dev)).cpu())
+        else:
+            viol_parts.append(_Hc @ d)
         del _Gc, _Hc
     viol = ((-kappa * nb - torch.cat(viol_parts)[valid])
             / (nt + 1e-30))
@@ -3712,7 +3733,8 @@ def main():
                                     args.rpbe_kappa,
                                     iters=args.proj_iters,
                                     cert_tol=1e-4,
-                                    b_norm=d_task_norm)
+                                    b_norm=d_task_norm,
+                                    device=device)
                             proj_diag["space"] = "proposal"
                             proj_diag["d_task_norm"] = d_task_norm
                             # Proposal-space conflict statistics (short

@@ -430,6 +430,25 @@ class LLMClient:
                 timeout=timeout,
                 default_headers=_extra_headers,
             )
+
+        # Optional raw-wire capture (meta_n/utils/wire_capture.py). Off unless
+        # META_N_WIRE_CAPTURE names a path, so a normal request is untouched.
+        # A failure here is LOGGED rather than swallowed: this is the instrument
+        # that tells a truncated answer apart from a tool call, so silently not
+        # installing it would recreate exactly the "we cannot see the response"
+        # problem it exists to fix.
+        self.wire_capture = None
+        _wire_path = os.environ.get("META_N_WIRE_CAPTURE", "").strip()
+        if _wire_path and self._client is not None:
+            try:
+                from meta_n.utils.wire_capture import install
+                self.wire_capture = install(self._client, _wire_path)
+                logger.info("wire capture enabled -> %s", _wire_path)
+            except Exception as e:                            # noqa: BLE001
+                logger.warning(
+                    "META_N_WIRE_CAPTURE=%s was requested but wire capture "
+                    "could NOT be installed (%r); raw request/response will not "
+                    "be recorded", _wire_path, e)
         # OpenRouter provider routing (extra_body passed to every request).
         # Azure ignores ``extra_body``; leaving it None there is correct.
         self._extra_body: dict | None = None
@@ -740,6 +759,29 @@ class LLMClient:
                         )
                     return "", pt, ct, tt
                 text = response.choices[0].message.content or ""
+                # A structured tool call carries its payload in message.tool_calls,
+                # NOT in content. Reading only `content` reduced such a response
+                # to a bare empty string, indistinguishable from a genuinely
+                # empty completion -- so the failure could not be classified and
+                # the tool name/arguments were lost. Capture the shape here.
+                _msg = response.choices[0].message
+                _tool_calls = list(getattr(_msg, "tool_calls", None) or [])
+                # Keep the WHOLE payload (id / name / arguments), not just the
+                # names: when an unexpected tool call is the failure, the
+                # arguments are the only evidence of what the model thought it
+                # was doing, and they were being thrown away entirely.
+                _tool_calls_payload = []
+                for _tc in _tool_calls:
+                    _fn = getattr(_tc, "function", None)
+                    _tool_calls_payload.append({
+                        "id": getattr(_tc, "id", None),
+                        "type": getattr(_tc, "type", None),
+                        "name": (getattr(_fn, "name", None)
+                                 if _fn is not None else None),
+                        "arguments": (getattr(_fn, "arguments", None)
+                                      if _fn is not None else None),
+                    })
+                _refusal = getattr(_msg, "refusal", None)
                 if not text.strip():
                     async with self._usage_lock:
                         self.cumulative_usage["empty_responses"] += 1
@@ -820,6 +862,12 @@ class LLMClient:
                         "prompt_tokens": pt,
                         "completion_tokens": ct,
                         "total_tokens": tt,
+                        # Structured-output shape. Zero tool calls on the normal
+                        # path; non-zero means the provider returned a tool call
+                        # and `text` is NOT the answer, whatever it contains.
+                        "tool_call_count": len(_tool_calls),
+                        "tool_calls": _tool_calls_payload,
+                        "refusal": _refusal,
                     })
                 if self.io_logger is not None and not _suppress_io_log:
                     # finish_reason and attempts are recorded on EVERY call, not
@@ -834,7 +882,10 @@ class LLMClient:
                         total_tokens=tt,
                         extra={"cached_tokens": cached, "cost_usd": cost,
                                "finish_reason": finish_reason,
-                               "attempts": attempt + 1},
+                               "attempts": attempt + 1,
+                               "tool_call_count": len(_tool_calls),
+                               "tool_calls": _tool_calls_payload,
+                               "refusal": _refusal},
                     )
                 return text, pt, ct, tt
             except (NotFoundError, APIConnectionError, APITimeoutError,

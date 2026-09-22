@@ -212,7 +212,11 @@ class Layer1Solver:
             script = self._extract_bash_script(response)
 
         ok, reason = validate_solver_output(
-            script, lang, meta.get("finish_reason"))
+            script, lang,
+            meta.get("finish_reason"),
+            meta.get("tool_calls"),
+            meta.get("refusal"),
+        )
 
         if not script.strip():
             logger.warning(
@@ -251,6 +255,11 @@ class Layer1Solver:
                 "completion_tokens": meta.get("completion_tokens"),
                 "reasoning_tokens": meta.get("reasoning_tokens"),
                 "reasoning_reported": meta.get("reasoning_reported"),
+                # Structured-output shape: non-empty means the provider
+                # returned a tool call and `script` is not the answer.
+                "tool_call_count": meta.get("tool_call_count"),
+                "tool_calls": meta.get("tool_calls"),
+                "refusal": meta.get("refusal"),
                 "total_tokens": tokens,
                 "response_len": len(response),
                 "script_len": len(script),

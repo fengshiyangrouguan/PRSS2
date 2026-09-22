@@ -172,7 +172,7 @@ def assert_launch_env(args, profile: SRIProfile) -> Dict[str, Any]:
             "    export CODEBERT_PATH=/root/autodl-tmp/models/codebert-base\n"
             "For the relay, additionally: RELAY_BASE_URL, and\n"
             "    export META_N_EXTRA_HEADERS_JSON="
-            "'{\"Accept-Encoding\": \"identity\"}'".format(
+            "'{{\"Accept-Encoding\": \"identity\"}}'".format(
                 bk.ALLOW_PAID_ENV, bk.ALLOW_PAID_TOKEN))
     ep = launch_endpoint()
     if not ep["base_url"] or not ep["api_key"]:

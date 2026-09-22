@@ -260,7 +260,13 @@ def _fabricate_seed(out: Path, seed: int, *, max_depth: int = None) -> dict:
             1 if arm == "official" else 9)
         acfg["sri"] = {"run_id": R.run_id_for(PROFILE, "gpt-5.5", seed),
                        "arm": arm, "search_seed": seed,
-                       "reduction_mode": arm,
+                       # The MODE the arm runs, not the arm's name: the
+                       # baseline slot runs `official_trace_k4` (see
+                       # ARM_REDUCTION_MODE). Hard-coding `arm` here is what let
+                       # this fixture keep passing after the baseline was
+                       # renamed, while every real run was rejected by the
+                       # freeze stage's treatment cross-check.
+                       "reduction_mode": R.ARM_REDUCTION_MODE[arm],
                        "gamma_checkpoint_sha256":
                            ("G" * 64 if arm == "predictive" else None)}
         (ad / "config.json").write_text(json.dumps(acfg, indent=2,
@@ -275,8 +281,9 @@ def _fabricate_seed(out: Path, seed: int, *, max_depth: int = None) -> dict:
                     "root_bundle_sha256": rb, "backbone": "gpt-5.5",
                     "search_seed": seed, "evaluator_mode": "mock",
                     "inherited_root_sha256": inherited},
-            treatment=({"reduction_mode": arm} if arm == "official" else
-                       {"reduction_mode": arm,
+            treatment=({"reduction_mode": R.ARM_REDUCTION_MODE[arm]} if
+                       arm == "official" else
+                       {"reduction_mode": R.ARM_REDUCTION_MODE[arm],
                         "gamma_checkpoint_sha256": "G" * 64}))
         man.write(ad / "manifest.json")
 
@@ -765,7 +772,12 @@ def test_every_command_carries_its_own_reduction_mode():
         for name, cmd in cmds.items():
             assert cmd.count("--reduction-mode") == 1, (name, cmd)
             got = cmd[cmd.index("--reduction-mode") + 1]
-            want = "official" if name in ("root", "official") else "predictive"
+            # The ROOT runs the native rule; each ARM runs the mode its
+            # treatment names (the baseline slot is `official_trace_k4`, not
+            # `official`). Read from ARM_REDUCTION_MODE so a future rename
+            # cannot leave this assertion checking a stale literal.
+            want = ("official" if name == "root"
+                    else R.ARM_REDUCTION_MODE[name])
             assert got == want, (name, got, want)
         # the root is the treatment-free shared generation, said explicitly
         assert cmds["root"][cmds["root"].index("--exp-name") + 1] == "phaseH_root"
@@ -869,9 +881,45 @@ def test_arm_commands_carry_the_full_required_flag_set():
                 if want is not None:
                     assert cmd[cmd.index(flag) + 1] == want, (arm, flag, want)
             assert cmd[cmd.index("--exp-name") + 1] == arm
-            assert cmd[cmd.index("--reduction-mode") + 1] == arm
+            assert cmd[cmd.index("--reduction-mode") + 1] == \
+                R.ARM_REDUCTION_MODE[arm]
             # the key is NEVER on the command line
             assert "--api-key" not in cmd, cmd
+
+
+def test_24_arm_refuses_a_gamma_that_no_longer_matches_the_fork(tmp_path=None):
+    """The Gamma gate runs BEFORE the paid subprocess, and its 'planned' identity
+    comes from the FORK stage -- not from re-hashing the file at arm start.
+
+    Regression for the first version of this guard, which re-hashed: after a
+    substitution the manifest, config.json and the on-disk file all agreed with
+    each other, so the three-way comparison passed while comparing three copies
+    of the same swap -- and it only ran once the arm had finished, i.e. after the
+    budget was already spent.
+
+    The fork here froze "A"*64; the file on disk hashes to something else. The
+    arm must refuse before doing any work.
+    """
+    with tempfile.TemporaryDirectory() as td:
+        out = Path(td)
+        R.record_stage(out, "root", inputs={},
+                       outputs={"root_bundle_sha256": "r" * 64,
+                                "root_dir": str(out / "root")})
+        R.record_stage(out, "fork", inputs={"root_bundle_sha256": "r" * 64},
+                       outputs={"arms": {}, "rule5_byte_identical": True,
+                                "gamma_checkpoint_sha256": "A" * 64})
+        gamma = out / "gamma.pt"
+        gamma.write_bytes(b"a DIFFERENT checkpoint")
+
+        args = _args(out)
+        try:
+            R.stage_arm(args, PROFILE, out, "predictive",
+                        gamma_checkpoint=str(gamma))
+        except R.StageError as e:
+            assert "replaced between planning" in str(e), str(e)
+        else:
+            raise AssertionError(
+                "a Gamma that no longer matches the fork was accepted")
 
 
 def _main() -> int:

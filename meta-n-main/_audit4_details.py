@@ -59,6 +59,54 @@ for a in ARCH:
 
 print()
 print("=" * 78)
+print("0b. HOST POLICY of each archive vs the formal profile")
+print("=" * 78)
+# The formal profile pins all five of these to true. They do NOT affect the
+# Phase-C A/B FAIRNESS -- both arms run the identical host -- but they decide
+# how to STATE what Gamma learned: if Phase-A used this same policy, the claim
+# is "offline predictive retention under the host policy"; if it did not, the
+# honest phrasing is "frozen predictive retention deployed across
+# search-policies". Neither needs a retrain; the difference is in the write-up.
+POLICY = ["consolidate", "regression_guard", "within_task_recursion",
+          "focus_current_headroom", "symmetric_trace_sampling"]
+PROFILE_POLICY = {k: True for k in POLICY}     # meta_n/configs/sri_primary6.yaml
+print("  formal sri_primary6 pins: %s"
+      % ", ".join("%s=%s" % (k, PROFILE_POLICY[k]) for k in POLICY))
+print()
+print("  %-30s %s" % ("run", "  ".join(k[:12] for k in POLICY)))
+mismatch = []
+for a in ARCH:
+    cfgp = os.path.join(a, "config.json")
+    vals = {}
+    if os.path.isfile(cfgp):
+        try:
+            c = json.load(open(cfgp, encoding="utf-8"))
+            vals = {k: c.get(k, "(absent)") for k in POLICY}
+        except Exception:                                     # noqa: BLE001
+            pass
+    for k in POLICY:
+        if vals.get(k, "(absent)") != PROFILE_POLICY[k]:
+            mismatch.append((os.path.basename(a)[:30], k, vals.get(k)))
+    print("  %-30s %s"
+          % (os.path.basename(a)[:30],
+             "  ".join("%-12s" % str(vals.get(k, "(absent)"))[:12]
+                       for k in POLICY)))
+print()
+if mismatch:
+    print("  MISMATCH vs the formal profile (%d):" % len(mismatch))
+    for rid, k, v in mismatch:
+        print("    %-30s %-26s archive=%r profile=%r"
+              % (rid, k, v, PROFILE_POLICY[k]))
+    print("  -> note it in the write-up; it does NOT invalidate the pair and")
+    print("     does NOT by itself justify a retrain.")
+else:
+    print("  RESULT: all five match the formal profile in every archive, so the")
+    print("          Gamma was trained under the same host policy it is deployed")
+    print("          into. Report as 'offline predictive retention under the")
+    print("          host policy'.")
+
+print()
+print("=" * 78)
 print("1. cut_items() failure in the FIRST draft (kept visible)")
 print("=" * 78)
 a0 = ARCH[0]

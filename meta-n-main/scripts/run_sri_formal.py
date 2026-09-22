@@ -609,6 +609,18 @@ def stage_root(args, profile: SRIProfile, out: Path) -> dict:
                                  "inherited_root_sha256": inherited,
                                  "environment_sha256": sha256_of(
                                      bundle["environment_fingerprint"]),
+                                 # The encoder identity the predictive arm's
+                                 # Gamma was trained against. Nothing ever
+                                 # verified it: preflight only checks that
+                                 # CODEBERT_PATH exists, and the Gamma carries
+                                 # no encoder field. Hashing a several-hundred-MB
+                                 # snapshot would be overkill, so RECORD the path
+                                 # and the pinned revision instead -- enough to
+                                 # see, in the artifacts, whether a later run used
+                                 # a different snapshot.
+                                 "codebert_path": os.environ.get(
+                                     "CODEBERT_PATH", "").strip() or None,
+                                 "encoder_revision": encoder_revision(),
                                  "root_config_sha256": sha256_file(
                                      exp / "config.json")},
                         extra={"root_bundle": bundle})
@@ -683,9 +695,19 @@ def stage_fork(args, profile: SRIProfile, out: Path, *,
 
 
 def build_arm_manifest(args, profile: SRIProfile, out: Path, arm: str, *,
-                       gamma_checkpoint: str | None) -> RunManifest:
+                       gamma_checkpoint: str | None,
+                       gamma_sha: Optional[str] = None) -> RunManifest:
     """The immutable per-arm manifest; the ONLY fields allowed to differ are the
-    treatment ones."""
+    treatment ones.
+
+    ``gamma_sha`` is the identity the FORK stage froze. Pass it and the manifest
+    BINDS that value instead of re-hashing the file: re-hashing here would make
+    the manifest agree with whatever file happens to be on disk at arm start, so
+    a Gamma swapped between fork and arm start would be recorded as if it were
+    the planned one -- the guard would compare three copies of the substitution
+    against each other and pass. Only when no fork identity exists (a direct
+    caller) is the file hashed.
+    """
     root = read_stage_manifest(out)["root"]
     slugs, _name_of = cohort_ids(profile)
     pinned = pinned_for(args, profile)
@@ -709,7 +731,7 @@ def build_arm_manifest(args, profile: SRIProfile, out: Path, arm: str, *,
     }
     treatment = {"reduction_mode": ARM_REDUCTION_MODE[arm]}
     if arm == "predictive":
-        treatment["gamma_checkpoint_sha256"] = (
+        treatment["gamma_checkpoint_sha256"] = gamma_sha or (
             sha256_file(gamma_checkpoint)
             if gamma_checkpoint and Path(gamma_checkpoint).is_file() else None)
     return RunManifest(arm=arm, profile=profile.identity(),
@@ -751,6 +773,13 @@ def write_sri_context(args, profile: SRIProfile, out: Path, arm: str,
         "data_dir": str(args.data_dir),
         "environment_sha256": man.get("root", {}).get("outputs", {}).get(
             "environment_sha256"),
+        # Encoder identity (see the root stage). Identical in both arms, so it
+        # never shows up in the arm-vs-arm config diff -- it is here so the
+        # artifacts answer "which CodeBERT snapshot did this run use?".
+        "codebert_path": man.get("root", {}).get("outputs", {}).get(
+            "codebert_path"),
+        "encoder_revision": man.get("root", {}).get("outputs", {}).get(
+            "encoder_revision"),
     }
     ctx["sri_context_sha256"] = sha256_of(
         {k: v for k, v in ctx.items() if k not in ("ledger_path",)})
@@ -784,21 +813,45 @@ def assert_root_inherited(arm_path: Path, want: Optional[str],
     return got
 
 
+def encoder_revision() -> Optional[str]:
+    """The pinned CodeBERT revision, recorded for provenance.
+
+    Imported lazily and tolerantly: this is bookkeeping, and the formal runner
+    must not fail to PLAN because a provenance constant moved.
+    """
+    try:
+        from meta_n.rpbe import config as _C
+        return str(getattr(_C, "ENCODER_REVISION", "")) or None
+    except Exception:                                             # noqa: BLE001
+        return None
+
+
 def assert_gamma_identity(planned: Optional[str], ran: Optional[str],
                           gamma_path: Optional[str]) -> str:
-    """§4b: the arm's Gamma must be the same FILE the plan bound.
+    """§4b: the Gamma an arm runs must be the same FILE the FORK stage bound.
 
-    `load_gamma_checkpoint` cannot enforce this. It verifies shape, parameter
-    count, geometry and an internal checksum -- and the RETIRED Gamma
+    `planned` MUST be the sha the fork stage froze -- not a hash recomputed at
+    arm start. Recomputing makes the check vacuous: a Gamma swapped between fork
+    and arm start would then be hashed fresh, agreed with by the manifest, by
+    config.json and by the current file, and the comparison would pass while
+    three copies of the substitution were compared against each other.
+
+    `load_gamma_checkpoint` cannot enforce this either. It verifies shape,
+    parameter count, geometry and an internal checksum -- and the RETIRED Gamma
     (_gamma_multitask_gemini31pro_phaseb.pt, trained on records built by the
     superseded traces+codes contract) shares its geometry with the CLEAN
     trace-only one, so a stale checkpoint loads without complaint and the run
     silently scores the wrong model. The file sha256 is the only sound identity.
 
     Three-way comparison, because each mismatch means something different:
-      plan vs arm   -> the recorded treatment is not the executed one
-      file missing  -> the identity cannot be checked at all
-      file vs arm   -> the checkpoint was swapped between planning and executing
+      planned vs ran   -> the recorded treatment is not the executed one
+      file missing     -> the identity cannot be checked at all
+      file vs ran      -> the checkpoint was replaced between fork and now
+
+    Called BOTH before the paid subprocess (with ran=planned, i.e. "does the
+    file still match what the plan froze?") and after it (with the arm's own
+    recorded sha), so a substitution is refused before any money is spent and a
+    mid-run swap is still caught.
 
     Returns the verified sha.
     """
@@ -842,11 +895,20 @@ def stage_arm(args, profile: SRIProfile, out: Path, arm: str, *,
 
     fork = require_stage(out, "fork",
                          inputs={"root_bundle_sha256": root_sha})
+    # The identity the FORK stage froze. This -- not a fresh hash -- is the
+    # "planned" Gamma. Everything downstream binds to it.
+    fork_gamma_sha = (fork.get("outputs") or {}).get("gamma_checkpoint_sha256")
+    if arm == "predictive":
+        # BEFORE the paid subprocess. The old ordering verified Gamma identity
+        # only after the arm had finished, so a swapped checkpoint still cost a
+        # full run before anything complained. Refuse first, spend second.
+        assert_gamma_identity(fork_gamma_sha, fork_gamma_sha, gamma_checkpoint)
     # the endpoint is treatment-EXTERNAL: both arms must use the same one, and it
     # is recorded in the manifest (the key itself never is)
     assert_launch_env(args, profile)
     man = build_arm_manifest(args, profile, out, arm,
-                             gamma_checkpoint=gamma_checkpoint)
+                             gamma_checkpoint=gamma_checkpoint,
+                             gamma_sha=fork_gamma_sha)
     old = arm_dir(out, arm) / "manifest.json"
     if old.is_file():
         assert_no_protocol_drift(RunManifest.read(old), man)
@@ -902,17 +964,19 @@ def stage_arm(args, profile: SRIProfile, out: Path, arm: str, *,
         raise StageError(
             "arm predictive recorded no gamma_checkpoint_sha256 in config.json")
 
-    # §4b (frozen 2026-09-23): the Gamma the arm ran must be the SAME FILE the
-    # plan bound. `load_gamma_checkpoint` CANNOT catch a substitution here: the
-    # retired Gamma (_gamma_multitask_gemini31pro_phaseb.pt) and the clean
-    # trace-only one live in the same geometry, so a stale checkpoint passes
-    # every shape / param-count / geometry / checksum check and the run quietly
-    # scores the wrong model. The file sha256 is the only sound identity.
+    # §4b (frozen 2026-09-23): the arm's Gamma must be the same FILE the FORK
+    # bound. `load_gamma_checkpoint` CANNOT enforce this: shape, parameter
+    # count, geometry and its internal checksum all pass for a DIFFERENT
+    # checkpoint in the same geometry -- which is exactly the case here, since
+    # the retired Gamma and the clean trace-only one are geometrically
+    # identical. The FILE sha256 is the only sound identity. The pre-subprocess
+    # gate above already refused a mismatched file; this closes the chain by
+    # confirming what the ARM ITSELF recorded, so a swap DURING the run is
+    # caught too.
     if arm == "predictive":
-        assert_gamma_identity(
-            (man.treatment or {}).get("gamma_checkpoint_sha256"),
-            sri.get("gamma_checkpoint_sha256"),
-            gamma_checkpoint)
+        assert_gamma_identity(fork_gamma_sha,
+                              sri.get("gamma_checkpoint_sha256"),
+                              gamma_checkpoint)
 
     # §4: the arm must have INHERITED the shared root, not regenerated one.
     assert_root_inherited(arm_dir(out, arm),
@@ -1673,7 +1737,20 @@ def stage_aggregate(args, profile: SRIProfile, out: Path) -> dict:
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--profile", default="sri_primary6")
-    ap.add_argument("--backbone", default="gpt-5.5")
+    # REQUIRED, with no default, on purpose. This used to default to "gpt-5.5",
+    # which made the single worst failure mode silent: the clean Gamma's Phase-A
+    # archives were generated by gemini-3.1-pro, so omitting --backbone would
+    # start a perfectly healthy-looking run of GPT-5.5 + a Gemini-trained Gamma
+    # and spend the full budget before anything could notice. It is a
+    # treatment-defining choice, so it must be stated. (The checkpoint carries no
+    # backbone field, so this cannot be machine-checked against the Gamma's
+    # training host -- it is an operator contract, enforced at the CLI.)
+    ap.add_argument("--backbone", required=True,
+                    help="the model BOTH arms run, e.g. gemini-3.1-pro. There "
+                         "is no default: a cross-backbone pair is still fair to "
+                         "each other but is a different experiment from the one "
+                         "the Gamma was trained for, and must be a deliberate "
+                         "choice.")
     ap.add_argument("--search-seed", type=int, default=0)
     ap.add_argument("--out", required=True)
     ap.add_argument("--stage", default="all", choices=("all",) + STAGES)

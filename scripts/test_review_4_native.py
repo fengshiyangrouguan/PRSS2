@@ -33,6 +33,7 @@ Usage (server, qwen3 environment):
       --gpu 0
 """
 import argparse
+import re
 import sys
 import types
 from pathlib import Path
@@ -129,16 +130,28 @@ def main():
     bad = [n for n, _p in trainable
            if "lora_" not in n and "comp_embeddings" not in n]
     assert not bad, "non-native trainable params: {}".format(bad[:5])
-    assert n_frozen > 0, "freeze-base froze nothing"
+    # peft's get_peft_model already froze the base (mark_only_lora_as_
+    # trainable), so the explicit freeze-base loop may freeze ZERO extra
+    # params — assert the resulting STATE (every non-native param is
+    # frozen), not the loop count.
+    frozen_ok = all(
+        not p.requires_grad
+        for n, p in model.named_parameters()
+        if "lora_" not in n and "comp_embeddings" not in n)
+    assert frozen_ok, "some non-native param stayed trainable"
     n_layers = model.model.config.num_hidden_layers
     n_exp = n_layers * 4 * 2 + 1   # q/k/v/o x {lora_A, lora_B} + comp rows
     assert len(trainable) == n_exp, (
         len(trainable), "expected {} layers x 4 proj x {{A,B}} + 1 comp "
         "row tensor = {}".format(n_layers, n_exp))
-    print("Part A PASS: {} frozen backbone params; {} trainable = "
-          "conditional LoRA ({} layers x 4 proj x {{A,B}}) + COMP/SUM "
-          "rows, no Gamma attached".format(n_frozen, len(trainable),
-                                           n_layers), flush=True)
+    print("Part A PASS: trainable = conditional LoRA ({} layers x 4 proj "
+          "x {{A,B}}) + COMP/SUM rows ({} tensors), every non-native "
+          "param frozen ({} frozen by peft, {} by the explicit loop), "
+          "no Gamma attached".format(n_layers, len(trainable),
+                                     len([1 for _n, p in
+                                          model.named_parameters()
+                                          if not p.requires_grad]),
+                                     n_frozen), flush=True)
 
     batch = get_batch(dialog, collator, device)
 
@@ -150,6 +163,8 @@ def main():
     (task_sum / max(n_valid, 1)).backward()
     lora_b_nz = lora_a_nz = comp_nz = 0
     frozen_with_grad = []
+    lora_b_zero = []
+    n_layers = model.model.config.num_hidden_layers
     for n, p in model.named_parameters():
         if not p.requires_grad:
             if p.grad is not None:
@@ -157,22 +172,39 @@ def main():
             continue
         g = p.grad
         assert g is not None, "trainable {} has no grad".format(n)
-        if "lora_B" in n and float(g.abs().sum()) > 0.0:
-            lora_b_nz += 1
-        if "comp_embeddings" in n and float(g.abs().sum()) > 0.0:
+        s = float(g.abs().sum())
+        if "lora_B" in n:
+            (lora_b_nz := lora_b_nz + 1) if s > 0.0 else \
+                lora_b_zero.append(n)
+        if "comp_embeddings" in n and s > 0.0:
             comp_nz += 1
     assert not frozen_with_grad, \
         "frozen params received gradients: {}".format(frozen_with_grad[:5])
-    assert lora_b_nz == n_layers * 4, (
-        lora_b_nz, "every layer/proj lora_B must receive task gradient")
+    # Structural zeros (conditional-LoRA design, NOT a bug): the LoRA
+    # branch activates ONLY at COMP/SUM positions, and the LAST layer's
+    # q/o output reaches only that position's own logits — COMP/SUM
+    # positions are never labels (-100 masked), so layers.35 q/o lora_B
+    # grads are EXACTLY zero.  k/v stay non-zero (attended downstream).
+    exp_zero = {(n_layers - 1, "q_proj"), (n_layers - 1, "o_proj")}
+    got_zero = set()
+    for n in lora_b_zero:
+        m = re.search(r"layers\.(\d+)\.self_attn\.(\w+_proj)", n)
+        got_zero.add((int(m.group(1)), m.group(2)))
+    assert lora_b_nz == n_layers * 4 - 2, (
+        lora_b_nz, lora_b_zero,
+        "every layer/proj lora_B except the structural zeros must "
+        "receive task gradient")
+    assert got_zero == exp_zero, (got_zero, exp_zero)
     assert comp_nz == 1, "comp rows must receive task gradient"
     print("Part B PASS: CE grads reach all {} lora_B tensors + comp "
-          "rows; {} frozen params have grad None".format(lora_b_nz,
-                                                         n_frozen),
-          flush=True)
+          "rows; structural zeros = layer {} q/o lora_B (conditional "
+          "LoRA + label mask); {} frozen params have grad None".format(
+              lora_b_nz, n_layers - 1,
+              sum(1 for _n, _p in model.named_parameters()
+                  if not _p.requires_grad)), flush=True)
 
     # ---- Part C (verification 3): z_t VJP to the conditional LoRA -----
-    meta = tc.parse_meta(batch, comp_ids, sum_ids, 0)
+    meta = tc.parse_meta(batch, comp_ids, sum_ids, 0)[0]  # per-row list
     assert meta["ok"] and meta["L"] >= 1, "sample must carry >= 1 cut"
     cfg = model.model.config
     n_heads = cfg.num_key_value_heads
@@ -190,24 +222,48 @@ def main():
     (gd * z).sum().backward()
     adapter.clear()
     lora_b_nz = lora_a_nz = comp_nz = 0
+    lora_b_zero = []
     for n, p in model.named_parameters():
-        if not p.requires_grad or p.grad is None:
+        if not p.requires_grad:
             continue
-        s = float(p.grad.detach().abs().sum())
-        if "lora_B" in n and s > 0.0:
-            lora_b_nz += 1
+        g = p.grad
+        if "lora_B" in n:
+            # NOTE: under the z_t VJP, layer 35's q/o lora_B grads are
+            # None (NO path in the graph — hidden35 feeds no downstream
+            # K/V), not zero tensors as under CE; count both as zeros.
+            if g is not None and float(g.detach().abs().sum()) > 0.0:
+                lora_b_nz += 1
+            else:
+                lora_b_zero.append(n)
+            continue
+        if g is None:
+            continue
+        s = float(g.detach().abs().sum())
         if "lora_A" in n and s > 0.0:
             lora_a_nz += 1
         if "comp_embeddings" in n and s > 0.0:
             comp_nz += 1
-    assert lora_b_nz == n_layers * 4 and comp_nz == 1, (
+    # Same structural zeros as Part B: z_t = lift(SUM K/V) flows back
+    # through the merge chain (COMP K/V <- k_proj/v_proj <- hidden
+    # chain), so every k/v lora_B plus layers 0..34 q/o (via the hidden
+    # chain feeding downstream k/v) receive gradient; layer 35's q/o
+    # output never reaches a label (COMP/SUM positions are masked).
+    exp_zero = {(n_layers - 1, "q_proj"), (n_layers - 1, "o_proj")}
+    got_zero = set()
+    for n in lora_b_zero:
+        m = re.search(r"layers\.(\d+)\.self_attn\.(\w+_proj)", n)
+        got_zero.add((int(m.group(1)), m.group(2)))
+    assert lora_b_nz == n_layers * 4 - 2 and comp_nz == 1, (
         lora_b_nz, comp_nz, "z_t must pull back to lora_B + comp rows")
+    assert got_zero == exp_zero, (got_zero, exp_zero, lora_b_zero,
+                                  lora_b_nz)
     assert lora_a_nz == 0, (
         "lora_A grads must be EXACTLY zero at theta_0: the PEFT B=0 "
         "zero branch kills the first-step A-gradient (the native "
         "counterpart of the gamma-line U/V note)")
     print("Part C PASS: z_t VJP reaches {} lora_B tensors + comp rows; "
-          "lora_A exactly zero (B=0 zero branch)".format(lora_b_nz),
+          "structural zeros = layer {} q/o lora_B; lora_A exactly zero "
+          "(B=0 zero branch)".format(lora_b_nz, n_layers - 1),
           flush=True)
 
     # ---- Part D (verification 4, unit): theta_0 reproducibility -------

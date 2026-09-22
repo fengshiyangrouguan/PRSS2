@@ -47,6 +47,18 @@ from meta_n.core.spine_routing import uses_external_spine
 from meta_n.core.verified_code import StubHeldoutVerifier
 
 logger = logging.getLogger(__name__)
+
+
+#: Domain separator for the CONTEXT rng's seed. Derived rather than shared so
+#: the two streams are not identical-by-construction, while both remain a
+#: deterministic function of `config.seed` (string seeding hashes the string,
+#: so this is stable across processes and Python versions).
+_CONTEXT_RNG_DOMAIN = "meta_n/context_rng/v1"
+
+
+def _context_rng_seed(seed) -> str:
+    """Seed for the context (trace-sampling) stream, derived from `seed`."""
+    return "{}:{}".format(_CONTEXT_RNG_DOMAIN, seed)
 console = Console()
 
 # Forensic improvement #3 — weight of the within-task depth*headroom selection
@@ -492,7 +504,36 @@ class EvolutionaryOrchestrator:
         # consolidate FOCUS pick (_consolidation_targets). Empty otherwise, so the
         # round-robin focus path is byte-identical when the guard is OFF.
         self._base_focus_scores: dict[str, float] = {}
+        # --- TWO INDEPENDENT RNG STREAMS (frozen 2026-09-23) ---------------
+        # `self.rng` drives the OUTER SEARCH: parent selection
+        # (Archive.select_parents -> rng.choices, archive.py:544), the gate
+        # task sample, and anything else the search itself decides.
+        #
+        # `self.context_rng` drives ONLY the trace sampler Omega's context
+        # reduction uses (ContextManager.sample_traces -> rng.sample).
+        #
+        # They were ONE object. That silently coupled the treatment to the
+        # search: the official arm's sampler consumes the stream while the
+        # predictive arm's Gamma selector consumes nothing, so from the second
+        # iteration onward the two arms drew DIFFERENT parents -- `select_parents`
+        # is called every iteration (line ~1064) on the same object the sampler
+        # had just advanced. Same `search_seed` in both arms did not help: the
+        # streams had already diverged. The measured difference between arms
+        # would then have mixed "which four traces" with "different outer
+        # random draws", which is exactly the confound the whole comparison
+        # exists to avoid.
+        #
+        # Both streams are seeded from `config.seed`, so a run stays fully
+        # reproducible and `--seed=N` still pins everything; they simply cannot
+        # advance each other. The context stream's seed is DERIVED (not equal)
+        # so the two streams are not identical-by-construction.
+        #
+        # NOTE: splitting changes which traces a given seed samples compared
+        # with runs made before this change. That is a determinism identity
+        # change, not a rule change -- the sampler's rule is untouched -- and
+        # it applies equally to every arm.
         self.rng = random.Random(config.seed)
+        self.context_rng = random.Random(_context_rng_seed(config.seed))
         # SRI formal instrumentation. DISABLED by default (a plain attribute, not
         # a config field, so a non-formal run is byte-identical): every hook is a
         # no-op until the formal runner assigns a real SRIHooks object.
@@ -543,13 +584,14 @@ class EvolutionaryOrchestrator:
         # is read off the executor above, so it is available here.
         if self._uses_external_spine():
             self._init_external_agent_spine()
-        # Thread our seeded RNG into Omega's trace sampler so `--seed=N`
-        # produces identical Omega prompts across runs (and survives
-        # --resume via the checkpointed RNG state — `random.Random.setstate`
-        # mutates this same object, so the ContextManager's reference stays
-        # in sync). Without this, ContextManager fell back to the
-        # module-level `random` which is unseeded.
-        self.omega.context_manager.rng = self.rng
+        # Thread the CONTEXT rng (not the outer-search one) into Omega's trace
+        # sampler so `--seed=N` produces identical Omega prompts across runs
+        # (and survives --resume via the checkpointed RNG state --
+        # `random.Random.setstate` mutates this same object, so the
+        # ContextManager's reference stays in sync). Without this, ContextManager
+        # fell back to the module-level `random`, which is unseeded. See the
+        # two-stream note above for why this must NOT be `self.rng`.
+        self.omega.context_manager.rng = self.context_rng
 
         if not config.temperatures:
             raise ValueError("temperatures list must not be empty")

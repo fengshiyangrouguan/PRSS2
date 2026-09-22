@@ -724,3 +724,66 @@ def main() -> int:
 
 if __name__ == "__main__":
     sys.exit(main())
+
+
+# --------------------------------------------------------------------------- #
+# §4b — the arm's Gamma must be the same FILE the plan bound
+# --------------------------------------------------------------------------- #
+
+def _gamma_file(tmp_path, payload=b"clean-traceonly-gamma"):
+    p = tmp_path / "gamma.pt"
+    p.write_bytes(payload)
+    return p
+
+
+def test_22_gamma_identity_accepts_a_match_and_returns_the_sha(tmp_path=None):
+    """The happy path returns the sha it VERIFIED, so the caller can record it."""
+    import hashlib
+    import tempfile
+
+    from scripts.run_sri_formal import assert_gamma_identity
+
+    with tempfile.TemporaryDirectory() as td:
+        p = _gamma_file(Path(td))
+        sha = hashlib.sha256(p.read_bytes()).hexdigest()
+        assert assert_gamma_identity(sha, sha, str(p)) == sha
+
+
+def test_23_gamma_identity_refuses_a_stale_or_swapped_checkpoint(tmp_path=None):
+    """The three failures mean different things, so all three must raise.
+
+    This is the case `load_gamma_checkpoint` cannot catch: the retired Gamma
+    (trained on the superseded traces+codes records) shares its geometry with
+    the clean trace-only one, so it loads without complaint. Only the FILE hash
+    distinguishes them.
+    """
+    import hashlib
+    import tempfile
+
+    import pytest
+
+    from scripts.run_sri_formal import StageError, assert_gamma_identity
+
+    with tempfile.TemporaryDirectory() as td:
+        p = _gamma_file(Path(td))
+        good = hashlib.sha256(p.read_bytes()).hexdigest()
+
+        # unpinned plan: identity was never bound
+        with pytest.raises(StageError, match="recorded no gamma_checkpoint_sha256"):
+            assert_gamma_identity(None, good, str(p))
+
+        # plan vs arm: the recorded treatment is not the executed one
+        with pytest.raises(StageError, match="identity drift"):
+            assert_gamma_identity("A" * 64, good, str(p))
+
+        # file vs arm: plan and arm AGREE, but the file on disk is not that
+        # Gamma -- the checkpoint was swapped between planning and execution
+        stale = _gamma_file(Path(td), b"retired-traces-plus-codes-gamma")
+        stale_sha = hashlib.sha256(stale.read_bytes()).hexdigest()
+        assert stale_sha != good
+        with pytest.raises(StageError, match="replaced between planning"):
+            assert_gamma_identity(good, good, str(stale))
+
+        # missing file: identity cannot be checked at all
+        with pytest.raises(StageError, match="is missing"):
+            assert_gamma_identity(good, good, str(Path(td) / "gone.pt"))

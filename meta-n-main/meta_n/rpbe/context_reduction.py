@@ -17,12 +17,15 @@ engine already calls:
     sampled    = engine.context_manager.sample_traces(traces)
     truncated  = engine.context_manager.truncate_context_stack(stack)
 
-`predictive` needs the JOINT decision (attention spans the concatenated
-item list `U_v = traces + context_stack`), but the engine hands the two halves
-in two separate calls with the stack second. The adapter therefore returns a
-list it keeps a handle on and FINALISES it in place on the stack call. A
-self-test drives both real sites to prove the finalised object is what
-`_build_prompt` receives.
+`predictive` selects the TRACES from the trace pool `U_v`; the injected-code
+stack `C_v` is BYPASSED (frozen 2026-09-22) and handed to Omega by the same
+native `truncate_context_stack` the baseline uses. So Gamma is not asked to
+compress Omega's whole context -- only to choose which runtime FEEDBACK Omega
+sees. The engine still hands the two halves in two separate calls with the
+stack second, so the adapter returns a list it keeps a handle on and FINALISES
+it in place on the stack call. A self-test drives both real sites to prove the
+finalised object is what `_build_prompt` receives, and that both comparison
+arms render the same four in the same order (see `canonical_order`).
 
 `_build_prompt` is never touched, `C_v` is never appended, and the weighted
 statistics stay in `diagnostics`.
@@ -62,6 +65,35 @@ MATCHED_K_STACK = 1
 #: consumes one of these slots, which leaves exactly one variable between the
 #: arms: WHICH four traces reach Omega.
 TRACE_K4 = 4
+
+
+def canonical_order(selected: Sequence[Any],
+                    pool: Sequence[Any]) -> List[Any]:
+    """Re-sort a selection into the POOL's own order (frozen 2026-09-23).
+
+    Both comparison arms are supposed to differ in exactly ONE thing: which
+    four traces they keep. Without this, they also differ in the ORDER they
+    render, and that is not nothing -- `_format_raw_traces` emits one block per
+    trace in list order, so two selections with identical MEMBERSHIP still
+    produce different prompt bytes. Concretely the native sampler returns
+    failures-then-successes while Gamma returns slot order, so
+    `{t2,t5,t1,t3}` vs `{t1,t3,t5,t2}` reached Omega as different prompts.
+
+    Ordering by the pool's original index removes that confound and makes the
+    stated claim literally true. It changes nothing else: not the attention,
+    not the selector, not the sampler, not k, not the token budget, and it
+    requires no retraining.
+
+    Identity-keyed on purpose: the sampler and the selector both return the
+    very objects from the pool (they subset, never copy), so `id()` is exact.
+    A fallback index is supplied for anything unexpected rather than raising,
+    because a silent reorder is not worth a crashed formal run -- but it sorts
+    last, so it cannot silently land in the middle of the pool order.
+    """
+    index = {}
+    for i, item in enumerate(pool):
+        index.setdefault(id(item), i)
+    return sorted(selected, key=lambda x: index.get(id(x), len(pool)))
 
 
 class _FinalisableList(list):
@@ -116,14 +148,19 @@ class ContextReducer:
     def _official_trace_k4(self, traces, context_stack):
         """k=4 heuristic traces + the native stack. Paired with `predictive`.
 
-        Structurally the native `_official`, with ONE difference: the trace
-        sampler is capped at TRACE_K4 instead of its own default. The stack goes
-        through the identical `truncate_context_stack` call, so the two arms see
-        the same stack and the only remaining variable is which four traces were
-        chosen. That is the comparison the whole experiment is for.
+        Structurally the native `_official`, with TWO differences:
+
+        * the trace sampler is capped at TRACE_K4 instead of its own default;
+        * the survivors are re-sorted into the pool's order (canonical_order),
+          so the arm differs from `predictive` in MEMBERSHIP only.
+
+        The stack goes through the identical `truncate_context_stack` call, so
+        the two arms see the same stack. The native rule itself is untouched --
+        it is `official` mode, and it is what the shared root runs.
         """
         sampled = self.context_manager.sample_traces(
             list(traces), max_total=TRACE_K4)
+        sampled = canonical_order(list(sampled), traces)
         stack = self.context_manager.truncate_context_stack(list(context_stack))
         return (list(sampled), list(stack),
                 dict(self._budget_diag("official_trace_k4", traces, sampled,
@@ -176,14 +213,28 @@ class ContextReducer:
             except Exception:                                 # noqa: BLE001
                 return None
         t_tok, s_tok = toks(sel, False), toks(stack, True)
-        return {"mode": mode,
-                "n_traces_in": len(traces), "n_traces_out": len(sel),
-                "n_stack_in": len(context_stack), "n_stack_out": len(stack),
-                "n_objects_out": len(sel) + len(stack),
-                "matched_context_objects": MATCHED_CONTEXT_OBJECTS,
-                "trace_tokens_out": t_tok, "stack_tokens_out": s_tok,
-                "total_tokens_out": (None if t_tok is None or s_tok is None
-                                     else t_tok + s_tok)}
+        rec = {"mode": mode,
+               "n_traces_in": len(traces), "n_traces_out": len(sel),
+               "n_stack_in": len(context_stack), "n_stack_out": len(stack),
+               "n_objects_out": len(sel) + len(stack),
+               "trace_tokens_out": t_tok, "stack_tokens_out": s_tok,
+               "total_tokens_out": (None if t_tok is None or s_tok is None
+                                    else t_tok + s_tok)}
+        # CAPACITY KEYS ARE MODE-SPECIFIC, deliberately. `matched_k4` caps the
+        # TOTAL object count at 4 (traces + stack); the trace-only modes cap
+        # only the TRACES and let the stack through untouched, so their total
+        # is `4 traces + the whole native stack` and can exceed 4. Writing
+        # `matched_context_objects: 4` for a trace-only mode would invite a
+        # downstream claim that Omega saw four objects in total, which is
+        # false for the main comparison -- so each mode declares its own cap.
+        if mode == "matched_k4":
+            rec["matched_context_objects"] = MATCHED_CONTEXT_OBJECTS
+            rec["matched_k_trace"] = MATCHED_K_TRACE
+            rec["matched_k_stack"] = MATCHED_K_STACK
+        elif mode in ("official_trace_k4", "predictive"):
+            rec["trace_cap"] = TRACE_K4
+            rec["stack_cap"] = None          # native truncation, not a k
+        return rec
 
     # -- full: nothing reduced; the model's hard limit is the only bound ---
     def _full(self, traces, context_stack):
@@ -224,6 +275,10 @@ class ContextReducer:
         # Empty stack on purpose: the selector ranks traces only.
         sel_t, _, diag = self.selector.reduce(
             trace_items, [], attention, budget)
+        # Same membership-only contract as the baseline: Gamma returns SLOT
+        # order, so re-sort both arms into the pool's order or the two prompts
+        # would differ in rendering order as well as in membership.
+        sel_t = canonical_order(list(sel_t), traces)
         # The stack, by the native rule -- byte-identical to the baseline's.
         sel_s = list(
             self.context_manager.truncate_context_stack(list(context_stack)))
@@ -469,6 +524,42 @@ def self_test() -> int:
     print("OK  official_trace_k4  {} traces + an identical stack -> the only "
           "variable is which four".format(d_k["n_traces_out"]))
 
+    # ...and "which four" must not silently include "in what order". The native
+    # sampler returns failures-then-successes and Gamma returns slot order, so
+    # with an INTERLEAVED pool the two arms would render the same trace set in
+    # different orders -- different prompt bytes from identical membership.
+    # `canonical_order` re-sorts both arms into the pool's order.
+    mixed = [Trace(task_id="m{}".format(i), script="s", stdout="o" * 100,
+                   success=(i % 2 == 0)) for i in range(6)]
+    pos = {id(t): i for i, t in enumerate(mixed)}
+
+    r_k4m = ContextReducer(ReductionMode.OFFICIAL_TRACE_K4)
+    t_k4m, _, d4m = r_k4m.reduce(mixed, [], budget=budget)
+    got_k4 = [pos[id(t)] for t in t_k4m]
+    assert len(t_k4m) == 4, d4m
+    assert got_k4 == sorted(got_k4), (
+        "official_trace_k4 must hand the traces in POOL order; got pool "
+        "positions {}".format(got_k4))
+
+    t_pm, _, _ = r_pred.reduce(mixed, [], budget=budget)
+    got_p = [pos[id(t)] for t in t_pm]
+    assert got_p == sorted(got_p), (
+        "predictive must hand the traces in POOL order; got pool positions "
+        "{}".format(got_p))
+
+    # Guard the guard: prove the raw sampler really does emit a DIFFERENT
+    # order, so the two assertions above are testing something rather than
+    # passing by luck. This is the 6-trace interleaved pool, so the native
+    # "failures then successes" output is not the pool order.
+    raw = ContextManager().sample_traces(list(mixed), max_total=4)
+    raw_pos = [pos[id(t)] for t in raw]
+    assert raw_pos != sorted(raw_pos), (
+        "the raw sampler already returned pool order; this pool no longer "
+        "discriminates and the check above is vacuous: {}".format(raw_pos))
+    print("OK  canonical order    both arms hand the pool order "
+          "(k4 {}, predictive {}); the raw sampler emitted {} first, so the "
+          "check is not vacuous".format(got_k4, got_p, raw_pos))
+
     # C_v IS NEVER APPENDED: the reducer's output carries no tasks/scores
     assert not hasattr(t_p, "tasks") and "tasks" not in d_p
     print("OK  no C_v appended    reducer output is traces+stack only")
@@ -510,8 +601,10 @@ def self_test() -> int:
 
     # ...and the forwarded seed is the one the sampler actually CONSUMES. This
     # is the only check that can tell "stored" from "used": store the same seed
-    # on a bare ContextManager and the drawn traces must come out identical,
-    # byte for byte, through the full engine call sequence.
+    # on a bare ContextManager and the sampled SET must come out identical
+    # through the full engine call sequence. Membership, not sequence, because
+    # `canonical_order` then re-sorts the survivors into the pool's order --
+    # which the second assertion pins separately.
     def k4_draw(seed_value):
         e = object.__new__(OmegaEngine)
         e.context_manager = ContextManager(symmetric_sampling=True)
@@ -523,15 +616,18 @@ def self_test() -> int:
         e.context_manager.truncate_context_stack(list(stack))
         return [t.task_id for t in holder]
 
-    drawn = k4_draw(7)
-    expect = [t.task_id for t in
-              random.Random(7).sample([t for t in traces if t.success], 4)]
-    assert drawn == expect, (drawn, expect)
-    # The pool is all-successes with 6 items and a 4-slot budget, so the draw
-    # is seed-dependent by construction -- a different seed must move it.
-    assert k4_draw(8) != drawn
-    print("OK  seed reaches sampler the four drawn traces reproduce "
-          "random.Random(7) exactly ({})".format(",".join(drawn)))
+    def raw_rule(seed_value):
+        return [t.task_id for t in random.Random(seed_value).sample(
+            [t for t in traces if t.success], 4)]
+
+    drawn, drawn8 = k4_draw(7), k4_draw(8)
+    assert sorted(drawn) == sorted(raw_rule(7)), (drawn, raw_rule(7))
+    assert sorted(drawn8) == sorted(raw_rule(8)), (drawn8, raw_rule(8))
+    # Pool order, explicitly: the arm must emit the pool's own sequence.
+    pool_ids = [t.task_id for t in traces]
+    assert drawn == [i for i in pool_ids if i in set(drawn)], drawn
+    print("OK  seed reaches sampler the four drawn traces are exactly what "
+          "random.Random(7) samples ({}), in pool order".format(",".join(drawn)))
 
     # site 1 shape (generate): sample then truncate, then read the holder
     holder = eng.context_manager.sample_traces(traces)

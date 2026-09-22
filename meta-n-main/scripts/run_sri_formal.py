@@ -784,6 +784,46 @@ def assert_root_inherited(arm_path: Path, want: Optional[str],
     return got
 
 
+def assert_gamma_identity(planned: Optional[str], ran: Optional[str],
+                          gamma_path: Optional[str]) -> str:
+    """§4b: the arm's Gamma must be the same FILE the plan bound.
+
+    `load_gamma_checkpoint` cannot enforce this. It verifies shape, parameter
+    count, geometry and an internal checksum -- and the RETIRED Gamma
+    (_gamma_multitask_gemini31pro_phaseb.pt, trained on records built by the
+    superseded traces+codes contract) shares its geometry with the CLEAN
+    trace-only one, so a stale checkpoint loads without complaint and the run
+    silently scores the wrong model. The file sha256 is the only sound identity.
+
+    Three-way comparison, because each mismatch means something different:
+      plan vs arm   -> the recorded treatment is not the executed one
+      file missing  -> the identity cannot be checked at all
+      file vs arm   -> the checkpoint was swapped between planning and executing
+
+    Returns the verified sha.
+    """
+    if not planned:
+        raise StageError(
+            "the predictive plan recorded no gamma_checkpoint_sha256; pass "
+            "--gamma-checkpoint so the arm's Gamma identity is pinned (§4)")
+    if planned != ran:
+        raise StageError(
+            "Gamma identity drift: the plan bound {!r} but the arm ran {!r}. "
+            "The recorded treatment is not the executed one."
+            .format(planned, ran))
+    if not gamma_path or not Path(gamma_path).is_file():
+        raise StageError(
+            "--gamma-checkpoint {} is missing; cannot verify the arm's Gamma "
+            "identity".format(gamma_path))
+    now = sha256_file(gamma_path)
+    if now != ran:
+        raise StageError(
+            "{} hashes to {} but the arm ran Gamma {}; the checkpoint was "
+            "replaced between planning and execution"
+            .format(gamma_path, now, ran))
+    return now
+
+
 def stage_arm(args, profile: SRIProfile, out: Path, arm: str, *,
               gamma_checkpoint: str | None) -> dict:
     slugs, _name_of = cohort_ids(profile)
@@ -861,6 +901,18 @@ def stage_arm(args, profile: SRIProfile, out: Path, arm: str, *,
     if arm == "predictive" and not sri.get("gamma_checkpoint_sha256"):
         raise StageError(
             "arm predictive recorded no gamma_checkpoint_sha256 in config.json")
+
+    # §4b (frozen 2026-09-23): the Gamma the arm ran must be the SAME FILE the
+    # plan bound. `load_gamma_checkpoint` CANNOT catch a substitution here: the
+    # retired Gamma (_gamma_multitask_gemini31pro_phaseb.pt) and the clean
+    # trace-only one live in the same geometry, so a stale checkpoint passes
+    # every shape / param-count / geometry / checksum check and the run quietly
+    # scores the wrong model. The file sha256 is the only sound identity.
+    if arm == "predictive":
+        assert_gamma_identity(
+            (man.treatment or {}).get("gamma_checkpoint_sha256"),
+            sri.get("gamma_checkpoint_sha256"),
+            gamma_checkpoint)
 
     # §4: the arm must have INHERITED the shared root, not regenerated one.
     assert_root_inherited(arm_dir(out, arm),

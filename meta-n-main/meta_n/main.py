@@ -159,17 +159,20 @@ def build_parser() -> argparse.ArgumentParser:
         default="official",
         help="Context reduction before every Omega call. `official` (default) "
              "is the historical path, byte-identical: it caps traces and the "
-             "context stack under two SEPARATE budgets. `predictive` swaps in "
-             "the RPBE adapter (frozen encoder + Gamma attention + "
-             "PredictiveSelector) and REQUIRES $CODEBERT_PATH. `matched_k4` is "
-             "the MATCHED-CAPACITY baseline: at most 4 objects total over "
-             "traces + stack, so it is comparable to `predictive` (bounded by "
-             "Gamma's n_slots). It answers 'at the same compression capacity, "
-             "is learned selection better than the hand rule', which `official` "
-             "cannot -- `official` answers 'how do we compare to the original "
-             "host'. `full` sends the unreduced context, bounded only by the "
-             "model's hard limit. The adapter covers BOTH call sites: generate "
-             "and refine.",
+             "context stack under two SEPARATE budgets. `official_trace_k4` is "
+             "THE MAIN BASELINE for the paired comparison: the same native path "
+             "with the trace sampler capped at 4 and the stack then truncated by "
+             "the SAME native rule, so it differs from `predictive` only in "
+             "WHICH four traces reach Omega. `predictive` swaps in the RPBE "
+             "adapter (frozen encoder + Gamma attention + PredictiveSelector) "
+             "and REQUIRES $CODEBERT_PATH and --gamma-checkpoint. `matched_k4` "
+             "is the RETIRED capacity ablation (at most 4 objects total over "
+             "traces + stack, from the phase that had Gamma compress both): it "
+             "is no longer the main comparison, because dropping the stack "
+             "changes the recursion mechanism, not just the trace choice. "
+             "`full` sends the unreduced context, bounded only by the model's "
+             "hard limit. The adapter covers BOTH call sites: generate and "
+             "refine.",
     )
     parser.add_argument(
         "--gamma-checkpoint",

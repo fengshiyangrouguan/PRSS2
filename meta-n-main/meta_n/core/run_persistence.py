@@ -87,19 +87,41 @@ class RunPersistence:
                 self._orch.archive = Archive(**self._orch._archive_kwargs())
                 return None
 
-            # Restore RNG state: convert lists back to tuples
+            # Restore RNG state: convert lists back to tuples. TWO streams as of
+            # 2026-09-23 (outer search + context sampling); see the orchestrator's
+            # two-stream note. A checkpoint written before the split carries no
+            # `context_rng_state`, in which case the context stream restarts from
+            # its derived seed -- the run is still deterministic, it just does not
+            # continue the pre-split trace sequence (which no longer exists).
             rng_state = checkpoint.get("rng_state")
-            if rng_state is not None and len(rng_state) >= 3:
-                try:
+            ctx_state = checkpoint.get("context_rng_state")
+            try:
+                if rng_state is not None and len(rng_state) >= 3:
                     self._orch.rng.setstate((
                         rng_state[0],
                         tuple(rng_state[1]),
                         rng_state[2],
                     ))
-                except (ValueError, TypeError) as e:
-                    logger.warning("Failed to restore RNG state: %s — using fresh RNG", e)
-                    self._orch.rng = random.Random(self._orch.config.seed)
-                    self._orch.omega.context_manager.rng = self._orch.rng
+            except (ValueError, TypeError) as e:
+                logger.warning("Failed to restore RNG state: %s — using fresh RNG", e)
+                self._reset_rng_streams()
+            try:
+                if ctx_state is not None and len(ctx_state) >= 3:
+                    self._orch.context_rng.setstate((
+                        ctx_state[0],
+                        tuple(ctx_state[1]),
+                        ctx_state[2],
+                    ))
+                elif rng_state is not None:
+                    logger.warning(
+                        "Checkpoint has no context_rng_state (written before the "
+                        "two-stream split) — restarting the trace-sampling stream "
+                        "from its derived seed. The run stays deterministic; it "
+                        "just does not continue the pre-split trace sequence.")
+            except (ValueError, TypeError) as e:
+                logger.warning("Failed to restore context RNG state: %s — "
+                               "using fresh context RNG", e)
+                self._reset_rng_streams()
 
             logger.info(
                 "Resumed from checkpoint: iteration=%d, archive=%d candidates, "
@@ -119,9 +141,24 @@ class RunPersistence:
             console.print(f"[yellow]Failed to load checkpoint: {e} — starting fresh[/yellow]")
             # Reset archive in case it was partially rebuilt before the error
             self._orch.archive = Archive(**self._orch._archive_kwargs())
-            self._orch.rng = random.Random(self._orch.config.seed)
-            self._orch.omega.context_manager.rng = self._orch.rng
+            self._reset_rng_streams()
             return None
+
+    def _reset_rng_streams(self) -> None:
+        """Rebuild BOTH rng streams from the configured seed, re-thread them.
+
+        Used by the resume fallbacks. The context stream must be re-assigned to
+        the engine's manager too: after `install`, `omega.context_manager` is the
+        adapter, whose `rng` property forwards to its base -- so this single
+        assignment reaches the sampler the arm actually uses. A local import
+        keeps `run_persistence` free of a module-level cycle with the
+        orchestrator, which imports this module.
+        """
+        from meta_n.core.evolutionary_orchestrator import _context_rng_seed
+        seed = self._orch.config.seed
+        self._orch.rng = random.Random(seed)
+        self._orch.context_rng = random.Random(_context_rng_seed(seed))
+        self._orch.omega.context_manager.rng = self._orch.context_rng
 
     def save_checkpoint(
         self,
@@ -177,6 +214,11 @@ class RunPersistence:
             "total_tokens": total_tokens,
             "convergence_history": convergence_history,
             "rng_state": list(self._orch.rng.getstate()),
+            # The context (trace-sampling) stream is a SEPARATE object as of
+            # 2026-09-23 -- see the two-stream note in the orchestrator __init__.
+            # Both must survive --resume, or a resumed arm would sample traces
+            # from a stream the uninterrupted arm never had.
+            "context_rng_state": list(self._orch.context_rng.getstate()),
             # Audit #1: persist the INNER-LLM token accounting so --resume can
             # restore it (read back with .get defaults in the resume branch).
             # Without this, token_usage.inner_* in summary.json covers only the
@@ -228,6 +270,8 @@ class RunPersistence:
             checkpoint["barred_from_best"] = barred
         # RNG state is (version, internalstate_tuple, gauss_next) — convert tuples to lists
         checkpoint["rng_state"][1] = list(checkpoint["rng_state"][1])
+        checkpoint["context_rng_state"][1] = list(
+            checkpoint["context_rng_state"][1])
         try:
             atomic_json_dump(out_dir / "checkpoint.json", checkpoint)
         except Exception:

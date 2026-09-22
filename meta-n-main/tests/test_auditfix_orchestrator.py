@@ -18,6 +18,7 @@ Findings covered (ids from .audit/audit_findings.json):
 """
 
 import json
+import random
 import types
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -526,3 +527,48 @@ async def test_finding1_inner_tokens_persist_and_restore_on_resume(tmp_path):
     assert res2.inner_prompt_tokens == 100
     assert res2.inner_completion_tokens == 23
     assert res2.inner_calls == 4
+
+
+# --------------------------------------------------------------------------- #
+# Finding 3 — the outer-search and trace-sampling RNG streams must be separate
+# --------------------------------------------------------------------------- #
+
+def test_outer_search_and_trace_sampling_rng_streams_are_independent():
+    """Consuming the trace sampler must NOT advance the outer-search stream.
+
+    Until 2026-09-23 one `random.Random` object did both jobs: the orchestrator
+    gave it to the ContextManager (trace sampling) AND to
+    `Archive.select_parents` (parent selection). The official arm's sampler
+    consumes it (`ContextManager.sample_traces -> rng.sample`) while the
+    predictive arm's Gamma selector consumes nothing, so from the SECOND
+    iteration onward the two arms drew different parents. An identical
+    `search_seed` in both arms did not help, because the streams had already
+    diverged -- which is exactly the confound the paired comparison exists to
+    exclude. Both streams stay seeded from `config.seed`, so runs remain
+    reproducible; they just cannot advance each other.
+    """
+    orch = _make_orch(seed=1234)
+
+    assert orch.context_rng is not orch.rng, (
+        "the trace sampler and the outer search must not share one stream")
+    # The engine's manager is handed the CONTEXT stream (reads back through the
+    # adapter's `rng` property in a real run).
+    assert orch.omega.context_manager.rng is orch.context_rng
+
+    outer_before = orch.rng.getstate()
+    # Exactly what ContextManager.sample_traces does.
+    orch.omega.context_manager.rng.sample(list(range(6)), 4)
+    assert orch.rng.getstate() == outer_before, (
+        "sampling traces advanced the OUTER search stream")
+
+    # ...and the converse: a parent-selection draw must not move the sampler.
+    ctx_before = orch.context_rng.getstate()
+    orch.rng.choices(["a", "b", "c"], k=1)
+    assert orch.context_rng.getstate() == ctx_before
+
+    # Both streams are reproducible from the configured seed.
+    twin = _make_orch(seed=1234)
+    assert twin.rng.getstate() == random.Random(1234).getstate()
+    assert twin.context_rng.getstate() == _make_orch(
+        seed=1234).context_rng.getstate()
+    assert twin.context_rng.getstate() != twin.rng.getstate()

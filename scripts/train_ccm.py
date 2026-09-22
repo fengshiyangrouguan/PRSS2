@@ -42,6 +42,7 @@ proposal space on the native line).
 
 import argparse
 import dataclasses
+import gc
 import hashlib
 import json
 import math
@@ -4066,6 +4067,16 @@ def main():
                 else:
                     grad_step()  # counters live inside grad_step (nonlocal)
                 _pf("grad_step", _t)
+                # CPU-memory hygiene (2026-09-23): the S4-2Obs window
+                # builds ~600 collated mini-batches and the QP streams
+                # ~100 block transfers per close; the Python-side cycle
+                # garbage (autograd graph wrappers, collator temporaries)
+                # is not reclaimed by refcounting alone and the RSS
+                # crept 98 -> 113GB across windows (the system OOM
+                # trigger sits at ~115GB).  A forced collection at the
+                # window boundary returns the allocator cache to the
+                # reuse pool.
+                gc.collect()
                 if profile:
                     n_cut = sum(1 for cr in cut_records for _ in cr)
                     parts = ["profile win={} n_mb={} n_cut_mb={}:".format(

@@ -741,11 +741,14 @@ def write_sri_context(args, profile: SRIProfile, out: Path, arm: str,
         "ledger_path": str(arm_dir(out, arm) / LEDGER_NAME),
         "gamma_checkpoint_sha256": manifest.treatment.get(
             "gamma_checkpoint_sha256"),
-        "reduction_mode": arm,
+        # The MODE the arm runs, not the arm's name -- main.py refuses to start
+        # when this disagrees with --reduction-mode, which is what catches a
+        # baseline slot silently running the wrong rule.
+        "reduction_mode": ARM_REDUCTION_MODE[arm],
         "profile_sha256": profile.sha256(),
         "manifest_sha256": manifest.sha256(),
         "gate_reason": resolve_effective_config(
-            profile, reduction_mode=arm)["gate_reason"],
+            profile, reduction_mode=ARM_REDUCTION_MODE[arm])["gate_reason"],
         "evaluator_mode": args.evaluator,
         # §6/§7: the search must never touch held-out test data; the final
         # stage is the only place a test split is read, and it runs afterwards.
@@ -976,7 +979,7 @@ def stage_freeze(args, profile: SRIProfile, out: Path) -> dict:
             "the two arms' config.json differ OUTSIDE the treatment block: {} "
             "-- the contrast is not clean".format(diff))
     if (s_off.get("reduction_mode"), s_pre.get("reduction_mode")) != \
-            ("official", "predictive"):
+            (ARM_REDUCTION_MODE["official"], ARM_REDUCTION_MODE["predictive"]):
         raise StageError(
             "unexpected treatment in config.json: official.sri={!r} "
             "predictive.sri={!r}".format(s_off.get("reduction_mode"),

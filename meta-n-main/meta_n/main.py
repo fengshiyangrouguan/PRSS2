@@ -154,14 +154,21 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--reduction-mode",
-        choices=["official", "predictive", "full"],
+        choices=["official", "predictive", "matched_k4", "full"],
         default="official",
         help="Context reduction before every Omega call. `official` (default) "
-             "is the historical path, byte-identical. `predictive` swaps in "
+             "is the historical path, byte-identical: it caps traces and the "
+             "context stack under two SEPARATE budgets. `predictive` swaps in "
              "the RPBE adapter (frozen encoder + Gamma attention + "
-             "PredictiveSelector) and REQUIRES $CODEBERT_PATH. `full` sends "
-             "the unreduced context, bounded only by the model's hard limit. "
-             "The adapter covers BOTH call sites: generate and refine.",
+             "PredictiveSelector) and REQUIRES $CODEBERT_PATH. `matched_k4` is "
+             "the MATCHED-CAPACITY baseline: at most 4 objects total over "
+             "traces + stack, so it is comparable to `predictive` (bounded by "
+             "Gamma's n_slots). It answers 'at the same compression capacity, "
+             "is learned selection better than the hand rule', which `official` "
+             "cannot -- `official` answers 'how do we compare to the original "
+             "host'. `full` sends the unreduced context, bounded only by the "
+             "model's hard limit. The adapter covers BOTH call sites: generate "
+             "and refine.",
     )
     parser.add_argument(
         "--gamma-checkpoint",

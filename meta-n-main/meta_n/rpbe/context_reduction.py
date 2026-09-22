@@ -37,6 +37,24 @@ from meta_n.rpbe.modes import ReductionMode
 from meta_n.rpbe.selector import PredictiveSelector
 from meta_n.utils.context_manager import ContextBudget, ContextManager
 
+#: MATCHED-CAPACITY BASELINE (frozen 2026-09-21). The predictive arm carries at
+#: most Gamma's ``n_slots`` objects in total over U_v = traces + context_stack.
+#: The native OFFICIAL path instead caps traces and the stack under two
+#: SEPARATE budgets, so from depth 3 on it carries its traces PLUS the entire
+#: stack while predictive carries n_slots objects in total -- measured on a live
+#: run: at d3 the official prompt held depth-2's injected code (1873 chars)
+#: while the predictive prompt read "(none -- you are the first meta-layer)".
+#: That changes the recursion mechanism itself, so the two arms were not
+#: comparable. This baseline sends at most the same number of objects.
+#:
+#: The split folds the original section preference (traces_ratio 0.65 /
+#: context_stack_ratio 0.35) onto that count: 3 traces + 1 stack item. Slots
+#: left unused by one kind are offered to the other, so a pool with no stack
+#: still yields 4 traces (which is what makes depth 2 identical across arms).
+MATCHED_CONTEXT_OBJECTS = 4
+MATCHED_K_TRACE = 3
+MATCHED_K_STACK = 1
+
 
 class _FinalisableList(list):
     """A list the adapter can rewrite in place once the stack arrives."""
@@ -70,6 +88,8 @@ class ContextReducer:
         budget = budget or self.context_manager.budget
         if self.mode is ReductionMode.OFFICIAL:
             return self._official(traces, context_stack)
+        if self.mode is ReductionMode.MATCHED_K4:
+            return self._matched_k4(traces, context_stack)
         if self.mode is ReductionMode.FULL:
             return self._full(traces, context_stack)
         return self._predictive(traces, context_stack, budget, current_traces)
@@ -79,10 +99,64 @@ class ContextReducer:
         sampled = self.context_manager.sample_traces(list(traces))
         stack = self.context_manager.truncate_context_stack(list(context_stack))
         return (list(sampled), list(stack),
-                {"mode": "official", "n_traces_in": len(traces),
-                 "n_traces_out": len(sampled),
-                 "n_stack_in": len(context_stack),
-                 "n_stack_out": len(stack)})
+                dict(self._budget_diag("official", traces, sampled,
+                                       context_stack, stack)))
+
+    # -- matched_k4: the matched-CAPACITY baseline (see the constants above) --
+    def _matched_k4(self, traces, context_stack):
+        total, cap_t, cap_s = (MATCHED_CONTEXT_OBJECTS, MATCHED_K_TRACE,
+                               MATCHED_K_STACK)
+        # The sampler is handed the JOINT total so it can never return more
+        # than could be used; the per-kind cap is applied below.
+        stack_all = list(
+            self.context_manager.truncate_context_stack(list(context_stack)))
+        trace_all = list(
+            self.context_manager.sample_traces(list(traces), max_total=total))
+
+        stack = stack_all[:cap_s]
+        sel = trace_all[:cap_t]
+        # Slots one kind leaves unused are offered to the other. This is what
+        # keeps depth 2 identical across arms: with an empty stack the trace
+        # side takes all four.
+        slack = total - len(stack) - len(sel)
+        if slack > 0 and len(stack) < len(stack_all):
+            add = min(slack, len(stack_all) - len(stack))
+            stack = stack + stack_all[len(stack):len(stack) + add]
+            slack -= add
+        if slack > 0 and len(sel) < len(trace_all):
+            add = min(slack, len(trace_all) - len(sel))
+            sel = sel + trace_all[len(sel):len(sel) + add]
+
+        return (sel, stack,
+                dict(self._budget_diag("matched_k4", traces, sel,
+                                       context_stack, stack)))
+
+    def _budget_diag(self, mode, traces, sel, context_stack, stack):
+        """Per-call capacity instrumentation, identical in shape for every mode.
+
+        Recording n_traces_out / n_stack_out / objects / tokens for BOTH arms is
+        the only way to prove the matched-capacity claim after the fact; without
+        it a capacity mismatch is invisible in the artifacts.
+        """
+        def toks(items, is_code):
+            name = ("_estimate_injected_code_tokens" if is_code
+                    else "_estimate_trace_tokens")
+            f = getattr(self.context_manager, name, None)
+            if f is None:
+                return None
+            try:
+                return int(sum(f(x) for x in items))
+            except Exception:                                 # noqa: BLE001
+                return None
+        t_tok, s_tok = toks(sel, False), toks(stack, True)
+        return {"mode": mode,
+                "n_traces_in": len(traces), "n_traces_out": len(sel),
+                "n_stack_in": len(context_stack), "n_stack_out": len(stack),
+                "n_objects_out": len(sel) + len(stack),
+                "matched_context_objects": MATCHED_CONTEXT_OBJECTS,
+                "trace_tokens_out": t_tok, "stack_tokens_out": s_tok,
+                "total_tokens_out": (None if t_tok is None or s_tok is None
+                                     else t_tok + s_tok)}
 
     # -- full: nothing reduced; the model's hard limit is the only bound ---
     def _full(self, traces, context_stack):
@@ -108,10 +182,10 @@ class ContextReducer:
         sel_t, sel_s, diag = self.selector.reduce(
             list(traces), list(context_stack), attention, budget)
         diag["mode"] = "predictive"
-        diag["n_traces_in"] = len(traces)
-        diag["n_traces_out"] = len(sel_t)
-        diag["n_stack_in"] = len(context_stack)
-        diag["n_stack_out"] = len(sel_s)
+        # Same instrumentation shape as every other mode, so the two arms' per-call
+        # records can be compared field by field (see _budget_diag).
+        diag.update(self._budget_diag("predictive", traces, sel_t,
+                                      context_stack, sel_s))
         return (sel_t, sel_s, diag)
 
 

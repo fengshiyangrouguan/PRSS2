@@ -76,6 +76,23 @@ STAGES = ("preflight", "root", "fork", "official", "predictive", "freeze",
           "audit", "final", "aggregate")
 ARMS = ("official", "predictive")
 
+#: Which context-reduction mode each ARM actually runs (frozen 2026-09-21).
+#:
+#: The `official` arm runs the MATCHED-CAPACITY baseline, NOT the native rule.
+#: The native path caps traces and the context stack under two SEPARATE budgets,
+#: so from depth 3 on it carried its traces PLUS the whole stack while the
+#: predictive arm is bounded by Gamma's `n_slots` objects in total -- measured
+#: on a live run: at d3 the official prompt held depth-2's injected code while
+#: the predictive prompt read "(none -- you are the first meta-layer)". The two
+#: arms were therefore running different recursion mechanisms and no score
+#: difference could be attributed to the selection method.
+#:
+#: The arm NAME stays `official` because that is the baseline slot in the
+#: ledger, manifest and audit pairing; what it RUNS is `matched_k4`. The native
+#: rule remains selectable by its own name, and answers the separate question
+#: "how do we compare to the original host".
+ARM_REDUCTION_MODE = {"official": "matched_k4", "predictive": "predictive"}
+
 STAGE_MANIFEST = "sri_stage_manifest.json"
 LEDGER_NAME = "proposal_slots.jsonl"
 REJECTED_DIRNAME = "rejected"
@@ -453,7 +470,10 @@ def build_arm_cmd(args, profile: SRIProfile, out: Path, arm: str,
                # default and the predictive arm silently runs the official
                # method; without --gamma-checkpoint, main.py's mandatory-Gamma
                # guard aborts the arm outright. Both flags were missing once.
-               "--reduction-mode", arm,
+               # The mode the ARM runs, which is NOT always the arm's own name:
+               # see ARM_REDUCTION_MODE. Rendering `arm` here is what silently
+               # ran the native rule for the baseline slot.
+               "--reduction-mode", ARM_REDUCTION_MODE[arm],
                *(["--gamma-checkpoint", str(args.gamma_checkpoint)]
                  if arm == "predictive" and args.gamma_checkpoint else []),
                "--output-dir", str(out / "arms"),
@@ -692,7 +712,7 @@ def build_arm_manifest(args, profile: SRIProfile, out: Path, arm: str, *,
             "preflight", {}).get("outputs", {}).get("pairing"),
         "arm_order": list(arm_order_for_seed(args.search_seed)),
     }
-    treatment = {"reduction_mode": arm}
+    treatment = {"reduction_mode": ARM_REDUCTION_MODE[arm]}
     if arm == "predictive":
         treatment["gamma_checkpoint_sha256"] = (
             sha256_file(gamma_checkpoint)
@@ -835,10 +855,11 @@ def stage_arm(args, profile: SRIProfile, out: Path, arm: str, *,
     cfg = read_run_config(arm_dir(out, arm))
     verify_run_config(cfg, pinned_for(args, profile), context=arm)
     sri = cfg.get("sri") or {}
-    if sri.get("reduction_mode") != arm:
+    if sri.get("reduction_mode") != ARM_REDUCTION_MODE[arm]:
         raise StageError(
-            "arm {} ran with reduction_mode={!r}; the treatment was not "
-            "applied".format(arm, sri.get("reduction_mode")))
+            "arm {} ran with reduction_mode={!r}, expected {!r}; the treatment "
+            "was not applied".format(arm, sri.get("reduction_mode"),
+                                     ARM_REDUCTION_MODE[arm]))
     if arm == "predictive" and not sri.get("gamma_checkpoint_sha256"):
         raise StageError(
             "arm predictive recorded no gamma_checkpoint_sha256 in config.json")

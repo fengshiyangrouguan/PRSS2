@@ -2318,32 +2318,47 @@ def main():
                         # Native proposal-space line (review 2026-09-22):
                         # the QP needs BOTH the pure task proposal
                         # (constraint norm ||d_task||) and the joint
-                        # proposal (center d_0).  The pass-2 forward is
-                        # split: 1a = task CE alone (snapshot the PURE
-                        # g_task BEFORE any aux accumulation), 1b = the
-                        # aggregate lambda-scaled RPBE gradient onto the
-                        # same grads -> g_joint.  retain_graph keeps
-                        # every fwd graph alive across the split.
-                        aux_pending = []
+                        # proposal (center d_0).  OOM fix (2026-09-22,
+                        # second): with the LoRA trainable, EVERY
+                        # layer's hidden carries grad, so one tree's
+                        # graph holds the full 36-layer saved
+                        # activations — retaining the whole window's
+                        # graphs (128 trees) blew the 40GB card twice.
+                        # Per-batch: task backward (retain for THIS
+                        # batch's aux) -> accumulate the PURE task
+                        # increment (grad delta) -> aux backward FREES
+                        # the graph.  pure_acc holds the exact pure
+                        # task gradient in scaled space.
+                        pure_acc = {}
                         for i, (b, sid) in enumerate(pending):
                             _restore_rng(pass1_rngs[i])  # P0: mask==pass1
                             task_mean, task_raw, n_valid, _aux, _n = \
                                 pass2_one(b, cut_records[i], g_by_oid,
                                           lambda_kf)
+                            _before = {
+                                id(p): p.grad.detach().clone()
+                                for p in params if p.grad is not None}
                             if task_mean.requires_grad:
                                 scaler.scale(
                                     task_mean
                                     / float(len(pending))).backward(
                                         retain_graph=True)
-                            aux_pending.append((_aux, _n))
+                            for p in params:
+                                if p.grad is None:
+                                    continue
+                                _prev = _before.get(id(p))
+                                _inc = p.grad.detach() - (
+                                    _prev if _prev is not None
+                                    else torch.zeros_like(p.grad))
+                                if id(p) in pure_acc:
+                                    pure_acc[id(p)].add_(_inc)
+                                else:
+                                    pure_acc[id(p)] = _inc.clone()
+                            if _n and _aux.requires_grad:
+                                scaler.scale(_aux).backward()  # frees graph
                             task_sum += float(task_raw.detach())
                             n_tokens += n_valid
-                        task_grads_pure = {
-                            id(p): p.grad.detach().clone()
-                            for p in params if p.grad is not None}
-                        for _aux, _n in aux_pending:
-                            if _n and _aux.requires_grad:
-                                scaler.scale(_aux).backward()
+                        task_grads_pure = pure_acc
                         task_grads = {
                             id(p): p.grad.detach().clone()
                             for p in params if p.grad is not None}
@@ -2403,10 +2418,20 @@ def main():
                         _restore_rng(pass1_rngs[i])  # P0: mask == pass1
                         fwd_out = run_forward(model, b, device,
                                               grad_enabled=True)
-                        for meta, oid, v in cut_records[i]:
+                        # OOM fix (review 2026-09-22): retain_graph on
+                        # EVERY cut kept this batch's full graph alive
+                        # for the whole window — with the LoRA trainable
+                        # (native), all 36 layers' activations carry
+                        # grad, so 128 trees of retained graphs blew the
+                        # 40GB card.  Retain only until the batch's LAST
+                        # cut; its backward frees the graph.  Gradient
+                        # VALUES are unchanged (retain only controls
+                        # graph lifetime).
+                        _cuts = [(meta, oid, v) for meta, oid, v
+                                 in cut_records[i]
+                                 if g_by_oid.get(oid) is not None]
+                        for _j, (meta, oid, v) in enumerate(_cuts):
                             g = g_by_oid.get(oid)
-                            if g is None:
-                                continue
                             optimizer.zero_grad(set_to_none=True)
                             z = collect_replay_z(meta, adapter, device,
                                                  v=v)
@@ -2418,14 +2443,22 @@ def main():
                             # (treewise bug found by the probe audit:
                             # the second cut's backward died on a freed
                             # graph — treewise mode had never run).
-                            aux_i.backward(retain_graph=True)
+                            aux_i.backward(
+                                retain_graph=(_j < len(_cuts) - 1))
                             # CPU-side accumulation (OOM fix):
                             # the dirs matrix is ~n_dirs x n_gamma fp32
                             # (~4GB for 1098 dirs); keeping the list on
                             # GPU plus the torch.stack copy doubled the
-                            # peak and blew the 40GB card.
+                            # peak and blew the 40GB card.  Structural
+                            # zeros (native): the last layer's q/o LoRA
+                            # has NO path in z's graph -> grad None,
+                            # pad with zeros (review 2026-09-22).
                             dirs.append(torch.cat(
                                 [p.grad.reshape(-1).float()
+                                 if p.grad is not None else
+                                 torch.zeros(p.numel(),
+                                             dtype=torch.float32,
+                                             device=p.device)
                                  for p in repr_params]).cpu())
                             for p in params:
                                 if id(p) not in repr_set \
@@ -2822,7 +2855,10 @@ def main():
                     if native_amp_skip:
                         # AMP overflow detected at unscale: back the
                         # scale off and discard the update (mirrors
-                        # grad_step's skip semantics).
+                        # grad_step's skip semantics).  The unscale_
+                        # records the per-device inf check the
+                        # GradScaler.update() assertion requires.
+                        scaler.unscale_(optimizer)
                         scaler.update()
                         optimizer_steps_executed += 1
                         amp_skipped_steps += 1
@@ -2855,6 +2891,12 @@ def main():
                                 # semantics — 0 at warmup step 0).
                                 p.data.add_(
                                     (p.grad.to(p.dtype)) * _lr_eff)
+                        # The unscale_ records the per-device inf check
+                        # GradScaler.update() asserts on (p.grad holds
+                        # the already-consumed d* — its rescale is
+                        # harmless; the real AMP check ran on the
+                        # g_joint snapshot in the projection branch).
+                        scaler.unscale_(optimizer)
                         scaler.update()
                         optimizer_steps_executed += 1
                         scheduler.step()

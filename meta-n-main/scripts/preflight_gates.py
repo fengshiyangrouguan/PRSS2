@@ -174,7 +174,8 @@ def gate4_routing():
         if mode != "official":
             install(e, ContextReducer(mode, encoder=StubEnc(),
                                       fusion=StubFusion()
-                                      if mode == "predictive" else None))
+                                      if mode == "predictive" else None,
+                                      context_manager=e.context_manager))
         return e
 
     for mode in ("full", "official", "predictive"):

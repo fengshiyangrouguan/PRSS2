@@ -85,7 +85,8 @@ async def run_mode(mode, traces, stack, budget, encoder, engine_budget=None):
     if mode != "official":
         reducer = ContextReducer(
             mode, encoder=encoder,
-            fusion=SlottedFusion() if mode == "predictive" else None)
+            fusion=SlottedFusion() if mode == "predictive" else None,
+            context_manager=eng.context_manager)
         install(eng, reducer)
 
     seen = {"calls": 0}

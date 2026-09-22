@@ -247,9 +247,54 @@ class PredictiveContextManagerAdapter:
                  base: Optional[ContextManager] = None) -> None:
         self.reducer = reducer
         self.base = base or ContextManager()
-        self.budget = self.base.budget
         self.last_diagnostics: Dict[str, Any] = {}
         self._pending = None
+
+    # -- the sampler's state lives on `base`, and is written THROUGH us -----
+    # `install` swaps this adapter into `engine.context_manager`, and only
+    # afterwards does the orchestrator write the search seed:
+    #
+    #     omega.context_manager.rng = self.rng      (evolutionary_orchestrator:552)
+    #     omega.context_manager.rng = ...           (run_persistence:102/123, both
+    #                                                --resume paths)
+    #
+    # That assignment now lands on the ADAPTER, while the reducer samples from
+    # `base`. Without forwarding, the seeded rng never reaches the trace
+    # sampler: provenance would record a search seed the run never used, and
+    # two seeds would produce byte-identical trace pools. Delegate rather than
+    # copy, so a state restore (`Random.setstate`) also lands on the live
+    # object across --resume.
+    @property
+    def rng(self):
+        return self.base.rng
+
+    @rng.setter
+    def rng(self, value):
+        self.base.rng = value
+
+    @property
+    def symmetric_sampling(self):
+        return self.base.symmetric_sampling
+
+    @symmetric_sampling.setter
+    def symmetric_sampling(self, value):
+        self.base.symmetric_sampling = value
+
+    @property
+    def budget(self):
+        return self.base.budget
+
+    @budget.setter
+    def budget(self, value):
+        self.base.budget = value
+
+    def __getattr__(self, name):
+        # Anything else the engine reaches for (the token estimators, anything
+        # added later) is the base manager's, not ours. `base` itself is
+        # guarded: a miss during __init__ would otherwise recurse forever.
+        if name == "base":
+            raise AttributeError(name)
+        return getattr(self.base, name)
 
     # called FIRST
     def sample_traces(self, traces):
@@ -363,14 +408,20 @@ class _StubFusion:
 
 def self_test() -> int:
     import os
+    import random
     from meta_n.core.meta_layer import InjectedCode, Trace
     from meta_n.utils.context_manager import ContextBudget
 
     print("context_reduction.py acceptance")
     print("=" * 68)
 
+    # Six traces, not three: the selector picks up to `n_slots` (=4) items and
+    # forbids repeats, so a 3-trace pool could never satisfy the old
+    # `n_selected == 4` assertion -- that assertion was written for the retired
+    # "traces + stack share four slots" interface and is exactly the kind of
+    # stale check that lets an interface change land half-wired.
     traces = [Trace(task_id="t{}".format(i), script="s", stdout="o" * 100,
-                    success=True) for i in range(3)]
+                    success=True) for i in range(6)]
     stack = [InjectedCode(pre_process="def p(): pass", rationale="r",
                           code_library={"f": "def f(): return 1"},
                           source_depth=d) for d in (2, 5, 3)]
@@ -392,18 +443,31 @@ def self_test() -> int:
     print("OK  full               nothing reduced ({} traces, {} stack), "
           "bounded only by the model limit".format(len(t_f), len(s_f)))
 
-    # PREDICTIVE goes through the selector
+    # PREDICTIVE goes through the selector -- over the TRACES ONLY. The stack is
+    # BYPASSED and re-attached by the native truncation, so it must come back
+    # unchanged and must not have consumed one of the four trace slots.
     r_pred = ContextReducer(ReductionMode.PREDICTIVE, encoder=_StubEncoder(),
                             fusion=_StubFusion())
     t_p, s_p, d_p = r_pred.reduce(traces, stack, budget=budget)
     assert d_p["mode"] == "predictive"
-    assert d_p["n_selected"] == 4, d_p["n_selected"]
+    assert d_p["n_traces_out"] == 4, d_p
+    assert d_p["n_stack_out"] == len(stack), d_p
     for t in t_p:
         assert any(t is x for x in traces)
     for c in s_p:
         assert any(c is x for x in stack)
-    print("OK  predictive         selector picked {} items; every returned "
-          "object is ORIGINAL (identity preserved)".format(d_p["n_selected"]))
+    print("OK  predictive         selected {} of {} traces; the {} stack "
+          "item(s) bypassed Gamma untouched".format(
+              d_p["n_traces_out"], len(traces), d_p["n_stack_out"]))
+
+    # ...and the main baseline differs ONLY in how those four are chosen
+    r_k4 = ContextReducer(ReductionMode.OFFICIAL_TRACE_K4)
+    t_k, s_k, d_k = r_k4.reduce(traces, stack, budget=budget)
+    assert d_k["mode"] == "official_trace_k4"
+    assert d_k["n_traces_out"] == 4, d_k
+    assert s_k == s_p, "the two arms must receive the SAME stack"
+    print("OK  official_trace_k4  {} traces + an identical stack -> the only "
+          "variable is which four".format(d_k["n_traces_out"]))
 
     # C_v IS NEVER APPENDED: the reducer's output carries no tasks/scores
     assert not hasattr(t_p, "tasks") and "tasks" not in d_p
@@ -413,13 +477,69 @@ def self_test() -> int:
     from meta_n.core.omega import OmegaEngine
     eng = object.__new__(OmegaEngine)
     eng.context_manager = ContextManager()
-    adapter = install(eng, r_pred)
+    engine_manager = eng.context_manager
+    # Constructed exactly as main.py does: with the ENGINE's manager. Building
+    # the reducer without one silently gives it a fresh ContextManager(), whose
+    # defaults replace the engine's: `symmetric_sampling` reverts to False, the
+    # sampler reads the module-level `random` instead of the search seed, and
+    # the token estimators / stack-truncation rule change under it. Nothing in
+    # config.json can see that -- it records keys, not live objects.
+    r_pred_shared = ContextReducer(ReductionMode.PREDICTIVE,
+                                   encoder=_StubEncoder(), fusion=_StubFusion(),
+                                   context_manager=engine_manager)
+    adapter = install(eng, r_pred_shared)
+    assert adapter.base is engine_manager
+    assert r_pred_shared.context_manager is engine_manager, (
+        "the reducer and the engine must share ONE ContextManager")
+    # `install` leaves the adapter in the engine slot, and the orchestrator
+    # then writes the seed THROUGH that slot (evolutionary_orchestrator:552 and
+    # both --resume paths in run_persistence). The reducer samples from
+    # `engine_manager`, so the adapter has to forward -- otherwise the recorded
+    # search_seed never reached the sampler.
+    seed = random.Random(7)
+    eng.context_manager.rng = seed
+    assert engine_manager.rng is seed, (
+        "the search seed must reach the sampler the reducer actually uses")
+    assert r_pred_shared.context_manager.rng is seed
+    eng.context_manager.symmetric_sampling = True
+    assert engine_manager.symmetric_sampling is True, (
+        "the profile's symmetric_sampling must reach the sampler")
+    assert eng.context_manager.budget is engine_manager.budget
+    print("OK  wiring             reducer + engine share ONE ContextManager, "
+          "and the orchestrator's writes reach the sampler through the adapter")
+
+    # ...and the forwarded seed is the one the sampler actually CONSUMES. This
+    # is the only check that can tell "stored" from "used": store the same seed
+    # on a bare ContextManager and the drawn traces must come out identical,
+    # byte for byte, through the full engine call sequence.
+    def k4_draw(seed_value):
+        e = object.__new__(OmegaEngine)
+        e.context_manager = ContextManager(symmetric_sampling=True)
+        r = ContextReducer(ReductionMode.OFFICIAL_TRACE_K4,
+                           context_manager=e.context_manager)
+        install(e, r)
+        e.context_manager.rng = random.Random(seed_value)
+        holder = e.context_manager.sample_traces(list(traces))
+        e.context_manager.truncate_context_stack(list(stack))
+        return [t.task_id for t in holder]
+
+    drawn = k4_draw(7)
+    expect = [t.task_id for t in
+              random.Random(7).sample([t for t in traces if t.success], 4)]
+    assert drawn == expect, (drawn, expect)
+    # The pool is all-successes with 6 items and a 4-slot budget, so the draw
+    # is seed-dependent by construction -- a different seed must move it.
+    assert k4_draw(8) != drawn
+    print("OK  seed reaches sampler the four drawn traces reproduce "
+          "random.Random(7) exactly ({})".format(",".join(drawn)))
 
     # site 1 shape (generate): sample then truncate, then read the holder
     holder = eng.context_manager.sample_traces(traces)
     returned_stack = eng.context_manager.truncate_context_stack(stack)
     assert holder.finalised, "holder was not finalised"
-    assert len(holder) == d_p["n_selected"] - len(returned_stack)
+    # The stack is BYPASSED, so it does NOT consume a trace slot: the holder
+    # carries exactly the selected traces, not (slots - stack items).
+    assert len(holder) == d_p["n_traces_out"], (len(holder), d_p)
     assert len(returned_stack) == d_p["n_stack_out"]
     print("OK  site: generate     holder finalised in place -> {} traces, "
           "{} stack (what _build_prompt sees)".format(len(holder),

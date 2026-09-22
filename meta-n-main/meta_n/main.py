@@ -2068,8 +2068,26 @@ async def async_main(args: argparse.Namespace):
                 f"    checksum={_gmeta.checksum}  params={_gmeta.param_count}  "
                 f"steps={_gmeta.steps}  status={_gmeta.status}  "
                 f"fingerprint={_gmeta.fingerprint()}")
+        # The reducer MUST share the engine's own ContextManager. Constructing
+        # it without one gives the reducer a FRESH ContextManager(), whose
+        # defaults silently replace the engine's: `symmetric_sampling` reverts
+        # to False (the profile pins true), the seeded `rng` the orchestrator
+        # writes, the token estimators and the stack-truncation rule are all
+        # bypassed -- and the formal runner's config.json parity check cannot
+        # see any of it, because it compares recorded keys, not live objects.
+        #
+        # Two sides have to line up, because `install` puts the ADAPTER in the
+        # engine slot while the reducer keeps sampling from the base:
+        #   * the reducer is built with `omega.context_manager` (the base), and
+        #   * the adapter forwards `rng` / `symmetric_sampling` / `budget` to
+        #     that same base -- the orchestrator writes `omega.context_manager
+        #     .rng = self.rng` AFTER install, i.e. through the adapter
+        #     (evolutionary_orchestrator.py:552, run_persistence.py:102/123).
+        # Get either side wrong and the recorded search_seed is not the seed
+        # the sampler used. self_test() asserts both, end to end.
         install(omega, ContextReducer(_reduction_mode, encoder=_rpbe_enc,
-                                      fusion=_rpbe_gamma))
+                                      fusion=_rpbe_gamma,
+                                      context_manager=omega.context_manager))
         console.print(
             f"  Reduction mode: {_reduction_mode} (RPBE adapter installed; "
             f"covers generate AND refine)")

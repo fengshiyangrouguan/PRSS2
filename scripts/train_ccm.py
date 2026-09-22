@@ -306,6 +306,19 @@ def parse_args():
                         "1-turn merge = lossless).  RAW gap — no hinge, "
                         "no epsilon (margin gating is a later ablation)."
                         "  Native actuation only.")
+    p.add_argument("--s4-ref-cache", action="store_true",
+                   help="S4 speed fix (review 2026-09-23): batch-"
+                        "precompute the full-reference NLL table for "
+                        "the WHOLE window before the S4 loop (no_grad, "
+                        "chunked multi-row forwards) and look it up "
+                        "per observation.  The full reference is a "
+                        "stop-grad scalar, so q_{t,h} = grad l_comp is "
+                        "UNCHANGED — this is a moving-reference "
+                        "batching, not an approximation (the l_full "
+                        "values are live).")
+    p.add_argument("--s4-ref-chunk", type=int, default=32,
+                   help="chunk rows per batched reference forward "
+                        "(--s4-ref-cache)")
     # monitoring
     p.add_argument("--log-every", type=int, default=10)
     p.add_argument("--checkpoint-every", type=int, default=250)
@@ -2527,6 +2540,48 @@ def main():
                         # the same rolling-release pattern as the
                         # sketch dirs loop).  Method-identical to the
                         # per-obs forwards, ~2x fewer forwards.
+                        # --s4-ref-cache: the full-reference NLLs for
+                        # the WHOLE window are precomputed in chunked
+                        # no_grad forwards before the loop and looked
+                        # up per observation (q_{t,h} is unchanged —
+                        # l_full is a stop-grad scalar).
+                        _ref_table = {}
+                        if args.s4_ref_cache:
+                            _ref_items = []
+                            for _i2 in range(len(pending)):
+                                for meta, oid, v in cut_records[_i2]:
+                                    if g_by_oid.get(oid) is None:
+                                        continue
+                                    for _h, _cd, _fd, _w in s4_obs_list(
+                                            meta, int(v)):
+                                        _ref_items.append(
+                                            ((oid, _h), _fd))
+                            with torch.no_grad():
+                                for _c0 in range(
+                                        0, len(_ref_items),
+                                        args.s4_ref_chunk):
+                                    _chunk = _ref_items[
+                                        _c0:_c0 + args.s4_ref_chunk]
+                                    _b3 = collator(
+                                        [{"dialog": _d,
+                                          "fixed_depth": True}
+                                         for _, _d in _chunk])
+                                    _b3 = {kk: vv.to(device)
+                                           for kk, vv in _b3.items()}
+                                    _f3 = run_forward(
+                                        model, _b3, device,
+                                        grad_enabled=False)
+                                    _sh3 = _f3.logits[..., :-1, :] \
+                                        .contiguous()
+                                    _sl3 = _b3["labels"][..., 1:] \
+                                        .contiguous()
+                                    for _j3, (_key, _d) in \
+                                            enumerate(_chunk):
+                                        _m3 = _sl3[_j3] != -100
+                                        _ref_table[_key] = float(
+                                            F.cross_entropy(
+                                                _sh3[_j3][_m3],
+                                                _sl3[_j3][_m3]))
                         for i, (b, sid) in enumerate(pending):
                             for meta, oid, v in cut_records[i]:
                                 if g_by_oid.get(oid) is None:
@@ -2543,28 +2598,35 @@ def main():
                                     .contiguous()
                                 _sl2 = _b2["labels"][..., 1:] \
                                     .contiguous()
-                                with torch.no_grad():
-                                    _b3 = collator(
-                                        [{"dialog": _d,
-                                          "fixed_depth": True}
-                                         for _, _, _d, _ in _obs])
-                                    _b3 = {kk: vv.to(device)
-                                           for kk, vv in _b3.items()}
-                                    _f3 = run_forward(
-                                        model, _b3, device,
-                                        grad_enabled=False)
-                                    _sh3 = _f3.logits[..., :-1, :] \
-                                        .contiguous()
-                                    _sl3 = _b3["labels"][..., 1:] \
-                                        .contiguous()
                                 for _j, (_h, _cdlg, _fdlg, _w) in \
                                         enumerate(_obs):
                                     _m2 = _sl2[_j] != -100
                                     _ce_c = F.cross_entropy(
                                         _sh2[_j][_m2], _sl2[_j][_m2])
-                                    _m3 = _sl3[_j] != -100
-                                    _ce_f = F.cross_entropy(
-                                        _sh3[_j][_m3], _sl3[_j][_m3])
+                                    if _ref_table:
+                                        _ce_f = _ref_table[(oid, _h)]
+                                        _ce_f = torch.tensor(
+                                            _ce_f, dtype=_ce_c.dtype,
+                                            device=_ce_c.device)
+                                    else:
+                                        with torch.no_grad():
+                                            _b3 = collator(
+                                                [{"dialog": _fdlg,
+                                                  "fixed_depth": True}])
+                                            _b3 = {kk: vv.to(device)
+                                                   for kk, vv
+                                                   in _b3.items()}
+                                            _f3 = run_forward(
+                                                model, _b3, device,
+                                                grad_enabled=False)
+                                            _sh3 = _f3.logits[
+                                                ..., :-1, :] \
+                                                .contiguous()
+                                            _sl3 = _b3["labels"][
+                                                ..., 1:].contiguous()
+                                            _m3 = _sl3 != -100
+                                            _ce_f = F.cross_entropy(
+                                                _sh3[_m3], _sl3[_m3])
                                     # raw gap, stop-grad full reference
                                     _loss_h = scaler.scale(
                                         lambda_kf * _w

@@ -1244,11 +1244,27 @@ def treewise_feasibility_projection(g_task_repr, repr_params, G, kappa,
     (the TGN 3-round one-row-at-a-time expansion is a solver-capacity
     device for large N and would only add rounds here).  The projection
     runs on SCALED (fp16 GradScaler) gradients — the QP is invariant to
-    a uniform positive rescaling of t and G, so the math is unaffected."""
+    a uniform positive rescaling of t and G, so the math is unaffected.
+
+    CPU-memory streaming (2026-09-23, S4 2Obs at 5.9M repr dims): the
+    S4-2Obs window holds ~600 rows x 5.9M fp32 (~14GB); stacking the
+    full G, H and K matrices peaked at ~80GB of CPU RAM and the system
+    OOM-killer took the training process.  The row normalization is
+    per-row, the Gram K = H H^T and the matvecs are exact block sums —
+    every stage streams in 64-row blocks, so the peak is the G list
+    itself (~14GB) + one block (~1.5GB).  The math is UNCHANGED
+    (exact streaming Gram; review 2026-09-22 pre-authorized).  G may be
+    a tensor (gamma line) or a list of rows (native line — no stack).
+    """
     sizes = [p.numel() for p in repr_params]
     t = torch.cat([-x.flatten().float() for x in g_task_repr])
     nt = float(t.norm())
-    diag = {"n_dirs": int(G.shape[0]) if G is not None else 0,
+    if isinstance(G, torch.Tensor):
+        _G_rows = list(G)
+    else:
+        _G_rows = list(G)
+    n_rows = len(_G_rows) if _G_rows else 0
+    diag = {"n_dirs": n_rows,
             "task_norm": nt, "cos_mean": None, "cos_med": None,
             "cos_p5": None, "cos_min": None, "frac_below": None,
             "frac_below_grid": None, "feasible_d0": None,
@@ -1267,7 +1283,7 @@ def treewise_feasibility_projection(g_task_repr, repr_params, G, kappa,
         for gt, p in zip(g_task_repr, repr_params):
             p.grad = gt.to(p.device)
 
-    if G is None or G.numel() == 0:
+    if not _G_rows:
         diag["note"] = "no_dirs"
         return True, diag
     if nt <= 1e-12:
@@ -1282,19 +1298,39 @@ def treewise_feasibility_projection(g_task_repr, repr_params, G, kappa,
     nb = float(b_norm) if b_norm is not None else nt
     diag["b_norm"] = nb
     k_eff = kappa * (nb / max(nt, 1e-30))
-    Gf = G.flatten(1).float()
-    ng = Gf.norm(dim=1)
+    _CH = 64
+
+    def _blocks():
+        for _c0 in range(0, n_rows, _CH):
+            yield _G_rows[_c0:_c0 + _CH], _c0
+
+    # ---- pass 1: norms + valid mask (streaming) ----------------------
+    ng_parts = []
+    for _blk, _ in _blocks():
+        _Gc = torch.stack(_blk).float()
+        ng_parts.append(_Gc.norm(dim=1))
+        del _Gc
+    ng = torch.cat(ng_parts)
     valid = ng > min_norm
     if not bool(valid.any()):
         diag["note"] = "no_valid_dirs"
         _write_task_only()
         return True, diag
-    Gv = Gf[valid]
-    n_valid = int(Gv.shape[0])
-    # ---- row-normalized half spaces (final spec) ----------------------
-    H = Gv / Gv.norm(dim=1, keepdim=True).clamp(min=min_norm)
-    cos = (H @ t) / nt          # h_j^T t / ||t|| = cos(g_j, t)
-    cos_np = cos.detach().cpu().numpy()
+    v_idx = torch.nonzero(valid).reshape(-1)
+    n_valid = int(v_idx.numel())
+    _pos_of = {int(_r): int(_k) for _k, _r in enumerate(v_idx.tolist())}
+
+    # ---- cos statistics (streaming H @ t) ----------------------------
+    cos_parts = []
+    for _blk, _ in _blocks():
+        _Gc = torch.stack(_blk).float()
+        _ngc = _Gc.norm(dim=1).clamp(min=min_norm)
+        _Hc = _Gc / _ngc[:, None]
+        cos_parts.append(_Hc @ t)
+        del _Gc, _Hc
+    cos = torch.cat(cos_parts) / nt
+    cos_valid = cos[valid]
+    cos_np = cos_valid.detach().cpu().numpy()
     diag["proj_n_valid"] = n_valid
     diag["cos_mean"] = float(np.mean(cos_np))
     diag["cos_med"] = float(np.median(cos_np))
@@ -1316,15 +1352,48 @@ def treewise_feasibility_projection(g_task_repr, repr_params, G, kappa,
         diag["max_viol"] = 0.0
         _write_task_only()
         return True, diag
-    # ---- full-set QP: K = H H^T, c = b - H t, b_j = -kappa*b_norm ------
-    b = -kappa * nb * torch.ones(n_valid, device=t.device)
-    K = H @ H.t()
-    c = b - (H @ t)
-    mu = _fista_nonneg(K, c, iters)
-    corr = H.t() @ mu              # = sum_j mu_j h_j  (= d* - t)
+    # ---- full-set QP: K = H H^T, c = b - H t (streaming exact sums) ---
+    K = torch.zeros(n_valid, n_valid)
+    c_vec = -kappa * nb * torch.ones(n_valid)
+    for _blk, _c0 in _blocks():
+        _Gc = torch.stack(_blk).float()
+        _ngc = _Gc.norm(dim=1).clamp(min=min_norm)
+        _m = _ngc > min_norm
+        if not bool(_m.any()):
+            del _Gc
+            continue
+        _Hv = _Gc[_m] / _ngc[_m, None]
+        K += _Hv @ _Hv.t()
+        _pos = [_pos_of[_c0 + _k] for _k in range(len(_m))
+                if bool(_m[_k])]
+        c_vec[_pos] -= _Hv @ t
+        del _Gc, _Hv
+    mu = _fista_nonneg(K, c_vec, iters)
+    # ---- corr = H^T mu (streaming) -----------------------------------
+    corr = torch.zeros(t.numel())
+    for _blk, _c0 in _blocks():
+        _Gc = torch.stack(_blk).float()
+        _ngc = _Gc.norm(dim=1).clamp(min=min_norm)
+        _m = _ngc > min_norm
+        if not bool(_m.any()):
+            del _Gc
+            continue
+        _Hv = _Gc[_m] / _ngc[_m, None]
+        _pos = [_pos_of[_c0 + _k] for _k in range(len(_m))
+                if bool(_m[_k])]
+        corr += _Hv.t() @ mu[_pos]
+        del _Gc, _Hv
     d = t + corr
-    # ---- full certificate: every row must satisfy h_j d >= -kappa*b_norm
-    viol = (-kappa * nb - (H @ d)) / (nt + 1e-30)
+    # ---- full certificate (streaming H @ d) --------------------------
+    viol_parts = []
+    for _blk, _ in _blocks():
+        _Gc = torch.stack(_blk).float()
+        _ngc = _Gc.norm(dim=1).clamp(min=min_norm)
+        _Hc = _Gc / _ngc[:, None]
+        viol_parts.append(_Hc @ d)
+        del _Gc, _Hc
+    viol = ((-kappa * nb - torch.cat(viol_parts)[valid])
+            / (nt + 1e-30))
     max_viol = float(viol.max()) if viol.numel() else 0.0
     diag["active"] = int((mu > 1e-8).sum())
     diag["proj_n_mu_pos"] = int((mu > 1e-8).sum())
@@ -3615,19 +3684,11 @@ def main():
                             d_task_norm = float(
                                 torch.cat([x.reshape(-1) for x in d_task])
                                 .double().norm())
-                            _G = torch.stack(dirs) if dirs else None
-                            if _G is not None:
-                                # Constraint sign flip: the frozen
-                                # definition is a LOWER bound in the
-                                # UPDATE space, q_i^T d* >=
-                                # -kappa*||q_i||*||d_task||.  The QP
-                                # variable d is the NEGATIVE update
-                                # (t = -center), so the row direction is
-                                # negated to encode the same half-space
-                                # (feasibility: the update must not
-                                # turn too far AGAINST the predictive
-                                # direction).
-                                _G = -_G
+                            # Streaming (2026-09-23): pass the dirs
+                            # LIST (no stack — the QP streams in
+                            # 64-row blocks); the sign flip negates
+                            # each row.
+                            _G = [-_r for _r in dirs] if dirs else None
                             proj_ok, proj_diag = \
                                 treewise_feasibility_projection(
                                     [x.detach().cpu() for x in d0],
@@ -3653,13 +3714,25 @@ def main():
                                 _dt_flat = torch.cat(
                                     [x.reshape(-1).float().cpu()
                                      for x in d_task])
-                                _Graw = torch.stack(dirs)
-                                _nr = _Graw.norm(dim=1)
-                                _denom = (_nr
-                                          * _dt_flat.norm()).clamp(
-                                              min=1e-12)
-                                _c = ((_Graw @ _dt_flat)
-                                      / _denom).numpy()
+                                # Streaming (2026-09-23): per-row cos
+                                # values in blocks + the aggregate as a
+                                # running sum (no full stack).
+                                _c_parts = []
+                                _agg = None
+                                for _c0 in range(0, len(dirs), 64):
+                                    _Gb = torch.stack(
+                                        dirs[_c0:_c0 + 64]).float()
+                                    _nrb = _Gb.norm(dim=1)
+                                    _c_parts.append(
+                                        ((_Gb @ _dt_flat)
+                                         / (_nrb
+                                            * _dt_flat.norm()).clamp(
+                                                min=1e-12)))
+                                    _sb = _Gb.sum(0)
+                                    _agg = (_sb if _agg is None
+                                            else _agg + _sb)
+                                    del _Gb, _sb
+                                _c = torch.cat(_c_parts).numpy()
                                 # Aggregate predictive direction vs the
                                 # task proposal (supervisor sweep,
                                 # review 2026-09-23): distinguishes
@@ -3668,7 +3741,6 @@ def main():
                                 # produces a task-orthogonal direction".
                                 # (dirs are scaled-space gradients; the
                                 # cosine is scale-invariant.)
-                                _agg = _Graw.sum(0)
                                 _agg_cos = float(
                                     ((_agg @ _dt_flat)
                                      / (_agg.norm()

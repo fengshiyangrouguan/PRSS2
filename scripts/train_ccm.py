@@ -2520,47 +2520,60 @@ def main():
                         # backward also accumulates the lambda-weighted
                         # aggregate predictive gradient (the joint
                         # proposal center d_0).
+                        # Speed fix (2026-09-23): the observations of
+                        # ONE tree batch into a single multi-row
+                        # forward (<=2 rows); the per-row CE backwards
+                        # share that graph (retain until the last row —
+                        # the same rolling-release pattern as the
+                        # sketch dirs loop).  Method-identical to the
+                        # per-obs forwards, ~2x fewer forwards.
                         for i, (b, sid) in enumerate(pending):
                             for meta, oid, v in cut_records[i]:
                                 if g_by_oid.get(oid) is None:
                                     continue
-                                for _h, _cdlg, _fdlg, _w in s4_obs_list(
-                                        meta, int(v)):
-                                    optimizer.zero_grad(set_to_none=True)
-                                    _b2 = collator([{"dialog": _cdlg,
-                                                     "fixed_depth": True}])
-                                    _b2 = {kk: vv.to(device)
-                                           for kk, vv in _b2.items()}
-                                    _f2 = run_forward(model, _b2, device,
-                                                      grad_enabled=True)
-                                    _sh2 = _f2.logits[..., :-1, :] \
+                                _obs = s4_obs_list(meta, int(v))
+                                _b2 = collator(
+                                    [{"dialog": _d, "fixed_depth": True}
+                                     for _, _d, _, _ in _obs])
+                                _b2 = {kk: vv.to(device)
+                                       for kk, vv in _b2.items()}
+                                _f2 = run_forward(model, _b2, device,
+                                                  grad_enabled=True)
+                                _sh2 = _f2.logits[..., :-1, :] \
+                                    .contiguous()
+                                _sl2 = _b2["labels"][..., 1:] \
+                                    .contiguous()
+                                with torch.no_grad():
+                                    _b3 = collator(
+                                        [{"dialog": _d,
+                                          "fixed_depth": True}
+                                         for _, _, _d, _ in _obs])
+                                    _b3 = {kk: vv.to(device)
+                                           for kk, vv in _b3.items()}
+                                    _f3 = run_forward(
+                                        model, _b3, device,
+                                        grad_enabled=False)
+                                    _sh3 = _f3.logits[..., :-1, :] \
                                         .contiguous()
-                                    _sl2 = _b2["labels"][..., 1:] \
+                                    _sl3 = _b3["labels"][..., 1:] \
                                         .contiguous()
-                                    _mask2 = _sl2 != -100
+                                for _j, (_h, _cdlg, _fdlg, _w) in \
+                                        enumerate(_obs):
+                                    _m2 = _sl2[_j] != -100
                                     _ce_c = F.cross_entropy(
-                                        _sh2[_mask2], _sl2[_mask2])
-                                    with torch.no_grad():
-                                        _b3 = collator(
-                                            [{"dialog": _fdlg,
-                                              "fixed_depth": True}])
-                                        _b3 = {kk: vv.to(device)
-                                               for kk, vv in _b3.items()}
-                                        _f3 = run_forward(
-                                            model, _b3, device,
-                                            grad_enabled=False)
-                                        _sh3 = _f3.logits[..., :-1, :] \
-                                            .contiguous()
-                                        _sl3 = _b3["labels"][..., 1:] \
-                                            .contiguous()
-                                        _mask3 = _sl3 != -100
-                                        _ce_f = F.cross_entropy(
-                                            _sh3[_mask3], _sl3[_mask3])
+                                        _sh2[_j][_m2], _sl2[_j][_m2])
+                                    _m3 = _sl3[_j] != -100
+                                    _ce_f = F.cross_entropy(
+                                        _sh3[_j][_m3], _sl3[_j][_m3])
                                     # raw gap, stop-grad full reference
                                     _loss_h = scaler.scale(
                                         lambda_kf * _w
                                         * (_ce_c - _ce_f.detach()))
-                                    _loss_h.backward()
+                                    optimizer.zero_grad(
+                                        set_to_none=True)
+                                    _loss_h.backward(
+                                        retain_graph=(
+                                            _j < len(_obs) - 1))
                                     dirs.append(torch.cat(
                                         [p.grad.reshape(-1).float()
                                          if p.grad is not None else

@@ -154,7 +154,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--reduction-mode",
-        choices=["official", "predictive", "matched_k4", "full"],
+        choices=["official", "official_trace_k4", "predictive", "matched_k4",
+                 "full"],
         default="official",
         help="Context reduction before every Omega call. `official` (default) "
              "is the historical path, byte-identical: it caps traces and the "

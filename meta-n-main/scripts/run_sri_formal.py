@@ -76,22 +76,17 @@ STAGES = ("preflight", "root", "fork", "official", "predictive", "freeze",
           "audit", "final", "aggregate")
 ARMS = ("official", "predictive")
 
-#: Which context-reduction mode each ARM actually runs (frozen 2026-09-21).
+#: Which context-reduction mode each ARM actually runs (frozen 2026-09-22).
 #:
-#: The `official` arm runs the MATCHED-CAPACITY baseline, NOT the native rule.
-#: The native path caps traces and the context stack under two SEPARATE budgets,
-#: so from depth 3 on it carried its traces PLUS the whole stack while the
-#: predictive arm is bounded by Gamma's `n_slots` objects in total -- measured
-#: on a live run: at d3 the official prompt held depth-2's injected code while
-#: the predictive prompt read "(none -- you are the first meta-layer)". The two
-#: arms were therefore running different recursion mechanisms and no score
-#: difference could be attributed to the selection method.
+#: The `official` arm runs `official_trace_k4`: FOUR heuristic traces plus the
+#: native stack. The predictive arm runs Gamma over the SAME trace pool and
+#: hands Omega the same native stack, so the only variable left is which four
+#: traces are selected. (Earlier revisions made the baseline either the native
+#: `official` -- more context than Gamma can carry -- or the joint-capacity
+#: `matched_k4`, which squeezed the stack; neither isolated the trace choice.)
 #:
-#: The arm NAME stays `official` because that is the baseline slot in the
-#: ledger, manifest and audit pairing; what it RUNS is `matched_k4`. The native
-#: rule remains selectable by its own name, and answers the separate question
-#: "how do we compare to the original host".
-ARM_REDUCTION_MODE = {"official": "matched_k4", "predictive": "predictive"}
+#: `matched_k4` is kept only as the capacity ablation from that earlier phase.
+ARM_REDUCTION_MODE = {"official": "official_trace_k4", "predictive": "predictive"}
 
 STAGE_MANIFEST = "sri_stage_manifest.json"
 LEDGER_NAME = "proposal_slots.jsonl"

@@ -155,9 +155,19 @@ def build_run_records(run_dir: os.PathLike | str, encoder: Any,
         if max_items is not None and len(items) > max_items:
             items = items[:max_items]
 
-        X_v = torch.as_tensor(encoder.encode(items), dtype=torch.float32)
         trace_part = [i for i in items
                       if type(i).__name__ == "Trace"]
+
+        # X_v encodes the TRACE POOL ONLY. It used to encode `items` =
+        # traces + injected codes, which made Gamma responsible for compressing
+        # Omega's ENTIRE context; that is a different (and much larger) job than
+        # choosing which runtime FEEDBACK Omega should see. Measured consequence
+        # on a live run: deployed against a stack it had been trained to
+        # compress, Gamma spent all 4 slots on traces and dropped the stack in
+        # 18/18 opportunities, while the hand rule kept it 20/20. The stack is
+        # now BYPASSED -- both arms hand the same stack to Omega untouched --
+        # so the only variable left is which 4 traces are selected.
+        X_v = torch.as_tensor(encoder.encode(trace_part), dtype=torch.float32)
         q_emb = torch.as_tensor(
             encoder.encode_query(encoder.serialize_query(trace_part)),
             dtype=torch.float32).reshape(-1)

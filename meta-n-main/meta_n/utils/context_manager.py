@@ -77,7 +77,7 @@ class ContextManager:
     def sample_traces(
         self,
         traces: list[Trace],
-        max_total: int = 4,
+        max_total: int = 20,
         failure_ratio: float = 0.75,
     ) -> list[Trace]:
         """
@@ -85,15 +85,13 @@ class ContextManager:
 
         Args:
             traces: All available traces
-            max_total: Maximum number of traces to return. **4, not upstream's
-                20** -- this is the MATCHED-CONTEXT-BUDGET rule (frozen
-                2026-09-21): the predictive arm is bounded by Gamma's
-                ``n_slots=4`` attention slots, so the official arm is capped to
-                the same k. Without it the arms run under different resource
-                ceilings and a difference cannot be attributed to the selection
-                METHOD. The baseline is reported as ``Meta^n (matched context
-                budget, k=4)``; upstream's 20 is still reachable by passing it
-                explicitly and belongs in the appendix.
+            max_total: Maximum number of traces to return. Left at upstream's
+                20 so `official` stays the NATIVE Meta^n rule. The SRI
+                experiment passes its trace budget EXPLICITLY instead of
+                editing this default: `official_trace_k4` and `predictive` both
+                ask for 4 (`TRACE_K4` in context_reduction), which keeps the
+                native host and the matched-capacity arms from contaminating
+                each other.
             failure_ratio: Target ratio of failures in sample (default 0.75 = 3:1)
 
         Returns:

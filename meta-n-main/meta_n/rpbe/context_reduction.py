@@ -55,6 +55,14 @@ MATCHED_CONTEXT_OBJECTS = 4
 MATCHED_K_TRACE = 3
 MATCHED_K_STACK = 1
 
+#: Trace budget for the MAIN comparison (frozen 2026-09-22). Both
+#: `official_trace_k4` and `predictive` select exactly this many TRACES, and
+#: both hand Omega the stack untouched by the same native
+#: `truncate_context_stack`. The stack therefore neither enters Gamma nor
+#: consumes one of these slots, which leaves exactly one variable between the
+#: arms: WHICH four traces reach Omega.
+TRACE_K4 = 4
+
 
 class _FinalisableList(list):
     """A list the adapter can rewrite in place once the stack arrives."""
@@ -88,6 +96,8 @@ class ContextReducer:
         budget = budget or self.context_manager.budget
         if self.mode is ReductionMode.OFFICIAL:
             return self._official(traces, context_stack)
+        if self.mode is ReductionMode.OFFICIAL_TRACE_K4:
+            return self._official_trace_k4(traces, context_stack)
         if self.mode is ReductionMode.MATCHED_K4:
             return self._matched_k4(traces, context_stack)
         if self.mode is ReductionMode.FULL:
@@ -100,6 +110,23 @@ class ContextReducer:
         stack = self.context_manager.truncate_context_stack(list(context_stack))
         return (list(sampled), list(stack),
                 dict(self._budget_diag("official", traces, sampled,
+                                       context_stack, stack)))
+
+    # -- official_trace_k4: THE MAIN BASELINE (frozen 2026-09-22) ----------
+    def _official_trace_k4(self, traces, context_stack):
+        """k=4 heuristic traces + the native stack. Paired with `predictive`.
+
+        Structurally the native `_official`, with ONE difference: the trace
+        sampler is capped at TRACE_K4 instead of its own default. The stack goes
+        through the identical `truncate_context_stack` call, so the two arms see
+        the same stack and the only remaining variable is which four traces were
+        chosen. That is the comparison the whole experiment is for.
+        """
+        sampled = self.context_manager.sample_traces(
+            list(traces), max_total=TRACE_K4)
+        stack = self.context_manager.truncate_context_stack(list(context_stack))
+        return (list(sampled), list(stack),
+                dict(self._budget_diag("official_trace_k4", traces, sampled,
                                        context_stack, stack)))
 
     # -- matched_k4: the matched-CAPACITY baseline (see the constants above) --
@@ -169,18 +196,37 @@ class ContextReducer:
 
     # -- predictive: encode -> fuse -> attention -> selector ---------------
     def _predictive(self, traces, context_stack, budget, current_traces):
+        """Gamma selects the TRACES; the stack is BYPASSED (frozen 2026-09-22).
+
+        Gamma's job is `trace pool -> 4 traces`. The injected-code stack does
+        NOT enter the encoder, does NOT compete for the 4 slots, and is handed to
+        Omega by the SAME native `truncate_context_stack` the baseline uses. So
+        the only variable between this arm and `official_trace_k4` is WHICH four
+        traces reach Omega.
+
+        It used to encode `traces + context_stack` and let both compete for the
+        same slots. Measured on a live run: Gamma then spent all 4 slots on
+        traces and dropped the stack in 18/18 opportunities, while the hand rule
+        kept it 20/20 -- Gamma had been made responsible for compressing Omega's
+        entire context instead of choosing Omega's runtime feedback.
+        """
         if self.encoder is None or self.fusion is None:
             raise RuntimeError(
                 "predictive mode needs the frozen encoder and Gamma; "
                 "construct ContextReducer(encoder=..., fusion=...)")
-        items: List[Any] = list(traces) + list(context_stack)
-        X = self.encoder.encode(items)
-        q_src = list(current_traces) if current_traces is not None else list(traces)
+        trace_items: List[Any] = list(traces)
+        X = self.encoder.encode(trace_items)
+        q_src = (list(current_traces) if current_traces is not None
+                 else trace_items)
         q_text = self.encoder.serialize_query(q_src)
         q_emb = self.encoder.encode_query(q_text)
         _, attention = self.fusion(X, q_emb, None)
-        sel_t, sel_s, diag = self.selector.reduce(
-            list(traces), list(context_stack), attention, budget)
+        # Empty stack on purpose: the selector ranks traces only.
+        sel_t, _, diag = self.selector.reduce(
+            trace_items, [], attention, budget)
+        # The stack, by the native rule -- byte-identical to the baseline's.
+        sel_s = list(
+            self.context_manager.truncate_context_stack(list(context_stack)))
         diag["mode"] = "predictive"
         # Same instrumentation shape as every other mode, so the two arms' per-call
         # records can be compared field by field (see _budget_diag).

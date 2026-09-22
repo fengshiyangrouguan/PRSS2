@@ -19,10 +19,12 @@ class ReductionMode(str, Enum):
 
     FULL = "full"
     OFFICIAL = "official"
+    OFFICIAL_TRACE_K4 = "official_trace_k4"
     PREDICTIVE = "predictive"
     MATCHED_K4 = "matched_k4"
 
     @property
     def uses_official_budget(self) -> bool:
         return self in (ReductionMode.OFFICIAL, ReductionMode.PREDICTIVE,
-                        ReductionMode.MATCHED_K4)
+                        ReductionMode.MATCHED_K4,
+                        ReductionMode.OFFICIAL_TRACE_K4)

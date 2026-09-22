@@ -1028,7 +1028,8 @@ def _json_safe(obj):
     return obj
 
 
-def adamw_proposal(optimizer, params, grads, step_count):
+def adamw_proposal(optimizer, params, grads, step_count,
+                   lr_override=None):
     """SHADOW AdamW proposal WITHOUT stepping (review 2026-09-22,
     proposal-space treewise projection).
 
@@ -1049,7 +1050,14 @@ def adamw_proposal(optimizer, params, grads, step_count):
     and the frozen method definition (paper logic) is the
     proposal-space projection — project the AdamW proposal, then write
     the projected vector back as the parameter update.
-    """
+
+    lr_override (review 2026-09-22 warmup fix): lr is a COMMON scalar
+    factor of the proposal — the QP direction space and the lambda
+    calibration ratio are lr-invariant, so those callers pass
+    lr_override=1.0 (direction space); the write-back multiplies by the
+    real current lr (0 during warmup step 0 keeps the warmup
+    semantics).  Callers that need the exact optimizer step (test 5)
+    leave it None to read the real lr."""
     out = []
     for p, g in zip(params, grads):
         _pg = optimizer.param_groups[0]
@@ -1060,7 +1068,8 @@ def adamw_proposal(optimizer, params, grads, step_count):
         grp = optimizer.param_groups[0]
         betas = tuple(grp["betas"])
         eps = float(grp.get("eps", 1e-8))
-        lr = float(_pg["lr"])
+        lr = (float(_pg["lr"]) if lr_override is None
+              else float(lr_override))
         wd = float(_pg.get("weight_decay", 0.0))
         st = optimizer.state.get(p, {})
         m = st.get("exp_avg", torch.zeros_like(p))
@@ -1079,14 +1088,18 @@ def adamw_proposal(optimizer, params, grads, step_count):
     return out
 
 
-def proposal_norm(optimizer, params, step_count):
+def proposal_norm(optimizer, params, step_count, lr_override=None):
     """L2 norm of the shadow AdamW proposal for the params' CURRENT
     .grad (calibration: r_eff measured in proposal space on the native
-    line; the gamma line keeps the plain gradient-norm calibration)."""
+    line; the gamma line keeps the plain gradient-norm calibration).
+    lr_override=1.0 for the lambda calibration: lr is a common factor,
+    so the r_eff RATIO is lr-invariant (warmup may set the real lr to
+    0 at theta_0, which would make both norms trivially zero)."""
     grads = [p.grad.detach().float() if p.grad is not None
              else torch.zeros_like(p, dtype=torch.float32)
              for p in params]
-    props = adamw_proposal(optimizer, params, grads, step_count)
+    props = adamw_proposal(optimizer, params, grads, step_count,
+                           lr_override=lr_override)
     return float(
         torch.cat([d.reshape(-1) for d in props]).double().norm())
 
@@ -1436,6 +1449,10 @@ def main():
             if _p.requires_grad:
                 _p.requires_grad_(False)
                 n_frozen += 1
+        # NOTE: peft's get_peft_model usually already froze the base
+        # (mark_only_lora_as_trainable), so n_frozen is often 0 — the
+        # loop is an idempotent guard, the RESULTING state is what
+        # matters (trainable = LoRA + comp rows).
         _base = model
         while not hasattr(_base, "layers") and hasattr(_base, "model"):
             _base = _base.model
@@ -2192,8 +2209,18 @@ def main():
                             fwd_out, b["labels"], device)
                         (task_sum_m / max(n_valid_m, 1)
                          / float(len(pending))).backward()
+                    if os.environ.get("CCM_CALIB_DIAG") == "1":
+                        _gd = [p for p in repr_params
+                               if p.grad is not None]
+                        print("CALIBDIAG task: n_grad={}/{} lr={} "
+                              "g_abs0={}".format(
+                                  len(_gd), len(repr_params),
+                                  optimizer.param_groups[0]["lr"],
+                                  float(_gd[0].grad.abs().sum())
+                                  if _gd else None), flush=True)
                     if args.rpbe_native_compression:
-                        g_task = proposal_norm(optimizer, repr_params, 1)
+                        g_task = proposal_norm(optimizer, repr_params, 1,
+                                               lr_override=1.0)
                     else:
                         g_task = repr_grad_norm(repr_params)
                     g_task_all = repr_grad_norm(params)
@@ -2221,7 +2248,8 @@ def main():
                             aux.backward()
                     _restore_rng(resume_rng)
                     if args.rpbe_native_compression:
-                        g_kf = proposal_norm(optimizer, repr_params, 1)
+                        g_kf = proposal_norm(optimizer, repr_params, 1,
+                                             lr_override=1.0)
                     else:
                         g_kf = repr_grad_norm(repr_params)
                     g_kf_all = repr_grad_norm(params)
@@ -2509,12 +2537,18 @@ def main():
                             _clip_gs(g_task_true)
                             native_g_joint = g_joint_true
                             _bc = optimizer_steps_executed + 1
+                            # Direction space (warmup fix, review
+                            # 2026-09-22): lr is a common scalar factor,
+                            # the QP and ||d_task|| are lr-invariant —
+                            # project the lr=1 direction, multiply the
+                            # real current lr back at write-back (0 at
+                            # warmup step 0 keeps the warmup semantics).
                             d0 = adamw_proposal(
                                 optimizer, repr_params, g_joint_true,
-                                _bc)
+                                _bc, lr_override=1.0)
                             d_task = adamw_proposal(
                                 optimizer, repr_params, g_task_true,
-                                _bc)
+                                _bc, lr_override=1.0)
                             d_task_norm = float(
                                 torch.cat([x.reshape(-1) for x in d_task])
                                 .double().norm())
@@ -2811,11 +2845,16 @@ def main():
                                 else:
                                     st["exp_avg_sq"] = (
                                         (1.0 - b2) * g * g).clone()
+                            _lr_eff = float(
+                                optimizer.param_groups[0]["lr"])
                             for p in repr_params:
-                                # theta <- theta + d* (QP wrote the
-                                # projected proposal; fp32 -> param
-                                # dtype for the in-place add).
-                                p.data.add_(p.grad.to(p.dtype))
+                                # theta <- theta + lr_eff * d* (QP
+                                # wrote the lr=1 projected proposal;
+                                # fp32 -> param dtype for the add; the
+                                # real current lr restores the warmup
+                                # semantics — 0 at warmup step 0).
+                                p.data.add_(
+                                    (p.grad.to(p.dtype)) * _lr_eff)
                         scaler.update()
                         optimizer_steps_executed += 1
                         scheduler.step()

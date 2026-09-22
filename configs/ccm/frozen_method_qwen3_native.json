@@ -35,9 +35,9 @@
    0.5
   ],
   "lambda_calibration": {
-   "rule": "r_eff = lambda * ||d_pred|| / ||d_task|| ~ 0.1, measured on theta_0 (calibration-only run, before ANY optimizer/scheduler step), calibrated once on the initial full window (training-only), then frozen for all seeds. NATIVE-scope measurement (review 2026-09-22): r_eff is the AdamW PROPOSAL-norm ratio on the native compression params (at theta_0 the optimizer state is empty -> first bias-correction step).",
-   "lambda_kf": null,
-   "lambda_kf_note": "NULL until the native calibration run commits it.  The gamma-line value 0.0061413 was measured on the Gamma scope and is NOT reused (constants are never reused across actuation geometries)."
+   "rule": "r_eff = lambda * ||d_pred|| / ||d_task|| ~ 0.1, measured on theta_0 (calibration-only run, before ANY optimizer/scheduler step), calibrated once on the initial full window (training-only), then frozen for all seeds. NATIVE-scope measurement (review 2026-09-22): r_eff is the AdamW PROPOSAL-norm ratio on the native compression params (lr=1 direction space — the ratio is lr-invariant; warmup sets the real lr to 0 at theta_0).",
+   "lambda_kf": 0.09979455277851518,
+   "lambda_kf_note": "Calibrated 2026-09-22 (native proposal-space r_eff at theta_0): r_eff = ||d_pred||/||d_task|| = 1.002, derived lambda = 0.1/1.002 = 0.0998.  Contrast: the gamma-line r_eff was 16.28 — on the native compression actuation the predictive proposal is the SAME order as the task proposal."
   },
   "z_v_source": "J_mem(M_v) fixed adapter (TGN identity is its special case); GQA hosts lift the memory from the KV heads (8) with head_dim 128; native mode lifts the PURE CCM mean (no Gamma residual exists)",
   "witness": "none (main experiment)",

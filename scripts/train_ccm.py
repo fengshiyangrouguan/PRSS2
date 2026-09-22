@@ -2458,18 +2458,27 @@ def main():
                             "no optimizer step executed")
                     if args.rpbe_native_compression:
                         # Native proposal-space projection (review
-                        # 2026-09-22).  The QP needs TRUE-value
-                        # gradients for the shadow AdamW proposals, so
-                        # unscale + clip FIRST (the gamma line runs the
-                        # QP on scaled gradients and keeps grad_step
-                        # unchanged — V11 numbers stay valid).
+                        # 2026-09-22).  P0 fix (2026-09-22 review): the
+                        # dirs-collection loop ends with
+                        # zero_grad(set_to_none=True), so NO live p.grad
+                        # exists here — the pure/joint snapshots taken
+                        # BEFORE the dirs loop are the only gradient
+                        # source.  They were recorded in SCALED space:
+                        # divide by the current scale to recover the
+                        # true values (no scaler.unscale_ needed).
                         scale_f = float(scaler.get_scale())
-                        scaler.unscale_(optimizer)
+                        g_joint_true = [
+                            (task_grads.get(id(p), torch.zeros_like(p))
+                             .detach() / scale_f)
+                            for p in repr_params]
+                        g_task_true = [
+                            (task_grads_pure.get(
+                                id(p), torch.zeros_like(p)).detach()
+                             / scale_f)
+                            for p in repr_params]
                         _inf = any(
-                            p.grad is not None
-                            and not bool(
-                                torch.isfinite(p.grad.detach()).all())
-                            for p in params)
+                            not bool(torch.isfinite(g).all())
+                            for g in g_joint_true)
                         if _inf:
                             # AMP overflow: no proposal / no QP / no
                             # update.  scaler backs off; the window
@@ -2480,21 +2489,25 @@ def main():
                                 "task_norm": 0.0, "b_norm": 0.0}
                             cert_fail = False
                             native_amp_skip = True
-                            for p in params:
-                                p.grad = None
                         else:
                             native_amp_skip = False
-                            torch.nn.utils.clip_grad_norm_(
-                                params, args.grad_clip)
-                            g_joint_true = [
-                                p.grad.detach().clone()
-                                for p in repr_params]
+                            # Global clip, the same threshold as
+                            # grad_step, applied to EACH proposal's
+                            # gradient source INDEPENDENTLY: g_task is
+                            # the exact gradient the task-only arm's
+                            # optimizer would consume, g_joint the one
+                            # the ours arm consumes.
+                            def _clip_gs(gs):
+                                _tot = math.sqrt(sum(
+                                    float((g.double() ** 2).sum())
+                                    for g in gs))
+                                if _tot > args.grad_clip:
+                                    _c = args.grad_clip / _tot
+                                    for g in gs:
+                                        g.mul_(_c)
+                            _clip_gs(g_joint_true)
+                            _clip_gs(g_task_true)
                             native_g_joint = g_joint_true
-                            g_task_true = [
-                                (task_grads_pure.get(
-                                    id(p), torch.zeros_like(p)).detach()
-                                 / scale_f)
-                                for p in repr_params]
                             _bc = optimizer_steps_executed + 1
                             d0 = adamw_proposal(
                                 optimizer, repr_params, g_joint_true,
@@ -2528,6 +2541,41 @@ def main():
                                     b_norm=d_task_norm)
                             proj_diag["space"] = "proposal"
                             proj_diag["d_task_norm"] = d_task_norm
+                            # Proposal-space conflict statistics (short
+                            # test C, review 2026-09-22): the frozen
+                            # method works in PROPOSAL space, so the
+                            # meaningful conflict measure is
+                            # c_i = q_i^T d_task / (||q_i|| ||d_task||)
+                            # — "if I took the task-only AdamW update,
+                            # how many predictive interfaces would
+                            # violate the tolerance band?".  The
+                            # corr_ratio from the QP diag is exactly
+                            # ||d* - d_0|| / ||d_0|| (corr = d*_qp - t,
+                            # ||t|| = ||d_0||).
+                            if dirs:
+                                _dt_flat = torch.cat(
+                                    [x.reshape(-1).float().cpu()
+                                     for x in d_task])
+                                _Graw = torch.stack(dirs)
+                                _nr = _Graw.norm(dim=1)
+                                _denom = (_nr
+                                          * _dt_flat.norm()).clamp(
+                                              min=1e-12)
+                                _c = ((_Graw @ _dt_flat)
+                                      / _denom).numpy()
+                                proj_diag.update({
+                                    "conflict_cos_mean":
+                                        float(_c.mean()),
+                                    "conflict_cos_med":
+                                        float(np.median(_c)),
+                                    "conflict_cos_p5":
+                                        float(np.percentile(_c, 5.0)),
+                                    "conflict_cos_min":
+                                        float(_c.min()),
+                                    "conflict_frac_neg_kappa":
+                                        float(np.mean(
+                                            _c < -args.rpbe_kappa)),
+                                })
                             cert_fail = bool(
                                 proj_diag.get("cert_fail"))
                             if not proj_ok:

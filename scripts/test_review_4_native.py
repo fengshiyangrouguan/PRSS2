@@ -119,6 +119,10 @@ def main():
     dialog, collator = tc.build_dataset(args, tokenizer)
 
     # ---- Part A: trainable set == native compression params ----------
+    # Seed the FIRST build too: Part D compares its digest against
+    # same-seed rebuilds, so the anchor construction must start from
+    # the same RNG state.
+    tc.seed_all(a.seed)
     model, n_frozen = native_build(args, tokenizer, device)
     trainable = [(n, p) for n, p in model.named_parameters()
                  if p.requires_grad]
@@ -207,11 +211,16 @@ def main():
           flush=True)
 
     # ---- Part D (verification 4, unit): theta_0 reproducibility -------
+    # Each rebuild re-seeds FIRST: the PEFT LoRA init draws from the
+    # global RNG, so a rebuild without re-seeding would get different
+    # lora_A values and fail the digest equality spuriously.
+    tc.seed_all(a.seed)
     digest_1 = tc.params_digest(
         [p for p in model.parameters() if p.requires_grad])
     hash_1 = paired_seed_hash(a.seed, model)
     del model, adapter, fwd_out
     torch.cuda.empty_cache()
+    tc.seed_all(a.seed)
     model2, _ = native_build(args, tokenizer, device)
     digest_2 = tc.params_digest(
         [p for p in model2.parameters() if p.requires_grad])
@@ -222,6 +231,7 @@ def main():
         "paired_seed_hash <=> identical sampling streams")
     del model2
     torch.cuda.empty_cache()
+    tc.seed_all(a.seed)
     model3, _ = native_build(args, tokenizer, device)
     hash_3 = paired_seed_hash(a.seed + 1, model3)
     assert hash_3 != hash_1, "different seed must change the hash"

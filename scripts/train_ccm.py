@@ -485,10 +485,13 @@ def enforce_frozen(args):
         if getattr(args, "host", "llama") != "qwen3":
             _why.append("native actuation v1 is Qwen3-only")
         if args.arm == "ours" \
-                and getattr(args, "rpbe_constrain_mode", "") != "treewise":
+                and getattr(args, "rpbe_constrain_mode", "") != "treewise" \
+                and not getattr(args, "s4_supervisor", False):
             _why.append("native ours requires --rpbe-constrain-mode "
                         "treewise (the aggregate branch would add the "
-                        "raw RPBE gradient onto the LoRA directly)")
+                        "raw RPBE gradient onto the LoRA directly); "
+                        "S4 aggregate is allowed as the two-phase "
+                        "post-conflict form (review 2026-09-23)")
         if _why:
             raise SystemExit(
                 "[frozen] actuation.mode=native in the frozen spec: "
@@ -3873,6 +3876,132 @@ def main():
                                   kf_closed + 1,
                                   proj_diag.get("max_viol", float("inf"))),
                               flush=True)
+                    aux_terms += n_cut_win
+                elif args.rpbe_native_compression \
+                        and args.s4_supervisor:
+                    # S4 AGGREGATE phase (review 2026-09-23 two-phase
+                    # form): after the treewise phase has pruned the
+                    # predictive gap, the per-interface conflict dies
+                    # out (active -> 0-3) and the QP idles.  The
+                    # aggregate phase keeps the lambda-weighted S4
+                    # gradient WITHOUT dirs/QP: joint = task + lambda *
+                    # sum w_h q_{t,h}, one ordinary AdamW step.  Cost
+                    # drops to the comp-dialogue forwards only.
+                    pure_acc = {}
+                    for i, (b, sid) in enumerate(pending):
+                        _restore_rng(pass1_rngs[i])  # P0: mask==pass1
+                        task_mean, task_raw, n_valid, _aux, _n = \
+                            pass2_one(b, cut_records[i], g_by_oid, 0.0)
+                        _before = {
+                            id(p): p.grad.detach().clone()
+                            for p in params if p.grad is not None}
+                        if task_mean.requires_grad:
+                            scaler.scale(
+                                task_mean
+                                / float(len(pending))).backward()
+                        for p in params:
+                            if p.grad is None:
+                                continue
+                            _prev = _before.get(id(p))
+                            _inc = p.grad.detach() - (
+                                _prev if _prev is not None
+                                else torch.zeros_like(p.grad))
+                            if id(p) in pure_acc:
+                                pure_acc[id(p)].add_(_inc)
+                            else:
+                                pure_acc[id(p)] = _inc.clone()
+                        task_sum += float(task_raw.detach())
+                        n_tokens += n_valid
+                    # Reference table (chunked batch, same as treewise).
+                    _ref_table = {}
+                    if args.s4_ref_cache:
+                        _ref_items = []
+                        for _i2 in range(len(pending)):
+                            for meta, oid, v in cut_records[_i2]:
+                                if g_by_oid.get(oid) is None:
+                                    continue
+                                for _h, _cd, _fd, _w in s4_obs_list(
+                                        meta, int(v)):
+                                    _ref_items.append(((oid, _h), _fd))
+                        with torch.no_grad():
+                            for _c0 in range(0, len(_ref_items),
+                                             args.s4_ref_chunk):
+                                _chunk = _ref_items[
+                                    _c0:_c0 + args.s4_ref_chunk]
+                                _b3 = collator(
+                                    [{"dialog": _d,
+                                      "fixed_depth": True}
+                                     for _, _d in _chunk])
+                                _b3 = {kk: vv.to(device)
+                                       for kk, vv in _b3.items()}
+                                _f3 = run_forward(
+                                    model, _b3, device,
+                                    grad_enabled=False)
+                                _sh3 = _f3.logits[..., :-1, :] \
+                                    .contiguous()
+                                _sl3 = _b3["labels"][..., 1:] \
+                                    .contiguous()
+                                for _j3, (_key, _d) in \
+                                        enumerate(_chunk):
+                                    _m3 = _sl3[_j3] != -100
+                                    _ref_table[_key] = float(
+                                        F.cross_entropy(
+                                            _sh3[_j3][_m3],
+                                            _sl3[_j3][_m3]))
+                    # Per-tree comp forwards, gradients ACCUMULATED
+                    # (no per-obs isolation, no dirs).
+                    for i, (b, sid) in enumerate(pending):
+                        for meta, oid, v in cut_records[i]:
+                            if g_by_oid.get(oid) is None:
+                                continue
+                            _obs = s4_obs_list(meta, int(v))
+                            _b2 = collator(
+                                [{"dialog": _d, "fixed_depth": True}
+                                 for _, _d, _, _ in _obs])
+                            _b2 = {kk: vv.to(device)
+                                   for kk, vv in _b2.items()}
+                            _f2 = run_forward(model, _b2, device,
+                                              grad_enabled=True)
+                            _sh2 = _f2.logits[..., :-1, :] \
+                                .contiguous()
+                            _sl2 = _b2["labels"][..., 1:] \
+                                .contiguous()
+                            for _j, (_h, _cdlg, _fdlg, _w) in \
+                                    enumerate(_obs):
+                                _m2 = _sl2[_j] != -100
+                                _ce_c = F.cross_entropy(
+                                    _sh2[_j][_m2], _sl2[_j][_m2])
+                                if _ref_table:
+                                    _ce_f = torch.tensor(
+                                        _ref_table[(oid, _h)],
+                                        dtype=_ce_c.dtype,
+                                        device=_ce_c.device)
+                                else:
+                                    with torch.no_grad():
+                                        _b3 = collator(
+                                            [{"dialog": _fdlg,
+                                              "fixed_depth": True}])
+                                        _b3 = {kk: vv.to(device)
+                                               for kk, vv
+                                               in _b3.items()}
+                                        _f3 = run_forward(
+                                            model, _b3, device,
+                                            grad_enabled=False)
+                                        _sh3 = _f3.logits[
+                                            ..., :-1, :] \
+                                            .contiguous()
+                                        _sl3 = _b3["labels"][
+                                            ..., 1:].contiguous()
+                                        _m3 = _sl3 != -100
+                                        _ce_f = F.cross_entropy(
+                                            _sh3[_m3], _sl3[_m3])
+                                _loss_h = scaler.scale(
+                                    lambda_kf * _w
+                                    * (_ce_c - _ce_f.detach()))
+                                _loss_h.backward(
+                                    retain_graph=(
+                                        _j < len(_obs) - 1))
+                        adapter.clear()
                     aux_terms += n_cut_win
                 else:
                     for i, (b, sid) in enumerate(pending):

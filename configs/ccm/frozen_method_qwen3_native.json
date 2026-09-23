@@ -62,8 +62,8 @@
   "cadence": "identical task samples and scheduler cadence across the two native arms"
  },
  "training": {
-  "steps": 60,
-  "steps_note": "Native Stage B budget = 60 windows (same budget convention as the gamma line).  trainable = conditional LoRA + COMP rows (backbone frozen, NO Gamma).  Native-ours = proposal-space treewise joint feasibility projection; Native-task-only = ordinary AdamW step (arm gamma_task_only + flag).  Sampling = q_L ∝ n_L + replay cap 12 (see sampling section).",
+  "steps": 100,
+  "steps_note": "Native Stage B budget EXTENDED to 100 windows (user ruling 2026-09-23: continue the s550 aggregate arm 50 windows past s50 because the s20->s50 PPL curve was still monotonically improving).  The first 60 follow the original gamma-line budget convention; the s50->s100 continuation is the post-conflict aggregate phase on the same protocol (resumed from step60 final, --no-warmup, checkpoint-every 10).  trainable = conditional LoRA + COMP rows (backbone frozen, NO Gamma).  Native-ours = proposal-space treewise joint feasibility projection; Native-task-only = ordinary AdamW step (arm gamma_task_only + flag).  Sampling = q_L ∝ n_L + replay cap 12 (see sampling section).",
   "official_protocol": {
    "arm": "ccm_merge_official",
    "merge_cadence": "official",

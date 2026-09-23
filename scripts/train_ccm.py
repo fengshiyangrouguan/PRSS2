@@ -313,6 +313,15 @@ def parse_args():
                         "actually loses vs the full reference) feed the "
                         "ACTIVE predictive center; the QP rows stay "
                         "UNGATED (learned interfaces keep protection).")
+    p.add_argument("--history-gamma", action="store_true",
+                   help="Stage-B history-branch correction (review "
+                        "2026-09-24): keep the native compressor "
+                        "FROZEN (LoRA + COMP rows), attach a zero-init "
+                        "Gamma whose residual enters WITH the history "
+                        "weight (t-1)/t — turn-3 structurally "
+                        "identical to the Stage-A checkpoint; S4/QP/"
+                        "cuts unchanged.  Requires "
+                        "--rpbe-native-compression.")
     p.add_argument("--s4-depth-mults", default="",
                    help="DB-DG-S4 depth reweight (review 2026-09-24): "
                         "comma-separated multipliers for t<=2, t=3..5, "
@@ -1694,8 +1703,12 @@ def main():
             "[micro-batch] RPBE arms require --micro-batch 1 (the "
             "two-pass replay and window machinery are batch=1 "
             "protocols); batch>1 is currently a task-only option")
-    if use_rpbe and not args.rpbe_native_compression:
+    if use_rpbe and (not args.rpbe_native_compression
+                     or getattr(args, "history_gamma", False)):
         attach_gamma(model, hidden=args.gamma_hidden)
+        if getattr(args, "history_gamma", False):
+            print("[history-gamma] Stage-B: Gamma attached on top of "
+                  "the native compressor", flush=True)
     if args.rpbe_native_compression and use_rpbe:
         # Native actuation (review 2026-09-22): the RPBE recursion node
         # is the native CCM merge step (M_{t-1}, u_t) -> M_t; the
@@ -1706,12 +1719,23 @@ def main():
         # the SUM-block K/V states lifted by extract_z ARE the pure
         # CCM mean M_t (Z_t = M_t by construction).
         n_frozen = 0
-        for _n, _p in model.named_parameters():
-            if "lora_" in _n or "comp_embeddings" in _n:
-                continue
-            if _p.requires_grad:
-                _p.requires_grad_(False)
-                n_frozen += 1
+        if getattr(args, "history_gamma", False):
+            # Stage-B (review 2026-09-24): freeze the native compressor
+            # (LoRA + COMP rows + backbone) and train the history-branch
+            # Gamma ONLY.
+            for _n, _p in model.named_parameters():
+                if "gamma" in _n:
+                    _p.requires_grad_(True)
+                elif _p.requires_grad:
+                    _p.requires_grad_(False)
+                    n_frozen += 1
+        else:
+            for _n, _p in model.named_parameters():
+                if "lora_" in _n or "comp_embeddings" in _n:
+                    continue
+                if _p.requires_grad:
+                    _p.requires_grad_(False)
+                    n_frozen += 1
         # NOTE: peft's get_peft_model usually already froze the base
         # (mark_only_lora_as_trainable), so n_frozen is often 0 — the
         # loop is an idempotent guard, the RESULTING state is what
@@ -1719,18 +1743,23 @@ def main():
         _base = model
         while not hasattr(_base, "layers") and hasattr(_base, "model"):
             _base = _base.model
-        assert not getattr(_base, "_gamma_attached", False), \
-            "native actuation must not carry an attached Gamma"
-        for _layer in _base.layers:
-            assert getattr(_layer.self_attn, "gamma", None) is None, \
-                "native actuation: found a layer-attached Gamma"
+        if not getattr(args, "history_gamma", False):
+            assert not getattr(_base, "_gamma_attached", False), \
+                "native actuation must not carry an attached Gamma"
+            for _layer in _base.layers:
+                assert getattr(_layer.self_attn, "gamma", None) is None, \
+                    "native actuation: found a layer-attached Gamma"
         # The LoRA stays train() (dropout pinned to 0.0 in wrap_lora),
         # so pass-1/pass-2 replay remains bit-identical (the RNG
         # protocol precondition).
         model.train()
         print("[native-compression] frozen {} backbone params; "
-              "trainable = conditional LoRA + COMP/SUM rows (pure "
-              "CCM-merge forward, Z_t = M_t)".format(n_frozen),
+              "trainable = {}".format(
+                  n_frozen,
+                  "history-branch Gamma (Stage-B)"
+                  if getattr(args, "history_gamma", False)
+                  else "conditional LoRA + COMP/SUM rows (pure "
+                       "CCM-merge forward, Z_t = M_t)"),
               flush=True)
     if args.init_from:
         # Two-stage init: the merge checkpoint carries LoRA + COMP rows

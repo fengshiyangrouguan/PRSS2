@@ -368,10 +368,12 @@ class LlamaAttention(nn.Module):
                         prev_v = v_base[:, :, t_i - 2] + res_prev_v
                     res_t_k = self.gamma(
                         prev_k, k_cur[:, :, t_i - 1], tt) \
-                        * valid[:, :, t_i - 1]
+                        * valid[:, :, t_i - 1] \
+                        * ((t_i - 1.0) / float(t_i))
                     res_t_v = self.gamma(
                         prev_v, v_cur[:, :, t_i - 1], tt) \
-                        * valid[:, :, t_i - 1]
+                        * valid[:, :, t_i - 1] \
+                        * ((t_i - 1.0) / float(t_i))
                     if _CCM_AUDIT_GAMMA:
                         kb = prev_k[0]              # [H, n_slots, D]
                         vb = prev_v[0]

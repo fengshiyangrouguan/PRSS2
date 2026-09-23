@@ -292,7 +292,7 @@ class LlamaAttention(nn.Module):
             # LaMP one-shot merge (t_max == 1) applies its own onetime
             # residual in the fast path instead (L2).
             if self.gamma is not None and sum_row_pos is not None \
-                    and int(sum_row_pos.shape[1]) >= 2:
+                    and int(sum_row_pos.shape[1]) >= 1:
                 bsz, n_heads, seq_len, head_dim = key_states.shape
                 n_slots = int(sum_row_pos.shape[2])
                 t_max = int(sum_row_pos.shape[1])
@@ -372,14 +372,17 @@ class LlamaAttention(nn.Module):
                         # t_i-2) plus that turn's residual register.
                         prev_k = k_base[:, :, t_i - 2] + res_prev_k
                         prev_v = v_base[:, :, t_i - 2] + res_prev_v
-                    res_t_k = self.gamma(
+                    _tfac = (t_i - 1.0) / float(t_i)
+                    # Persistent history branch (review fix
+                    # 2026-09-24): r_t = (t-1)/t * (r_{t-1} + R_t).
+                    _raw_k = self.gamma(
                         prev_k, k_cur[:, :, t_i - 1], tt) \
-                        * valid[:, :, t_i - 1] \
-                        * ((t_i - 1.0) / float(t_i))
-                    res_t_v = self.gamma(
+                        * valid[:, :, t_i - 1]
+                    res_t_k = _tfac * (res_prev_k + _raw_k)
+                    _raw_v = self.gamma(
                         prev_v, v_cur[:, :, t_i - 1], tt) \
-                        * valid[:, :, t_i - 1] \
-                        * ((t_i - 1.0) / float(t_i))
+                        * valid[:, :, t_i - 1]
+                    res_t_v = _tfac * (res_prev_v + _raw_v)
                     if _CCM_AUDIT_GAMMA:
                         kb = prev_k[0]              # [H, n_slots, D]
                         vb = prev_v[0]

@@ -38,7 +38,6 @@ spec.loader.exec_module(R)
 from meta_n.sri.protocol import (ProtocolError, RunManifest,        # noqa: E402
                                  default_profile_path, load_profile,
                                  sha256_file)
-from meta_n.sri.ledger import SlotLedger, assert_completeness        # noqa: E402
 
 PROFILE = load_profile(default_profile_path("sri_primary6"))
 SLUGS, _ = R.cohort_ids(PROFILE)
@@ -77,22 +76,21 @@ if ledger.is_file():
     opens = {r["slot_id"] for r in rows if r.get("kind") == "open"}
     admits = sum(1 for r in rows
                  if r.get("terminal_status") == "evaluated_admitted")
-    # Use the PROTOCOL's own completeness check, not a hand-rolled one. Pairing
-    # opens with finalizes is necessary but NOT sufficient: a run that lost a
-    # whole slot (23 opens, 23 finalizes) passes that and then dies inside
-    # `stage_freeze` -- after the predictive arm has been PAID FOR. This is the
-    # same validator freeze uses, so whatever it accepts here, freeze accepts.
+    # THE VALIDATOR `stage_freeze` ITSELF USES -- not a re-implementation of it.
+    # An earlier version called `assert_completeness` on a hand-built SlotLedger
+    # with `_hdr = {}`, which silently DISABLES the ledger's provenance check and
+    # skipped `assert_placeable` entirely. A ledger with the right slot count but
+    # the wrong run_id / arm / backbone / cohort / seed / root hash -- or with
+    # structural depths the audit cannot place -- would have passed this script
+    # and then been rejected by freeze, AFTER the predictive arm was paid for.
+    # Delegating means any check added to freeze later applies here too, instead
+    # of the two drifting apart.
     try:
-        led = SlotLedger.__new__(SlotLedger)      # mirrors ledger.read_ledger
-        led.path = ledger
-        led._hdr = {}
-        led._open, led._final = {}, {}
-        led._load()
-        assert_completeness(led, PROFILE.beam_width, PROFILE.beam_candidates,
-                            PROFILE.max_iterations)
-    except ProtocolError as e:
-        problems.append("ledger fails the protocol's own completeness check: %s"
-                        % e)
+        R._load_frozen_ledger(PROFILE, OUT, ARM)
+    except (ProtocolError, R.StageError) as e:
+        problems.append("the official ledger would FAIL stage_freeze's own "
+                        "validation: %s" % e)
+    # Diagnostic only -- the gate above is `_load_frozen_ledger`.
     if len(opens) != int(PROFILE.nominal_slots):
         problems.append("nominal grid is %d slots, ledger has %d"
                         % (int(PROFILE.nominal_slots), len(opens)))

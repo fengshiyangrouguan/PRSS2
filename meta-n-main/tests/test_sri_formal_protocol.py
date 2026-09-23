@@ -810,21 +810,41 @@ def test_28_a_ledger_missing_one_nominal_slot_is_rejected(tmp_path=None):
     with tempfile.TemporaryDirectory() as td:
         led = _ledger(Path(td))
         hk = SRIHooks(ledger=led, run_dir=Path(td), cohort=["T1"])
-        grid = [(i, ps, cs) for i in range(6) for ps in range(2)
+        # ITERATION IS 1..6, NOT 0..5. `nominal_slot_ids` defines the canonical
+        # grid that way, so a 0-based fixture builds a grid with an EXTRA it0 and
+        # a MISSING it6 -- which fails completeness no matter what the test then
+        # drops, proving nothing. Pin the identity before dropping anything.
+        grid = [(i, ps, cs) for i in range(1, 7) for ps in range(2)
                 for cs in range(2)]
         assert len(grid) == 24, grid
-        dropped = grid[-1]
-        for (i, ps, cs) in grid:
-            if (i, ps, cs) == dropped:
-                continue                       # lose exactly one nominal slot
-            h = hk.open(iteration=i, parent_slot=ps, child_slot=cs,
-                        parent_id="p", parent_structural_depth=2,
-                        gate_effective=True)
-            hk.close(h, "evaluated_admitted")
-        # every remaining slot IS finalized, so a pairing-only check passes
-        assert led.unfinalized() == []
+        assert {L.slot_id_for(i, ps, cs) for (i, ps, cs) in grid} ==             set(L.nominal_slot_ids(2, 2, 6)), "fixture is not the canonical grid"
+        def build(name, skip=None):
+            """A ledger from the canonical grid, minus `skip` if given."""
+            l = _ledger(Path(td) / name)
+            h = SRIHooks(ledger=l, run_dir=Path(td), cohort=["T1"])
+            for (i, ps, cs) in grid:
+                if (i, ps, cs) == skip:
+                    continue
+                hk = h.open(iteration=i, parent_slot=ps, child_slot=cs,
+                            parent_id="p", parent_structural_depth=2,
+                            gate_effective=True)
+                h.close(hk, "evaluated_admitted")
+            return l
+
+        # NON-VACUITY: the FULL canonical grid must PASS. Without this, the test
+        # would also "pass" if the fixture were wrong and nothing could ever
+        # satisfy the validator -- which is exactly the 0-based-grid false
+        # positive this test shipped with.
+        full = build("full")
+        L.assert_completeness(full, 2, 2, 6)
+
+        # ...and losing exactly one canonical slot must FAIL. Every remaining
+        # open IS finalized, so a pairing-only check still passes and only
+        # completeness catches it.
+        short = build("short", skip=grid[-1])
+        assert short.unfinalized() == []
         try:
-            L.assert_completeness(led, 2, 2, 6)
+            L.assert_completeness(short, 2, 2, 6)
             raise AssertionError("an incomplete ledger was accepted")
         except PR.ProtocolError as e:
             assert "missing" in str(e), str(e)

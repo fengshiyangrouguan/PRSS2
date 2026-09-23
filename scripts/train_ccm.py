@@ -330,6 +330,19 @@ def parse_args():
                         "interface-level balance in recursive "
                         "computation (audit: t1-2 rows carry 51.5% of "
                         "the gradient mass while t6-13 carry 20.7%).")
+    p.add_argument("--paired-geometry-audit", action="store_true",
+                   help="paired d0->d* geometry audit (review "
+                        "2026-09-24): on the first closed window, "
+                        "compute BOTH the original and the DB-DG "
+                        "proposal centers (d0_orig, d0_db), project "
+                        "each through the SAME full QP row set, and "
+                        "dump r_0/c_0/r_*/c_* plus the six-group "
+                        "(cut-depth x horizon) dual/QP-correction "
+                        "decomposition into paired_audit.json, then "
+                        "exit.  Answers: QP washes out the center "
+                        "change (r_0 large, r_* ~ 0) vs center "
+                        "unchanged (r_0 ~ 0) vs true Pareto trade-off "
+                        "(both large).")
     p.add_argument("--s4-ref-cache", action="store_true",
                    help="S4 speed fix (review 2026-09-23): batch-"
                         "precompute the full-reference NLL table for "
@@ -1247,7 +1260,8 @@ def proposal_norm(optimizer, params, step_count, lr_override=None):
 
 def treewise_feasibility_projection(g_task_repr, repr_params, G, kappa,
                                     iters=400, cert_tol=1e-6, min_norm=1e-9,
-                                    b_norm=None, device=None):
+                                    b_norm=None, device=None,
+                                    out_mu=False):
     """Tree-wise RPBE Feasibility Projection — TGN final-spec alignment
     (2026-09-15, ported from tgb_link_loop._cstr_group_close_treewise,
     the b523cf3 lineage; the Cimmino refinement there is kappa=0-only and
@@ -1491,14 +1505,14 @@ def treewise_feasibility_projection(g_task_repr, repr_params, G, kappa,
         # the caller skips the representation step for this window).
         diag["note"] = "cert_fail"
         diag["cert_fail"] = True
-        return False, diag
+        return (False, diag, None) if out_mu else (False, diag)
     with torch.no_grad():
         for p, cp, gt in zip(repr_params, torch.split(corr, sizes),
                              g_task_repr):
             # .to(p.device): the QP runs on CPU (V11 OOM fix — the
             # G matrix GPU peak was the last 4GB that blew the card).
             p.grad = (gt - cp.view_as(p)).to(p.device)
-    return True, diag
+    return (True, diag, mu) if out_mu else (True, diag)
 
 
 def repr_grad_norm(params):
@@ -2680,6 +2694,9 @@ def main():
                     native_amp_skip = False  # native proposal write-back
                     dirs = []
                     s4_pred_acc = {}
+                    _paired = bool(args.paired_geometry_audit)
+                    s4_pred_acc_orig = {} if _paired else None
+                    _row_meta = [] if _paired else None
                     _early_drop_step = (int(round(
                         1.0 / args.early_cut_drop_ratio))
                         if args.early_cut_drop_ratio > 0 else 0)
@@ -2873,6 +2890,12 @@ def main():
                                                          dtype=torch.float32,
                                                          device=p.device)
                                              for p in repr_params]).cpu())
+                                        if _row_meta is not None:
+                                            _tt2 = int(v) + 1
+                                            _row_meta.append(
+                                                (0 if _tt2 <= 2
+                                                 else 1 if _tt2 <= 5
+                                                 else 2, _h))
                                     for p in params:
                                         if p.grad is None:
                                             continue
@@ -2906,6 +2929,16 @@ def main():
                                                 if _center_scale != 1.0
                                                 else p.grad.detach()
                                                 .clone())
+                                        if _paired:
+                                            if id(p) in s4_pred_acc_orig:
+                                                s4_pred_acc_orig[
+                                                    id(p)].add_(
+                                                    p.grad.detach())
+                                            else:
+                                                s4_pred_acc_orig[
+                                                    id(p)] = (
+                                                    p.grad.detach()
+                                                    .clone())
                                 adapter.clear()
                         # joint (scaled space) = pure task + lambda-w-
                         # eighted aggregate S4 gradient.
@@ -3869,6 +3902,112 @@ def main():
                             d_task_norm = float(
                                 torch.cat([x.reshape(-1) for x in d_task])
                                 .double().norm())
+                            if _paired:
+                                # Paired d0->d* geometry audit (review
+                                # 2026-09-24): original vs DB-DG center,
+                                # SAME QP rows, six-group dual split.
+                                def _d0_from(acc):
+                                    _gj = {}
+                                    for p in params:
+                                        _v = task_grads_pure.get(id(p))
+                                        _v = (_v.clone() if _v is not None
+                                              else torch.zeros_like(p))
+                                        _e = acc.get(id(p))
+                                        if _e is not None:
+                                            _v = _v + _e
+                                        _gj[id(p)] = _v
+                                    return adamw_proposal(
+                                        optimizer, repr_params, _gj, _bc,
+                                        lr_override=1.0)
+                                d0_orig = _d0_from(s4_pred_acc_orig)
+                                d0_db = _d0_from(s4_pred_acc)
+                                f_orig = torch.cat(
+                                    [x.reshape(-1).double()
+                                     for x in d0_orig]).cpu()
+                                f_db = torch.cat(
+                                    [x.reshape(-1).double()
+                                     for x in d0_db]).cpu()
+                                _n_orig = f_orig.norm()
+                                r0 = float((f_db - f_orig).norm()
+                                           / max(_n_orig, 1e-12))
+                                c0 = float((f_db @ f_orig)
+                                           / max(_n_orig
+                                                 * f_db.norm(), 1e-12))
+                                _Gp = [-_r for _r in dirs] \
+                                    if dirs else None
+                                _ok_o, _dg_o, _mu_o = \
+                                    treewise_feasibility_projection(
+                                        [x.detach().cpu()
+                                         for x in d0_orig],
+                                        repr_params, _Gp,
+                                        args.rpbe_kappa,
+                                        iters=args.proj_iters,
+                                        cert_tol=1e-4, out_mu=True)
+                                _p_orig = {id(p): p.grad.clone()
+                                           if p.grad is not None
+                                           else None for p in repr_params}
+                                _ok_d, _dg_d, _mu_d = \
+                                    treewise_feasibility_projection(
+                                        [x.detach().cpu() for x in d0_db],
+                                        repr_params, _Gp,
+                                        args.rpbe_kappa,
+                                        iters=args.proj_iters,
+                                        cert_tol=1e-4, out_mu=True)
+                                _f_orig = torch.cat(
+                                    [p.grad.reshape(-1).double().cpu()
+                                     for p in repr_params])
+                                _f_db = torch.cat(
+                                    [p.grad.reshape(-1).double().cpu()
+                                     for p in repr_params])
+                                _n_orig = _f_orig.norm()
+                                rs = float((_f_db - _f_orig).norm()
+                                           / max(_n_orig, 1e-12))
+                                cs = float((_f_db @ _f_orig)
+                                           / max(_n_orig
+                                                 * _f_db.norm(), 1e-12))
+                                # restore: the SECOND projection wrote
+                                # .grad — put the FIRST back for the
+                                # exit (no optimizer step anyway).
+                                for p in repr_params:
+                                    p.grad = _p_orig[id(p)]
+                                # six-group dual decomposition (mu is
+                                # over the row-normalized H rows; the
+                                # per-group correction norms would need
+                                # row-level H, so report n_active and
+                                # sum_mu per group).
+                                _groups = {}
+                                for _gi, (_tg, _hg) in enumerate(
+                                        _row_meta):
+                                    _k = "t{}_{}".format(
+                                        ["1-2", "3-5", "6-13"][_tg],
+                                        "local" if _hg == 1
+                                        else "root")
+                                    _g = _groups.setdefault(
+                                        _k, {"n_active": 0,
+                                             "sum_mu": 0.0})
+                                    if _mu_o is not None \
+                                            and float(_mu_o[_gi]) > 1e-8:
+                                        _g["n_active"] += 1
+                                        _g["sum_mu"] += float(
+                                            _mu_o[_gi])
+                                with (out / "paired_audit.json") \
+                                        .open("w") as _f:
+                                    json.dump({
+                                        "r0": r0, "c0": c0,
+                                        "rs": rs, "cs": cs,
+                                        "ok_orig": _ok_o,
+                                        "ok_db": _ok_d,
+                                        "active_orig":
+                                            _dg_o.get("active"),
+                                        "active_db":
+                                            _dg_d.get("active"),
+                                        "groups": _groups,
+                                    }, _f, indent=1)
+                                print("[paired-audit] dumped -> {}"
+                                      .format(out
+                                              / "paired_audit.json"),
+                                      flush=True)
+                                sys.exit(0)
                             # Streaming (2026-09-23): pass the dirs
                             # LIST (no stack — the QP streams in
                             # 64-row blocks); the sign flip negates

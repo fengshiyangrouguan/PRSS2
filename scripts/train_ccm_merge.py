@@ -78,6 +78,13 @@ def parse_args():
     p.add_argument("--checkpoint-every", type=int, default=50)
     p.add_argument("--log-every", type=int, default=10)
     p.add_argument("--resume-from", default="")
+    p.add_argument("--official-adapter", default="",
+                   help="llama released Step-2 compression adapter dir "
+                        "(llama-7b-no-online-merge_recur-ntok2)")
+    p.add_argument("--with-gamma", action="store_true",
+                   help="attach the post-merge Gamma residual and make "
+                        "it trainable (gemma joint control, user ruling "
+                        "2026-09-24)")
     return p.parse_args()
 
 
@@ -99,6 +106,25 @@ def save_json(path, obj):
 
 
 def build_tokenizer(args):
+    if args.host == "llama":
+        from transformers import LlamaTokenizer
+        tok = LlamaTokenizer.from_pretrained(args.model_name_or_path)
+        tok.pad_token = tok.eos_token
+        tok.pad_token_id = tok.pad_token_id if tok.pad_token_id is not None \
+            else tok.eos_token_id
+        tok.bos_token_id = tok.bos_token_id or 1
+        tok.eos_token_id = tok.eos_token_id or 2
+        tok.padding_side = "left"
+        added = [f"<COMP{k}>" for k in range(N_TOK)] \
+            + [f"<SUM{k}>" for k in range(N_TOK)]
+        tok.add_special_tokens({"additional_special_tokens": added})
+        ids = [tok.convert_tokens_to_ids(f"<COMP{k}>")
+               for k in range(N_TOK)] \
+            + [tok.convert_tokens_to_ids(f"<SUM{k}>")
+               for k in range(N_TOK)]
+        tok.comp_token_id = ids[:N_TOK]
+        tok.sum_token_id = ids[N_TOK:]
+        return tok
     if args.host == "qwen3":
         from transformers import AutoTokenizer
         from transformers.models.qwen3.configuration_qwen3 import Qwen3Config
@@ -237,9 +263,42 @@ def build_model_merge(args, device):
             [text_cfg.vocab_size + k for k in range(N_TOK)],
             [text_cfg.vocab_size + N_TOK + k for k in range(N_TOK)])
         return model.to(device)
-    if args.host != "qwen3":
-        raise NotImplementedError(
-            "train_ccm_merge currently targets the qwen3 host")
+    if args.host == "llama":
+        # Official merged host (train_ccm build_official_host parity,
+        # fp32 per review round 7): Step-1 foundation merged + released
+        # Step-2 adapter + SeparatedEmbedding COMP rows.
+        from transformers.models.llama.configuration_llama import \
+            LlamaConfig
+        from src.arch.ccm_llama import LlamaForCausalLM_CCM
+        from src.model import load_lora_weight, peft_custom
+        from src.utils import SeparatedEmbedding
+        from peft import LoraConfig
+        config = LlamaConfig.from_pretrained(args.model_name_or_path)
+        config.comp_relative_embedding = args.relative_embedding
+        model = LlamaForCausalLM_CCM.from_pretrained(
+            args.model_name_or_path, config=config,
+            torch_dtype=torch.float32)
+        model = model.to(device)
+        load_lora_weight(args.foundation, model, merge=True)
+        model.update_comp_token([32000 + k for k in range(N_TOK)],
+                                [32000 + N_TOK + k
+                                 for k in range(N_TOK)])
+        model.model.embed_tokens = SeparatedEmbedding(
+            model.model.embed_tokens, 2 * N_TOK)
+        lora_cfg = LoraConfig().from_pretrained(args.official_adapter)
+        model = peft_custom.get_peft_model(model, lora_cfg)
+        load_lora_weight(args.official_adapter, model, merge=False)
+        for _p in model.parameters():
+            _p.requires_grad_(False)
+        model.base_model.model.model.embed_tokens \
+            .comp_embeddings.weight.requires_grad_(True)
+        for _n, _p in model.named_parameters():
+            if "lora_" in _n:
+                _p.requires_grad_(True)
+        model._official_host = True
+        return model
+    raise NotImplementedError(
+        "train_ccm_merge currently targets the qwen3 host")
     from transformers.models.qwen3.configuration_qwen3 import Qwen3Config
     from src.arch.ccm_qwen3 import Qwen3ForCausalLM_CCM
     from src.utils import SeparatedEmbedding
@@ -398,6 +457,14 @@ def main():
     tokenizer = build_tokenizer(args)
     model = build_model_merge(args, device)
     model = wrap_lora_merge(model, args.lora_r, args.lora_dropout)
+    if args.with_gamma:
+        from rpbe.hosts.ccm.ccm_patch import attach_gamma
+        attach_gamma(model, hidden=64)
+        for _n, _p in model.named_parameters():
+            if "gamma" in _n:
+                _p.requires_grad_(True)
+        print("[merge] Gamma attached (trainable, joint control)",
+              flush=True)
     model.update_comp_token(
         [tokenizer.comp_token_id[k] for k in range(N_TOK)],
         [tokenizer.sum_token_id[k] for k in range(N_TOK)])

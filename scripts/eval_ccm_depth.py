@@ -151,6 +151,23 @@ def eval_split(model, collator, dialogs, device, limit, name,
 
 def load_ccm_arm(args, device, ckpt):
     tokenizer = tc.build_tokenizer(args)
+    if args.host == "gemma4":
+        # gemma4 Stage-2 checkpoints carry the MERGE-chain layout
+        # (SeparatedEmbedding comp rows + PLE resize, train_ccm_merge
+        # semantics).  train_ccm's build_model gemma4 branch builds the
+        # RPBE double-table resize instead — no comp_embeddings key —
+        # and strict-load fails.  Reuse the exact chain the checkpoints
+        # were trained with (review fix 2026-09-23).
+        import train_ccm_merge as tcm
+        model = tcm.build_model_merge(args, device)
+        model = tcm.wrap_lora_merge(model, 8, 0.0)
+        model.update_comp_token(
+            [tokenizer.comp_token_id[k] for k in range(tc.N_TOK)],
+            [tokenizer.sum_token_id[k] for k in range(tc.N_TOK)])
+        dummy = torch.optim.AdamW(
+            [p for p in model.parameters() if p.requires_grad], lr=1e-3)
+        tc.load_trainable(ckpt, model, dummy, device, load_optimizer=False)
+        return tokenizer, model
     model = tc.build_model(args, device)
     model = tc.wrap_lora(model, args.lora_r)
     model.update_comp_token(

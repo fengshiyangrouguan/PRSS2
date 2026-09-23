@@ -385,8 +385,11 @@ def _frozen_path(args):
     if getattr(args, "frozen", ""):
         return Path(args.frozen)
     if getattr(args, "rpbe_native_compression", False):
+        _name = "frozen_method_qwen3_native.json" \
+            if getattr(args, "host", "llama") == "qwen3" \
+            else "frozen_method_llama_native.json"
         return Path(__file__).resolve().parents[1] / "configs" / "ccm" \
-            / "frozen_method_qwen3_native.json"
+            / _name
     name = "frozen_method_qwen3.json" if getattr(args, "host", "llama") \
         == "qwen3" else "frozen_method.json"
     return Path(__file__).resolve().parents[1] / "configs" / "ccm" / name
@@ -490,8 +493,16 @@ def enforce_frozen(args):
         if getattr(args, "rpbe_lr", None) is not None:
             _why.append("--rpbe-lr would silently route ALL native "
                         "params into the rpbe_lr group")
-        if getattr(args, "host", "llama") != "qwen3":
-            _why.append("native actuation v1 is Qwen3-only")
+        if getattr(args, "host", "llama") not in ("qwen3", "llama"):
+            _why.append("native actuation v1 is Qwen3/Llama-only")
+        if args.host == "llama" and not getattr(args, "official_host",
+                                                False):
+            # Llama native = the official merged host (Step-1 foundation
+            # merged + released Step-2 adapter + SeparatedEmbedding):
+            # forgetting --official-host would silently train from the
+            # raw resize host (the R8 retired layout).
+            _why.append("llama native requires --official-host (the "
+                        "merged official model)")
         if args.arm == "ours" \
                 and getattr(args, "rpbe_constrain_mode", "") != "treewise" \
                 and not getattr(args, "s4_supervisor", False):

@@ -1,0 +1,114 @@
+{
+ "_comment": "LLAMA NATIVE-ACTUATION frozen spec (2026-09-24): the RPBE recursion node is the native CCM merge step (M_{t-1}, u_t) -> M_t with depth D=L and Z_t = M_t; the actuated params are the conditional LoRA of the OFFICIAL merged host (released Step-2 compression adapter) + the COMP/SUM SeparatedEmbedding rows.  Theta_0 = the official merged model (Step-1 default-LoRA foundation merged into the base + released Step-2 adapter + SeparatedEmbedding COMP rows — build_official_host).  User ruling 2026-09-24: fork the llama merged model and run 10 treewise windows (S4 supervisor, no-warmup, checkpoint every 2 windows) on the seetacloud A100-80G box (connect.nma1.seetacloud.com:19657).",
+ "frozen_source": "Qwen3 native-actuation frozen spec (frozen_method_qwen3_native.json) re-instantiated on the llama official merged host; the host semantics are the frozen_method.json official-host protocol (build_official_host, review round 7)",
+ "actuation": {
+  "mode": "native",
+  "scope": "conditional LoRA (released Step-2 adapter) + COMP/SUM comp_embeddings rows (SeparatedEmbedding); recursion node = native merge step (M_{t-1}, u_t) -> M_t, depth D=L; Z_t = M_t",
+  "theta0": "official merged host: llama-7b-hf + Step-1 foundation (llama-7b-no, merged) + released Step-2 compression adapter (llama-7b-no-online-merge_recur-ntok2) + SeparatedEmbedding COMP rows (build_official_host; fp32 throughout per review round 7)",
+  "projection_space": "AdamW proposal space (same as the qwen3 native line): d_0 = shadow-AdamW joint proposal from g_task + lambda*g_pred; d* = argmin 1/2||d-d_0||^2 s.t. q_i^T d >= -kappa*||q_i||*||d_task||; theta <- theta + d* written back directly",
+  "lambda_fact": "lambda does NOT affect the pure half-space feasibility region (cancels on both sides); lambda is meaningful only through the joint proposal center d_0"
+ },
+ "backbone": {
+  "model": "llama-7b (original LLaMA-7B, not LLaMA-2)",
+  "hf_identifier": "huggyllama/llama-7b",
+  "vendored_commit": "a89dd08e2c9587ec9c6c3ad339bb154c33e6b41a",
+  "attn_type": "merge_recur",
+  "n_tok_lock": 2,
+  "torch_compile": "disabled on all three arms",
+  "dtype": "fp32 (the official host path keeps fp32 throughout — SeparatedEmbedding comp rows + peft conditional-LoRA forward)",
+  "host_path": "official host ONLY: build_official_host (Step-1 foundation merged + released Step-2 compression adapter + SeparatedEmbedding COMP rows); the legacy resize host is not the DailyDialog method"
+ },
+ "adapter": {
+  "lora_r": 8,
+  "lora_r_note": "the released Step-2 compression adapter's conditional LoRA (loaded through peft_custom, NOT re-wrapped — the trainer skips wrap_lora under --official-host).  The COMP/SUM rows stay trainable (official protocol trains them)."
+ },
+ "rpbe": {
+  "ridge_eps": 0.001,
+  "sketch_dim_m": 32,
+  "rpbe_map_seed": 0,
+  "z_v_dim": 128,
+  "horizon_weights": [
+   0.5,
+   0.5
+  ],
+  "lambda_calibration": {
+   "rule": "same as the qwen3 native line: r_eff = lambda * ||d_pred|| / ||d_task|| ~ 0.1 measured at theta_0 (the official merged host) on the first closed window, native proposal-space (lr=1 direction space), then frozen.",
+   "lambda_kf": null,
+   "lambda_kf_note": "NULL PENDING CALIBRATION (2026-09-24): calibrate once on the llama official merged host (S4 supervisor) and commit the derived lambda here.  The trainer refuses the ours arm while this field is null."
+  },
+  "z_v_source": "J_mem(M_v) fixed adapter; llama host lifts the memory from all attention heads (32, head_dim = hidden / heads)",
+  "witness": "none (main experiment)",
+  "sketch_ensemble_n_branches": 4,
+  "sketch_ensemble_note": "four independent 32-dim branches (J_ens = mean_r J_r); depth bucket b(L_v) modulates the future signature phi_r.",
+  "oas_shrinkage": {
+   "enabled": true,
+   "rule": "paired OAS covariance shrinkage per branch; the fixed ridge keeps only its numerical-safety role."
+  }
+ },
+ "gamma": {
+  "placement": "NOT ATTACHED in native mode (kept for the enforce_frozen gamma.hidden binding)",
+  "hidden": 64,
+  "time_dim": 16
+ },
+ "window": {
+  "min_effective_cuts": 128,
+  "collection": "adaptive by effective cut count (dialogues with k>=4), not a mechanical microbatch count",
+  "cadence": "identical task samples and scheduler cadence across the two native arms"
+ },
+ "training": {
+  "steps": 10,
+  "steps_note": "User ruling 2026-09-24: 10 treewise windows from the merged model (no-warmup, checkpoint every 2 windows -> s2..s10 + final).  trainable = official conditional LoRA + COMP rows (backbone frozen, NO Gamma).",
+  "official_protocol": {
+   "arm": "ccm_merge_official",
+   "merge_cadence": "official",
+   "grad_accum": 128,
+   "random_k": true,
+   "data_stream": "shuffled epoch loop (each dialogue exactly once per epoch)",
+   "thresholds": "train max_len_total 400, val/test 600 (official data.py)",
+   "micro_batch": 1,
+   "micro_batch_note": "RPBE arms require micro-batch 1 (two-pass replay protocol)"
+  },
+  "grad_clip": 1.0,
+  "grad_clip_source": "official HF Trainer default (max_grad_norm)",
+  "merge_cadence": "window-matched",
+  "two_pass_replay": "pass1 no-grad statistics forward, pass2 grad replay forward (RPBE arms only)",
+  "rpbe_gamma_only": false,
+  "rpbe_lr": null,
+  "proposal_space": {
+   "center": "d_0 = shadow AdamW proposal of g_joint = g_task + lambda*g_pred (moments read from the CURRENT optimizer state, never stepped)",
+   "constraint_norm": "||d_task|| = shadow AdamW proposal norm of the PURE task gradient (snapshotted before the aux accumulation)",
+   "half_spaces": "q_i^T d* >= -kappa*||q_i||*||d_task|| (lower bound in update space)",
+   "write_back": "theta <- theta + d*; optimizer moments updated with the true-value clipped joint gradient; scheduler/scaler cadence identical to the task-only arm",
+   "cert_fail": "whole-window skip including the task update (inherited gamma-line semantics), cert_skip_steps recorded"
+  },
+  "seeds": 1,
+  "seeds_note": "seed 0 only (same ruling as the qwen3 line)",
+  "eval": "eval_llama_pooled_B.py (protocol B pooled, official host semantics) — exact script/args to be confirmed at eval time",
+  "checkpoint_every": 2,
+  "checkpoint_every_note": "user ruling 2026-09-24: checkpoint every 2 windows (10-window budget -> s2..s10 + final)",
+  "schedule_total_steps": 1000,
+  "schedule_note": "warmup/cosine over 1000 steps (warmup ratio 0.03); --no-warmup on the fork: the first window steps at the peak lr and the cosine descends from there"
+ },
+ "sampling": {
+  "depth_levels": [
+   1,
+   2,
+   4,
+   8,
+   13
+  ],
+  "k_of_L": "L + 2 (fixed prefix length per depth)",
+  "q_alpha": 1.0,
+  "q_alpha_note": "q_L ∝ n_L^q_alpha, q_alpha=1 (natural frequency) with the replay cap — same convention as the qwen3 native line",
+  "max_replays": 12,
+  "rule": "depth-stratified legal cuts with natural-frequency depth weights + per-dialogue replay cap; ONE original dialogue per window (tree_id = stable original dialogue id); L=1 dialogues carry task CE only."
+ },
+ "official_host": {
+  "enabled": true,
+  "note": "llama native REQUIRES --official-host (the merged official model): the trainer refuses the ours arm without it.  The CLI also needs --foundation <llama-7b-no> and --official-adapter <llama-7b-no-online-merge_recur-ntok2> (build_official_host reads both; on the seetacloud box they live under /root/autodl-tmp/result/dialog/)."
+ },
+ "freeze_host": {
+  "enabled": false,
+  "scope": "native mode freezes the BACKBONE only: trainable = conditional LoRA + COMP/SUM rows; the trainer refuses --freeze-host / --rpbe-gamma-only / --rpbe-lr under native actuation"
+ }
+}

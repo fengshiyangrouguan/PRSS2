@@ -49,9 +49,14 @@ from typing import Any, Dict, List, Optional
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO))
 
-from meta_n.rpbe.budget import Caps, Fuse, total_cost            # noqa: E402
 from meta_n.sri.protocol import (CONFIG_KEY_TO_CLI,              # noqa: E402
                                  STRUCTURAL6, render_pinned_flags)
+
+# `meta_n.rpbe.budget` is imported INSIDE main(), AFTER .env is sourced. It
+# freezes `LEDGER_DIR = Path(os.environ.get("META_N_COST_LEDGER_DIR", ...))` at
+# IMPORT time, so importing it at module level would pin the ledger to the
+# pre-.env default while the child processes write to the .env one -- the
+# external fuse would then watch a file nobody writes and report zero spend.
 
 #: The clean-Gamma Phase-A protocol. A reference config that disagrees on ANY of
 #: these is refused: it would mean the archives describe a different distribution
@@ -82,11 +87,15 @@ DEFAULT_ENV_FILE = "/root/autodl-tmp/meta-n-main/.env"
 
 
 def load_env_file(path: str) -> int:
-    """`set -a; . <file>; set +a`, in Python.
+    """`set -a; . <file>; set +a`, done by ACTUAL BASH.
 
-    Overwrites, like bash's `.`, so the launcher's environment is the SAME one
-    the old bash launcher produced rather than a merge with whatever the calling
-    shell happened to have.
+    Hand-parsing is not equivalent to `source`: it cannot do `export K=v`, does
+    not expand `K="$OTHER/xxx"`, and mishandles quoting/continuations. This file
+    supplies the relay key, the pricing override JSON and the cost ledger
+    directory -- so imitating the shell grammar here is exactly the kind of
+    quiet divergence that turns into a wrong provider or a wrong ledger. Running
+    bash and reading the resulting environment back makes the launcher's
+    environment BYTE-FOR-BYTE the one the old bash launcher produced.
     """
     p = Path(path)
     if not p.is_file():
@@ -95,15 +104,35 @@ def load_env_file(path: str) -> int:
             "launcher sourced this before every run; skipping it turns a "
             "missing relay key into a failure that only appears once the "
             "first PAID call is attempted.".format(path))
-    n = 0
-    for line in p.read_text(encoding="utf-8").splitlines():
-        line = line.strip()
-        if not line or line.startswith("#") or "=" not in line:
+    before = set(os.environ)
+    r = subprocess.run(["bash", "-c", 'set -a; . "$1"; set +a; env -0',
+                        "_", str(p)], capture_output=True)
+    if r.returncode != 0:
+        raise SystemExit("sourcing {} failed: {}".format(
+            p, r.stderr.decode("utf-8", "replace")[-400:]))
+    for chunk in r.stdout.split(b"\x00"):
+        if not chunk:
             continue
-        k, v = line.split("=", 1)
-        os.environ[k.strip()] = v.strip().strip('"').strip("'")
-        n += 1
-    return n
+        k, _, v = chunk.decode("utf-8", "replace").partition("=")
+        if k:
+            os.environ[k] = v
+    return len(set(os.environ) - before)
+
+
+def child_ledger_path() -> Path:
+    """The EXACT file the child's `CostTracker` will write to.
+
+    `CostTracker` keys its ledger by the MACHINE-LOCAL date (`utc=False`) under
+    `META_N_COST_LEDGER_DIR` (default `~/.meta_n_costs`), while `budget.py`
+    freezes that env var at import and keys by UTC. When local != UTC those are
+    two different files for part of every day -- not only across a UTC midnight
+    -- and an external fuse watching the wrong one sees no spend at all. This
+    reproduces the child's convention rather than approximating it.
+    """
+    d = os.environ.get("META_N_COST_LEDGER_DIR", "").strip()
+    base = Path(d).expanduser() if d else Path.home() / ".meta_n_costs"
+    import datetime as _dt
+    return base / "{}.jsonl".format(_dt.datetime.now().strftime("%Y-%m-%d"))
 
 
 def load_reference_set(pattern: str) -> List[Dict[str, Any]]:
@@ -258,17 +287,32 @@ def main() -> int:
         return 0
 
     n = load_env_file(args.env_file)
-    print("  loaded %d key(s) from %s" % (n, args.env_file))
+    print("  sourced %s -> %d new env key(s)" % (args.env_file, n))
 
-    # ONE baseline for the WHOLE batch -- taken here, once, before any run.
-    baseline = total_cost()
+    # AFTER the sourcing, or budget.py pins the pre-.env ledger dir.
+    from meta_n.rpbe.budget import Caps, Fuse, total_cost
+
+    ledger = child_ledger_path()
+    # Spend ALREADY on the books for the child's own day-key. The inner guard
+    # stops a run when the DAY's total reaches its cap, and it has no notion of a
+    # batch baseline -- so setting the cap to the batch allowance alone would
+    # kill a run partway through whenever earlier spend existed (measured
+    # concern: $7 already spent + a $36 allowance leaves only $29 of headroom,
+    # and the run dies at $36 of DAILY spend, not $36 of BATCH spend).
+    #
+    # The intent is "the batch may ADD up to batch_total_cap", so the inner cap
+    # has to be today_before_batch + batch_total_cap; the outer fuse below then
+    # enforces the part that actually matters, batch_spend <= batch_total_cap.
+    baseline = total_cost(ledger)
+    daily_cap = baseline + float(args.batch_total_cap)
+    os.environ["META_N_DAILY_BUDGET_USD"] = str(daily_cap)
     caps = Caps(per_run=float(args.per_run_cap), total=float(args.batch_total_cap))
-    # The inner guard's ledger is SHARED ACROSS PROCESSES, so it must see the
-    # batch allowance. Setting it to the per-run cap would make run 2 start
-    # already "over budget" from run 1's spend.
-    os.environ["META_N_DAILY_BUDGET_USD"] = str(float(args.batch_total_cap))
-    print("  batch baseline $%.4f   per-run cap $%.2f   batch total cap $%.2f"
-          % (baseline, caps.per_run, caps.total))
+    print("  ledger        : %s" % ledger)
+    print("  spend already on it today : $%.4f" % baseline)
+    print("  inner daily cap           : $%.4f  (already-spent + batch cap)"
+          % daily_cap)
+    print("  batch cap (outer fuse)    : $%.2f   per-run cap $%.2f"
+          % (caps.total, caps.per_run))
     print()
 
     rc = 0
@@ -289,20 +333,23 @@ def main() -> int:
                                  start_new_session=True)
         # The SAME baseline for every run: phase_spend = total - baseline is then
         # cumulative over the batch, which is what a batch cap means.
-        reason = wait_with_fuse(p, Fuse(p.pid, caps, phase_baseline=baseline))
+        # SAME path the child writes to, so phase_spend is the batch's own
+        # new spend and not zero-by-mistake.
+        reason = wait_with_fuse(
+            p, Fuse(p.pid, caps, phase_baseline=baseline, path=ledger))
         if reason is not None:
             print("  !! FUSE FIRED: %s -- run killed" % reason)
             rc = 1
             break
         print("[%s] seed=%d done rc=%s   batch spend $%.4f"
               % (time.strftime("%F %T"), s, p.returncode,
-                 total_cost() - baseline))
+                 total_cost(ledger) - baseline))
         if p.returncode != 0:
             rc = p.returncode
             break
 
     print()
-    print("  REAL batch spend: $%.4f" % (total_cost() - baseline))
+    print("  REAL batch spend: $%.4f" % (total_cost(ledger) - baseline))
     return rc
 
 

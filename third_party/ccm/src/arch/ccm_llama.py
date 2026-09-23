@@ -346,6 +346,11 @@ class LlamaAttention(nn.Module):
             if self.gamma is not None and sum_row_pos is not None \
                     and int(sum_row_pos.shape[1]) >= 1:
                 n_slots = int(sum_row_pos.shape[2])
+                # Self-bind (review fix 2026-09-24): n_heads/head_dim
+                # were only bound in the t_max>=2 gather block above —
+                # a t_max==1 dialogue (L=1) skipped it and this block
+                # raised UnboundLocalError (Stage-B attach path).
+                bsz, n_heads, _sl, head_dim = key_states.shape
                 res_prev_k = torch.zeros(bsz, n_heads, n_slots, head_dim,
                                          dtype=key_states.dtype,
                                          device=key_states.device)

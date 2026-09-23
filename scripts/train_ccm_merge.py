@@ -51,6 +51,8 @@ def parse_args():
     p = argparse.ArgumentParser(
         "CCM merge training (official Step-2 protocol, self-contained)")
     p.add_argument("--model-name-or-path", required=True)
+    p.add_argument("--no-warmup", action="store_true",
+                   help="skip warmup on resume (fork semantics)")
     p.add_argument("--host", default="qwen3",
                    choices=["llama", "qwen3", "gemma4"])
     p.add_argument("--foundation", default="",
@@ -406,10 +408,10 @@ def main():
     params = [p for p in model.parameters() if p.requires_grad]
     optimizer = torch.optim.AdamW(params, lr=args.lr, weight_decay=0.0)
     total_steps = max(1, args.max_steps)
-    warmup_steps = max(1, int(0.03 * total_steps))
+    warmup_steps = 0 if args.no_warmup else max(1, int(0.03 * total_steps))
 
     def _lr_lambda(s):
-        if s < warmup_steps:
+        if warmup_steps > 0 and s < warmup_steps:
             return float(s) / float(warmup_steps)
         progress = float(s - warmup_steps) / float(
             max(1, total_steps - warmup_steps))

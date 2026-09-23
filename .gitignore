@@ -12,3 +12,14 @@ __pycache__/
 _fuse_test/
 pilot_01/
 *.log
+
+# SECRETS -- never commit. `_box.py` carries the box password in plaintext and
+# the probes carry relay keys; all four were sitting untracked in the tree.
+_box.py
+_fix_key.py
+_probe_*.py
+
+# scratch bundles/patches staged for the box, not evidence
+_other_patches/
+_their_changes.diff
+sri_real_smoke.py

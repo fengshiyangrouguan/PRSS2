@@ -787,3 +787,4 @@ def test_23_gamma_identity_refuses_a_stale_or_swapped_checkpoint(tmp_path=None):
         # missing file: identity cannot be checked at all
         with pytest.raises(StageError, match="is missing"):
             assert_gamma_identity(good, good, str(Path(td) / "gone.pt"))
+

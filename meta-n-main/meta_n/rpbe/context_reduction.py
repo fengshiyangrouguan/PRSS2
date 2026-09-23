@@ -107,6 +107,140 @@ class _FinalisableList(list):
         self.owner = owner
 
 
+class SiblingAllocator:
+    """Deterministic sibling diversification (frozen 2026-09-23).
+
+    THE PROBLEM IT SOLVES, MEASURED. For one parent, every sibling proposal
+    reduces the IDENTICAL pool, and `q` is defined as the pool's rendering
+    (encoder.py §2.8) -- so X and q_emb are identical across siblings. Gamma is a
+    deterministic function, so every sibling received the SAME 4 traces. On the
+    seed-0 run: 4 siblings -> 1 distinct subset, while the native arm samples
+    randomly and gets subset exploration for free. That is a real structural
+    asymmetry between the arms and a candidate mechanism for the observed shape
+    (fast dev rise, early lineage peak, no matching held-out gain).
+
+    WHAT IS DELIBERATELY NOT CHANGED. Gamma's scores, Gamma's own Top-k, the
+    theory, the budget, k, and the native arm. The FIRST proposal for a given
+    (pool, stack) gets EXACTLY the old selection, so the exploitation path that
+    already worked is preserved byte-for-byte; only the other proposals for the
+    same input are diversified. No temperature, no loss, no random draw --
+    selection is a pure function of the ranked scores and what has already been
+    assigned, so the arm stays fully reproducible.
+
+    THE RULE. With Gamma's ranking r1..r6 and k=4:
+      * the top 2 are PROTECTED -- every subset contains {r1, r2};
+      * an exploration subset replaces exactly ONE of {r3, r4} with one of
+        {r5, r6}, i.e. |S ∩ S_1| == k-1;
+      * among the legal subsets, pick lexicographically
+            max ( D(S), U(S) )
+        where D(S) = sum over already-assigned S' of (k - |S ∩ S'|) and
+        U(S) = sum of Gamma scores in S. Diversity first, Gamma utility only as
+        the tie-break -- which is why no lambda has to be chosen.
+    """
+
+    def __init__(self):
+        self._counts: Dict[Any, int] = {}
+        self._assigned: Dict[Any, List[Tuple[int, ...]]] = {}
+
+    @staticmethod
+    def identity_key(traces: Sequence[Any],
+                     context_stack: Sequence[Any]) -> Tuple[str, str]:
+        """Stable key for "the same reduction input".
+
+        Content-based, not identity-based, so two calls that see the same pool
+        and the same stack land in the same group even across processes. That is
+        the right grouping: the point is "these proposals share an input", which
+        is exactly when collapsing to one subset is the defect.
+        """
+        import hashlib as _h
+
+        def h(s):
+            return _h.sha256(str(s).encode("utf-8", "replace")).hexdigest()[:16]
+
+        pool = ";".join("%s|%s|%s|%s" % (getattr(t, "task_id", "?"),
+                                        h(getattr(t, "script", "")),
+                                        bool(getattr(t, "success", False)),
+                                        getattr(t, "score", None))
+                        for t in traces)
+        stack = ";".join("%s|%s|%s" % (getattr(c, "source_depth", None),
+                                       h(getattr(c, "pre_process", "")),
+                                       h(getattr(c, "rationale", "")))
+                         for c in context_stack)
+        return pool, stack
+
+    @staticmethod
+    def _subsets(ranked: Sequence[int], k: int, n: int,
+                 core_keep: int, overlap: int) -> List[Tuple[int, ...]]:
+        """k-subsets keeping the top `core_keep` and overlapping S_1 by `overlap`."""
+        import itertools
+        if n <= k:
+            return [tuple(ranked[:n])]
+        core = set(ranked[:min(core_keep, k)])
+        ref = set(ranked[:k])
+        out = []
+        for comb in itertools.combinations(ranked, k):
+            S = set(comb)
+            if not core <= S:
+                continue
+            if len(S & ref) != overlap:
+                continue
+            out.append(tuple(i for i in ranked if i in S))   # keep rank order
+        return out
+
+    def allocate(self, key, ranked: Sequence[int], k: int,
+                 score_of, fits) -> Tuple[Tuple[int, ...], int, str]:
+        """(subset as indices into the ranked pool, variant, kind).
+
+        variant 0 is the untouched Top-k. `fits` guards the trace token budget;
+        a subset that would overrun it is never offered.
+        """
+        n = len(ranked)
+        variant = self._counts.get(key, 0)
+        self._counts[key] = variant + 1
+        top = tuple(ranked[:min(k, n)])
+        if variant == 0 or n <= k:
+            self._assigned.setdefault(key, []).append(top)
+            return top, 0, "exploit"
+
+        assigned = self._assigned.setdefault(key, [top])
+        cands = self._subsets(ranked, k, n, core_keep=2, overlap=k - 1)
+        cands = [c for c in cands if fits(c)]
+        if not cands:                        # relax: allow two replacements
+            cands = [c for c in self._subsets(ranked, k, n, core_keep=2,
+                                              overlap=k - 2) if fits(c)]
+        if not cands:                        # last resort: core only
+            cands = [c for c in self._subsets(ranked, k, n, core_keep=2,
+                                              overlap=0) if fits(c)]
+        if not cands:
+            self._assigned[key].append(top)
+            return top, variant, "exploit"
+
+        def D(S):
+            return sum(k - len(set(S) & set(S2)) for S2 in assigned)
+
+        def U(S):
+            return sum(float(score_of[i]) for i in S)
+
+        # Uniqueness first. D/U can tie across every remaining candidate -- with
+        # a 6->4 pool and one replacement there are only four legal subsets, and
+        # once three are assigned the rest tie on both. Without this the
+        # lexicographic max re-picks an ALREADY-ASSIGNED subset and the arm
+        # collapses again (measured: 4 siblings -> 3 unique instead of 4). Using
+        # an unassigned subset whenever one exists is the deterministic reading
+        # of "make the siblings as different as possible".
+        unchosen = [c for c in cands if c not in assigned]
+        best = max(unchosen or cands,
+                   key=lambda S: (D(S), U(S), -ranked.index(S[0])))
+        self._assigned[key].append(best)
+        return best, variant, "explore"
+
+
+#: Allocator instance shared by a run. Module-level on purpose: the reducer is
+#: constructed once per process (main.py), but a fresh ContextReducer built by a
+#: harness must NOT silently restart the variant sequence mid-run.
+_SIBLING_ALLOCATOR = SiblingAllocator()
+
+
 class ContextReducer:
     """Mode-aware reducer. Pure function of its inputs; holds no state."""
 
@@ -162,9 +296,18 @@ class ContextReducer:
             list(traces), max_total=TRACE_K4)
         sampled = canonical_order(list(sampled), traces)
         stack = self.context_manager.truncate_context_stack(list(context_stack))
-        return (list(sampled), list(stack),
-                dict(self._budget_diag("official_trace_k4", traces, sampled,
-                                       context_stack, stack)))
+        diag = dict(self._budget_diag("official_trace_k4", traces, sampled,
+                                      context_stack, stack))
+        # RECORD ONLY -- the selection above is untouched. The baseline had no
+        # selection record either, which is why "what did the native rule keep on
+        # this call?" was unanswerable below depth 2 in the seed-0 analysis.
+        diag["allocator"] = "native_sampling"
+        diag["pool_trace_ids"] = [getattr(t, "task_id", "?") for t in traces]
+        diag["selected_trace_ids"] = [getattr(t, "task_id", "?")
+                                      for t in sampled]
+        diag["pool_hash"], diag["stack_hash"] = \
+            SiblingAllocator.identity_key(list(traces), list(context_stack))
+        return (list(sampled), list(stack), diag)
 
     # -- matched_k4: the matched-CAPACITY baseline (see the constants above) --
     def _matched_k4(self, traces, context_stack):
@@ -275,6 +418,39 @@ class ContextReducer:
         # Empty stack on purpose: the selector ranks traces only.
         sel_t, _, diag = self.selector.reduce(
             trace_items, [], attention, budget)
+
+        # ---- sibling diversification (frozen 2026-09-23) -------------------
+        # Variant 0 is the selector's own output, UNCHANGED, so the exploitation
+        # path is byte-identical to the pre-change arm. Only the other proposals
+        # sharing this SAME input get a diversified subset; see SiblingAllocator
+        # for why identical inputs used to force identical selections.
+        import torch as _torch
+        n_items = len(trace_items)
+        k = min(TRACE_K4, n_items)
+        mass = attention.detach().to(_torch.float64).sum(dim=0)
+        # `ranked[pos]` is the pool index of the pos-th best trace; every score
+        # and subset below is expressed in RANK POSITIONS, which is what the
+        # allocator's diversity/utility arithmetic needs.
+        ranked = sorted(range(n_items), key=lambda i: (-float(mass[i]), i))
+        score_by_pos = {pos: float(mass[ranked[pos]]) for pos in range(n_items)}
+        est = getattr(self.context_manager, "_estimate_trace_tokens", None)
+
+        def fits(subset):
+            """Subsets are rank positions; guard the trace token budget."""
+            if est is None or budget is None:
+                return True
+            try:
+                return (sum(est(trace_items[ranked[pos]]) for pos in subset)
+                        <= budget.traces_budget)
+            except Exception:                                 # noqa: BLE001
+                return True
+
+        key = SiblingAllocator.identity_key(trace_items, context_stack)
+        picked, variant, kind = _SIBLING_ALLOCATOR.allocate(
+            key, ranked, k, score_by_pos, fits)
+        if variant != 0:
+            sel_t = [trace_items[ranked[pos]] for pos in picked]
+
         # Same membership-only contract as the baseline: Gamma returns SLOT
         # order, so re-sort both arms into the pool's order or the two prompts
         # would differ in rendering order as well as in membership.
@@ -283,6 +459,18 @@ class ContextReducer:
         sel_s = list(
             self.context_manager.truncate_context_stack(list(context_stack)))
         diag["mode"] = "predictive"
+        # Selection-trajectory record. Without this the 4-of-N choice is not
+        # persisted anywhere (no trace ids in proposal_slots.jsonl), which is why
+        # the seed-0 run could not be analysed below depth 2 at all.
+        diag["allocator"] = "sibling_diverse_v1"
+        diag["allocator_variant"] = int(variant)
+        diag["allocator_kind"] = kind
+        diag["pool_hash"], diag["stack_hash"] = key
+        diag["pool_trace_ids"] = [getattr(t, "task_id", "?") for t in trace_items]
+        diag["gamma_rank"] = [getattr(trace_items[i], "task_id", "?")
+                              for i in ranked]
+        diag["gamma_scores"] = [round(float(mass[i]), 8) for i in ranked]
+        diag["selected_trace_ids"] = [getattr(t, "task_id", "?") for t in sel_t]
         # Same instrumentation shape as every other mode, so the two arms' per-call
         # records can be compared field by field (see _budget_diag).
         diag.update(self._budget_diag("predictive", traces, sel_t,
@@ -382,12 +570,24 @@ class PredictiveContextManagerAdapter:
 
 TRACE_ENV = "META_N_REDUCTION_TRACE"
 
+#: Monotonic counter over every reduction this process performs. It is what
+#: lets `reduction_trace.jsonl` be joined back to `proposal_slots.jsonl` (which
+#: carries slot_id / parent_id / depth but no trace ids): the reducer cannot see
+#: the candidate identity, so ORDER is the join key.
+_REDUCTION_SEQ = [0]
+
 
 def _append_trace(diag: Dict[str, Any]) -> None:
     """Append one reduction's diagnostics to a JSONL if requested.
 
     Used by the three-mode E2E to prove what each mode actually did, without
     changing any engine behaviour. Off unless META_N_REDUCTION_TRACE is set.
+
+    Carries the whole SELECTION TRAJECTORY: pool identity, the pool's content
+    hash (so siblings sharing an input are recognisable), Gamma's raw scores and
+    rank, the allocator variant, and the chosen trace ids. Without this the
+    4-of-N choice is persisted nowhere and depths >= 3 cannot be analysed at all
+    -- which is exactly what happened on the seed-0 run.
     """
     import json
     import os
@@ -397,6 +597,8 @@ def _append_trace(diag: Dict[str, Any]) -> None:
         return
     try:
         rec = dict(diag)
+        _REDUCTION_SEQ[0] += 1
+        rec["reduction_seq"] = _REDUCTION_SEQ[0]
         rec["ts"] = time.time()
         rec["pid"] = os.getpid()
         with open(path, "a", encoding="utf-8") as f:
@@ -559,6 +761,69 @@ def self_test() -> int:
     print("OK  canonical order    both arms hand the pool order "
           "(k4 {}, predictive {}); the raw sampler emitted {} first, so the "
           "check is not vacuous".format(got_k4, got_p, raw_pos))
+
+    # --- sibling diversification: the four frozen acceptance criteria ------
+    # The defect this fixes: every sibling of one parent reduces the IDENTICAL
+    # pool with an identical q, and Gamma is deterministic, so all of them used
+    # to receive the same 4 traces (measured on seed 0: 4 siblings -> 1 distinct
+    # subset). The native arm samples randomly and gets subset exploration for
+    # free; the Gamma arm had none.
+    _SIBLING_ALLOCATOR._counts.clear()
+    _SIBLING_ALLOCATOR._assigned.clear()
+    pool6 = [Trace(task_id="s{}".format(i), script="s", stdout="o" * 100,
+                   success=True) for i in range(6)]
+    r_div = ContextReducer(ReductionMode.PREDICTIVE, encoder=_StubEncoder(),
+                           fusion=_StubFusion())
+
+    def draw_four(capture=None):
+        out = []
+        for _ in range(4):
+            t, _, dd = r_div.reduce(list(pool6), [], budget=budget)
+            if capture is not None and not capture:
+                capture.append(dd)
+            out.append(tuple(sorted(x.task_id for x in t)))
+        return out
+
+    cap = []
+    first = draw_four(cap)
+    d0 = cap[0]
+    # The untouched Top-k, computed by calling the SELECTOR directly. Going
+    # through `reduce` would consume another allocator variant and compare
+    # variant 0 against variant 4.
+    _X = r_pred.encoder.encode(pool6)
+    _q = r_pred.encoder.encode_query(r_pred.encoder.serialize_query(pool6))
+    _att = r_pred.fusion(_X, _q, None)[1]
+    _raw, _, _ = r_pred.selector.reduce(list(pool6), [], _att, budget)
+    base_ids = tuple(sorted(t.task_id for t in _raw))
+
+    # A. behaviour preserved: variant 0 IS the untouched Top-k
+    assert first[0] == base_ids, (first[0], base_ids)
+    assert d0["allocator_variant"] == 0 and d0["allocator_kind"] == "exploit"
+    print("OK  A behaviour kept   variant 0 == the untouched Gamma Top-k {}"
+          .format(",".join(first[0])))
+
+    # B. diversity restored
+    uniq = sorted(set(first))
+    union = sorted({t for s in first for t in s})
+    assert len(uniq) == 4, uniq
+    assert all(len(s) == 4 for s in first), first
+    core = set(d0["gamma_rank"][:2])          # recorded by _predictive
+    for s in first:
+        assert core <= set(s), (s, core)
+    print("OK  B diversity back   4 siblings -> {} unique subsets; union={} "
+          "(of 6); Gamma top-2 {} kept in every subset".format(
+              len(uniq), len(union), sorted(core)))
+
+    # C. budget untouched: still exactly k=4 traces per proposal
+    assert TRACE_K4 == 4
+    print("OK  C budget same      every variant keeps exactly k={} traces"
+          .format(TRACE_K4))
+
+    # D. reproducible: same input, fresh state -> identical selections
+    _SIBLING_ALLOCATOR._counts.clear()
+    _SIBLING_ALLOCATOR._assigned.clear()
+    assert draw_four() == first
+    print("OK  D reproducible     same pool re-run gives byte-identical subsets")
 
     # C_v IS NEVER APPENDED: the reducer's output carries no tasks/scores
     assert not hasattr(t_p, "tasks") and "tasks" not in d_p

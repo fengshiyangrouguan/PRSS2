@@ -33,6 +33,9 @@ statistics stay in `diagnostics`.
 
 from __future__ import annotations
 
+import json
+import os
+
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from meta_n.core.meta_layer import InjectedCode, Trace
@@ -107,6 +110,36 @@ class _FinalisableList(list):
         self.owner = owner
 
 
+def _full_repr(obj: Any) -> str:
+    """Every field of a Trace / InjectedCode, sorted, as text.
+
+    Used only on the official path (which logs the key but never allocates on
+    it), so completeness matters more than speed here.
+    """
+    try:
+        d = obj.model_dump()                    # pydantic v2
+    except AttributeError:
+        try:
+            d = dict(vars(obj))
+        except TypeError:
+            return str(obj)
+    return repr(sorted(d.items(), key=lambda kv: str(kv[0])))
+
+
+def _stack_text(code: Any) -> str:
+    """Exactly what Omega renders for one injected-code layer.
+
+    `code_library` / `code_library_bash` are rendered into the stack text but
+    were missing from the first version of the key.
+    """
+    try:
+        from meta_n.core.omega import OmegaEngine
+        eng = object.__new__(OmegaEngine)
+        return OmegaEngine._format_context_stack(eng, [code])
+    except Exception:                                         # noqa: BLE001
+        return _full_repr(code)
+
+
 class SiblingAllocator:
     """Deterministic sibling diversification (frozen 2026-09-23).
 
@@ -141,32 +174,89 @@ class SiblingAllocator:
     def __init__(self):
         self._counts: Dict[Any, int] = {}
         self._assigned: Dict[Any, List[Tuple[int, ...]]] = {}
+        self._warm_path: Optional[str] = None
+        self._warmed = False
+
+    def warm_from(self, path: Optional[str]) -> None:
+        """Point the allocator at the reduction trace it must REPLAY on start.
+
+        WHY THIS IS REQUIRED, not a nicety. On `--resume` the orchestrator skips
+        already-completed candidates, but a fresh Python process starts with
+        empty counters. So the first reduction the new process performs for a
+        group is really the 2nd, 3rd, ... sibling -- and it would be handed
+        variant 0 again, changing the treatment in a way that depends only on
+        WHEN the machine crashed. Replaying the trace makes the variant a
+        function of the group's history rather than of process uptime.
+        """
+        self._warm_path = path
+        self._warmed = False
+
+    def _ensure_warm(self) -> None:
+        if self._warmed:
+            return
+        self._warmed = True
+        path = (self._warm_path or "").strip()
+        if not path or not os.path.isfile(path):
+            return
+        try:
+            with open(path, encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    r = json.loads(line)
+                    pool_h, stack_h = r.get("pool_hash"), r.get("stack_hash")
+                    pos = r.get("allocator_picked_positions")
+                    var = r.get("allocator_variant")
+                    if pool_h is None or pos is None or var is None:
+                        continue
+                    key = (pool_h, stack_h)
+                    self._counts[key] = max(self._counts.get(key, 0),
+                                            int(var) + 1)
+                    self._assigned.setdefault(key, []).append(tuple(pos))
+        except (OSError, ValueError):
+            # A corrupt/absent trace leaves the counters empty, which is the
+            # pre-fix behaviour; it is logged by the caller, never silent.
+            return
 
     @staticmethod
     def identity_key(traces: Sequence[Any],
-                     context_stack: Sequence[Any]) -> Tuple[str, str]:
+                     context_stack: Sequence[Any],
+                     encoder: Any = None) -> Tuple[str, str]:
         """Stable key for "the same reduction input".
 
-        Content-based, not identity-based, so two calls that see the same pool
-        and the same stack land in the same group even across processes. That is
-        the right grouping: the point is "these proposals share an input", which
-        is exactly when collapsing to one subset is the defect.
+        CONTENT-COMPLETE, not a hand-picked field list. The first version hashed
+        only (task_id, script, success, score) for traces and
+        (source_depth, pre_process, rationale) for stack layers -- but the
+        encoder serializes stdout / stderr / error_summary / eval_feedback into X
+        and q, and Omega renders `code_library` / `code_library_bash` into the
+        stack text. Two genuinely DIFFERENT inputs could therefore hash EQUAL and
+        be merged into one sibling group, which is a silent treatment change.
+
+        When an encoder is supplied, its own `serialize()` is hashed -- that is
+        the exact text Gamma consumes, so the key cannot drift from the input as
+        fields are added later. Without one (the official path only logs this),
+        every field of the object is dumped.
         """
         import hashlib as _h
 
-        def h(s):
-            return _h.sha256(str(s).encode("utf-8", "replace")).hexdigest()[:16]
+        def digest(obj, text=None):
+            h = _h.sha256()
+            h.update((text if text is not None
+                      else _full_repr(obj)).encode("utf-8", "replace"))
+            return h.hexdigest()[:16]
 
-        pool = ";".join("%s|%s|%s|%s" % (getattr(t, "task_id", "?"),
-                                        h(getattr(t, "script", "")),
-                                        bool(getattr(t, "success", False)),
-                                        getattr(t, "score", None))
-                        for t in traces)
-        stack = ";".join("%s|%s|%s" % (getattr(c, "source_depth", None),
-                                       h(getattr(c, "pre_process", "")),
-                                       h(getattr(c, "rationale", "")))
-                         for c in context_stack)
-        return pool, stack
+        pool_parts, stack_parts = [], []
+        ser = getattr(encoder, "serialize_item", None)
+        for t in traces:
+            if ser is not None:
+                txt, ty, dep = ser(t)
+                pool_parts.append("%s|%d|%d" % (digest(None, txt), ty, dep))
+            else:
+                pool_parts.append(digest(t))
+        for c in context_stack:
+            stack_parts.append(digest(None, _stack_text(c)))
+        return ";".join(pool_parts), ";".join(stack_parts)
 
     @staticmethod
     def _subsets(ranked: Sequence[int], k: int, n: int,
@@ -189,11 +279,20 @@ class SiblingAllocator:
 
     def allocate(self, key, ranked: Sequence[int], k: int,
                  score_of, fits) -> Tuple[Tuple[int, ...], int, str]:
-        """(subset as indices into the ranked pool, variant, kind).
+        """(subset as rank positions, variant, kind).
 
-        variant 0 is the untouched Top-k. `fits` guards the trace token budget;
-        a subset that would overrun it is never offered.
+        `ranked[:k]` MUST be the canonical selector's own picks, in its order --
+        the caller builds it that way. That is what makes "variant 0 == the old
+        selection" and "exploration subsets replace one element of S_1" true
+        statements rather than intentions: an earlier version ranked by summed
+        attention mass, which is NOT the same set the slot-wise selector
+        produces, so the allocator was protecting and perturbing a DIFFERENT
+        subset than the one variant 0 actually emitted.
+
+        `fits` guards the trace token budget; a subset that would overrun it is
+        never offered.
         """
+        self._ensure_warm()
         n = len(ranked)
         variant = self._counts.get(key, 0)
         self._counts[key] = variant + 1
@@ -416,22 +515,29 @@ class ContextReducer:
         q_emb = self.encoder.encode_query(q_text)
         _, attention = self.fusion(X, q_emb, None)
         # Empty stack on purpose: the selector ranks traces only.
-        sel_t, _, diag = self.selector.reduce(
+        sel_t_raw, _, diag = self.selector.reduce(
             trace_items, [], attention, budget)
 
         # ---- sibling diversification (frozen 2026-09-23) -------------------
-        # Variant 0 is the selector's own output, UNCHANGED, so the exploitation
-        # path is byte-identical to the pre-change arm. Only the other proposals
-        # sharing this SAME input get a diversified subset; see SiblingAllocator
-        # for why identical inputs used to force identical selections.
+        # The ranking is CANONICAL-FIRST: r1..r_k are the slot-wise selector's
+        # own picks in its own order, and only the traces it did NOT pick are
+        # ordered by summed attention mass. That matters because the selector is
+        # a slot-aware unique assignment (`softmax` per slot, then argmax with
+        # no repeats) while summed mass is a global ranking, and the two are NOT
+        # mathematically the same set. Ranking by mass and then claiming
+        # "variant 0 is the old selection" and "exploration replaces one element
+        # of S_1" would have been describing a DIFFERENT S_1 than the one variant
+        # 0 emitted.
         import torch as _torch
         n_items = len(trace_items)
         k = min(TRACE_K4, n_items)
         mass = attention.detach().to(_torch.float64).sum(dim=0)
-        # `ranked[pos]` is the pool index of the pos-th best trace; every score
-        # and subset below is expressed in RANK POSITIONS, which is what the
-        # allocator's diversity/utility arithmetic needs.
-        ranked = sorted(range(n_items), key=lambda i: (-float(mass[i]), i))
+        idx_of = {id(t): i for i, t in enumerate(trace_items)}
+        base = [idx_of[id(t)] for t in sel_t_raw if id(t) in idx_of]
+        rest = [i for i in range(n_items) if i not in set(base)]
+        rest.sort(key=lambda i: (-float(mass[i]), i))
+        # every subset below is expressed in RANK POSITIONS
+        ranked = base + rest
         score_by_pos = {pos: float(mass[ranked[pos]]) for pos in range(n_items)}
         est = getattr(self.context_manager, "_estimate_trace_tokens", None)
 
@@ -445,17 +551,24 @@ class ContextReducer:
             except Exception:                                 # noqa: BLE001
                 return True
 
-        key = SiblingAllocator.identity_key(trace_items, context_stack)
-        # RANK-POSITION space, deliberately. `ranked[0]` is the best POOL index,
-        # `ranked[1]` the next, etc. The allocator must work on positions so that
-        # one index space is used throughout: its `score_of` is position-keyed,
-        # and `sel_t` below maps a position back through `ranked`. The first
-        # draft passed `ranked` itself, so the returned "positions" were pool
-        # indices and were then re-indexed through `ranked` again -- a live run
-        # showed variant 1 producing the SAME subset as variant 0.
+        # Replay the trace so a RESUMED process continues the variant sequence
+        # instead of restarting it at 0 (see SiblingAllocator.warm_from).
+        _SIBLING_ALLOCATOR.warm_from(os.environ.get(TRACE_ENV))
+        key = SiblingAllocator.identity_key(trace_items, context_stack,
+                                            encoder=self.encoder)
+        # RANK-POSITION space throughout: `ranked[pos]` is a POOL index, `pos` is
+        # a rank position, and `sel_t` maps a position back through `ranked`
+        # exactly once. An earlier draft passed `ranked` where positions were
+        # expected and then re-indexed, so the returned "positions" were pool
+        # indices -- a live run showed variant 1 equal to variant 0.
         picked, variant, kind = _SIBLING_ALLOCATOR.allocate(
             key, list(range(n_items)), k, score_by_pos, fits)
-        if variant != 0:
+        if variant == 0:
+            # VERBATIM, not re-derived: this is what makes "variant 0 == the old
+            # selection" true even if the selector returned fewer than k items
+            # under the token budget.
+            sel_t = list(sel_t_raw)
+        else:
             sel_t = [trace_items[ranked[pos]] for pos in picked]
 
         # Same membership-only contract as the baseline: Gamma returns SLOT
@@ -472,6 +585,10 @@ class ContextReducer:
         diag["allocator"] = "sibling_diverse_v1"
         diag["allocator_variant"] = int(variant)
         diag["allocator_kind"] = kind
+        # The allocator's own decision, in RANK POSITIONS. Persisted because it
+        # is what `warm_from` replays after a crash: without it a resumed process
+        # cannot reconstruct which subsets a group has already been assigned.
+        diag["allocator_picked_positions"] = [int(p) for p in picked]
         diag["pool_hash"], diag["stack_hash"] = key
         diag["pool_trace_ids"] = [getattr(t, "task_id", "?") for t in trace_items]
         diag["gamma_rank"] = [getattr(trace_items[i], "task_id", "?")
@@ -602,16 +719,26 @@ def _append_trace(diag: Dict[str, Any]) -> None:
     path = os.environ.get(TRACE_ENV, "").strip()
     if not path:
         return
+    rec = dict(diag)
+    _REDUCTION_SEQ[0] += 1
+    rec["reduction_seq"] = _REDUCTION_SEQ[0]
+    rec["ts"] = time.time()
+    rec["pid"] = os.getpid()
+    # FAIL LOUDLY. This trace is now load-bearing: it carries the selection
+    # trajectory (`pool_hash`, `allocator_picked_positions`) that the allocator
+    # REPLAYS after a crash, and the only record of the 4-of-N choice below
+    # depth 2. Swallowing an OSError here -- a full disk, a bad path -- would let
+    # a paid run continue while the evidence it depends on silently vanished,
+    # and the loss would only surface at analysis time. A caller who does not
+    # want the cost simply leaves META_N_REDUCTION_TRACE unset.
     try:
-        rec = dict(diag)
-        _REDUCTION_SEQ[0] += 1
-        rec["reduction_seq"] = _REDUCTION_SEQ[0]
-        rec["ts"] = time.time()
-        rec["pid"] = os.getpid()
         with open(path, "a", encoding="utf-8") as f:
             f.write(json.dumps(rec, default=str) + "\n")
-    except OSError:
-        pass
+    except OSError as e:
+        raise RuntimeError(
+            "{} is set to {!r} but the reduction trace could not be written: "
+            "{}. The allocator replays this file after --resume, so continuing "
+            "without it would change the treatment.".format(TRACE_ENV, path, e))
 
 
 def install(engine, reducer: ContextReducer) -> "PredictiveContextManagerAdapter":
@@ -691,6 +818,29 @@ class _StubFusionRev:
         A = torch.zeros(self.n_slots, n)
         for k in range(self.n_slots):
             A[k, n - 1 - k] = 1.0            # prefer the LAST items first
+        return torch.zeros(self.n_slots, X.shape[1]), A
+
+
+class _StubFusionAdversarial:
+    """Attention where the summed-mass Top-4 is NOT the selector's pick set.
+
+    Every slot slightly prefers its own item over item 5, so the slot-wise
+    selector keeps items 0..3 and never takes 5 -- while item 5 accumulates the
+    LARGEST summed mass (it is the runner-up in every row). Ranking by summed
+    mass would therefore protect and perturb {5,0,1,2}, a different set from the
+    one variant 0 actually emits. That is the P0-1 defect: the allocator must be
+    built on the selector's set, not on a mass ranking that merely resembles it.
+    """
+
+    def __init__(self, n_slots=4):
+        self.n_slots = n_slots
+
+    def __call__(self, X, q_emb, mask):
+        import torch
+        A = torch.zeros(self.n_slots, X.shape[0])
+        for k in range(self.n_slots):
+            A[k, k] = 0.50          # slot k's own item
+            A[k, -1] = 0.49         # item 5 is runner-up EVERYWHERE
         return torch.zeros(self.n_slots, X.shape[1]), A
 
 
@@ -879,6 +1029,89 @@ def self_test() -> int:
     _SIBLING_ALLOCATOR._assigned.clear()
     assert draw_four() == first
     print("OK  D reproducible     same pool re-run gives byte-identical subsets")
+
+    # E. ADVERSARIAL: the allocator must be built on the SELECTOR's pick set,
+    # not on a summed-mass ranking that merely resembles it. Here item 5 has the
+    # largest summed mass but the slot-wise selector never takes it, so a
+    # mass-ranked S_1 would differ from what variant 0 actually emits.
+    _SIBLING_ALLOCATOR._counts.clear()
+    _SIBLING_ALLOCATOR._assigned.clear()
+    r_adv = ContextReducer(ReductionMode.PREDICTIVE, encoder=_StubEncoder(),
+                           fusion=_StubFusionAdversarial())
+    adv, adv_d = [], []
+    for _ in range(4):
+        t, _, dd = r_adv.reduce(list(pool6), [], budget=budget)
+        adv_d.append(dd)
+        adv.append(tuple(sorted(x.task_id for x in t)))
+    # the selector's own set, computed directly
+    _Xa = r_adv.encoder.encode(pool6)
+    _qa = r_adv.encoder.encode_query(r_adv.encoder.serialize_query(pool6))
+    _Aa = r_adv.fusion(_Xa, _qa, None)[1]
+    _rawa, _, _ = r_adv.selector.reduce(list(pool6), [], _Aa, budget)
+    canonical = tuple(sorted(t.task_id for t in _rawa))
+    # ...and the mass ranking, to prove the two really do differ here
+    _mass = _Aa.detach().sum(dim=0)
+    _ids = [t.task_id for t in pool6]
+    by_mass = tuple(sorted(_ids[i] for i in sorted(
+        range(len(_ids)), key=lambda i: (-float(_mass[i]), i))[:4]))
+    assert by_mass != canonical, (by_mass, canonical,
+                                  "this stub must DISAGREE, else E is vacuous")
+    assert adv[0] == canonical, (adv[0], canonical)
+    core = tuple(adv_d[0]["gamma_rank"][:2])
+    for _i, s in enumerate(adv):
+        assert len(s) == 4, s
+        assert set(core) <= set(s), (s, core)
+        if _i:
+            # variant 0 IS S_1; only the EXPLORATION variants must replace
+            # exactly one element of it (overlap k-1).
+            assert len(set(s) & set(adv[0])) == 3, (s, adv[0])
+    assert len(set(adv)) == 4, adv
+    print("OK  E adversarial      mass-Top4 {} != selector {}; variant 0 still "
+          "emits the SELECTOR set and the other three replace one element of it"
+          .format(",".join(x[:10] for x in by_mass),
+                  ",".join(x[:10] for x in canonical)))
+
+    # F. RESUME: a fresh process must continue the variant sequence, not restart
+    # it at 0. Without the replay the first reduction after a crash would be
+    # handed variant 0 again, changing the treatment based on WHEN it crashed.
+    import tempfile
+    import json as _json
+    _SIBLING_ALLOCATOR._counts.clear()
+    _SIBLING_ALLOCATOR._assigned.clear()
+    with tempfile.TemporaryDirectory() as _td:
+        _tpath = os.path.join(_td, "trace.jsonl")
+        os.environ[TRACE_ENV] = _tpath
+        try:
+            def draw_and_log():
+                t, _, dd = r_div.reduce(list(pool6), [], budget=budget)
+                _append_trace(dd)
+                return tuple(sorted(x.task_id for x in t))
+
+            _SIBLING_ALLOCATOR._counts.clear()
+            _SIBLING_ALLOCATOR._assigned.clear()
+            open(_tpath, "w").close()
+            full = [draw_and_log() for _ in range(4)]
+
+            # simulate: two siblings done, then the process dies
+            _SIBLING_ALLOCATOR._counts.clear()
+            _SIBLING_ALLOCATOR._assigned.clear()
+            open(_tpath, "w").close()
+            first = [draw_and_log() for _ in range(2)]
+            assert first == full[:2], (first, full)
+
+            # a NEW process: empty counters, but it replays the trace
+            _SIBLING_ALLOCATOR._counts.clear()
+            _SIBLING_ALLOCATOR._assigned.clear()
+            _SIBLING_ALLOCATOR.warm_from(_tpath)
+            after = [draw_and_log() for _ in range(2)]
+            assert after == full[2:], (after, full[2:])
+            # and the trace itself stayed append-only across the restart
+            assert len([l for l in open(_tpath, encoding="utf-8")
+                        if l.strip()]) == 4
+        finally:
+            os.environ.pop(TRACE_ENV, None)
+    print("OK  F resume replay    after a simulated crash the next sibling gets "
+          "variant 2, not variant 0 (identical to the uninterrupted sequence)")
 
     # C_v IS NEVER APPENDED: the reducer's output carries no tasks/scores
     assert not hasattr(t_p, "tasks") and "tasks" not in d_p

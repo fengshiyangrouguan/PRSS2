@@ -621,6 +621,9 @@ def stage_root(args, profile: SRIProfile, out: Path) -> dict:
                                  "codebert_path": os.environ.get(
                                      "CODEBERT_PATH", "").strip() or None,
                                  "encoder_revision": encoder_revision(),
+                                 "codebert_snapshot_sha256":
+                                     encoder_snapshot_digest(os.environ.get(
+                                         "CODEBERT_PATH", "").strip()),
                                  "root_config_sha256": sha256_file(
                                      exp / "config.json")},
                         extra={"root_bundle": bundle})
@@ -780,6 +783,8 @@ def write_sri_context(args, profile: SRIProfile, out: Path, arm: str,
             "codebert_path"),
         "encoder_revision": man.get("root", {}).get("outputs", {}).get(
             "encoder_revision"),
+        "codebert_snapshot_sha256": man.get("root", {}).get("outputs", {}).get(
+            "codebert_snapshot_sha256"),
     }
     ctx["sri_context_sha256"] = sha256_of(
         {k: v for k, v in ctx.items() if k not in ("ledger_path",)})
@@ -824,6 +829,42 @@ def encoder_revision() -> Optional[str]:
         return str(getattr(_C, "ENCODER_REVISION", "")) or None
     except Exception:                                             # noqa: BLE001
         return None
+
+
+def encoder_snapshot_digest(path: Optional[str]) -> Optional[str]:
+    """SHA256 over the codebert snapshot's key files.
+
+    `CODEBERT_PATH` says WHERE the encoder came from and `ENCODER_REVISION` says
+    which revision was REQUESTED -- but `from_pretrained(local_path)` reads
+    whatever bytes are actually in that local directory, so neither pins the
+    identity of E_0 itself. Hashing the handful of files the loader reads is
+    cheap (a few hundred MB, far cheaper than one API proposal) and turns "we
+    believe it was the same snapshot" into a checkable claim.
+    """
+    if not path:
+        return None
+    import hashlib
+    root = Path(path)
+    if not root.is_dir():
+        return None
+    wanted = ("config.json", "vocab.txt", "tokenizer.json",
+              "tokenizer_config.json", "special_tokens_map.json",
+              "pytorch_model.bin", "model.safetensors")
+    h = hashlib.sha256()
+    seen = []
+    for name in wanted:
+        f = root / name
+        if not f.is_file():
+            continue
+        seen.append(name)
+        h.update(name.encode("utf-8"))
+        with open(f, "rb") as fh:
+            for chunk in iter(lambda: fh.read(1 << 20), b""):
+                h.update(chunk)
+    if not seen:
+        return None
+    h.update("|".join(seen).encode("utf-8"))
+    return h.hexdigest()
 
 
 def assert_gamma_identity(planned: Optional[str], ran: Optional[str],

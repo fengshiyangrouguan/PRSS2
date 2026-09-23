@@ -1806,10 +1806,16 @@ def main():
     total_steps = max(1, int(args.schedule_total_steps
                             if args.schedule_total_steps is not None
                             else args.max_steps))
-    warmup_steps = max(1, int(0.03 * total_steps))
+    # Fork semantics (review 2026-09-23): --init-from continues from an
+    # ALREADY-TRAINED theta (e.g. merge s300/s500), so the warmup that
+    # exists for random initializations is skipped — the first window
+    # steps at the peak lr and the cosine descends from there.  (The old
+    # behavior restarted the scheduler from zero, wasting ~30 of the 50
+    # windows in the warmup trough.)
+    warmup_steps = 0 if args.init_from else max(1, int(0.03 * total_steps))
 
     def _lr_lambda(s):
-        if s < warmup_steps:
+        if warmup_steps > 0 and s < warmup_steps:
             return float(s) / float(warmup_steps)
         progress = float(s - warmup_steps) / float(
             max(1, total_steps - warmup_steps))

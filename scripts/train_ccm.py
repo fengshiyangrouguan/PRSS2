@@ -2929,7 +2929,7 @@ def main():
                                     if audit_rows is not None:
                                         audit_rows.append(
                                             (int(meta["L"]), int(_h),
-                                             dirs[-1]))
+                                             int(v), dirs[-1]))
                                     for p in params:
                                         if p.grad is None:
                                             continue
@@ -3913,11 +3913,22 @@ def main():
                                      for x in d_task]).cpu()
                                 _cells = {}
                                 _tot = 0.0
-                                for _L, _h, _q in audit_rows:
+                                for _L, _h, _t, _q in audit_rows:
                                     _qd = _q.double()
                                     _nrm = float(_qd.norm())
-                                    _k = "L{}_{}".format(
-                                        _L, "local" if _h == 1
+                                    # Cut-depth t bucket (review
+                                    # 2026-09-24): deep trees
+                                    # recursively CONTAIN the shallow
+                                    # semantics — the endpoint L
+                                    # overcounts long-horizon mass, so
+                                    # decompose by the obs's own
+                                    # recursion depth t (v is the
+                                    # 0-based cut index; t = v + 1).
+                                    _tb = ("t1-2" if _t + 1 <= 2
+                                           else "t3-5" if _t + 1 <= 5
+                                           else "t6-13")
+                                    _k = "{}_{}".format(
+                                        _tb, "local" if _h == 1
                                         else "root")
                                     _c = _cells.setdefault(
                                         _k, {"N": 0, "sum_norm": 0.0,

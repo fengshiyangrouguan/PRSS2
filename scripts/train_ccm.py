@@ -320,6 +320,14 @@ def parse_args():
     p.add_argument("--s4-ref-chunk", type=int, default=32,
                    help="chunk rows per batched reference forward "
                         "(--s4-ref-cache)")
+    p.add_argument("--no-warmup", action="store_true",
+                   help="explicit warmup skip (fork/resume semantics, "
+                        "review 2026-09-23): the first window steps at "
+                        "the peak lr and the cosine descends from "
+                        "there.  Needed on RESUME of a fork arm — "
+                        "--resume-from does not set --init-from, so "
+                        "without this flag the scheduler rebuild would "
+                        "silently reintroduce the 30-step warmup.")
     # monitoring
     p.add_argument("--log-every", type=int, default=10)
     p.add_argument("--checkpoint-every", type=int, default=250)
@@ -1814,8 +1822,11 @@ def main():
     # exists for random initializations is skipped — the first window
     # steps at the peak lr and the cosine descends from there.  (The old
     # behavior restarted the scheduler from zero, wasting ~30 of the 50
-    # windows in the warmup trough.)
-    warmup_steps = 0 if args.init_from else max(1, int(0.03 * total_steps))
+    # windows in the warmup trough.)  --no-warmup forces the same on a
+    # RESUME of a fork arm (resume rebuilds the scheduler; without the
+    # flag it would reintroduce the 30-step warmup).
+    warmup_steps = 0 if (args.init_from or args.no_warmup) \
+        else max(1, int(0.03 * total_steps))
 
     def _lr_lambda(s):
         if warmup_steps > 0 and s < warmup_steps:

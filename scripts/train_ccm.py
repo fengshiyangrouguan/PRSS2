@@ -3908,6 +3908,16 @@ def main():
                                 # Paired d0->d* geometry audit (review
                                 # 2026-09-24): original vs DB-DG center,
                                 # SAME QP rows, six-group dual split.
+                                print("[paired-audit] dbdg={} dirs={} "
+                                      "acc_db={} acc_orig={} abar={:.4f} "
+                                      "drop_step={}".format(
+                                          _dbdg,
+                                          len(dirs) if dirs else 0,
+                                          len(s4_pred_acc),
+                                          len(s4_pred_acc_orig),
+                                          _dbdg_abar,
+                                          _early_drop_step),
+                                      flush=True)
                                 def _d0_from(acc):
                                     _gj = {}
                                     for p in params:

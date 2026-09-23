@@ -1553,14 +1553,19 @@ def stage_final(args, profile: SRIProfile, out: Path) -> dict:
     """§7: ONE dev-selected deployable candidate, evaluated on held-out test."""
     slugs, _name_of = cohort_ids(profile)
     frz = _assert_frozen(out, allow_planned=not args.execute)
-    # AUDIT IS A REQUIREMENT, ENFORCED HERE AND NOT BY A LAUNCHER. The protocol
-    # orders freeze -> audit -> final, audit being the canonical independent
-    # re-evaluation gate. Leaving it to the launcher was not enough: a real,
-    # runnable `_r3_final_only.sh` shipped with "audit deliberately skipped" in
-    # its header and could take any frozen run straight to held-out. A protocol
-    # dependency that only an operator's habit enforces is not a dependency.
-    require_stage(out, "audit", inputs={"freeze": frz["inputs_sha256"]},
-                  allow_planned=not args.execute)
+    # NO AUDIT REQUIREMENT (reverted 2026-09-23, at the operator's request).
+    #
+    # `7ee939d` added `require_stage(out, "audit", ...)` here, because the
+    # protocol orders freeze -> audit -> final and audit is the canonical
+    # independent re-evaluation gate. It was REMOVED again deliberately, not
+    # lost: the audit is LOCAL and 0 API but takes hours (each parent/child is
+    # re-evaluated on 6 tasks x 3 repeats), its metric (R_2->3) is not in the
+    # paper, and the held-out number does NOT depend on it -- `final` reads the
+    # test split, which the audit never touches.
+    #
+    # THE CONSEQUENCE IS REAL AND MUST BE STATED IN PROVENANCE: a run whose
+    # audit is skipped is NOT protocol-complete. `_r3_final_only.sh` is the same
+    # hole in script form. Re-add this line to close it again.
     if not args.execute:
         print("[plan] would select ONE deployable candidate per arm on DEV "
               "only (synthesized oracles excluded), then evaluate it on the "

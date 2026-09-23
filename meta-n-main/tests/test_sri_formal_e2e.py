@@ -922,29 +922,54 @@ def test_24_arm_refuses_a_gamma_that_no_longer_matches_the_fork(tmp_path=None):
                 "a Gamma that no longer matches the fork was accepted")
 
 
-def test_29_final_refuses_without_the_audit_stage(tmp_path=None):
-    """The protocol orders freeze -> audit -> final, so `stage_final` must
-    refuse when the audit has not run.
+def test_29_final_does_not_require_audit_and_the_skip_is_recorded(tmp_path=None):
+    """The audit requirement in `stage_final` was REVERTED on purpose.
 
-    This is a CODE requirement, not a launcher convention. `_r3_final_only.sh`
-    shipped in this repo with "audit deliberately skipped" in its header and
-    could take any frozen run straight to the held-out split; a protocol
-    dependency that only an operator's habit enforces is not a dependency.
+    `7ee939d` added `require_stage(out, "audit", ...)`; it was removed at the
+    operator's request, because the audit is LOCAL and 0 API but takes hours
+    (every parent/child re-evaluated on 6 tasks x 3 repeats), its metric
+    (R_2->3) is not in the paper, and the held-out number does not depend on it.
+
+    The invariant worth pinning is therefore NOT the gate's presence but that
+    the removal is EXPLICIT. A run whose audit is skipped is not
+    protocol-complete, and that has to be visible in the code rather than
+    inferred from a missing stage -- otherwise the next reader cannot tell a
+    deliberate skip from a forgotten stage. Re-add the `require_stage` line to
+    close the hole again.
     """
+    import ast
     import inspect
+    import textwrap
 
     src = inspect.getsource(R.stage_final)
-    assert 'require_stage(out, "audit"' in src, (
-        "stage_final no longer requires the audit stage -- a frozen run could "
-        "reach held-out with the canonical audit skipped")
 
-    with tempfile.TemporaryDirectory() as td:
-        out = Path(td)
-        try:
-            R.require_stage(out, "audit", inputs={"freeze": "x"})
-            raise AssertionError("require_stage accepted a missing audit")
-        except R.StageError as e:
-            assert "audit" in str(e), str(e)
+    def code_only(text):
+        """Source with docstrings and comments stripped.
+
+        The check below is about CODE, and the docstring deliberately NAMES the
+        removed call while explaining the removal -- scanning raw text for that
+        literal therefore always matches (it did, on the first draft of this
+        test).
+        """
+        tree = ast.parse(textwrap.dedent(text))
+        for node in ast.walk(tree):
+            if not isinstance(node, (ast.Module, ast.FunctionDef,
+                                     ast.AsyncFunctionDef, ast.ClassDef)):
+                continue
+            body = node.body
+            if (body and isinstance(body[0], ast.Expr)
+                    and isinstance(body[0].value, ast.Constant)
+                    and isinstance(body[0].value.value, str)):
+                node.body = body[1:] or [ast.Pass()]
+        return ast.unparse(tree)
+
+    assert 'require_stage(out, "audit"' not in code_only(src), (
+        "stage_final requires the audit again -- that is fine, but then this "
+        "test and its rationale are stale and must be updated")
+    low = src.lower()
+    assert "not protocol-complete" in low and "reverted" in low, (
+        "the audit skip must state, in the code, WHY it was removed and what it "
+        "costs: a run without an audit is not protocol-complete")
 
 
 def _main() -> int:

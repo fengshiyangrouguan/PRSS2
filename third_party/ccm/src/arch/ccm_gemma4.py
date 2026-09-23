@@ -341,8 +341,8 @@ class Gemma4CCMTextAttention(nn.Module):
                         bsz, n_heads, n_slots, head_dim,
                         dtype=key_states.dtype, device=key_states.device)
                     res_prev_v = torch.zeros_like(res_prev_k)
-                    res_all_k = torch.zeros_like(k_base)
-                    res_all_v = torch.zeros_like(v_base)
+                    res_list_k = []
+                    res_list_v = []
                     valid = sum_row_valid.to(key_states.dtype).unsqueeze(1)
                     valid = valid.unsqueeze(-1)  # [B, 1, T, n_slots, 1]
                     for t_i in range(1, t_max + 1):
@@ -373,8 +373,15 @@ class Gemma4CCMTextAttention(nn.Module):
                             * valid[:, :, t_i - 1] * _tfac
                         res_prev_k = res_t_k
                         res_prev_v = res_t_v
-                        res_all_k[:, :, t_i - 1] = res_t_k
-                        res_all_v[:, :, t_i - 1] = res_t_v
+                        res_list_k.append(res_t_k)
+                        res_list_v.append(res_t_v)
+                    # Stack (NOT in-place index assignment — the
+                    # freeze-host-safe assembly keeps the Gamma graph
+                    # alive; in-place writes into a no-grad zeros
+                    # tensor disconnected the graph and the S4 backward
+                    # raised "element 0 does not require grad").
+                    res_all_k = torch.stack(res_list_k, dim=2)
+                    res_all_v = torch.stack(res_list_v, dim=2)
                     for b in range(bsz):
                         key_states[b] = key_states[b].index_add(
                             1, sum_row_pos[b].reshape(-1),

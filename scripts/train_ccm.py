@@ -1734,12 +1734,15 @@ def main():
         model = build_official_host(args, device)
     else:
         model = build_model(args, device)
-    if args.foundation and not args.official_host:
+    if args.foundation and not args.official_host \
+            and args.host != "gemma4":
         # Official two-stage protocol: merge the Step-1 default LoRA
         # (llama-7b-no) into the base weights BEFORE attaching our
         # conditional LoRA / Gamma.  The official merge path adds
         # (B @ A) * scaling to the frozen params directly and needs no
-        # LoRA structure on the model.
+        # LoRA structure on the model.  (gemma4 merges its Step-1
+        # adapter INSIDE build_model's gemma4 branch — its Step-1 ckpt
+        # is a plain torch payload, not an HF adapter directory.)
         from src.model import load_lora_weight
         load_lora_weight(args.foundation, model, merge=True)
         print("[foundation] merged {}".format(args.foundation), flush=True)

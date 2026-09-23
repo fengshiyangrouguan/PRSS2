@@ -298,10 +298,11 @@ class Gemma4CCMTextAttention(nn.Module):
                 no_sum_mask = (1 - sum_mask).to(key_states.dtype) \
                     .unsqueeze(1).unsqueeze(-1)
 
-                # RPBE: Gamma recurrence scan (t_max >= 2), same math
-                # as the Llama/qwen3 hosts.
+                # RPBE: Gamma recurrence scan (t_max >= 1: t=1 builds
+                # a legal zero-grad path for the frozen-compressor
+                # Stage-B), same math as the Llama/qwen3 hosts.
                 if self.gamma is not None and sum_row_pos is not None \
-                        and int(sum_row_pos.shape[1]) >= 2:
+                        and int(sum_row_pos.shape[1]) >= 1:
                     n_heads = key_states.shape[1]
                     head_dim = key_states.shape[3]
                     n_slots = int(sum_row_pos.shape[2])
@@ -332,7 +333,7 @@ class Gemma4CCMTextAttention(nn.Module):
 
                 # RPBE: per-turn residual recurrence over the SUM rows.
                 if self.gamma is not None and sum_row_pos is not None \
-                        and int(sum_row_pos.shape[1]) >= 2:
+                        and int(sum_row_pos.shape[1]) >= 1:
                     n_heads = key_states.shape[1]
                     head_dim = key_states.shape[3]
                     n_slots = int(sum_row_pos.shape[2])
@@ -363,14 +364,21 @@ class Gemma4CCMTextAttention(nn.Module):
                             prev_k = k_base[:, :, t_i - 2] + res_prev_k
                             prev_v = v_base[:, :, t_i - 2] + res_prev_v
                         _tfac = (t_i - 1.0) / float(t_i)
-                        res_t_k = self.gamma(
+                        # Persistent history branch (review fix
+                        # 2026-09-24): r_t = (t-1)/t * (r_{t-1} + R_t)
+                        # — the already-applied correction keeps
+                        # propagating WITH the history weight, not just
+                        # the fresh candidate R_t.
+                        _raw_k = self.gamma(
                             prev_k,
                             k_cur[:, :, t_i - 1], tt) \
-                            * valid[:, :, t_i - 1] * _tfac
-                        res_t_v = self.gamma(
+                            * valid[:, :, t_i - 1]
+                        res_t_k = _tfac * (res_prev_k + _raw_k)
+                        _raw_v = self.gamma(
                             prev_v,
                             v_cur[:, :, t_i - 1], tt) \
-                            * valid[:, :, t_i - 1] * _tfac
+                            * valid[:, :, t_i - 1]
+                        res_t_v = _tfac * (res_prev_v + _raw_v)
                         res_prev_k = res_t_k
                         res_prev_v = res_t_v
                         res_list_k.append(res_t_k)

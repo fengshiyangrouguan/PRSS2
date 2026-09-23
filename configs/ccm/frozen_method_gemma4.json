@@ -1,5 +1,5 @@
 {
- "_comment": "THE authoritative DailyDialog spec (review ruling 2026-09-21): frozen_method.json is the single formal spec for the LLaMA DailyDialog line.  The R8/R10-era file is archived as frozen_method_r10_legacy.json — it described the OLD protocol (single penultimate cut v=k-3, Gamma from t=2, trainable LoRA+COMP, lambda 0.00594) and must NOT be used as the method identity anymore.  lambda_kf is null until the ONE recalibration on the fixed code is committed here. GEMMA4 VARIANT (2026-09-23): the gemma Stage-2 resume runs the official 1000-step recipe — training.steps=1000 and checkpoint_every=50 (the llama/qwen3 formal lines keep steps=60).",
+ "_comment": "THE authoritative DailyDialog spec (review ruling 2026-09-21): frozen_method.json is the single formal spec for the LLaMA DailyDialog line.  The R8/R10-era file is archived as frozen_method_r10_legacy.json — it described the OLD protocol (single penultimate cut v=k-3, Gamma from t=2, trainable LoRA+COMP, lambda 0.00594) and must NOT be used as the method identity anymore.  lambda_kf is null until the ONE recalibration on the fixed code is committed here. GEMMA4 VARIANT (2026-09-23): the gemma Stage-2 resume runs the official 1000-step recipe — training.steps=700 (resume 300 -> 700, user ruling) and checkpoint_every=50 (the llama/qwen3 formal lines keep steps=60).",
  "frozen_source": "review ruling 2026-09-21 (cut collector / Gamma placement / raw-turn chi-phi / freeze-host / validation-only selection); supersedes the R10 legacy spec",
  "backbone": {
   "model": "llama-7b (original LLaMA-7B, not LLaMA-2)",
@@ -62,7 +62,7 @@
   "cadence": "identical task samples and scheduler cadence across the three arms"
  },
  "training": {
-  "steps": 1000,
+  "steps": 700,
   "steps_note": "Review-fix protocol (2026-09-21): 60 windows, task-only / ours from the SAME theta_0 (official CCM-merge host, frozen, zero-init Gamma).  The R10-era 300-step budget belonged to the retired protocol.",
   "grad_clip": 1.0,
   "merge_cadence": "window-matched",

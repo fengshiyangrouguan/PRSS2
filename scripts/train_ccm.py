@@ -1881,7 +1881,7 @@ def main():
         # protocol precondition).
         model.train()
         print("[native-compression] frozen {} backbone params; "
-              "trainable = {}{}".format(
+              "trainable = {}".format(
                   n_frozen,
                   "history-branch Gamma (Stage-B)"
                   if getattr(args, "history_gamma", False)

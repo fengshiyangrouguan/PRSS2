@@ -35,8 +35,8 @@
   ],
   "lambda_calibration": {
    "rule": "same as the qwen3 native line: r_eff = lambda * ||d_pred|| / ||d_task|| ~ 0.1 measured at theta_0 (init-from step600) on the first closed window, native proposal-space (lr=1 direction space), then frozen.",
-   "lambda_kf": null,
-   "lambda_kf_note": "NULL PENDING RECALIBRATION (review 2026-09-24): history-Gamma trains a DIFFERENT parameter space than the native lambda was calibrated in.  Calibrate once on the Stage-B theta_0 and commit here."
+   "lambda_kf": 0.09993213254769473,
+   "lambda_kf_note": "Calibrated 2026-09-24 on the Stage-B theta_0 (init-from s10 + history-Gamma, Gamma-only proposal space): r_eff = 1.0007, derived lambda = 0.0999.  Matches the llama Stage-B (0.09987) and the native compress values (0.09987) — the proposal-space r_eff is ~1 on every actuation geometry tested."
   },
   "z_v_source": "J_mem(M_v) fixed adapter; GQA hosts lift the memory from the KV heads; native mode lifts the PURE CCM mean (no Gamma residual exists)",
   "witness": "none (main experiment)",

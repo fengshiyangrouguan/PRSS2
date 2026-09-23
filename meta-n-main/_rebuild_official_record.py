@@ -35,8 +35,10 @@ spec = importlib.util.spec_from_file_location(
 R = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(R)
 
-from meta_n.sri.protocol import (RunManifest, default_profile_path,  # noqa: E402
-                                 load_profile, sha256_file)
+from meta_n.sri.protocol import (ProtocolError, RunManifest,        # noqa: E402
+                                 default_profile_path, load_profile,
+                                 sha256_file)
+from meta_n.sri.ledger import SlotLedger, assert_completeness        # noqa: E402
 
 PROFILE = load_profile(default_profile_path("sri_primary6"))
 SLUGS, _ = R.cohort_ids(PROFILE)
@@ -72,19 +74,28 @@ admits = 0
 if ledger.is_file():
     rows = [json.loads(l) for l in ledger.read_text(encoding="utf-8").splitlines()
             if l.strip()]
-    # The ledger is WRITE-AHEAD: one `kind=open` row when a slot starts and one
-    # `kind=finalize` row when it ends, joined by slot_id. Counting rows and
-    # calling the opens "unfinalized" is wrong -- 24 slots are 48 rows.
     opens = {r["slot_id"] for r in rows if r.get("kind") == "open"}
-    fins = {r["slot_id"] for r in rows if r.get("kind") == "finalize"}
-    missing = sorted(opens - fins)
-    if missing:
-        problems.append("%d slot(s) opened but never finalized: %s"
-                        % (len(missing), missing[:4]))
     admits = sum(1 for r in rows
                  if r.get("terminal_status") == "evaluated_admitted")
-    if not opens:
-        problems.append("the ledger records no `open` rows at all")
+    # Use the PROTOCOL's own completeness check, not a hand-rolled one. Pairing
+    # opens with finalizes is necessary but NOT sufficient: a run that lost a
+    # whole slot (23 opens, 23 finalizes) passes that and then dies inside
+    # `stage_freeze` -- after the predictive arm has been PAID FOR. This is the
+    # same validator freeze uses, so whatever it accepts here, freeze accepts.
+    try:
+        led = SlotLedger.__new__(SlotLedger)      # mirrors ledger.read_ledger
+        led.path = ledger
+        led._hdr = {}
+        led._open, led._final = {}, {}
+        led._load()
+        assert_completeness(led, PROFILE.beam_width, PROFILE.beam_candidates,
+                            PROFILE.max_iterations)
+    except ProtocolError as e:
+        problems.append("ledger fails the protocol's own completeness check: %s"
+                        % e)
+    if len(opens) != int(PROFILE.nominal_slots):
+        problems.append("nominal grid is %d slots, ledger has %d"
+                        % (int(PROFILE.nominal_slots), len(opens)))
 else:
     problems.append("no %s" % R.LEDGER_NAME)
 
@@ -117,7 +128,11 @@ R.record_stage(
              "log": str(OUT / ("%s.log" % ARM)),
              "context": str(R.context_path(OUT, ARM)),
              "ledger": str(ledger),
-             "config_sha256": sha256_file(a / "config.json")})
+             "config_sha256": sha256_file(a / "config.json")},
+    # Forensic transparency: this record was RE-DERIVED from the artifacts after
+    # the original was pruned, not produced by the run that wrote them. Without
+    # this flag the two are indistinguishable in the manifest.
+    extra={"reconstructed_from_artifacts": True})
 after = R.read_stage_manifest(OUT)
 print("  stages after : %s" % sorted(after))
 print("  official inputs_sha256 = %s" % after[ARM]["inputs_sha256"])

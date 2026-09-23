@@ -922,6 +922,31 @@ def test_24_arm_refuses_a_gamma_that_no_longer_matches_the_fork(tmp_path=None):
                 "a Gamma that no longer matches the fork was accepted")
 
 
+def test_29_final_refuses_without_the_audit_stage(tmp_path=None):
+    """The protocol orders freeze -> audit -> final, so `stage_final` must
+    refuse when the audit has not run.
+
+    This is a CODE requirement, not a launcher convention. `_r3_final_only.sh`
+    shipped in this repo with "audit deliberately skipped" in its header and
+    could take any frozen run straight to the held-out split; a protocol
+    dependency that only an operator's habit enforces is not a dependency.
+    """
+    import inspect
+
+    src = inspect.getsource(R.stage_final)
+    assert 'require_stage(out, "audit"' in src, (
+        "stage_final no longer requires the audit stage -- a frozen run could "
+        "reach held-out with the canonical audit skipped")
+
+    with tempfile.TemporaryDirectory() as td:
+        out = Path(td)
+        try:
+            R.require_stage(out, "audit", inputs={"freeze": "x"})
+            raise AssertionError("require_stage accepted a missing audit")
+        except R.StageError as e:
+            assert "audit" in str(e), str(e)
+
+
 def _main() -> int:
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for fn in fns:

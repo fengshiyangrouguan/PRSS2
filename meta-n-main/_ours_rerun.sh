@@ -33,6 +33,18 @@ say "OURS_RERUN_START  (same frozen root; official archive reused)"
 say "reduction trace (WAL, kept across resume) -> $META_N_REDUCTION_TRACE"
 say "rows already in the trace: $(wc -l < "$META_N_REDUCTION_TRACE" 2>/dev/null || echo 0)"
 
+# BEFORE ANY PAID ACTION. The rerun setup prunes the stage manifest to
+# preflight/root/fork, which also removes the `official` record -- and
+# `stage_freeze` refuses when an arm stage is missing, so the predictive arm
+# would be PAID FOR and then fail. Depending on an operator to remember this is
+# not acceptable on a chain that spends real money, so the rebuild (which
+# validates the official artifacts first and refuses on any inconsistency) runs
+# here, unconditionally, every time.
+say "=== preflight: validate + rebuild the official stage record (0 API) ==="
+/root/miniconda3/bin/python _rebuild_official_record.py \
+  || { say "official record rebuild VALIDATION FAILED -- refusing to spend"; exit 1; }
+say "official record ready"
+
 # PAID: the predictive arm only. `official` is NOT re-run -- the allocator never
 # touched its path, and its stage record was rebuilt from the on-disk artifacts.
 say "=== STAGE predictive ==="

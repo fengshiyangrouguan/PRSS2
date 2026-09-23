@@ -185,9 +185,25 @@ class SiblingAllocator:
         empty counters. So the first reduction the new process performs for a
         group is really the 2nd, 3rd, ... sibling -- and it would be handed
         variant 0 again, changing the treatment in a way that depends only on
-        WHEN the machine crashed. Replaying the trace makes the variant a
-        function of the group's history rather than of process uptime.
+        WHEN the machine crashed.
+
+        CALLED ON EVERY REDUCTION, SO IT MUST BE IDEMPOTENT. `_predictive` hands
+        the env path in on every call (the allocator has no other way to learn
+        it). Re-arming unconditionally would make `_ensure_warm` REPLAY on every
+        reduction, appending the replayed history to a list that already holds it
+        -- so `_assigned` would grow like [S0], [S0,S0], [S0,S0,S1], ... and the
+        diversity term D(S) would weight the earliest subsets ever more heavily.
+        The rule would silently stop being "one distance per assigned sibling".
+
+        So: same path + already warmed -> no-op. A DIFFERENT path clears the
+        in-memory state and replays once, which is what a caller switching WALs
+        wants.
         """
+        if path == self._warm_path and self._warmed:
+            return
+        if path != self._warm_path:
+            self._counts.clear()
+            self._assigned.clear()
         self._warm_path = path
         self._warmed = False
 
@@ -197,27 +213,52 @@ class SiblingAllocator:
         self._warmed = True
         path = (self._warm_path or "").strip()
         if not path or not os.path.isfile(path):
-            return
+            return                      # a fresh run: nothing to replay
+        max_seq = 0
         try:
             with open(path, encoding="utf-8") as f:
-                for line in f:
+                for lineno, line in enumerate(f, 1):
                     line = line.strip()
                     if not line:
                         continue
-                    r = json.loads(line)
+                    try:
+                        r = json.loads(line)
+                    except ValueError as e:
+                        # A JSONL WAL's most likely corruption is exactly this:
+                        # the process was killed mid-write, leaving a truncated
+                        # final line. Continuing would resume from a PARTIAL
+                        # history and keep spending money on a treatment that is
+                        # no longer the one under test, so fail closed -- the
+                        # same standard `_append_trace` now holds on the write
+                        # side.
+                        raise RuntimeError(
+                            "reduction trace {} is corrupt at line {}: {}. This "
+                            "file is the allocator's write-ahead log; refusing "
+                            "to continue from a partial history."
+                            .format(path, lineno, e)) from e
                     pool_h, stack_h = r.get("pool_hash"), r.get("stack_hash")
                     pos = r.get("allocator_picked_positions")
                     var = r.get("allocator_variant")
+                    seq = r.get("reduction_seq", 0)
+                    try:
+                        max_seq = max(max_seq, int(seq or 0))
+                    except (TypeError, ValueError):
+                        pass
                     if pool_h is None or pos is None or var is None:
-                        continue
+                        continue        # a row from an older allocator version
                     key = (pool_h, stack_h)
                     self._counts[key] = max(self._counts.get(key, 0),
                                             int(var) + 1)
                     self._assigned.setdefault(key, []).append(tuple(pos))
-        except (OSError, ValueError):
-            # A corrupt/absent trace leaves the counters empty, which is the
-            # pre-fix behaviour; it is logged by the caller, never silent.
-            return
+        except OSError as e:
+            raise RuntimeError(
+                "reduction trace {} exists but could not be read: {}. The "
+                "allocator replays it after --resume, so continuing without it "
+                "would change the treatment.".format(path, e)) from e
+        # Keep the record's sequence MONOTONIC across processes: a resumed run
+        # that restarted at 1 would make `reduction_seq` useless as the join key
+        # to proposal_slots.jsonl.
+        _REDUCTION_SEQ[0] = max(_REDUCTION_SEQ[0], max_seq)
 
     @staticmethod
     def identity_key(traces: Sequence[Any],
@@ -734,6 +775,13 @@ def _append_trace(diag: Dict[str, Any]) -> None:
     try:
         with open(path, "a", encoding="utf-8") as f:
             f.write(json.dumps(rec, default=str) + "\n")
+            f.flush()
+            # fsync: the trace is the allocator's write-ahead log, and a run that
+            # resumes after a machine-level crash must not lose the rows that
+            # decide which variant each sibling already consumed. The file is
+            # tens of rows per arm, so the cost is negligible next to one LLM
+            # request.
+            os.fsync(f.fileno())
     except OSError as e:
         raise RuntimeError(
             "{} is set to {!r} but the reduction trace could not be written: "
@@ -1071,47 +1119,84 @@ def self_test() -> int:
           .format(",".join(x[:10] for x in by_mass),
                   ",".join(x[:10] for x in canonical)))
 
-    # F. RESUME: a fresh process must continue the variant sequence, not restart
-    # it at 0. Without the replay the first reduction after a crash would be
-    # handed variant 0 again, changing the treatment based on WHEN it crashed.
     import tempfile
-    import json as _json
     _SIBLING_ALLOCATOR._counts.clear()
     _SIBLING_ALLOCATOR._assigned.clear()
+
+    def _reset_alloc():
+        _SIBLING_ALLOCATOR._counts.clear()
+        _SIBLING_ALLOCATOR._assigned.clear()
+        _SIBLING_ALLOCATOR._warm_path = None
+        _SIBLING_ALLOCATOR._warmed = False
+
+    def _draw():
+        t, _, dd = r_div.reduce(list(pool6), [], budget=budget)
+        return tuple(sorted(x.task_id for x in t)), dd
+
+    # G. the WAL must not change the answer. WAL-OFF gives the design rule's
+    #    sequence; WAL-ON must reproduce it EXACTLY, and the replayed state must
+    #    not double-count history. Without an idempotent `warm_from` the replay
+    #    re-appends what is already in `_assigned` on every reduction, so `D(S)`
+    #    weights the earliest subsets more and more -- and a WAL-vs-WAL
+    #    comparison cannot see it, because both sides share the defect.
+    _reset_alloc()
+    os.environ.pop(TRACE_ENV, None)
+    wal_off = [_draw()[0] for _ in range(4)]
+
     with tempfile.TemporaryDirectory() as _td:
         _tpath = os.path.join(_td, "trace.jsonl")
         os.environ[TRACE_ENV] = _tpath
         try:
-            def draw_and_log():
-                t, _, dd = r_div.reduce(list(pool6), [], budget=budget)
+            open(_tpath, "w").close()
+            _reset_alloc()
+            wal_on = []
+            for _ in range(4):
+                s, dd = _draw()
                 _append_trace(dd)
-                return tuple(sorted(x.task_id for x in t))
+                wal_on.append(s)
+            assert wal_on == wal_off, (wal_on, wal_off)
+            assert len(_SIBLING_ALLOCATOR._assigned) == 1
+            (_k,) = list(_SIBLING_ALLOCATOR._assigned)
+            assert len(_SIBLING_ALLOCATOR._assigned[_k]) == 4, (
+                "the replayed history was re-appended: %d entries for 4 "
+                "reductions" % len(_SIBLING_ALLOCATOR._assigned[_k]))
+            print("OK  G WAL is neutral   WAL-on reproduces the WAL-off sequence "
+                  "exactly; 4 reductions leave 4 assigned subsets, not "
+                  "1+2+3+4")
 
-            _SIBLING_ALLOCATOR._counts.clear()
-            _SIBLING_ALLOCATOR._assigned.clear()
+            # F. RESUME. The reference is the WAL-OFF sequence above -- the
+            # design rule -- NOT a WAL-on baseline, which would share whatever
+            # defect the WAL has.
+            _reset_alloc()
             open(_tpath, "w").close()
-            full = [draw_and_log() for _ in range(4)]
+            first = []
+            for _ in range(2):
+                s, dd = _draw()
+                _append_trace(dd)
+                first.append(s)
+            assert first == wal_off[:2], (first, wal_off)
 
-            # simulate: two siblings done, then the process dies
-            _SIBLING_ALLOCATOR._counts.clear()
-            _SIBLING_ALLOCATOR._assigned.clear()
-            open(_tpath, "w").close()
-            first = [draw_and_log() for _ in range(2)]
-            assert first == full[:2], (first, full)
-
-            # a NEW process: empty counters, but it replays the trace
-            _SIBLING_ALLOCATOR._counts.clear()
-            _SIBLING_ALLOCATOR._assigned.clear()
+            _reset_alloc()                     # a NEW process
             _SIBLING_ALLOCATOR.warm_from(_tpath)
-            after = [draw_and_log() for _ in range(2)]
-            assert after == full[2:], (after, full[2:])
-            # and the trace itself stayed append-only across the restart
+            after = []
+            for _ in range(2):
+                s, dd = _draw()
+                _append_trace(dd)
+                after.append(s)
+            assert after == wal_off[2:], (after, wal_off[2:])
             assert len([l for l in open(_tpath, encoding="utf-8")
                         if l.strip()]) == 4
+            # the sequence number must keep rising across the restart
+            seqs = [json.loads(l)["reduction_seq"]
+                    for l in open(_tpath, encoding="utf-8") if l.strip()]
+            assert seqs == sorted(set(seqs)) and len(seqs) == 4, seqs
+            print("OK  F resume replay    after a simulated crash the next "
+                  "sibling gets the SAME subset as the uninterrupted WAL-off "
+                  "run (variant {}, not variant 0)".format(
+                      len(wal_off) - 1))
         finally:
             os.environ.pop(TRACE_ENV, None)
-    print("OK  F resume replay    after a simulated crash the next sibling gets "
-          "variant 2, not variant 0 (identical to the uninterrupted sequence)")
+            _reset_alloc()
 
     # C_v IS NEVER APPENDED: the reducer's output carries no tasks/scores
     assert not hasattr(t_p, "tasks") and "tasks" not in d_p

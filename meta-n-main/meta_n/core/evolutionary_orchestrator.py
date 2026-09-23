@@ -1160,6 +1160,28 @@ class EvolutionaryOrchestrator:
                                                  child_slot=k)
                             continue
 
+                        # A slot that CRASHED mid-dispatch is terminal in the
+                        # ledger (the resume sweep closed it as
+                        # generation_error / crashed_process) but its candidate
+                        # never reached the archive, so `completed_set` above does
+                        # not know about it. Without this check the loop would
+                        # call `open` again and the ledger -- one `open` row per
+                        # nominal slot -- would raise, killing a run that had
+                        # already been paid for. A spent slot stays spent: it is
+                        # one observation, and re-running it would also consume a
+                        # SECOND allocator variant for the same sibling.
+                        if self.sri.slot_is_terminal(iteration=iteration,
+                                                     parent_slot=parent_idx,
+                                                     child_slot=k):
+                            logger.info("  Skipping spent slot: %s", child_id)
+                            console.print(
+                                f"  [dim]Skipping {child_id} (slot already "
+                                f"terminal from a previous process)[/dim]")
+                            self.sri.resume_note(iteration=iteration,
+                                                 parent_slot=parent_idx,
+                                                 child_slot=k)
+                            continue
+
                         any_new_work = True
                         child_start = time.time()
                         temperature = self._select_temperature(k, iteration)

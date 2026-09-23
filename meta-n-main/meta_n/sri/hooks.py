@@ -175,6 +175,27 @@ class SRIHooks:
         handle.closed = True
         self._open.pop(handle.slot_id, None)
 
+    def slot_is_terminal(self, *, iteration: int, parent_slot: int,
+                         child_slot: int) -> bool:
+        """Has this nominal slot already reached a terminal state?
+
+        ON --resume THIS IS THE GAP `completed_set` CANNOT COVER. The
+        orchestrator skips a child whose candidate is in the archive, but a
+        crash between `open` and archive admission leaves the slot SPENT (the
+        resume sweep closed it as generation_error / crashed_process) while the
+        candidate is absent. The loop would then call `open` again and the
+        ledger -- which refuses a second `open` row for one nominal slot --
+        would raise AFTER the run had already paid for the earlier iterations.
+
+        A spent nominal slot stays spent: it is one experimental observation,
+        and re-running it would also consume a SECOND allocator variant for the
+        same sibling. `resume_note` then references the existing row.
+        """
+        if not self.enabled:
+            return False
+        return bool(self.ledger.is_finalized(
+            slot_id_for(iteration, parent_slot, child_slot)))
+
     def resume_note(self, *, iteration: int, parent_slot: int,
                     child_slot: int) -> None:
         """A resumed run re-entered an already-finalized slot (§5).

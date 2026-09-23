@@ -788,3 +788,43 @@ def test_23_gamma_identity_refuses_a_stale_or_swapped_checkpoint(tmp_path=None):
         with pytest.raises(StageError, match="is missing"):
             assert_gamma_identity(good, good, str(Path(td) / "gone.pt"))
 
+
+
+# --------------------------------------------------------------------------- #
+# Pre-spend completeness: a ledger missing one nominal slot must FAIL
+# --------------------------------------------------------------------------- #
+
+def test_28_a_ledger_missing_one_nominal_slot_is_rejected(tmp_path=None):
+    """23 finalised slots out of 24 must FAIL, not read as a smaller run.
+
+    Pairing every `open` with a `finalize` is NOT enough: a run that lost a whole
+    slot has all of its opens finalized and is still incomplete. This is exactly
+    what the official-record rebuild checks BEFORE spending on the predictive
+    arm -- accepting an incomplete ledger there means paying, and then failing
+    inside `stage_freeze` via this same validator.
+    """
+    import tempfile
+
+    from meta_n.sri import ledger as L
+
+    with tempfile.TemporaryDirectory() as td:
+        led = _ledger(Path(td))
+        hk = SRIHooks(ledger=led, run_dir=Path(td), cohort=["T1"])
+        grid = [(i, ps, cs) for i in range(6) for ps in range(2)
+                for cs in range(2)]
+        assert len(grid) == 24, grid
+        dropped = grid[-1]
+        for (i, ps, cs) in grid:
+            if (i, ps, cs) == dropped:
+                continue                       # lose exactly one nominal slot
+            h = hk.open(iteration=i, parent_slot=ps, child_slot=cs,
+                        parent_id="p", parent_structural_depth=2,
+                        gate_effective=True)
+            hk.close(h, "evaluated_admitted")
+        # every remaining slot IS finalized, so a pairing-only check passes
+        assert led.unfinalized() == []
+        try:
+            L.assert_completeness(led, 2, 2, 6)
+            raise AssertionError("an incomplete ledger was accepted")
+        except PR.ProtocolError as e:
+            assert "missing" in str(e), str(e)

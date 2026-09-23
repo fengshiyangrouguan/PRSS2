@@ -1553,6 +1553,14 @@ def stage_final(args, profile: SRIProfile, out: Path) -> dict:
     """§7: ONE dev-selected deployable candidate, evaluated on held-out test."""
     slugs, _name_of = cohort_ids(profile)
     frz = _assert_frozen(out, allow_planned=not args.execute)
+    # AUDIT IS A REQUIREMENT, ENFORCED HERE AND NOT BY A LAUNCHER. The protocol
+    # orders freeze -> audit -> final, audit being the canonical independent
+    # re-evaluation gate. Leaving it to the launcher was not enough: a real,
+    # runnable `_r3_final_only.sh` shipped with "audit deliberately skipped" in
+    # its header and could take any frozen run straight to held-out. A protocol
+    # dependency that only an operator's habit enforces is not a dependency.
+    require_stage(out, "audit", inputs={"freeze": frz["inputs_sha256"]},
+                  allow_planned=not args.execute)
     if not args.execute:
         print("[plan] would select ONE deployable candidate per arm on DEV "
               "only (synthesized oracles excluded), then evaluate it on the "

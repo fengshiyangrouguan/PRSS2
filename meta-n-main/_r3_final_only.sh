@@ -1,11 +1,15 @@
 #!/bin/bash
-# final -> aggregate for seed 0, alone (0 concurrency with the audit: a CO-Bench
-# score counts instances finishing inside a 10s timeout, so a second heavy job
-# would move the number we are measuring).
+# SUPERSEDED / DISABLED BY DESIGN -- do NOT use for a formal run.
 #
-# `stage_final` depends on FREEZE only -- verified in the code
-# (`frz = _assert_frozen(out)`, inputs={"freeze": ...}), never on the audit. So
-# running final without the audit is a REORDERING, not a missing input.
+# This launcher ran `freeze -> final -> aggregate` with the canonical transition
+# audit DELIBERATELY SKIPPED. It produced the seed-0 numbers before the protocol
+# dependency was enforced. `stage_final` now REQUIRES the audit stage, so this
+# script will fail at the final stage -- which is the intended outcome, and the
+# reason it is kept rather than deleted: it is the concrete instance that showed
+# "the normal launcher runs audit" was an operator habit, not a guarantee.
+#
+# Use _ours_rerun.sh (freeze -> audit -> final -> aggregate).
+#
 set -uo pipefail
 
 REPO=/root/autodl-tmp/rpbe-sri/meta-n-main

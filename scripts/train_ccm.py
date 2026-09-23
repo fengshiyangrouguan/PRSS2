@@ -747,7 +747,6 @@ def build_model(args, device):
             [text_cfg.vocab_size + N_TOK + k for k in range(N_TOK)])
         return model
     from transformers.models.llama.configuration_llama import LlamaConfig
-    from transformers.models.llama.configuration_llama import LlamaConfig
     from src.arch.ccm_llama import LlamaForCausalLM_CCM
     config = LlamaConfig.from_pretrained(args.model_name_or_path)
     config.comp_relative_embedding = args.relative_embedding

@@ -345,7 +345,7 @@ class Gemma4CCMTextAttention(nn.Module):
                     res_all_v = torch.zeros_like(v_base)
                     valid = sum_row_valid.to(key_states.dtype).unsqueeze(1)
                     valid = valid.unsqueeze(-1)  # [B, 1, T, n_slots, 1]
-                    for t_i in range(2, t_max + 1):
+                    for t_i in range(1, t_max + 1):
                         tt = torch.full((bsz, 1), t_i,
                                         dtype=torch.float32,
                                         device=key_states.device)
@@ -354,13 +354,21 @@ class Gemma4CCMTextAttention(nn.Module):
                         # the residual enters WITH the history weight
                         # (t-1)/t — zero at t=1 (turn-3 identical to the
                         # native compressor), full strength at depth.
+                        # t=1 still CALLS gamma (zero prev) so the graph
+                        # stays connected when the compressor is frozen.
+                        if t_i == 1:
+                            prev_k = torch.zeros_like(k_base[:, :, 0])
+                            prev_v = torch.zeros_like(v_base[:, :, 0])
+                        else:
+                            prev_k = k_base[:, :, t_i - 2] + res_prev_k
+                            prev_v = v_base[:, :, t_i - 2] + res_prev_v
                         _tfac = (t_i - 1.0) / float(t_i)
                         res_t_k = self.gamma(
-                            k_base[:, :, t_i - 2] + res_prev_k,
+                            prev_k,
                             k_cur[:, :, t_i - 1], tt) \
                             * valid[:, :, t_i - 1] * _tfac
                         res_t_v = self.gamma(
-                            v_base[:, :, t_i - 2] + res_prev_v,
+                            prev_v,
                             v_cur[:, :, t_i - 1], tt) \
                             * valid[:, :, t_i - 1] * _tfac
                         res_prev_k = res_t_k

@@ -1895,18 +1895,30 @@ def main():
     if use_rpbe:
         # GQA hosts (qwen3) lift the memory from the KV heads (8) with
         # the config's explicit head_dim (128); the Llama host uses all
-        # attention heads (32, head_dim = hidden / heads).
+        # attention heads (32, head_dim = hidden / heads).  gemma4 is
+        # heterogeneous: sliding layers 2 KV heads x 256, full layers
+        # 2 x 512 — the flat dim is the per-layer sum (review fix
+        # 2026-09-23, JMemLift per_layer_dims).
+        per_layer_dims = None
         if args.host == "qwen3":
             n_heads = cfg.num_key_value_heads
             head_dim = getattr(cfg, "head_dim",
                                cfg.hidden_size // cfg.num_attention_heads)
+        elif args.host == "gemma4":
+            n_heads = cfg.num_key_value_heads
+            head_dim = 0
+            per_layer_dims = [
+                int(cfg.per_layer_config[i].num_key_value_heads)
+                * int(cfg.per_layer_config[i].head_dim)
+                for i in range(cfg.num_hidden_layers)]
         else:
             n_heads = cfg.num_attention_heads
             head_dim = cfg.hidden_size // cfg.num_attention_heads
         adapter = CCMHostAdapter(model, n_layers=cfg.num_hidden_layers,
                                  n_heads=n_heads,
                                  head_dim=head_dim,
-                                 z_dim=args.z_dim, seed=args.rpbe_seed)
+                                 z_dim=args.z_dim, seed=args.rpbe_seed,
+                                 per_layer_dims=per_layer_dims)
         # Review round 8: FOUR independent 32-dim sketch branches (the
         # single 64-dim sketch had too much collision variance for the
         # rare turn-14 rows).  J_ens = mean_r J_r at window close; the

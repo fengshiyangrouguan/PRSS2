@@ -30,7 +30,7 @@ class CCMHostAdapter:
 
     def __init__(self, model, *, n_layers: int, n_heads: int,
                  n_slots: int = 2, kv_pairs: int = 2, head_dim: int = 128,
-                 z_dim: int = 128, seed: int = 0):
+                 z_dim: int = 128, seed: int = 0, per_layer_dims=None):
         from .ccm_patch import _base_model
         base = _base_model(model)
         if len(getattr(base, "layers", [])) != int(n_layers):
@@ -47,7 +47,8 @@ class CCMHostAdapter:
         self.j_mem = JMemLift(n_layers=n_layers, n_heads=n_heads,
                               n_slots=n_slots, kv_pairs=kv_pairs,
                               head_dim=head_dim, z_dim=z_dim,
-                              seed=seed).to(device)
+                              seed=seed,
+                              per_layer_dims=per_layer_dims).to(device)
         self.z_dim = int(z_dim)
         self._cache: List[Optional[tuple]] = [None] * self.n_layers
 

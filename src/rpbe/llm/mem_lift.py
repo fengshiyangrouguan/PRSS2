@@ -29,7 +29,8 @@ class JMemLift(nn.Module):
 
     def __init__(self, *, n_layers: int, n_heads: int, n_slots: int = 2,
                  kv_pairs: int = 2, head_dim: int = 128, z_dim: int = 128,
-                 seed: int = 0, repeats: int = 3):
+                 seed: int = 0, repeats: int = 3,
+                 per_layer_dims=None):
         super().__init__()
         self.n_layers = int(n_layers)
         self.n_heads = int(n_heads)
@@ -37,8 +38,16 @@ class JMemLift(nn.Module):
         self.kv_pairs = int(kv_pairs)
         self.head_dim = int(head_dim)
         self.z_dim = int(z_dim)
-        self.full_dim = _mem_layout(n_layers, n_heads, n_slots, kv_pairs,
-                                    head_dim)
+        if per_layer_dims is not None:
+            # Heterogeneous hosts (gemma4): sliding/full layers carry
+            # different KV heads x head_dim, so the flat coordinate
+            # count is the sum over the caller-provided per-layer
+            # dims (the sketch tables only need the total; the frozen
+            # measurement has no layout semantics).
+            self.full_dim = int(sum(per_layer_dims)) * n_slots * kv_pairs
+        else:
+            self.full_dim = _mem_layout(n_layers, n_heads, n_slots,
+                                        kv_pairs, head_dim)
         # Base pass: every input coordinate maps at least once.
         rows = torch.arange(self.full_dim)
         cols = rows % self.z_dim

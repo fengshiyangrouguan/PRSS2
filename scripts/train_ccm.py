@@ -4172,6 +4172,13 @@ def main():
                             for p, g in zip(repr_params,
                                             native_g_joint):
                                 st = optimizer.state[p]
+                                # torch only initializes state["step"]
+                                # inside optimizer.step(); the manual
+                                # write-back never calls step(), so
+                                # maintain it here (state_dict /
+                                # resume compatibility, 2026-09-23).
+                                st["step"] = torch.tensor(
+                                    float(optimizer_steps_executed + 1))
                                 if "exp_avg" in st:
                                     st["exp_avg"].mul_(b1).add_(
                                         g, alpha=1.0 - b1)

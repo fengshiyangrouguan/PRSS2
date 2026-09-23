@@ -89,12 +89,12 @@ def main():
         label_pad_token_id=-100)
 
     model = build_official_host(device)
-    _gammas = tc.attach_gamma(model, hidden=64)
-    # fp16 consistency: Gamma modules are plain attribute assignments
-    # (not traversed by model.to); cast explicitly (same as the R8
-    # official-host eval path)
-    for _g in _gammas:
-        _g.half()
+    # NO gamma attach (native S4 line, 2026-09-24): the train side runs
+    # the official host WITHOUT Gamma; attaching it here triggers the
+    # ccm_llama.py recur-scan block whose n_heads binding only happens
+    # under t_max>=2 — turn_3 dialogues (L=1, t_max=1) then raise
+    # UnboundLocalError n_heads.  The merge baseline and the native
+    # treewise checkpoints are all Gamma-free.
     if a.ckpt != "NONE":
         payload = torch.load(a.ckpt, map_location=device,
                              weights_only=False)

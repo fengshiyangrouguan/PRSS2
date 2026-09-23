@@ -428,8 +428,11 @@ def _frozen_path(args):
                  else "frozen_method_gemma4_native.json")
         return Path(__file__).resolve().parents[1] / "configs" / "ccm" \
             / _name
-    name = "frozen_method_qwen3.json" if getattr(args, "host", "llama") \
-        == "qwen3" else "frozen_method.json"
+    name = ("frozen_method_qwen3.json"
+            if getattr(args, "host", "llama") == "qwen3"
+            else "frozen_method_gemma4_joint.json"
+            if getattr(args, "host", "llama") == "gemma4"
+            else "frozen_method.json")
     return Path(__file__).resolve().parents[1] / "configs" / "ccm" / name
 
 

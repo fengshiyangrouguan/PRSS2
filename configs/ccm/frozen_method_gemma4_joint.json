@@ -1,0 +1,89 @@
+{
+ "_comment": "GEMMA4 JOINT variant (user ruling 2026-09-24): gamma + comp JOINT training control from the gemma Stage-2 merge step600 — conditional LoRA + COMP rows + Gamma ALL trainable (freeze_host.enabled=false), pure task CE (gamma_task_only arm, lambda=0), our window sampling, 50 windows, checkpoint every 10.  Mirrors the llama Joint protocol on the gemma host.",
+ "frozen_source": "review ruling 2026-09-21 (cut collector / Gamma placement / raw-turn chi-phi / freeze-host / validation-only selection); supersedes the R10 legacy spec",
+ "backbone": {
+  "model": "llama-7b (original LLaMA-7B, not LLaMA-2)",
+  "hf_identifier": "huggyllama/llama-7b",
+  "vendored_commit": "a89dd08e2c9587ec9c6c3ad339bb154c33e6b41a",
+  "attn_type": "merge_recur",
+  "n_tok_lock": 2,
+  "torch_compile": "disabled on all three arms",
+  "host_path": "official host ONLY: build_official_host (Step-1 foundation merged + released Step-2 compression adapter + SeparatedEmbedding COMP rows); the legacy resize host is not the DailyDialog method"
+ },
+ "adapter": {
+  "lora_r": 8,
+  "lora_r_note": "LoRA rank for the conditional adapter (r=8 fixed for the formal runs)",
+  "official_adapter": "released Step-2 compression adapter dir (env OFFICIAL_ADAPTER at eval; CLI --official-adapter at train)"
+ },
+ "rpbe": {
+  "ridge_eps": 0.001,
+  "sketch_dim_m": 32,
+  "rpbe_map_seed": 0,
+  "z_v_dim": 128,
+  "horizon_weights": [
+   0.5,
+   0.5
+  ],
+  "lambda_calibration": {
+   "rule": "R10 gamma-scope calibration (review 2026-09-16): lambda = 0.1 / r_eff measured on the GAMMA group only at theta_0, first full window, before ANY optimizer step",
+   "lambda_kf": null,
+   "lambda_kf_note": "NULL PENDING RECALIBRATION (review ruling 2026-09-21): the old 0.005936691082765761 was calibrated under the retired protocol (single penultimate cut, Gamma from t=2, trainable LoRA+COMP scope).  The fixed protocol changed the cut set (t=1..L), the Gamma placement (M_0=0) and the trainable scope (Gamma only), so the gradient geometry is different.  Recalibrate ONCE on the fixed code and commit the derived lambda here.  The trainer refuses the ours arm while this field is null."
+  },
+  "z_v_source": "J_mem(M_t) fixed adapter at block_idx = t - 1 for t = 1..L (one cut per actual compression layer; review ruling 2026-09-21)",
+  "cut_supervision": "t < L: obs1 (C=u_{t+1}, Y=u_{t+2}, w=0.5) + obs2 (C=(u_{t+1}, u_{t+2}, one-update), Y=y, w=0.5); t = L: single row (C=c, Y=y, w=1.0).  chi/phi are built from the RAW tokenized turns [u_1..u_L, c, y], never from spans of the collated ids.",
+  "witness": "none (main experiment)",
+  "sketch_ensemble_n_branches": 4,
+  "sketch_ensemble_note": "four independent 32-dim branches (J_ens = mean_r J_r; never concatenated into one 128-dim covariance).  Depth bucket b(L) modulates the future signature with LOCAL cut depth L=t in 1..13.",
+  "oas_shrinkage": {
+   "enabled": true,
+   "rule": "paired OAS covariance shrinkage per branch"
+  }
+ },
+ "gamma": {
+  "placement": "one module per layer, shared across the K/V merges and the two COMP/SUM slots; recurrence M_t = mean(h_1..h_t) + R_Gamma(M_{t-1}, h_t, t) for EVERY t = 1..L with M_0 = 0 (review ruling 2026-09-21: the first compression layer is inside the method, L=1 included)",
+  "hidden": 64,
+  "time_dim": 16,
+  "init_scale": 0.02,
+  "zero_init": "U0=0 zero-output projection init; step 0 residual is bit-for-bit zero.  Gradient note: with U_0 = 0 the first step updates only U (dR/dV vanishes at U = 0).",
+  "parameter_budget": "32 layers x ~25.7k = ~821k < 1M"
+ },
+ "freeze_host": {
+  "enabled": false,
+  "scope": "NOT frozen in the joint control: trainable = conditional LoRA + COMP/SUM rows + Gamma (the llama Joint protocol analogue on gemma).",
+  "mode": "host model.eval() + Gamma modules train() — the released conditional LoRA dropout (0.05) must not perturb the frozen host forward; gradients still flow through the host to Gamma"
+ },
+ "official_host": {
+  "enabled": false,
+  "note": "the DailyDialog formal arms run on the official host (build_official_host); the legacy resize host is retired for this method.  For the ours / gamma_task_only arms the trainer REFUSES to start without --official-host (enforce_frozen)."
+ },
+ "window": {
+  "min_effective_cuts": 128,
+  "collection": "adaptive by effective cut count (dialogues with L>=1; review ruling 2026-09-21: L=1 emits its terminal cut)",
+  "cadence": "identical task samples and scheduler cadence across the three arms"
+ },
+ "training": {
+  "steps": 50,
+  "steps_note": "Review-fix protocol (2026-09-21): 60 windows, task-only / ours from the SAME theta_0 (official CCM-merge host, frozen, zero-init Gamma).  The R10-era 300-step budget belonged to the retired protocol.",
+  "grad_clip": 1.0,
+  "merge_cadence": "window-matched",
+  "two_pass_replay": "pass1 no-grad statistics forward, pass2 grad replay forward (RPBE arms only)",
+  "rpbe_gamma_only": true,
+  "checkpoint_every": 10,
+  "schedule_total_steps": 1000,
+  "schedule_note": "original 1000-step warmup/cosine schedule kept",
+  "checkpoint_selection": "validation only (clean_split=True, eval_source=val).  The official val+test pooled protocol remains a CCM-reproduction report only and never selects a checkpoint.",
+  "checkpoint_every_note": "user ruling 2026-09-24: every 10 windows (50-window joint control)"
+ },
+ "sampling": {
+  "depth_levels": [
+   1,
+   2,
+   4,
+   8,
+   13
+  ],
+  "n_turns_of_L": "L + 2 TURNS (fixed prefix length in turns per depth; NOT meta.k = len(blocks)+1 = L + 1)",
+  "cut_depths": "every sample at endpoint L contributes cuts at LOCAL depths t = 1..L (maps.pv depth = t; Llmmaps registers local depths 1..13, out-of-range values fail fast — no modulo fold)",
+  "rule": "q_L ~ 1/sqrt(n_L) with 3x-uniform oversampling cap; ONE original dialogue per window (tree_id = stable original dialogue id)."
+ }
+}

@@ -60,12 +60,12 @@ def build_eval_dataset(args, tokenizer, pooled, online, comp_type):
     if getattr(args, "host", "llama") == "qwen3":
         from src.data.dialogue.qwen3_data import Qwen3DialogueDataset
         dialog = Qwen3DialogueDataset(
-            tokenizer, mirror=args.dialog_mirror)
+            tokenizer, mirror=args.dialog_mirror, pooled=pooled)
         return dialog, comp_args
     if getattr(args, "host", "llama") == "gemma4":
         from src.data.dialogue.gemma4_data import Gemma4DialogueDataset
         dialog = Gemma4DialogueDataset(
-            tokenizer, mirror=args.dialog_mirror)
+            tokenizer, mirror=args.dialog_mirror, pooled=pooled)
         return dialog, comp_args
     from src.data.dialogue.data import DialogueDataset
     dialog = DialogueDataset(tokenizer, comp_token=tokenizer.comp_token_id,
@@ -137,6 +137,37 @@ def eval_split(model, collator, dialogs, device, limit, name,
                     out = model(
                         input_ids=batch["input_ids"].to(device),
                         attention_mask=batch["attention_mask"].to(device))
+                s, n = eval_ce_shifted_noeos(out, batch["labels"], device,
+                                             eos_id=eos_id)
+                total += float(s.detach())
+                n_tok += n
+        nll = total / max(n_tok, 1)
+        per_bucket[b] = {"nll": nll, "tokens": n_tok,
+                         "dialogues": len(items)}
+        print("{} {}: nll={:.4f} ({} tok, {} dlg)".format(
+            name, b, nll, n_tok, len(items)), flush=True)
+    return per_bucket
+
+
+def eval_official_buckets(model, collator, dialog, device, limit, name,
+                          eos_id=2):
+    """Official Protocol B buckets: _subsample truncation semantics
+    (dialogues with >= n_turn turns truncated to the first n_turn;
+    turn_14 uses n_turn=15), NOT the exact-turn-count grouping of
+    eval_split.  The caller must pass a pooled dataset (val + test)."""
+    per_bucket = {}
+    for b in sorted(TURN_BUCKETS):
+        n_turn = TURN_BUCKETS[b][0]
+        items = dialog._subsample(dialog.valset, n_turn=n_turn)
+        if limit:
+            items = items[:limit]
+        total = 0.0
+        n_tok = 0
+        with torch.no_grad():
+            for i in range(0, len(items), 8):
+                batch = collator(items[i:i + 8])
+                out = tc.run_forward(model, batch, device,
+                                     grad_enabled=False)
                 s, n = eval_ce_shifted_noeos(out, batch["labels"], device,
                                              eos_id=eos_id)
                 total += float(s.detach())
@@ -372,6 +403,13 @@ def main():
                                                a.limit, name,
                                                use_ccm=True,
                                                eos_id=eos_id)
+            elif a.pooled and args.host in ("qwen3", "gemma4"):
+                # Official Protocol B: _subsample buckets over the
+                # pooled val+test (eval_split's exact-turn grouping is
+                # the depth-curve protocol, not the official buckets).
+                results[name] = eval_official_buckets(
+                    model, collator, dialog, device, a.limit, name,
+                    eos_id=eos_id)
             else:
                 results[name] = eval_split(model, collator, eval_dialogs,
                                            device, a.limit, name,

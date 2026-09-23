@@ -262,6 +262,14 @@ class Gemma4CCMTextAttention(nn.Module):
             key_states, value_states = shared_kv_states[self.layer_type]
             key_states = key_states.to(query_states.device)
             value_states = value_states.to(query_states.device)
+            # RPBE: the inherited K/V already carries the provider
+            # layer's SUM merge — fill the memory cache here too so the
+            # per-layer JMemLift sees every layer (review fix
+            # 2026-09-23: extract_z raised "memory cache empty" on the
+            # shared layers, which skip the merge block below).
+            if self.mem_callback is not None:
+                self.mem_callback(key_states, value_states, sum_mask,
+                                  sum_row_pos)
         else:
             key_states = self.k_proj(hidden_states,
                                      comp_mask=comp_mask).view(hidden_shape)

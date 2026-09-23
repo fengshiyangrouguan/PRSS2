@@ -66,14 +66,41 @@ EXTENDED10: Tuple[str, ...] = PRIMARY6 + (
 # and the encoder serialises task identity into X -- so against this cohort that
 # Gamma has never seen its tasks. That is CROSS-COHORT deployment, a different
 # experiment from "Gamma learns which traces to keep"; the stronger claim needs
-# a Gamma retrained on Structural6 archives.
+# a Gamma retrained on Structural6 archives. Phase-A itself is COHORT-COUPLED
+# (a candidate's score is the mean over every cohort task, the beam ranks by it,
+# and a record's label `r` is a difference of those means), so records cannot be
+# spliced across cohorts -- the whole Phase-A has to be re-run.
+#
+# THE SCREENING RULES, FIXED BEFORE ANY RESULT IS SEEN. Membership is NEVER
+# random and is never revisited after a run: a fixed rule is applied, and the
+# first candidate in a frozen order that passes is taken.
+#   1. dev and test both non-empty;
+#   2. more than one family/scale, so there is something to generalise across;
+#   3. dev score resolution fine enough for a beam -- the dev score is
+#      "#instances finishing inside the 10s timeout / #dev instances", so a task
+#      with 4 dev instances quantises to 0.25 while one with 40 quantises to
+#      0.025;
+#   4. NO TASK MAY DOMINATE THE WALL-CLOCK COST of a candidate evaluation
+#      relative to the rest of the cohort. An extremely high-instance-count task
+#      may pass rules 1-3 and still be excluded here; such a task may be kept as
+#      a stress test, but not as a primary-cohort member. MEASURED, with a stub
+#      that spins to the instance budget: Hybrid Reentrant Shop Scheduling --
+#      which passes rules 1-3 -- costs 1607s for ONE candidate's dev split
+#      against 95s for Job shop, i.e. it alone would exceed the rest of the
+#      cohort combined.
+#
+# Assignment problem was dropped for rule 3 (4 dev instances -> 0.25 steps);
+# Hybrid Reentrant was passed over for rule 4 despite passing rules 1-3, and
+# Job shop scheduling -- the next entry in the frozen backup order -- was taken.
+# Neither exclusion cites a run outcome: no paired run existed for this cohort
+# when the screen was applied.
 STRUCTURAL6: Tuple[str, ...] = (
     "Aircraft landing",
-    "Assignment problem",
     "Capacitated warehouse location",
     "Common due date scheduling",
     "Flow shop scheduling",
     "Generalised assignment problem",
+    "Job shop scheduling",
 )
 
 # Profile name -> the cohort it must carry. A profile whose cohort does not match

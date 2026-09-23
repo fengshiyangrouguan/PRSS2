@@ -16,13 +16,24 @@
 # here is CROSS-COHORT deployment -- a different experiment from "Gamma learns
 # which traces to keep". Supporting that stronger claim needs a retrained Gamma.
 name: sri_structural6
+#
+# SCREENING (fixed before any result was seen; membership is never random and is
+# never revisited after a run). Assignment problem was dropped for score
+# resolution -- 4 dev instances quantise the dev score to 0.25 steps, the
+# coarsest of any candidate. Hybrid Reentrant Shop Scheduling passed structure
+# and resolution but was passed over under the wall-clock rule: measured, ONE
+# candidate's dev split costs 1607s there against 95s for Job shop, so it alone
+# would dominate the cohort's evaluation cost. It stays available as a stress
+# test, not as a primary member. Job shop scheduling was next in the frozen
+# backup order and is taken. Neither exclusion cites a run outcome: no paired run
+# existed for this cohort when the screen was applied.
 cohort:
   - Aircraft landing
-  - Assignment problem
   - Capacitated warehouse location
   - Common due date scheduling
   - Flow shop scheduling
   - Generalised assignment problem
+  - Job shop scheduling
 
 # --- formal search profile (§3.3) -----------------------------------------
 beam_width: 2            # B

@@ -290,6 +290,11 @@ def main():
     ap.add_argument("--ours-ckpt", default="")
     ap.add_argument("--official-adapter", default="")
     ap.add_argument("--lora-ckpt", default="")
+    ap.add_argument("--foundation", default="",
+                    help="Step-1 foundation merge source (gemma4 host: "
+                         "the Step-1 adapter-only ckpt merged into the "
+                         "base INSIDE build_model before the "
+                         "conditional LoRA attach)")
     ap.add_argument("--model-name-or-path",
                     default="/root/autodl-tmp/llama-7b-hf")
     ap.add_argument("--dialog-mirror",
@@ -316,7 +321,7 @@ def main():
         arm="ours", model_name_or_path=a.model_name_or_path,
         dialog_mirror=a.dialog_mirror, relative_embedding="skip",
         lora_r=8, z_dim=128, rpbe_seed=0, sketch_dim=64, gamma_hidden=64,
-        host=a.host, official_host=False, foundation="",
+        host=a.host, official_host=False, foundation=a.foundation,
         official_adapter="")
 
     tokenizer = tc.build_tokenizer(args)

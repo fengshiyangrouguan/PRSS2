@@ -343,14 +343,28 @@ class SiblingAllocator:
             return top, 0, "exploit"
 
         assigned = self._assigned.setdefault(key, [top])
-        cands = self._subsets(ranked, k, n, core_keep=2, overlap=k - 1)
-        cands = [c for c in cands if fits(c)]
-        if not cands:                        # relax: allow two replacements
-            cands = [c for c in self._subsets(ranked, k, n, core_keep=2,
-                                              overlap=k - 2) if fits(c)]
-        if not cands:                        # last resort: core only
-            cands = [c for c in self._subsets(ranked, k, n, core_keep=2,
-                                              overlap=0) if fits(c)]
+        # WIDEN THE CONSTRAINT UNTIL AN UNASSIGNED SUBSET EXISTS -- not merely
+        # until one is non-empty. The first version widened only when a level
+        # produced NO candidates, so once the one-replacement level
+        # (overlap = k-1, which holds exactly (k-2+1)*(n-k) = 4 subsets for
+        # n=6, k=4) had been fully assigned it fell through to `max(cands)` and
+        # re-picked an ALREADY-ASSIGNED subset. Measured on a live 6-sibling
+        # group: 5 distinct subsets instead of the 6 that are reachable.
+        # The tightest level that still has something new wins, so the frozen
+        # "replace exactly one element" preference holds while it can.
+        cands: List[Tuple[int, ...]] = []
+        for _ov in range(k - 1, -1, -1):
+            if _ov < 2 and k >= 4:
+                # core (top-2) subset S forces |S n ref| >= 2, so lower levels
+                # are provably empty; stop rather than scan them.
+                break
+            level = [c for c in self._subsets(ranked, k, n, core_keep=2,
+                                              overlap=_ov) if fits(c)]
+            if not level:
+                continue
+            cands = level
+            if any(c not in assigned for c in level):
+                break
         if not cands:
             self._assigned[key].append(top)
             return top, variant, "exploit"
@@ -1071,6 +1085,22 @@ def self_test() -> int:
         assert set(rk[:2]) <= set(s), (s, rk, rev)
     print("OK  B' non-identity     same 4-unique result when the ranking is NOT "
           "the pool order (the index-space check that the flat stub hid)")
+
+    # H. EXHAUSTION. A group can hold MORE than 4 siblings: the beam re-selects
+    # the same parent in a later iteration, so its (pool, stack) key repeats and
+    # the group grows. The allocator must keep producing NEW subsets until the
+    # reachable set is exhausted -- for n=6, k=4 that is S_1 (1) + the
+    # one-replacement level (4) + the two-replacement level (1) = 6 -- instead
+    # of repeating an assigned subset once the tightest level is used up. A live
+    # 6-sibling group got 5.
+    _SIBLING_ALLOCATOR._counts.clear()
+    _SIBLING_ALLOCATOR._assigned.clear()
+    subs6 = [tuple(sorted(x.task_id for x in
+                          r_div.reduce(list(pool6), [], budget=budget)[0]))
+             for _ in range(6)]
+    assert len(set(subs6)) == 6, subs6
+    print("OK  H exhaustion       6 siblings of one parent get 6 DISTINCT "
+          "subsets (no repeat once the one-replacement level runs out)")
 
     # D. reproducible: same input, fresh state -> identical selections
     _SIBLING_ALLOCATOR._counts.clear()

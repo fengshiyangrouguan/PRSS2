@@ -53,11 +53,35 @@ EXTENDED10: Tuple[str, ...] = PRIMARY6 + (
     "Job shop scheduling",
 )
 
+# Structural6 (frozen 2026-09-23) -- a SEPARATE cohort, NOT a replacement.
+#
+# WHY A NEW PROFILE RATHER THAN AN EDIT OF PRIMARY6. `sri_primary6.yaml` states
+# the primary cohort "may NOT be replaced ... after any result is observed
+# (§3.2)", and results HAVE been observed on it (seed 0, twice). Registering the
+# swap as its own cohort keeps the completed runs attached to the task set they
+# were actually run on; editing PRIMARY6 in place would silently re-label them.
+#
+# THE CONSEQUENCE THAT MATTERS MOST. `_gamma_mt_gem_traceonly_clean_phaseb.pt`
+# was trained (Phase B) on CutRecords built from Phase-A archives OF PRIMARY6,
+# and the encoder serialises task identity into X -- so against this cohort that
+# Gamma has never seen its tasks. That is CROSS-COHORT deployment, a different
+# experiment from "Gamma learns which traces to keep"; the stronger claim needs
+# a Gamma retrained on Structural6 archives.
+STRUCTURAL6: Tuple[str, ...] = (
+    "Aircraft landing",
+    "Assignment problem",
+    "Capacitated warehouse location",
+    "Common due date scheduling",
+    "Flow shop scheduling",
+    "Generalised assignment problem",
+)
+
 # Profile name -> the cohort it must carry. A profile whose cohort does not match
 # its name is refused, so the two formal cohorts can never be silently mixed.
 PROFILE_COHORTS: Dict[str, Tuple[str, ...]] = {
     "sri_primary6": PRIMARY6,
     "sri_extended10": EXTENDED10,
+    "sri_structural6": STRUCTURAL6,
     # Not a paper profile: the same protocol at minimum scale (B=K=T=1), used to
     # run the whole real chain once before any formal spend. It is registered here
     # so it still cannot carry a cohort that does not match its name.

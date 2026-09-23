@@ -1,0 +1,123 @@
+# SRI formal profile -- STRUCTURAL6 cohort (frozen 2026-09-23)
+#
+# A SEPARATE cohort, not a replacement. `sri_primary6.yaml`'s own header says the
+# primary cohort "may NOT be replaced by the extended cohort after any result is
+# observed (§3.2)", and results WERE observed on it (seed 0, twice). So the swap
+# is registered as its own profile: completed runs stay attached to the task set
+# they were actually run on, and this cohort starts with no results of its own.
+#
+# Every OTHER pinned parameter below is byte-identical to sri_primary6.yaml --
+# the point of the change is the task set, and nothing else may move with it.
+#
+# COST IMPLICATION, stated here because it is easy to miss: this cohort needs its
+# own frozen root (the root's gen0 is over the cohort's tasks), and NEITHER arm
+# can reuse an archive from the other cohort. The Gamma checkpoint was trained on
+# PRIMARY6 archives, and the encoder serialises task identity into X, so using it
+# here is CROSS-COHORT deployment -- a different experiment from "Gamma learns
+# which traces to keep". Supporting that stronger claim needs a retrained Gamma.
+name: sri_structural6
+cohort:
+  - Aircraft landing
+  - Assignment problem
+  - Capacitated warehouse location
+  - Common due date scheduling
+  - Flow shop scheduling
+  - Generalised assignment problem
+
+# --- formal search profile (§3.3) -----------------------------------------
+beam_width: 2            # B
+beam_candidates: 2       # K
+max_iterations: 6        # T  (the 6th iteration is extra depth-4..6 opportunity)
+max_depth: 6
+no_early_stop: true
+
+# --- seed families (§3.3): all three are NESTED inside a search seed ------
+search_seeds: [0, 1, 2, 3, 4]
+search_eval_repeats: 3       # denoise a candidate's score during search
+audit_repeats: 3             # canonical transition-audit repeats
+test_repeats: 3              # held-out repeats (stochastic evaluators only)
+
+# --- generation knobs (result-affecting; pinned, never inherited) ---------
+#
+# 32768, not 1024 (changed 2026-09-21, measured). These Gemini routes count
+# hidden reasoning INSIDE the completion budget: the model reliably spends
+# 13k-27k tokens thinking before it emits a solver. At 1024 every call came
+# back finish_reason='length' and the extractor handed truncated fragments
+# (172-char stubs) downstream as if they were programs. 32768 leaves room for
+# the reasoning AND a few thousand tokens of visible answer.
+max_tokens: 32768
+# Kept 0 deliberately: finish_reason='length' is a HARD FAILURE that is counted
+# rather than silently rescued, so the admission criterion "no length in 18/18"
+# keeps its meaning. An escalation here would turn a failed call into a
+# first-attempt failure + retry success, which has to be reported separately.
+empty_retry_max_tokens: 0
+# Self-debug retries per failing task -- NOT transport retries. Conflating the
+# two is how a run's retry policy silently stops being reproducible; the
+# transport knob is `llm_max_retries` below.
+max_retries: 0
+# Transport retries inside LLMClient (connection / timeout / 5xx / throttle).
+# Pinned here so BOTH arms provably share one value and config.json records it.
+# Before this it was LLMConfig's dataclass default (3) and invisible to
+# verify_run_config, so no result file could prove the two arms matched.
+llm_max_retries: 2
+reasoning_effort: low
+temperatures: [0.5, 0.7, 0.9]
+novelty_alpha: 0.3
+
+# Execution concurrency -- PINNED because it is result-affecting for
+# CO-Bench: a task's dev score is "#instances finishing inside the 10s
+# timeout / #instances", so a different worker count means a different
+# score from the same script (measured: assignment_problem 0.5000 at the
+# search's resolved 8, 0.2500 at a contended setting).
+# 0 is refused: it would resolve to cpu_count, i.e. machine-dependent.
+parallel: 1
+# 8, NOT 1: 8 is what the search side has always resolved to
+# (min(cpu_count, 8)) on every box this work has run on, so the audit and the
+# search then score under the SAME per-instance budget -- which is the point.
+# Pinning 1 would reduce contention further, but makes the audit roughly 8x
+# slower AND puts it on a different budget than the search that selected the
+# candidates being audited.
+instance_workers: 8
+
+# Hard ceiling on billed backend requests PER ARM. Insurance against a
+# runaway loop spending someone else's relay quota; generous relative
+# to the work, so it should never fire.
+max_backend_requests: 400
+
+# --- gate / consolidation (§8) --------------------------------------------
+# consolidate=true SKIPS the quality gate, so gate_tasks MUST be 0: a profile
+# claiming an active three-task gate that can never run is refused at load.
+consolidate: true
+gate_tasks: 0
+gate_repeats: 1
+gate_margin: 0.0
+protect_floor: null
+regression_guard: true
+regression_guard_repeats: 3
+within_task_recursion: true
+focus_current_headroom: true
+symmetric_trace_sampling: true
+paired_eval: false
+elite_rotation: false
+
+# Formal runs never read the bundled benchmark-features YAML: its `defaults`
+# block sets result-affecting keys (consolidate / regression_guard /
+# within_task_recursion / focus_current_headroom / symmetric_trace_sampling)
+# that this profile names explicitly instead.
+benchmark_config: none
+
+# --- frozen estimator constant (§2.2) -------------------------------------
+regression_threshold: 0.02
+
+# NOT deterministic, and this is now MEASURED rather than assumed: on the real
+# CO-Bench dev split, 4 of the 6 primary tasks reproduce their recorded score
+# exactly while 2 (aircraft_landing, common_due_date_scheduling -- the two
+# slowest) do not, because the evolved solvers are wall-clock-budgeted anytime
+# heuristics drawing unseeded `random`. Three back-to-back runs of one script on
+# aircraft_landing gave 0.6742 / 0.7229 / 0.6933 (spread 0.0487), more than twice
+# the 0.02 regression threshold.
+#
+# So repeats are REAL repeat measurements, never cacheable shortcuts. The
+# evaluator still verifies determinism per task before caching anything, and
+# reports the tasks that disagreed, but with this false nothing is cached.
+deterministic_evaluator_caches_repeats: false

@@ -35,8 +35,8 @@
   ],
   "lambda_calibration": {
    "rule": "same as the qwen3 native line: r_eff = lambda * ||d_pred|| / ||d_task|| ~ 0.1 measured at theta_0 (init-from step600) on the first closed window, native proposal-space (lr=1 direction space), then frozen.",
-   "lambda_kf": null,
-   "lambda_kf_note": "NULL PENDING CALIBRATION (2026-09-23): calibrate once on the gemma theta_0 (init-from step600 + S4 supervisor) and commit the derived lambda here. The trainer refuses the ours arm while this field is null."
+   "lambda_kf": 0.09987369461385258,
+   "lambda_kf_note": "Calibrated 2026-09-23 (gemma native proposal-space r_eff at theta_0 = init-from step600): r_eff = 1.0013, derived lambda = 0.1/1.0013 = 0.0999.  Matches the qwen3 native value (0.0998, r_eff 1.002) — the proposal-space r_eff on native compression params is ~1 across hosts."
   },
   "z_v_source": "J_mem(M_v) fixed adapter; GQA hosts lift the memory from the KV heads; native mode lifts the PURE CCM mean (no Gamma residual exists)",
   "witness": "none (main experiment)",

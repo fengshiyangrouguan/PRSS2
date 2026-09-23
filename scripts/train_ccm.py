@@ -320,6 +320,13 @@ def parse_args():
                         "only (never the QP rows), window-mean "
                         "normalized over ALL observations, e.g. "
                         "'0.5,1.0,1.5'.  Empty = no depth weighting.")
+    p.add_argument("--no-qp", action="store_true",
+                   help="No-QP arm (review 2026-09-24 deep-floor "
+                        "probe): skip the treewise feasibility "
+                        "projection entirely and write d* = d_0 back "
+                        "(same task + lambda S4 center, no feasibility "
+                        "correction).  Pairs with --s4-supervisor; the "
+                        "dirs are still collected for diagnostics.")
     p.add_argument("--early-cut-drop-ratio", type=float, default=0.0,
                    help="cut-depth balancing (review 2026-09-24): "
                         "deterministically drop this fraction of t<=2 "
@@ -4100,15 +4107,30 @@ def main():
                             # 64-row blocks); the sign flip negates
                             # each row.
                             _G = [-_r for _r in dirs] if dirs else None
-                            proj_ok, proj_diag = \
-                                treewise_feasibility_projection(
-                                    [x.detach().cpu() for x in d0],
-                                    repr_params, _G,
-                                    args.rpbe_kappa,
-                                    iters=args.proj_iters,
-                                    cert_tol=1e-4,
-                                    b_norm=d_task_norm,
-                                    device=device)
+                            if getattr(args, "no_qp", False):
+                                # No-QP arm (review 2026-09-24 deep-
+                                # floor probe): d* = d_0, write the
+                                # proposal back directly (the QP's
+                                # successful write-back is p.grad =
+                                # -d*, so here p.grad = -d_0).
+                                with torch.no_grad():
+                                    for _p, _dv in zip(repr_params, d0):
+                                        _p.grad = (-_dv).to(_p.device)
+                                proj_diag = {"note": "no_qp",
+                                             "n_dirs":
+                                                 len(dirs) if dirs
+                                                 else 0}
+                                proj_ok = True
+                            else:
+                                proj_ok, proj_diag = \
+                                    treewise_feasibility_projection(
+                                        [x.detach().cpu() for x in d0],
+                                        repr_params, _G,
+                                        args.rpbe_kappa,
+                                        iters=args.proj_iters,
+                                        cert_tol=1e-4,
+                                        b_norm=d_task_norm,
+                                        device=device)
                             proj_diag["space"] = "proposal"
                             proj_diag["d_task_norm"] = d_task_norm
                             # Proposal-space conflict statistics (short

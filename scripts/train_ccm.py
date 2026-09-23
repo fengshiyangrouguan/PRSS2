@@ -307,6 +307,19 @@ def parse_args():
                         "1-turn merge = lossless).  RAW gap — no hinge, "
                         "no epsilon (margin gating is a later ablation)."
                         "  Native actuation only.")
+    p.add_argument("--s4-deficit-gate", action="store_true",
+                   help="DB-DG-S4 (review 2026-09-24): only "
+                        "observations with Delta_{t,h} > 0 (compression "
+                        "actually loses vs the full reference) feed the "
+                        "ACTIVE predictive center; the QP rows stay "
+                        "UNGATED (learned interfaces keep protection).")
+    p.add_argument("--s4-depth-mults", default="",
+                   help="DB-DG-S4 depth reweight (review 2026-09-24): "
+                        "comma-separated multipliers for t<=2, t=3..5, "
+                        "t>=6 applied to the ACTIVE predictive center "
+                        "only (never the QP rows), window-mean "
+                        "normalized over ALL observations, e.g. "
+                        "'0.5,1.0,1.5'.  Empty = no depth weighting.")
     p.add_argument("--early-cut-drop-ratio", type=float, default=0.0,
                    help="cut-depth balancing (review 2026-09-24): "
                         "deterministically drop this fraction of t<=2 "
@@ -2816,6 +2829,41 @@ def main():
                         1.0 / args.early_cut_drop_ratio))
                         if args.early_cut_drop_ratio > 0 else 0)
                     _early_cnt = 0
+                    # DB-DG-S4 state (review 2026-09-24)
+                    _dbdg = bool(args.s4_deficit_gate) \
+                        or bool(args.s4_depth_mults)
+                    _dbdg_mults = None
+                    if args.s4_depth_mults:
+                        _pm = [float(x) for x in
+                               args.s4_depth_mults.split(",")]
+                        assert len(_pm) == 3, args.s4_depth_mults
+                        _dbdg_mults = _pm
+                    _dbdg_abar = 1.0
+                    _dbdg_diag = None
+                    if _dbdg:
+                        _wsum = 0.0
+                        _wasum = 0.0
+                        for _i2 in range(len(pending)):
+                            for meta, oid, v in cut_records[_i2]:
+                                if g_by_oid.get(oid) is None:
+                                    continue
+                                for _h, _cd, _fd, _w in s4_obs_list(
+                                        meta, int(v)):
+                                    _tt = int(v) + 1
+                                    _aa = (_dbdg_mults[0] if _tt <= 2
+                                           else _dbdg_mults[1]
+                                           if _tt <= 5
+                                           else _dbdg_mults[2]) \
+                                        if _dbdg_mults else 1.0
+                                    _wsum += _w
+                                    _wasum += _w * _aa
+                        _dbdg_abar = (_wasum / _wsum
+                                      if _wsum > 0 else 1.0)
+                        _dbdg_diag = {
+                            "mass_raw": [0.0, 0.0, 0.0],
+                            "mass_active": [0.0, 0.0, 0.0],
+                            "n_gate": [0, 0, 0],
+                            "n_tot": [0, 0, 0]}
                     if args.rpbe_native_compression \
                             and args.s4_supervisor:
                         # S4 formal supervisor (review 2026-09-23
@@ -2940,6 +2988,28 @@ def main():
                                         if _early_cnt % _early_drop_step \
                                                 == 0:
                                             _skip_row = True
+                                    # DB-DG-S4 (review 2026-09-24):
+                                    # deficit gate + depth reweight
+                                    # apply to the ACTIVE center only.
+                                    _center_scale = 1.0
+                                    _dbdg_g = 2
+                                    if _dbdg:
+                                        _tt = int(v) + 1
+                                        _dbdg_g = (0 if _tt <= 2
+                                                   else 1 if _tt <= 5
+                                                   else 2)
+                                        _delta = float(
+                                            _ce_c.detach()) - float(
+                                                _ce_f.detach()
+                                                if torch.is_tensor(
+                                                    _ce_f) else _ce_f)
+                                        _gate = 1.0 if _delta > 0 \
+                                            else 0.0
+                                        _aa = _dbdg_mults[_dbdg_g] \
+                                            if _dbdg_mults else 1.0
+                                        _center_scale = (_aa
+                                                         / _dbdg_abar) \
+                                            * _gate
                                     if not _skip_row:
                                         dirs.append(torch.cat(
                                             [p.grad.reshape(-1).float()
@@ -2956,12 +3026,40 @@ def main():
                                     for p in params:
                                         if p.grad is None:
                                             continue
-                                        if id(p) in s4_pred_acc:
-                                            s4_pred_acc[id(p)].add_(
-                                                p.grad.detach())
+                                        if _dbdg:
+                                            _gn = float(
+                                                p.grad.detach()
+                                                .double().norm())
+                                            _dbdg_diag["mass_raw"][
+                                                _dbdg_g] += _gn
+                                            _dbdg_diag["n_tot"][
+                                                _dbdg_g] += 1
+                                            if _center_scale > 0:
+                                                _dbdg_diag["n_gate"][
+                                                    _dbdg_g] += 1
+                                                _dbdg_diag[
+                                                    "mass_active"][
+                                                    _dbdg_g] += (
+                                                        _gn
+                                                        * _center_scale)
+                                        if _center_scale != 1.0:
+                                            if id(p) in s4_pred_acc:
+                                                s4_pred_acc[id(p)].add_(
+                                                    p.grad.detach()
+                                                    * _center_scale)
+                                            else:
+                                                s4_pred_acc[id(p)] = (
+                                                    p.grad.detach()
+                                                    .clone()
+                                                    * _center_scale)
                                         else:
-                                            s4_pred_acc[id(p)] = (
-                                                p.grad.detach().clone())
+                                            if id(p) in s4_pred_acc:
+                                                s4_pred_acc[id(p)].add_(
+                                                    p.grad.detach())
+                                            else:
+                                                s4_pred_acc[id(p)] = (
+                                                    p.grad.detach()
+                                                    .clone())
                                 adapter.clear()
                         # joint (scaled space) = pure task + lambda-w-
                         # eighted aggregate S4 gradient.
@@ -4136,6 +4234,25 @@ def main():
                         _f.write(json.dumps(_json_safe(
                             {"step": int(step), "event": "treewise_proj",
                              **proj_diag})) + "\n")
+                        if _dbdg_diag is not None:
+                            _f.write(json.dumps(_json_safe(
+                                {"step": int(step), "event": "s4_dbdg",
+                                 "abar": _dbdg_abar,
+                                 "mults": _dbdg_mults,
+                                 "mass_raw":
+                                     [round(x, 2) for x in
+                                      _dbdg_diag["mass_raw"]],
+                                 "mass_active":
+                                     [round(x, 2) for x in
+                                      _dbdg_diag["mass_active"]],
+                                 "pr_delta_pos": [
+                                     round(
+                                         _dbdg_diag["n_gate"][_g]
+                                         / _dbdg_diag["n_tot"][_g], 4)
+                                     if _dbdg_diag["n_tot"][_g]
+                                     else None
+                                     for _g in range(3)],
+                                 })) + "\n")
                     if cert_fail:
                         print("[rpbe-cstr] window={} CERT_FAIL "
                               "max_viol={:.3e} skipping repr step".format(

@@ -33,8 +33,8 @@
   ],
   "lambda_calibration": {
    "rule": "same as the qwen3 native line: r_eff = lambda * ||d_pred|| / ||d_task|| ~ 0.1 measured at theta_0 (the official merged host) on the first closed window, native proposal-space (lr=1 direction space), then frozen.",
-   "lambda_kf": null,
-   "lambda_kf_note": "NULL PENDING CALIBRATION (2026-09-24): calibrate once on the llama official merged host (S4 supervisor) and commit the derived lambda here.  The trainer refuses the ours arm while this field is null."
+   "lambda_kf": 0.09974519358869541,
+   "lambda_kf_note": "Calibrated 2026-09-24 (llama official merged host, native proposal-space r_eff at theta_0): r_eff = 1.0026, derived lambda = 0.1/1.0026 = 0.0997.  Matches qwen3 (0.0998, r_eff 1.002) and gemma4 (0.0999, r_eff 1.001) — the proposal-space r_eff on native compression params is ~1 across all three hosts."
   },
   "z_v_source": "J_mem(M_v) fixed adapter; llama host lifts the memory from all attention heads (32, head_dim = hidden / heads)",
   "witness": "none (main experiment)",

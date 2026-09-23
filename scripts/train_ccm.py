@@ -3918,6 +3918,15 @@ def main():
                                           _dbdg_abar,
                                           _early_drop_step),
                                       flush=True)
+                                if s4_pred_acc and s4_pred_acc_orig:
+                                    _k0 = list(s4_pred_acc.keys())[0]
+                                    print("[paired-audit] key0 db_norm="
+                                          "{:.6f} orig_norm={:.6f}".format(
+                                              float(s4_pred_acc[_k0]
+                                                    .double().norm()),
+                                              float(s4_pred_acc_orig[_k0]
+                                                    .double().norm())),
+                                          flush=True)
                                 def _d0_from(acc):
                                     _gj = {}
                                     for p in params:

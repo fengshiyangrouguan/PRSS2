@@ -307,6 +307,16 @@ def parse_args():
                         "1-turn merge = lossless).  RAW gap — no hinge, "
                         "no epsilon (margin gating is a later ablation)."
                         "  Native actuation only.")
+    p.add_argument("--early-cut-drop-ratio", type=float, default=0.0,
+                   help="cut-depth balancing (review 2026-09-24): "
+                        "deterministically drop this fraction of t<=2 "
+                        "rows from the TREEWISE QP constraint set "
+                        "(every 1/ratio-th early row skipped; the "
+                        "aggregate S4 center d_0 is UNCHANGED).  "
+                        "Endpoint-level sampling does not imply "
+                        "interface-level balance in recursive "
+                        "computation (audit: t1-2 rows carry 51.5% of "
+                        "the gradient mass while t6-13 carry 20.7%).")
     p.add_argument("--s4-ref-cache", action="store_true",
                    help="S4 speed fix (review 2026-09-23): batch-"
                         "precompute the full-reference NLL table for "
@@ -2657,6 +2667,10 @@ def main():
                     native_amp_skip = False  # native proposal write-back
                     dirs = []
                     s4_pred_acc = {}
+                    _early_drop_step = (int(round(
+                        1.0 / args.early_cut_drop_ratio))
+                        if args.early_cut_drop_ratio > 0 else 0)
+                    _early_cnt = 0
                     if args.rpbe_native_compression \
                             and args.s4_supervisor:
                         # S4 formal supervisor (review 2026-09-23
@@ -2774,13 +2788,21 @@ def main():
                                     _loss_h.backward(
                                         retain_graph=(
                                             _j < len(_obs) - 1))
-                                    dirs.append(torch.cat(
-                                        [p.grad.reshape(-1).float()
-                                         if p.grad is not None else
-                                         torch.zeros(p.numel(),
-                                                     dtype=torch.float32,
-                                                     device=p.device)
-                                         for p in repr_params]).cpu())
+                                    _skip_row = False
+                                    if _early_drop_step \
+                                            and int(v) + 1 <= 2:
+                                        _early_cnt += 1
+                                        if _early_cnt % _early_drop_step \
+                                                == 0:
+                                            _skip_row = True
+                                    if not _skip_row:
+                                        dirs.append(torch.cat(
+                                            [p.grad.reshape(-1).float()
+                                             if p.grad is not None else
+                                             torch.zeros(p.numel(),
+                                                         dtype=torch.float32,
+                                                         device=p.device)
+                                             for p in repr_params]).cpu())
                                     for p in params:
                                         if p.grad is None:
                                             continue

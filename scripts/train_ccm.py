@@ -307,6 +307,14 @@ def parse_args():
                         "1-turn merge = lossless).  RAW gap — no hinge, "
                         "no epsilon (margin gating is a later ablation)."
                         "  Native actuation only.")
+    p.add_argument("--gradient-audit", action="store_true",
+                   help="gradient-mass audit (review 2026-09-24): "
+                        "record every S4 observation's (endpoint depth "
+                        "L, horizon h in {1=local, 2=root}, q_{L,h}) "
+                        "during the first closed window, then dump the "
+                        "(L,h) decomposition of N / sum||q|| / mass "
+                        "share / q^T d_task into gradient_audit.json "
+                        "and exit (no optimizer step).")
     p.add_argument("--s4-ref-cache", action="store_true",
                    help="S4 speed fix (review 2026-09-23): batch-"
                         "precompute the full-reference NLL table for "
@@ -2793,6 +2801,7 @@ def main():
                     native_amp_skip = False  # native proposal write-back
                     dirs = []
                     s4_pred_acc = {}
+                    audit_rows = [] if args.gradient_audit else None
                     if args.rpbe_native_compression \
                             and args.s4_supervisor:
                         # S4 formal supervisor (review 2026-09-23
@@ -2917,6 +2926,10 @@ def main():
                                                      dtype=torch.float32,
                                                      device=p.device)
                                          for p in repr_params]).cpu())
+                                    if audit_rows is not None:
+                                        audit_rows.append(
+                                            (int(meta["L"]), int(_h),
+                                             dirs[-1]))
                                     for p in params:
                                         if p.grad is None:
                                             continue
@@ -3889,6 +3902,67 @@ def main():
                             d_task_norm = float(
                                 torch.cat([x.reshape(-1) for x in d_task])
                                 .double().norm())
+                            if audit_rows is not None:
+                                # gradient-mass audit (review
+                                # 2026-09-24): decompose the effective
+                                # predictive gradient mass by
+                                # (endpoint depth L, horizon h) and
+                                # dump, then exit before the QP.
+                                _dt_flat = torch.cat(
+                                    [x.reshape(-1).double()
+                                     for x in d_task])
+                                _cells = {}
+                                _tot = 0.0
+                                for _L, _h, _q in audit_rows:
+                                    _qd = _q.double()
+                                    _nrm = float(_qd.norm())
+                                    _k = "L{}_{}".format(
+                                        _L, "local" if _h == 1
+                                        else "root")
+                                    _c = _cells.setdefault(
+                                        _k, {"N": 0, "sum_norm": 0.0,
+                                             "mass2": 0.0, "proj": 0.0})
+                                    _c["N"] += 1
+                                    _c["sum_norm"] += _nrm
+                                    _c["mass2"] += _nrm * _nrm
+                                    _c["proj"] += float(
+                                        (_qd * _dt_flat).sum())
+                                    _tot += _nrm
+                                _audit = {"d_task_norm":
+                                          float(_dt_flat.norm()),
+                                          "total_mass": _tot,
+                                          "cells": {}}
+                                for _k in sorted(_cells):
+                                    _c = _cells[_k]
+                                    _cos = (_c["proj"]
+                                            / (_c["sum_norm"]
+                                               * float(_dt_flat.norm()))
+                                            if _c["sum_norm"] > 0
+                                            and _dt_flat.norm() > 0
+                                            else None)
+                                    _audit["cells"][_k] = {
+                                        "N": _c["N"],
+                                        "sum_norm":
+                                            round(_c["sum_norm"], 3),
+                                        "mass_share":
+                                            round(_c["sum_norm"] / _tot,
+                                                  4),
+                                        "mass2": round(_c["mass2"], 3),
+                                        "proj_d_task":
+                                            round(_c["proj"], 3),
+                                        "cos_to_d_task":
+                                            round(_cos, 6)
+                                            if _cos is not None
+                                            else None,
+                                    }
+                                with (out / "gradient_audit.json") \
+                                        .open("w") as _f:
+                                    json.dump(_audit, _f, indent=1)
+                                print("[gradient-audit] dumped {} -> {}"
+                                      .format(len(audit_rows),
+                                              out / "gradient_audit.json"),
+                                      flush=True)
+                                sys.exit(0)
                             # Streaming (2026-09-23): pass the dirs
                             # LIST (no stack — the QP streams in
                             # 64-row blocks); the sign flip negates

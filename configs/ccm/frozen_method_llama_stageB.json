@@ -33,8 +33,8 @@
   ],
   "lambda_calibration": {
    "rule": "same as the qwen3 native line: r_eff = lambda * ||d_pred|| / ||d_task|| ~ 0.1 measured at theta_0 (the official merged host) on the first closed window, native proposal-space (lr=1 direction space), then frozen.",
-   "lambda_kf": null,
-   "lambda_kf_note": "NULL PENDING RECALIBRATION (review 2026-09-24): the history-Gamma Stage-B trains a DIFFERENT parameter space than the native-compress lambda (0.0997) was calibrated in.  Calibrate once on the Stage-B theta_0 and commit here."
+   "lambda_kf": 0.0998739471128577,
+   "lambda_kf_note": "Calibrated 2026-09-24 on the Stage-B theta_0 (init-from s2 + history-Gamma, Gamma-only proposal space): r_eff = 1.0013, derived lambda = 0.0999.  Nearly identical to the native-compress value (0.0997) — the proposal-space r_eff is ~1 on the Gamma geometry too."
   },
   "z_v_source": "J_mem(M_v) fixed adapter; llama host lifts the memory from all attention heads (32, head_dim = hidden / heads)",
   "witness": "none (main experiment)",

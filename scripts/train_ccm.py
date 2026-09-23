@@ -1260,8 +1260,7 @@ def proposal_norm(optimizer, params, step_count, lr_override=None):
 
 def treewise_feasibility_projection(g_task_repr, repr_params, G, kappa,
                                     iters=400, cert_tol=1e-6, min_norm=1e-9,
-                                    b_norm=None, device=None,
-                                    out_mu=False):
+                                    b_norm=None, device=None):
     """Tree-wise RPBE Feasibility Projection — TGN final-spec alignment
     (2026-09-15, ported from tgb_link_loop._cstr_group_close_treewise,
     the b523cf3 lineage; the Cimmino refinement there is kappa=0-only and
@@ -1505,14 +1504,17 @@ def treewise_feasibility_projection(g_task_repr, repr_params, G, kappa,
         # the caller skips the representation step for this window).
         diag["note"] = "cert_fail"
         diag["cert_fail"] = True
-        return (False, diag, None) if out_mu else (False, diag)
+        return False, diag
     with torch.no_grad():
         for p, cp, gt in zip(repr_params, torch.split(corr, sizes),
                              g_task_repr):
             # .to(p.device): the QP runs on CPU (V11 OOM fix — the
             # G matrix GPU peak was the last 4GB that blew the card).
             p.grad = (gt - cp.view_as(p)).to(p.device)
-    return (True, diag, mu) if out_mu else (True, diag)
+    # dual mu exposure for the paired geometry audit (review
+    # 2026-09-24): a plain list, json-serializable.
+    diag["mu"] = [float(x) for x in mu.detach().cpu()]
+    return True, diag
 
 
 def repr_grad_norm(params):
@@ -3935,24 +3937,25 @@ def main():
                                                  * f_db.norm(), 1e-12))
                                 _Gp = [-_r for _r in dirs] \
                                     if dirs else None
-                                _ok_o, _dg_o, _mu_o = \
+                                _ok_o, _dg_o = \
                                     treewise_feasibility_projection(
                                         [x.detach().cpu()
                                          for x in d0_orig],
                                         repr_params, _Gp,
                                         args.rpbe_kappa,
                                         iters=args.proj_iters,
-                                        cert_tol=1e-4, out_mu=True)
+                                        cert_tol=1e-4)
                                 _p_orig = {id(p): p.grad.clone()
                                            if p.grad is not None
                                            else None for p in repr_params}
-                                _ok_d, _dg_d, _mu_d = \
+                                _ok_d, _dg_d = \
                                     treewise_feasibility_projection(
                                         [x.detach().cpu() for x in d0_db],
                                         repr_params, _Gp,
                                         args.rpbe_kappa,
                                         iters=args.proj_iters,
-                                        cert_tol=1e-4, out_mu=True)
+                                        cert_tol=1e-4)
+                                _mu_o = _dg_o.get("mu")
                                 _f_orig = torch.cat(
                                     [p.grad.reshape(-1).double().cpu()
                                      for p in repr_params])

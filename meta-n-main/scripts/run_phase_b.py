@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import sys
 from pathlib import Path
@@ -31,9 +32,10 @@ from meta_n.rpbe import config as C                      # noqa: E402
 from meta_n.rpbe.census import (SPLIT_PROTOCOL,          # noqa: E402
                                 partition_tree_roles_v421)
 from meta_n.rpbe.fusion import SlottedFusion             # noqa: E402
-from meta_n.rpbe.records import CutMeta, CutRecord       # noqa: E402
+from meta_n.rpbe.records import CutMeta, CutRecord, load_jsonl  # noqa: E402
 from meta_n.rpbe.trainer import PhaseB                   # noqa: E402
 from meta_n.rpbe.window import StatWindow                # noqa: E402
+from meta_n.sri.protocol import STRUCTURAL6               # noqa: E402
 
 # NO DEFAULT RECORDS PATH. `runs/_official_records_latest.jsonl` was the
 # PRIMARY6-era default, and a default is how the WRONG cohort's records get
@@ -42,20 +44,16 @@ from meta_n.rpbe.window import StatWindow                # noqa: E402
 
 
 def load_records(path):
-    out = []
-    for line in open(path, encoding="utf-8"):
-        r = json.loads(line)
-        m = r["meta"]
-        out.append(CutRecord(
-            meta=CutMeta(candidate_id=m["candidate_id"], depth=m["depth"],
-                         run_id=m["run_id"],
-                         root_candidate_id=m["root_candidate_id"]),
-            cut_id=tuple(r["cut_id"]), tree_id=tuple(r["tree_id"]),
-            occurrence_seq=r["occurrence_seq"],
-            X_v=torch.tensor(r["X_v"]), q_emb=torch.tensor(r["q_emb"]),
-            mask=torch.tensor(r["mask_valid"]), p=torch.tensor(r["p"]),
-            r=r["r"], weight=r["weight"]))
-    return out
+    """The OFFICIAL records loader, not a hand-rolled one.
+
+    The hand-rolled version read `mask_valid` straight into a BOOL tensor, while
+    `CutRecord.from_dict` restores the ADDITIVE float mask the fusion expects.
+    Measured on the real records: the two agree TODAY only because every entry is
+    valid (all-True bool vs all-0 float differ by a constant per row, and softmax
+    is shift-invariant), but with any padded item the bool path would add 0.0
+    where the additive mask means -inf, i.e. it would fail to mask padding.
+    """
+    return load_jsonl(str(path))
 
 
 def main() -> int:
@@ -70,7 +68,7 @@ def main() -> int:
                     help="Structural6 Phase-A records JSONL. REQUIRED: the "
                          "Gamma must be trained on records built from THIS "
                          "cohort's archives.")
-    ap.add_argument("--init-from", default=None,
+    ap.add_argument("--init-from", required=True,
                     help="CONTINUE training an existing Gamma checkpoint (warm start) instead of random init. Used to carry the Phase-B structure learned on one backbone onto another backbone's records.")
     args = ap.parse_args()
 
@@ -104,6 +102,30 @@ def main() -> int:
         paid0 = snapshot()["backend_requests"]
 
     recs = load_records(args.records)
+
+    # CONTAINMENT ONLY PROVES WHERE THE FILE IS. Copying PRIMARY6 records into
+    # the Structural6 root passes it. So verify PROVENANCE: every run_id in the
+    # records must name a real run under --phase-a-root, and that run's own
+    # config.json must carry the Structural6 cohort.
+    _want = sorted(STRUCTURAL6)
+    _ids = {}
+    for _r in recs:
+        _ids[_r.meta.run_id] = _ids.get(_r.meta.run_id, 0) + 1
+    for _rid in sorted(_ids):
+        _hits = sorted(Path(args.phase_a_root).glob("**/%s/config.json" % _rid))
+        if not _hits:
+            raise SystemExit(
+                "records name run_id %r but no such run exists under "
+                "--phase-a-root (%s): the records do not come from this "
+                "cohort's Phase-A." % (_rid, args.phase_a_root))
+        _c = json.loads(_hits[0].read_text(encoding="utf-8"))
+        if sorted(_c.get("bench_tasks") or []) != _want:
+            raise SystemExit(
+                "records name run_id %r, but that run's config.json carries "
+                "bench_tasks=%s, not Structural6. Those records describe a "
+                "DIFFERENT cohort." % (_rid, _c.get("bench_tasks")))
+    print("  run provenance : %d run(s) verified under %s, all Structural6"
+          % (len(_ids), args.phase_a_root))
     trees = sorted({r.tree_id for r in recs})
     task_roots, protect_roots = partition_tree_roles_v421(trees)
     tw, pw = StatWindow(name="task"), StatWindow(name="protect")
@@ -128,21 +150,16 @@ def main() -> int:
     # not what the original training did. If it stays tiny the
     # checkpoint is just the old Gamma relabelled -- which is exactly
     # the failure mode of a backbone mismatch, so it must be visible.
-    if args.init_from:
-        _ck = torch.load(args.init_from, map_location="cpu",
-                         weights_only=False)
-        _state = (_ck.get("state_dict")
-                  if isinstance(_ck, dict) and "state_dict" in _ck
-                  else _ck)
-        _missing, _unexpected = fusion.load_state_dict(_state,
-                                                       strict=False)
-        print("  init_from      : %s" % args.init_from)
-        print("    loaded %d entries  missing=%s  unexpected=%s"
-              % (len(_state), list(_missing)[:4], list(_unexpected)[:4]))
-        if _missing:
-            raise SystemExit(
-                "init_from left %d parameter(s) unset: %s"
-                % (len(_missing), list(_missing)[:6]))
+    # WARM START, via the repo's OWN loader rather than a bare torch.load +
+    # load_state_dict(strict=False). `load_gamma_checkpoint(strict=True)` checks
+    # the checkpoint's geometry (n_branches / m_sketch / b_v_dim), which a
+    # state_dict SHAPE check cannot see -- and those fields change the training
+    # geometry, so a mismatched load would train the wrong model quietly.
+    from meta_n.rpbe.checkpoint import load_gamma_checkpoint
+    fusion, _ckmeta = load_gamma_checkpoint(args.init_from, fusion, strict=True)
+    print("  init_from      : %s" % args.init_from)
+    print("    checksum=%s params=%s steps=%s"
+          % (_ckmeta.checksum, _ckmeta.param_count, _ckmeta.steps))
 
     w0 = [p.detach().clone() for p in fusion.parameters()]
 
@@ -170,9 +187,17 @@ def main() -> int:
         print("  J_task trace    : %.6f -> %.6f (min %.6f max %.6f)"
               % (js[0], js[-1], min(js), max(js)))
 
-    committed = int(hist["steps"]) >= 1
+    # ADAPTED means BOTH: at least one step committed AND the parameters
+    # actually moved. `committed_steps >= 1` alone would accept a run whose
+    # certificate blocked every update, and the chain would carry an UNCHANGED
+    # Gamma into Phase C while reporting success.
+    adapted = (int(hist["steps"]) >= 1 and math.isfinite(moved)
+               and moved > 0.0)
     print()
-    if committed:
+    print("  adapted         : %s  (committed>=1 AND max|dtheta|>0)"
+          % adapted)
+    print()
+    if adapted:
         meta = tb.save_gamma(args.out, extra={
             "records": args.records, "split_protocol": SPLIT_PROTOCOL,
             "task_trees": len(task_roots), "protect_trees": len(protect_roots),
@@ -197,6 +222,13 @@ def main() -> int:
         paid1 = snapshot()["backend_requests"]
     print()
     print("  API cost        : %d backend requests (must be 0)" % (paid1 - paid0))
+    # A run that did NOT adapt must NOT look like success. The old version
+    # printed "do not spend on Phase C" and then returned 0 whenever no API was
+    # spent, so an automatic chain would carry the un-adapted Gamma forward.
+    if not adapted:
+        print("  NOT ADAPTED -> non-zero exit; the automatic chain must stop "
+              "here rather than train Phase C against an unchanged Gamma.")
+        return 2
     return 0 if (paid1 - paid0) == 0 else 1
 
 

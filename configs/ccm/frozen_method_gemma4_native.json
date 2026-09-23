@@ -58,8 +58,8 @@
   "cadence": "identical task samples and scheduler cadence across the two native arms"
  },
  "training": {
-  "steps": 10,
-  "steps_note": "User ruling 2026-09-23: fork the gemma Stage-2 merge step600 and run 10 treewise windows (no-warmup; checkpoint every 2 windows).  trainable = conditional LoRA + COMP rows (backbone frozen, NO Gamma).",
+  "steps": 20,
+  "steps_note": "EXTENDED to 20 windows (user ruling 2026-09-24): the first 10 follow the 2026-09-23 fork ruling (step600 fork, treewise, checkpoint every 2); the s10->s20 continuation resumes from checkpoint_step10 (full state: optimizer/scheduler/rng) with --no-warmup on the same treewise protocol — the s6/s8 PPL curve kept improving (deep buckets recovering), so the user ruled to keep treewise running.  trainable = conditional LoRA + COMP rows (backbone frozen, NO Gamma).",
   "official_protocol": {
    "arm": "ccm_merge_official",
    "merge_cadence": "official",

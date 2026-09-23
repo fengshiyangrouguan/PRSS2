@@ -14,10 +14,18 @@ pilot_01/
 *.log
 
 # SECRETS -- never commit. `_box.py` carries the box password in plaintext and
-# the probes carry relay keys; all four were sitting untracked in the tree.
+# these probes carry relay keys; all were sitting untracked in the tree.
+#
+# NAMED EXPLICITLY, not `_probe_*.py`: that glob also swallowed a legitimate
+# measurement script (`_probe_dev_runtime.py`, which holds no secret and is the
+# evidence for the cohort's wall-clock screen), so the guard was hiding real
+# work alongside the secrets.
 _box.py
 _fix_key.py
-_probe_*.py
+_probe_big.py
+_probe_gem.py
+_probe_maxtok.py
+_probe_think.py
 
 # scratch bundles/patches staged for the box, not evidence
 _other_patches/

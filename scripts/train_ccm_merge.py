@@ -331,11 +331,16 @@ def wrap_lora_merge(model, r, dropout):
     for _n, _p in model.named_parameters():
         if "lora_" in _n:
             _p.requires_grad_(True)
-    # Unified path: both qwen3 and gemma4 use SeparatedEmbedding (the
-    # gemma slice hack was invalid — nn.Parameter requires_grad is
-    # tensor-level, a row slice assignment does nothing).
-    model.base_model.model.model.embed_tokens.comp_embeddings.weight \
-        .requires_grad_(True)
+    # Unified path: qwen3/gemma4 use SeparatedEmbedding under
+    # base_model.model.MODEL; llama's CausalLM wraps the LlamaModel
+    # directly (one level shallower).
+    if model.base_model.model.model is not None \
+            and hasattr(model.base_model.model.model, "embed_tokens"):
+        model.base_model.model.model.embed_tokens \
+            .comp_embeddings.weight.requires_grad_(True)
+    else:
+        model.base_model.model.embed_tokens \
+            .comp_embeddings.weight.requires_grad_(True)
     n_tr = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print("[merge] trainable params:", n_tr, flush=True)
     return model
@@ -526,8 +531,14 @@ def main():
         restored = ["model({} tensors)".format(len(ck["model"]))]
         degraded = []
         if ck.get("optimizer_state") is not None:
-            optimizer.load_state_dict(ck["optimizer_state"])
-            restored.append("optimizer")
+            try:
+                optimizer.load_state_dict(ck["optimizer_state"])
+                restored.append("optimizer")
+            except ValueError:
+                # Joint control (--with-gamma) adds a parameter group
+                # the old checkpoint lacks — moments restart from zero.
+                degraded.append("optimizer group mismatch (joint "
+                                "Gamma added) — moments restart")
         else:
             degraded.append("Adam moments restart from zero "
                             "(weights and step counter unaffected)")

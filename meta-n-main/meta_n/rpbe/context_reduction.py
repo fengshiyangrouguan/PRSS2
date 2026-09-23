@@ -446,8 +446,15 @@ class ContextReducer:
                 return True
 
         key = SiblingAllocator.identity_key(trace_items, context_stack)
+        # RANK-POSITION space, deliberately. `ranked[0]` is the best POOL index,
+        # `ranked[1]` the next, etc. The allocator must work on positions so that
+        # one index space is used throughout: its `score_of` is position-keyed,
+        # and `sel_t` below maps a position back through `ranked`. The first
+        # draft passed `ranked` itself, so the returned "positions" were pool
+        # indices and were then re-indexed through `ranked` again -- a live run
+        # showed variant 1 producing the SAME subset as variant 0.
         picked, variant, kind = _SIBLING_ALLOCATOR.allocate(
-            key, ranked, k, score_by_pos, fits)
+            key, list(range(n_items)), k, score_by_pos, fits)
         if variant != 0:
             sel_t = [trace_items[ranked[pos]] for pos in picked]
 
@@ -663,6 +670,30 @@ class _StubFusion:
         return Z, A
 
 
+class _StubFusionRev:
+    """Like `_StubFusion` but with a NON-identity preference order.
+
+    WHY THIS EXISTS. The default stub's slot k prefers item k, so the score
+    ranking equals the pool order -- which makes "pool index" and "rank position"
+    the SAME NUMBER, and that hid a double-indexing bug in the allocator: the
+    first draft passed pool indices where positions were expected, and a LIVE run
+    caught it (variant 1 produced the same subset as variant 0) while the
+    self-test stayed green. Reversing the preference separates the two index
+    spaces so the check actually bites.
+    """
+
+    def __init__(self, n_slots=4):
+        self.n_slots = n_slots
+
+    def __call__(self, X, q_emb, mask):
+        import torch
+        n = X.shape[0]
+        A = torch.zeros(self.n_slots, n)
+        for k in range(self.n_slots):
+            A[k, n - 1 - k] = 1.0            # prefer the LAST items first
+        return torch.zeros(self.n_slots, X.shape[1]), A
+
+
 def self_test() -> int:
     import os
     import random
@@ -818,6 +849,30 @@ def self_test() -> int:
     assert TRACE_K4 == 4
     print("OK  C budget same      every variant keeps exactly k={} traces"
           .format(TRACE_K4))
+
+    # B'. the same check under a NON-identity ranking, so pool index and rank
+    # position are different numbers. Without this the two index spaces coincide
+    # and a double-indexing bug in the allocator passes silently (it did).
+    _SIBLING_ALLOCATOR._counts.clear()
+    _SIBLING_ALLOCATOR._assigned.clear()
+    r_rev = ContextReducer(ReductionMode.PREDICTIVE, encoder=_StubEncoder(),
+                           fusion=_StubFusionRev())
+    rev_cap = []
+    rev = []
+    for _ in range(4):
+        t, _, dd = r_rev.reduce(list(pool6), [], budget=budget)
+        rev_cap.append(dd)
+        rev.append(tuple(sorted(x.task_id for x in t)))
+    rk = rev_cap[0]["gamma_rank"]
+    assert rk != ["s%d" % i for i in range(6)], (
+        "this stub must produce a NON-identity ranking, or the two index spaces "
+        "coincide and the check below is vacuous: %s" % rk)
+    assert len(set(rev)) == 4, rev
+    assert all(len(s) == 4 for s in rev), rev
+    for s in rev:
+        assert set(rk[:2]) <= set(s), (s, rk, rev)
+    print("OK  B' non-identity     same 4-unique result when the ranking is NOT "
+          "the pool order (the index-space check that the flat stub hid)")
 
     # D. reproducible: same input, fresh state -> identical selections
     _SIBLING_ALLOCATOR._counts.clear()

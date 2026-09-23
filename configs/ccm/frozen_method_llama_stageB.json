@@ -84,8 +84,8 @@
   "seeds": 1,
   "seeds_note": "seed 0 only (same ruling as the qwen3 line)",
   "eval": "eval_llama_pooled_B.py (protocol B pooled, official host semantics) — exact script/args to be confirmed at eval time",
-  "checkpoint_every": 10,
-  "checkpoint_every_note": "Stage-B checkpoints every 10 windows",
+  "checkpoint_every": 2,
+  "checkpoint_every_note": "user ruling 2026-09-24: checkpoint every 2 windows (Stage-B s2->s12 -> s4/s6/s8/s10/s12 + final)",
   "schedule_total_steps": 1000,
   "schedule_note": "warmup/cosine over 1000 steps (warmup ratio 0.03); --no-warmup on the fork: the first window steps at the peak lr and the cosine descends from there"
  },

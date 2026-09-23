@@ -385,8 +385,11 @@ def _frozen_path(args):
     if getattr(args, "frozen", ""):
         return Path(args.frozen)
     if getattr(args, "rpbe_native_compression", False):
+        _name = ("frozen_method_qwen3_native.json"
+                 if getattr(args, "host", "llama") == "qwen3"
+                 else "frozen_method_gemma4_native.json")
         return Path(__file__).resolve().parents[1] / "configs" / "ccm" \
-            / "frozen_method_qwen3_native.json"
+            / _name
     name = "frozen_method_qwen3.json" if getattr(args, "host", "llama") \
         == "qwen3" else "frozen_method.json"
     return Path(__file__).resolve().parents[1] / "configs" / "ccm" / name
@@ -490,8 +493,8 @@ def enforce_frozen(args):
         if getattr(args, "rpbe_lr", None) is not None:
             _why.append("--rpbe-lr would silently route ALL native "
                         "params into the rpbe_lr group")
-        if getattr(args, "host", "llama") != "qwen3":
-            _why.append("native actuation v1 is Qwen3-only")
+        if getattr(args, "host", "llama") not in ("qwen3", "gemma4"):
+            _why.append("native actuation v1 is Qwen3/Gemma4-only")
         if args.arm == "ours" \
                 and getattr(args, "rpbe_constrain_mode", "") != "treewise" \
                 and not getattr(args, "s4_supervisor", False):
@@ -740,8 +743,18 @@ def build_model(args, device):
                     n_merged += 1
             print("[gemma4] foundation merged: {} LoRA modules from {}"
                   .format(n_merged, args.foundation), flush=True)
-        model.resize_token_embeddings(text_cfg.vocab_size + 2 * N_TOK,
-                                      mean_resizing=False)
+        # Merge-chain embedding layout (review fix 2026-09-23): the
+        # gemma Stage-2 checkpoints carry the SeparatedEmbedding comp-
+        # row keys (train_ccm_merge semantics) — the RPBE double-table
+        # resize has no comp_embeddings key and strict-load of a merge
+        # ckpt fails.  Align build_model with build_model_merge.
+        from src.utils import SeparatedEmbedding
+        model.model.embed_tokens = SeparatedEmbedding(
+            model.model.embed_tokens, 2 * N_TOK)
+        # The PLE table is looked up by the SAME input_ids — grow it to
+        # match (zero rows, frozen), same as the merge chain.
+        model.model.resize_ple_embeddings(
+            text_cfg.vocab_size + 2 * N_TOK)
         model.update_comp_token(
             [text_cfg.vocab_size + k for k in range(N_TOK)],
             [text_cfg.vocab_size + N_TOK + k for k in range(N_TOK)])
@@ -1753,7 +1766,7 @@ def main():
         model.update_comp_token(
             [tokenizer.comp_token_id[k] for k in range(N_TOK)],
             [tokenizer.sum_token_id[k] for k in range(N_TOK)])
-        if args.host == "qwen3":
+        if args.host in ("qwen3", "gemma4"):
             # Two-stage flow (user ruling 2026-09-17): the COMP rows
             # stay TRAINABLE in stage 2 — the merge checkpoint is the
             # init, task gradients keep refining them (RPBE still

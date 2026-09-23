@@ -349,14 +349,20 @@ class Gemma4CCMTextAttention(nn.Module):
                         tt = torch.full((bsz, 1), t_i,
                                         dtype=torch.float32,
                                         device=key_states.device)
+                        # History-branch correction (review 2026-09-24):
+                        # M_t = (t-1)/t (M_{t-1} + R_t) + (1/t) h_t, so
+                        # the residual enters WITH the history weight
+                        # (t-1)/t — zero at t=1 (turn-3 identical to the
+                        # native compressor), full strength at depth.
+                        _tfac = (t_i - 1.0) / float(t_i)
                         res_t_k = self.gamma(
                             k_base[:, :, t_i - 2] + res_prev_k,
                             k_cur[:, :, t_i - 1], tt) \
-                            * valid[:, :, t_i - 1]
+                            * valid[:, :, t_i - 1] * _tfac
                         res_t_v = self.gamma(
                             v_base[:, :, t_i - 2] + res_prev_v,
                             v_cur[:, :, t_i - 1], tt) \
-                            * valid[:, :, t_i - 1]
+                            * valid[:, :, t_i - 1] * _tfac
                         res_prev_k = res_t_k
                         res_prev_v = res_t_v
                         res_all_k[:, :, t_i - 1] = res_t_k

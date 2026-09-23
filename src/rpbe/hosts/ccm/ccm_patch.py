@@ -64,9 +64,12 @@ def attach_gamma(model, *, head_dim=None, hidden=64, time_dim=16,
         attn = layer.self_attn
         if getattr(attn, "gamma", None) is not None:
             raise ValueError("Gamma already attached to this model")
-        if head_dim is None:
-            head_dim = attn.head_dim
-        attn.gamma = GammaResidual(head_dim, time_dim=time_dim, hidden=hidden,
+        # Per-layer head_dim (review fix 2026-09-24): gemma layers are
+        # heterogeneous (sliding 256 / full 512) — caching the first
+        # layer's value made every later Gamma use the wrong input
+        # width (mat1 1040 x 528 crash on the full layers).
+        _hd = attn.head_dim if head_dim is None else head_dim
+        attn.gamma = GammaResidual(_hd, time_dim=time_dim, hidden=hidden,
                                    init_scale=init_scale).to(device)
         modules.append(attn.gamma)
     base._gamma_attached = True

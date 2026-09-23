@@ -1,17 +1,19 @@
 {
-  "_comment": "CCM-merge x RPBE frozen method (plan v2 P0-3): machine-readable freeze of the method decisions. The trainer must read values from here (no silent defaults) and refuse inconsistent CLI overrides. Sources: Ky-Fan ridge/m from the completed 5-seed TGN experiment; lambda_kf from the r_eff~0.1 calibration rule (plan L5), produced by the calibration-only run and committed HERE before the five seeds run.",
-  "frozen_source": "five-seed TGN experiment on Wikipedia (exact_replay, ridge=1e-3, m=64, lambda calibrated to r_eff~0.1 = 0.088)",
+  "_comment": "THE authoritative DailyDialog spec (review ruling 2026-09-21): frozen_method.json is the single formal spec for the LLaMA DailyDialog line.  The R8/R10-era file is archived as frozen_method_r10_legacy.json — it described the OLD protocol (single penultimate cut v=k-3, Gamma from t=2, trainable LoRA+COMP, lambda 0.00594) and must NOT be used as the method identity anymore.  lambda_kf is null until the ONE recalibration on the fixed code is committed here.",
+  "frozen_source": "review ruling 2026-09-21 (cut collector / Gamma placement / raw-turn chi-phi / freeze-host / validation-only selection); supersedes the R10 legacy spec",
   "backbone": {
     "model": "llama-7b (original LLaMA-7B, not LLaMA-2)",
     "hf_identifier": "huggyllama/llama-7b",
     "vendored_commit": "a89dd08e2c9587ec9c6c3ad339bb154c33e6b41a",
     "attn_type": "merge_recur",
     "n_tok_lock": 2,
-    "torch_compile": "disabled on all three arms"
+    "torch_compile": "disabled on all three arms",
+    "host_path": "official host ONLY: build_official_host (Step-1 foundation merged + released Step-2 compression adapter + SeparatedEmbedding COMP rows); the legacy resize host is not the DailyDialog method"
   },
   "adapter": {
     "lora_r": 8,
-    "lora_r_note": "LoRA rank for the trainable adapter (train_ccm historical default; L1 official reproduction skipped by user decision, r=8 fixed for the formal runs)"
+    "lora_r_note": "LoRA rank for the conditional adapter (r=8 fixed for the formal runs)",
+    "official_adapter": "released Step-2 compression adapter dir (env OFFICIAL_ADAPTER at eval; CLI --official-adapter at train)"
   },
   "rpbe": {
     "ridge_eps": 0.001,
@@ -23,46 +25,53 @@
       0.5
     ],
     "lambda_calibration": {
-      "rule": "r_eff = lambda * ||g_KF|| / ||g_task|| ~ 0.1, measured on theta_0 (calibration-only run, before ANY optimizer/scheduler step), calibrated once on the initial full window (training-only), then frozen for all seeds",
-      "lambda_kf": 0.005936691082765761,
-      "lambda_kf_note": "R8 RECALIBRATED (2026-09-08, theta_0 under the round-8 protocol: depth-stratified sampling + 4x32 sketch ensemble + OAS shrinkage): r_eff(lambda=1)=4.485, derived lambda = 0.1/r_eff = 0.02230. Old protocol value 1.6234e-3 retired (J scale changed ~6x)."
+      "rule": "R10 gamma-scope calibration (review 2026-09-16): lambda = 0.1 / r_eff measured on the GAMMA group only at theta_0, first full window, before ANY optimizer step",
+      "lambda_kf": null,
+      "lambda_kf_note": "NULL PENDING RECALIBRATION (review ruling 2026-09-21): the old 0.005936691082765761 was calibrated under the retired protocol (single penultimate cut, Gamma from t=2, trainable LoRA+COMP scope).  The fixed protocol changed the cut set (t=1..L), the Gamma placement (M_0=0) and the trainable scope (Gamma only), so the gradient geometry is different.  Recalibrate ONCE on the fixed code and commit the derived lambda here.  The trainer refuses the ours arm while this field is null."
     },
-    "z_v_source": "J_mem(M_v) fixed adapter (TGN identity is its special case)",
+    "z_v_source": "J_mem(M_t) fixed adapter at block_idx = t - 1 for t = 1..L (one cut per actual compression layer; review ruling 2026-09-21)",
+    "cut_supervision": "t < L: obs1 (C=u_{t+1}, Y=u_{t+2}, w=0.5) + obs2 (C=(u_{t+1}, u_{t+2}, one-update), Y=y, w=0.5); t = L: single row (C=c, Y=y, w=1.0).  chi/phi are built from the RAW tokenized turns [u_1..u_L, c, y], never from spans of the collated ids.",
     "witness": "none (main experiment)",
     "sketch_ensemble_n_branches": 4,
-    "sketch_ensemble_note": "Review round 8 (2026-09-07): the single 64-dim sketch is replaced by FOUR independent 32-dim branches (J_ens = mean_r J_r; never concatenated into one 128-dim covariance). Depth bucket b(L_v) modulates the future signature phi_r(h,b(L)) = phi_h + b_L^(r) with fixed per-branch per-depth +/-1 signatures.",
+    "sketch_ensemble_note": "four independent 32-dim branches (J_ens = mean_r J_r; never concatenated into one 128-dim covariance).  Depth bucket b(L) modulates the future signature with LOCAL cut depth L=t in 1..13.",
     "oas_shrinkage": {
       "enabled": true,
-      "rule": "paired OAS covariance shrinkage per branch: C_ZZ'=(1-a_Z)C_ZZ+a_Z I, C_PP'=(1-a_P)C_PP+a_P I, C_ZP'=sqrt((1-a_Z)(1-a_P)) C_ZP; a_Z,a_P from the OAS rule (Chen et al. 2010) estimated on the current window, stop-gradient. The fixed ridge keeps only its numerical-safety role."
+      "rule": "paired OAS covariance shrinkage per branch"
     }
   },
   "gamma": {
-    "placement": "one module per layer, shared across the K/V merges and the two COMP/SUM slots",
+    "placement": "one module per layer, shared across the K/V merges and the two COMP/SUM slots; recurrence M_t = mean(h_1..h_t) + R_Gamma(M_{t-1}, h_t, t) for EVERY t = 1..L with M_0 = 0 (review ruling 2026-09-21: the first compression layer is inside the method, L=1 included)",
     "hidden": 64,
     "time_dim": 16,
     "init_scale": 0.02,
-    "zero_init": "U0=0 zero-output projection init (Review round 7 / user ruling 2026-09-07): R = U tanh(V [prev;cur;time(t)]) with U.weight exactly 0 and V small random (init_scale). Step 0 residual is bit-for-bit zero AND every U/V parameter receives gradient from the first step. The old scalar gate s (s=0 init) is REMOVED — it left U/V with zero gradient at step 0.",
-    "parameter_budget": "32 layers x ~25.7k = ~821k < 1M",
-    "init_note": "See src/rpbe/hosts/ccm/gamma_residual.py class docstring; code aligned 2026-09-07 11:36, spec synced 2026-09-07."
+    "zero_init": "U0=0 zero-output projection init; step 0 residual is bit-for-bit zero.  Gradient note: with U_0 = 0 the first step updates only U (dR/dV vanishes at U = 0).",
+    "parameter_budget": "32 layers x ~25.7k = ~821k < 1M"
+  },
+  "freeze_host": {
+    "enabled": true,
+    "scope": "backbone + conditional LoRA + COMP/SUM embeddings all frozen (train Gamma ONLY); optimizer holds only the Gamma group.  For the ours / gamma_task_only arms the trainer REFUSES to start without --freeze-host (enforce_frozen).",
+    "mode": "host model.eval() + Gamma modules train() — the released conditional LoRA dropout (0.05) must not perturb the frozen host forward; gradients still flow through the host to Gamma"
+  },
+  "official_host": {
+    "enabled": true,
+    "note": "the DailyDialog formal arms run on the official host (build_official_host); the legacy resize host is retired for this method.  For the ours / gamma_task_only arms the trainer REFUSES to start without --official-host (enforce_frozen)."
   },
   "window": {
     "min_effective_cuts": 128,
-    "collection": "adaptive by effective cut count (dialogues with k>=4), not a mechanical microbatch count",
+    "collection": "adaptive by effective cut count (dialogues with L>=1; review ruling 2026-09-21: L=1 emits its terminal cut)",
     "cadence": "identical task samples and scheduler cadence across the three arms"
   },
   "training": {
-    "steps": 300,
-    "steps_note": "300 GLOBAL/window steps for the round-7 official-host arms (user ruling 2026-09-07): task-only-cont / ours-cont from the official merge-adapter start, lr 3e-5, checkpoint every 50. Prior: 500 (e50 curve); previous 1000 (per-paper claim).",
+    "steps": 60,
+    "steps_note": "Review-fix protocol (2026-09-21): 60 windows, task-only / ours from the SAME theta_0 (official CCM-merge host, frozen, zero-init Gamma).  The R10-era 300-step budget belonged to the retired protocol.",
     "grad_clip": 1.0,
-    "grad_clip_source": "official HF Trainer default (max_grad_norm); train_ccm must refuse an inconsistent override",
     "merge_cadence": "window-matched",
-    "merge_cadence_note": "window-matched: all three arms fire an update on the same adaptive boundary (>= min_effective_cuts dialogues with k>=4); the fixed grad_accum cadence exists only for the ccm_merge_official reproduction arm, whose arm name marks it as outside the main result",
-    "two_pass_replay": "pass1 no-grad statistics forward, pass2 grad replay forward (training only; inference is a single forward)",
-    "seeds": 5,
-    "eval": "matched-cohort depth curves on the clean test split; primary metric = per-token NLL difference",
+    "two_pass_replay": "pass1 no-grad statistics forward, pass2 grad replay forward (RPBE arms only)",
+    "rpbe_gamma_only": true,
     "checkpoint_every": 50,
     "schedule_total_steps": 1000,
-    "schedule_note": "Keep the ORIGINAL 1000-step warmup/cosine LR schedule (warmup=30, cosine over 1000) while the e50 pilot stops at 500 — review ruling 2026-09-05: a 500-step schedule would NOT be the first half of the 1000-step run."
+    "schedule_note": "original 1000-step warmup/cosine schedule kept",
+    "checkpoint_selection": "validation only (clean_split=True, eval_source=val).  The official val+test pooled protocol remains a CCM-reproduction report only and never selects a checkpoint."
   },
   "sampling": {
     "depth_levels": [
@@ -73,7 +82,7 @@
       13
     ],
     "n_turns_of_L": "L + 2 TURNS (fixed prefix length in turns per depth; NOT meta.k = len(blocks)+1 = L + 1)",
-    "rule": "depth-stratified legal cuts: q_L ~ 1/sqrt(n_L) with 3x-uniform oversampling cap; ONE original dialogue per window (tree_id = stable original dialogue id, not the stream cursor); turn-14/L=13 uses only long-enough dialogues with the target FIXED at the 15th turn and a 13-turn compressed history; L=1 dialogues carry task CE only (v = k - 3 >= 1 requires L >= 2).",
-    "paired_report": "scripts/eval_ccm_paired.py: paired d_i = NLL_task,i - NLL_ours,i; BCa bootstrap (20k), Huber location, paired randomization test, LOO stability, single-dialogue share <= 20%, branch direction agreement >= 3/4."
+    "cut_depths": "every sample at endpoint L contributes cuts at LOCAL depths t = 1..L (maps.pv depth = t; Llmmaps registers local depths 1..13, out-of-range values fail fast — no modulo fold)",
+    "rule": "q_L ~ 1/sqrt(n_L) with 3x-uniform oversampling cap; ONE original dialogue per window (tree_id = stable original dialogue id)."
   }
 }

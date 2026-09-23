@@ -14,6 +14,18 @@ Three arms, identical task samples / seed / cadence:
                   exact surrogate (numerically zero, gradient = window
                   J).  One optimizer step per closed window.
 
+Native actuation (--rpbe-native-compression, review 2026-09-22): the
+RPBE recursion node is the native CCM merge step (M_{t-1}, u_t) -> M_t
+with depth D=L and Z_t = M_t; the actuated params are the conditional
+LoRA + COMP/SUM comp-embedding rows (the backbone is frozen, no Gamma
+module).  ``ours`` + flag = Native-Ours: the treewise QP runs in ADAMW
+PROPOSAL space — d_0 = joint proposal (g_task + lambda*g_pred through
+the shadow AdamW state), d* = Proj_F(d_0) with half-spaces
+q_i^T d >= -kappa*||q_i||*||d_task||, and theta <- theta + d* is
+written back directly.  ``gamma_task_only`` + flag = Native-task-only:
+the ordinary AdamW step on the same data stream.  The gamma line keeps
+the V11 gradient-space treewise implementation unchanged.
+
 RNG protocol (plan L5): each microbatch's pass-1 forward runs under a
 saved RNG state that is restored right after (builder counters are NOT
 restored — cut ids stay monotonic), so the data-sampling stream matches
@@ -24,11 +36,13 @@ asserted at startup (L6 test 3).  Pass 2 restores the window-start state
 
 Lambda follows the r_eff calibration rule (plan L5); --calibrate-lambda
 measures r_eff = ||g_KF|| / ||g_task|| on the first closed window and
-exits with the derived lambda.
+exits with the derived lambda (gradient space on the gamma line,
+proposal space on the native line).
 """
 
 import argparse
 import dataclasses
+import gc
 import hashlib
 import json
 import math
@@ -45,6 +59,7 @@ for _k in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS"):
 
 import numpy as np
 import torch
+from torch.nn import functional as F
 
 torch.set_num_threads(int(os.environ["OMP_NUM_THREADS"]))
 
@@ -58,9 +73,11 @@ for p in (str(SRC), str(CCM)):
 from rpbe.hosts.ccm.adapter import CCMHostAdapter
 from rpbe.hosts.ccm.ccm_patch import (N_TOK_LOCK, attach_gamma,
                                       paired_seed_hash, wrap_lora)
+from rpbe.hosts.ccm.gamma_residual import GammaResidual
 from rpbe.llm.dialogue_records import (DialogueCutBuilder, DialogueMeta,
                                        Llmmaps, MEM_TAU)
 from rpbe.llm.utterance_embed import UtteranceEmbed
+from rpbe.llm.mem_lift import JMemLift
 from rpbe.loss import KFMomentWindow
 from rpbe.training.checkpoint import _restore_rng, _rng_state
 
@@ -155,8 +172,7 @@ def parse_args():
                    choices=["llama", "qwen3", "gemma4"],
                    help="backbone host: llama = vendored LlamaModelCCM "
                         "(R8-R10 line); qwen3 = Qwen3-4B CCM port "
-                        "(feature_QWEN); gemma4 = Gemma-4-E4B CCM port "
-                        "(feature_GEMMA, transformers 5.x)")
+                        "(feature_QWEN)")
     p.add_argument("--frozen", default="",
                    help="override the frozen spec path (llama v2 "
                         "comp-trainable experiment)")
@@ -255,6 +271,63 @@ def parse_args():
                         "auxiliary gradient on non-Gamma params is "
                         "discarded.  The global lambda calibration no "
                         "longer dilutes r_eff across LoRA/COMP.")
+    p.add_argument("--rpbe-native-compression", action="store_true",
+                   help="COMP-RPBE native actuation (review 2026-09-22): "
+                        "the RPBE recursion node is the native CCM merge "
+                        "step (M_{t-1}, u_t) -> M_t with depth D=L and "
+                        "Z_t = M_t; the actuated parameters are the "
+                        "native compression params (conditional LoRA + "
+                        "COMP/SUM comp-embedding rows) instead of a "
+                        "post-merge Gamma residual.  Skips attach_gamma, "
+                        "freezes the backbone, and runs the "
+                        "proposal-space treewise projection (ours).  "
+                        "Requires the native actuation spec "
+                        "(frozen_method_qwen3_native.json); mutually "
+                        "exclusive with --freeze-host / "
+                        "--rpbe-gamma-only / --rpbe-lr.")
+    p.add_argument("--supervisor-mode", default="current",
+                   choices=["current", "root_only"],
+                   help="predictive supervisor variant (sweep, review "
+                        "2026-09-23): current = 2Obs (local u_{t+1}->"
+                        "u_{t+2} + short-suffix->y); root_only = every "
+                        "cut supervises the final target y with the "
+                        "remaining suffix (u_{t+1}..u_L, c) as context "
+                        "(single row per cut, w=1.0)")
+    p.add_argument("--s4-supervisor", action="store_true",
+                   help="FORMAL S4 supervisor (review 2026-09-23, "
+                        "frozen candidate): keep the original 2Obs "
+                        "topology, replace the CountSketch/Ky-Fan "
+                        "scoring of every observation with the "
+                        "real-token NLL gap "
+                        "Delta_{t,h} = l_comp - sg(l_full), where "
+                        "l_comp = -log p(Y | M_t, C) and l_full = "
+                        "-log p_ref(Y | U_t, C) share the SAME future "
+                        "conditioning C (only the compression of the "
+                        "history differs; the full reference is a "
+                        "1-turn merge = lossless).  RAW gap — no hinge, "
+                        "no epsilon (margin gating is a later ablation)."
+                        "  Native actuation only.")
+    p.add_argument("--s4-ref-cache", action="store_true",
+                   help="S4 speed fix (review 2026-09-23): batch-"
+                        "precompute the full-reference NLL table for "
+                        "the WHOLE window before the S4 loop (no_grad, "
+                        "chunked multi-row forwards) and look it up "
+                        "per observation.  The full reference is a "
+                        "stop-grad scalar, so q_{t,h} = grad l_comp is "
+                        "UNCHANGED — this is a moving-reference "
+                        "batching, not an approximation (the l_full "
+                        "values are live).")
+    p.add_argument("--s4-ref-chunk", type=int, default=32,
+                   help="chunk rows per batched reference forward "
+                        "(--s4-ref-cache)")
+    p.add_argument("--no-warmup", action="store_true",
+                   help="explicit warmup skip (fork/resume semantics, "
+                        "review 2026-09-23): the first window steps at "
+                        "the peak lr and the cosine descends from "
+                        "there.  Needed on RESUME of a fork arm — "
+                        "--resume-from does not set --init-from, so "
+                        "without this flag the scheduler rebuild would "
+                        "silently reintroduce the 30-step warmup.")
     # monitoring
     p.add_argument("--log-every", type=int, default=10)
     p.add_argument("--checkpoint-every", type=int, default=250)
@@ -306,9 +379,14 @@ FROZEN_PATH = Path(__file__).resolve().parents[1] / "configs" / "ccm" \
 
 def _frozen_path(args):
     """Per-host frozen spec.  --frozen overrides everything (used by the
-    llama v2 comp-trainable experiment)."""
+    llama v2 comp-trainable experiment).  The native-compression flag
+    selects the native actuation spec automatically (review 2026-09-22)
+    unless an explicit --frozen is given."""
     if getattr(args, "frozen", ""):
         return Path(args.frozen)
+    if getattr(args, "rpbe_native_compression", False):
+        return Path(__file__).resolve().parents[1] / "configs" / "ccm" \
+            / "frozen_method_qwen3_native.json"
     name = "frozen_method_qwen3.json" if getattr(args, "host", "llama") \
         == "qwen3" else "frozen_method.json"
     return Path(__file__).resolve().parents[1] / "configs" / "ccm" / name
@@ -372,6 +450,72 @@ def enforce_frozen(args):
             "[frozen] arm {} must run with the frozen window-matched "
             "cadence; --merge-cadence official is reserved for "
             "ccm_merge_official".format(args.arm))
+    # Review ruling (2026-09-21): the freeze-host protocol is MANDATORY
+    # for the main RPBE arms — a forgotten --freeze-host silently reverts
+    # to LoRA+COMP+Gamma joint training (the exact confound the
+    # freeze-host design removes).  Same for --official-host where the
+    # spec pins the official build (legacy resize host retired).
+    for _key, _flag in (("freeze_host", "freeze_host"),
+                        ("official_host", "official_host")):
+        _section = fz.get(_key)
+        if not isinstance(_section, dict) or not _section.get("enabled"):
+            continue
+        if args.arm in ("ours", "gamma_task_only") \
+                and not getattr(args, _flag, False):
+            raise SystemExit(
+                "[frozen] {}.enabled=true in the frozen spec: the {} "
+                "arm MUST pass --{}".format(_key, args.arm,
+                                            _flag.replace("_", "-")))
+    # Actuation guard (review 2026-09-22, COMP-RPBE native design): the
+    # spec's actuation.mode pins WHICH parameter block the RPBE
+    # recursion actuates.  mode=native (conditional LoRA + COMP/SUM rows,
+    # proposal-space treewise) and the gamma flag must agree with the
+    # spec in BOTH directions — a native spec without the flag would
+    # silently train the old post-merge Gamma, and the flag with a gamma
+    # spec would silently attach no Gamma while the spec still binds
+    # gamma.hidden.
+    act_mode = fz.get("actuation", {}).get("mode", "gamma")
+    native_flag = bool(getattr(args, "rpbe_native_compression", False))
+    if act_mode == "native":
+        _why = []
+        if args.arm not in ("ours", "gamma_task_only"):
+            _why.append("arm {} is not an RPBE arm".format(args.arm))
+        if not native_flag:
+            _why.append("missing --rpbe-native-compression")
+        if getattr(args, "freeze_host", False):
+            _why.append("--freeze-host is the Gamma-only protocol")
+        if getattr(args, "rpbe_gamma_only", False):
+            _why.append("--rpbe-gamma-only has no scope under native "
+                        "actuation")
+        if getattr(args, "rpbe_lr", None) is not None:
+            _why.append("--rpbe-lr would silently route ALL native "
+                        "params into the rpbe_lr group")
+        if getattr(args, "host", "llama") != "qwen3":
+            _why.append("native actuation v1 is Qwen3-only")
+        if args.arm == "ours" \
+                and getattr(args, "rpbe_constrain_mode", "") != "treewise" \
+                and not getattr(args, "s4_supervisor", False):
+            _why.append("native ours requires --rpbe-constrain-mode "
+                        "treewise (the aggregate branch would add the "
+                        "raw RPBE gradient onto the LoRA directly); "
+                        "S4 aggregate is allowed as the two-phase "
+                        "post-conflict form (review 2026-09-23)")
+        if _why:
+            raise SystemExit(
+                "[frozen] actuation.mode=native in the frozen spec: "
+                + "; ".join(_why))
+    elif native_flag:
+        raise SystemExit(
+            "[frozen] --rpbe-native-compression given but the spec's "
+            "actuation.mode is '{}' — native flag + gamma spec (or a "
+            "stale spec) would silently train the wrong parameter "
+            "block".format(act_mode))
+    if getattr(args, "s4_supervisor", False) and (
+            args.arm != "ours"
+            or not getattr(args, "rpbe_native_compression", False)):
+        raise SystemExit(
+            "[s4] --s4-supervisor is the native-ours formal supervisor "
+            "(--arm ours --rpbe-native-compression required)")
     # Lambda authority: the calibration-only run writes the derived
     # lambda into the frozen spec; afterwards the number overrides any
     # CLI value and re-calibration is refused.
@@ -479,6 +623,7 @@ def build_tokenizer(args):
         tok.sum_token_id = ids[N_TOK:]
         tok._gemma4_host = True  # eval collator dispatch marker
         return tok
+    from transformers import LlamaTokenizer
     from transformers import LlamaTokenizer
     tok = LlamaTokenizer.from_pretrained(args.model_name_or_path)
     tok.pad_token = tok.eos_token
@@ -602,6 +747,7 @@ def build_model(args, device):
             [text_cfg.vocab_size + N_TOK + k for k in range(N_TOK)])
         return model
     from transformers.models.llama.configuration_llama import LlamaConfig
+    from transformers.models.llama.configuration_llama import LlamaConfig
     from src.arch.ccm_llama import LlamaForCausalLM_CCM
     config = LlamaConfig.from_pretrained(args.model_name_or_path)
     config.comp_relative_embedding = args.relative_embedding
@@ -694,6 +840,7 @@ def build_dataset(args, tokenizer):
             label_pad_token_id=-100)
         return dialog, collator
     from src.data.dialogue.data import DialogueDataset
+    from src.data.dialogue.data import DialogueDataset
     from src.data.dialogue.collator import DataCollatorForDialogue_LLAMA
     dialog = DialogueDataset(tokenizer, comp_token=tokenizer.comp_token_id,
                              online=True, add_comp_token=True,
@@ -783,14 +930,18 @@ def depth_sampling_probs(pools, alpha=None):
     return (w / w.sum()).astype(np.float64)
 
 
-def parse_meta(batch, comp_ids, sum_ids, sample_id_global, orig_ids=None):
+def parse_meta(batch, comp_ids, sum_ids, sample_id_global, orig_ids=None,
+               raw_dialogs=None):
     """Deterministic per-sample metadata from the padded collator batch.
 
-    Returns a list (one per batch row) of dicts: k, blocks (C0/S0
-    positions per turn), utterance_spans, prompt_end.  Every turn block
-    is [C0, C1, S0, S1] right after its utterance; the final context turn
-    carries no block.  ``sample_id_global`` is the stream-global sample
-    index (unique across epochs) used as the tree identity.
+    Returns a list (one per batch row) of dicts: k, L, blocks (C0/S0
+    positions per turn), utterance_spans, prompt_end, raw_dialog.  Every
+    turn block is [C0, C1, S0, S1] right after its utterance; the final
+    context turn carries no block.  ``sample_id_global`` is the
+    stream-global sample index (unique across epochs) used as the tree
+    identity.  ``raw_dialogs`` (review ruling 2026-09-21) carries the
+    collator's own tokenized turns [u_1..u_L, c, y] per row — the ONLY
+    source for chi/phi; spans/ids stay model-position metadata.
     """
     ids = batch["input_ids"]
     labels = batch["labels"]
@@ -811,17 +962,27 @@ def parse_meta(batch, comp_ids, sum_ids, sample_id_global, orig_ids=None):
         n_completion = int((labels[b] != -100).sum())
         prompt_end = L - n_completion
         k = len(blocks) + 1  # context turns = blocks + final blockless turn
+        depth_L = len(blocks)  # compressed-history turns (review ruling:
+                               # the canonical cut depth L = k - 1)
         utterance_spans = []
         prev_end = -1
         for (c0_pos, _s0) in blocks:
             utterance_spans.append((prev_end + 1, c0_pos))
             prev_end = c0_pos + 3  # S1 position
         utterance_spans.append((prev_end + 1, prompt_end))
+        raw = None
+        if raw_dialogs is not None and b < len(raw_dialogs):
+            raw = [list(u) for u in raw_dialogs[b]]
+            if ok:
+                assert len(raw) == depth_L + 2, (
+                    "raw_dialog turns {} != L + 2 = {}".format(
+                        len(raw), depth_L + 2))
         metas.append({"sample_id": int(sample_id_global) + b, "row": b,
-                      "k": k,
+                      "k": k, "L": depth_L,
                       "blocks": blocks,
                       "utterance_spans": utterance_spans,
                       "prompt_end": prompt_end, "ok": ok,
+                      "raw_dialog": raw,
                       # Review round 8: stable ORIGINAL dialogue id for
                       # the tree identity (fall back to the stream cursor
                       # when the caller does not supply it).
@@ -909,13 +1070,13 @@ def task_ce_rows(out, labels, device):
 
 
 def collect_replay_z(meta, adapter, device, v=None):
-    """Pass-2 extraction ONLY: z_v at cut position v (gradient-
+    """Pass-2 extraction ONLY: z_t at block_idx v = t - 1 (gradient-
     connected).  No builder, no chi, no p — those finished their job at
-    the pass-1 window close (L6.5 review structural fix).  R10: v=None
-    keeps the historical penultimate cut; the chain-wise replay passes
-    the per-cut v explicitly."""
+    the pass-1 window close (L6.5 review structural fix).  Review ruling
+    (2026-09-21): block_idx = t - 1 is the ONLY cut indexing rule; v=None
+    means the terminal cut t = L (block_idx L - 1)."""
     if v is None:
-        v = meta["k"] - 3
+        v = int(meta["L"]) - 1
     s0_pos = meta["blocks"][v][1]
     sum_positions = torch.tensor([[s0_pos, s0_pos + 1]],
                                  dtype=torch.long, device=device)
@@ -923,64 +1084,120 @@ def collect_replay_z(meta, adapter, device, v=None):
 
 
 def collect_rows(meta, adapter, builder, utter_embed, phi_embed,
-                 embed_tokens, batch, device):
-    """CONDITIONAL 2Obs, R10 CHAIN-WISE (review 2026-09-16):
+                 embed_tokens, batch, device,
+                 supervisor_mode="current"):
+    """Review ruling (2026-09-21): ONE CUT PER ACTUAL COMPRESSION LAYER.
 
-      obs1: C = u_{v+1},              Y = u_{v+2}        (both in prompt)
-      obs2: C = (u_{v+1}, u_{v+2}, one-update), Y = u_k (labels, EOS out)
+      t = 1..L,  block_idx = t - 1   (the ONLY cut indexing rule)
 
-    The historical single cut v = k - 3 supervised only the penultimate
-    merge; Theorem 4 sums local defects over the WHOLE chain, so every
-    legal cut position v in {0, ..., k - 3} (t = v + 1 merges) now emits
-    its own two horizon rows (one occurrence id per cut).  z extraction
-    is batched (extract_z takes [n_cuts, 2]); chi/phi stay frozen
-    input-embedding sketches (no extra LLaMA forward, no grad flow)."""
-    if not meta["ok"] or meta["k"] < 3:
+    with raw_dialog = [u_1..u_L, c, y] (len L + 2, tokenized turns):
+
+      t < L:  obs1  C = u_{t+1},  Y = u_{t+2}          (w = 0.5)
+              obs2  C = (u_{t+1}, u_{t+2}, one-update), Y = y  (w = 0.5)
+      t = L:  single legal observation  C = c,  Y = y  (w = 1.0)
+              — the terminal cut does not fabricate a second future.
+
+    supervisor_mode="root_only" (supervisor sweep, review 2026-09-23):
+    EVERY t supervises the final root target y with the remaining
+    suffix as the context — (M_t, C_t^{suffix}) -> y with
+    C_t = (u_{t+1}..u_L, c), a single row per cut at w = 1.0.  No
+    surrogate local target u_{t+2}.
+
+    Chi/phi are built from the RAW utterance tokens (the collator's
+    sample() already had them; the old code carved spans out of the
+    collated input_ids, dragging BOS / chat headers / separators into
+    the "utterance" sketches).  The model forward is used ONLY to lift
+    z_t from block_idx t - 1.  Chi/phi stay frozen input-embedding
+    sketches (no extra forward, no grad flow)."""
+    if not meta["ok"] or meta["L"] < 1:
         return []
-    k = meta["k"]
-    n_cuts = k - 2          # v = 0 .. k - 3 (one cut per merge depth)
+    L = int(meta["L"])
+    raw = meta["raw_dialog"]
+    assert len(raw) == L + 2, (
+        "raw_dialog length {} != L + 2 = {}".format(len(raw), L + 2))
     # extract_z's gather expands sum_positions along the BATCH dim, so
     # a multi-row [n_cuts, 2] input would index batch 1..n_cuts against
     # a batch-1 cache.  Extract one cut at a time (each call is a cheap
     # per-layer gather, not a forward).
     zs = [adapter.extract_z(torch.tensor(
-        [[meta["blocks"][v][1], meta["blocks"][v][1] + 1]],
+        [[meta["blocks"][t - 1][1], meta["blocks"][t - 1][1] + 1]],
         dtype=torch.long, device=device))[0]
-        for v in range(n_cuts)]  # [n_cuts, z_dim]
-    spans = meta["utterance_spans"]
-    ids = batch["input_ids"][meta["row"]]
-    labs = batch["labels"][meta["row"]]
-    # u_k = the target utterance: valid label tokens minus the EOS.
-    # V11 (review): Obs2 future becomes LOCAL — Y_v^(2) = u_{v+3} per
-    # cut, so the second observation tests "M_v -> real continuation ->
-    # M_{v+1} -> next predictive target".  Only the DEEPEST cut
-    # (v = k-3) keeps u_{v+3} = u_k, i.e. the final task target.
-    valid_pos = (labs != -100).nonzero(as_tuple=False).flatten()
-    uk_pos = valid_pos[:-1] if len(valid_pos) > 1 else valid_pos
-    u_k_ids = ids[uk_pos].unsqueeze(0).to(device)
+        for t in range(1, L + 1)]  # [L, z_dim]
     dm = DialogueMeta(sample_id=int(meta["sample_id"]), k=int(meta["k"]),
                       sum_positions=[(p + 2, p + 3) for (p, _s)
                                      in meta["blocks"]],
                       utterance_spans=list(meta["utterance_spans"]),
-                      orig_id=int(meta.get("orig_id", -1)))
+                      orig_id=int(meta.get("orig_id", -1)),
+                      L=L, raw_dialog=list(raw))
+
+    def _tok(idx):
+        return torch.tensor(list(raw[idx]), dtype=torch.long,
+                            device=device).unsqueeze(0)
+
     rows = []
-    for v in range(n_cuts):
-        u_v1 = ids[spans[v + 1][0]:spans[v + 1][1]].unsqueeze(0).to(device)
-        u_v2 = ids[spans[v + 2][0]:spans[v + 2][1]].unsqueeze(0).to(device)
-        # V11 local future: u_{v+3} is a prompt turn for v+3 <= k-1,
-        # and the target u_k for the deepest cut (v+3 == k).
-        if v + 3 <= len(spans) - 1:
-            u_v3 = ids[spans[v + 3][0]:spans[v + 3][1]].unsqueeze(0) \
-                .to(device)
+    for t in range(1, L + 1):
+        if supervisor_mode == "root_only":
+            # (M_t, suffix) -> y for EVERY t: the suffix is the
+            # remaining future dialogue (u_{t+1}..u_L, c); the terminal
+            # cut's suffix is just c (same as the current design).
+            suffix_ids = torch.tensor(
+                [tok for idx in range(t, L + 1) for tok in raw[idx]],
+                dtype=torch.long, device=device).unsqueeze(0)
+            y_ids = _tok(L + 1)
+            chi1 = utter_embed(embed_tokens, suffix_ids, tag=0)
+            phi1 = phi_embed(embed_tokens, y_ids, tag=0)
+            chi2, phi2 = chi1, phi1  # unused (single row)
+            rows.extend(builder.build(dm, zs[t - 1], chi1[0], chi2[0],
+                                      phi1[0], phi2[0], v=t - 1,
+                                      single=True))
+            continue
+        if t < L:
+            u_nxt = _tok(t)          # u_{t+1}  (raw index t)
+            u_nx2 = _tok(t + 1)      # u_{t+2}
+            y_ids = _tok(L + 1)      # y (target)
+            chi1 = utter_embed(embed_tokens, u_nxt, tag=0)
+            phi1 = phi_embed(embed_tokens, u_nx2, tag=0)
+            chi2 = utter_embed.combine(embed_tokens, u_nxt, u_nx2, tag=1)
+            phi2 = phi_embed(embed_tokens, y_ids, tag=1)
         else:
-            u_v3 = u_k_ids
-        chi1 = utter_embed(embed_tokens, u_v1, tag=0)
-        phi1 = phi_embed(embed_tokens, u_v2, tag=0)
-        phi2 = phi_embed(embed_tokens, u_v3, tag=1)
-        chi2 = utter_embed.combine(embed_tokens, u_v1, u_v2, tag=1)
-        rows.extend(builder.build(dm, zs[v], chi1[0], chi2[0],
-                                  phi1[0], phi2[0], v=v))
+            c_ids = _tok(L)          # c (context turn)
+            y_ids = _tok(L + 1)      # y (target)
+            chi1 = utter_embed(embed_tokens, c_ids, tag=0)
+            phi1 = phi_embed(embed_tokens, y_ids, tag=0)
+            chi2, phi2 = chi1, phi1  # unused on the single-row path
+        rows.extend(builder.build(dm, zs[t - 1], chi1[0], chi2[0],
+                                  phi1[0], phi2[0], v=t - 1))
     return rows
+
+
+def s4_obs_list(meta, v):
+    """(h, comp_dlg, full_dlg, w) per observation of cut v (S4 formal
+    supervisor, review 2026-09-23).
+
+    Both dialogues share the SAME future conditioning (C, Y); only the
+    history's information source differs: comp compresses u_1..u_t into
+    M_t (t-turn merge), full gives u_1..u_t as ONE lossless context
+    turn (a 1-turn merge is the identity).  Weights follow the original
+    2Obs topology (0.5/0.5 below the terminal, single w=1 at t=L).
+    """
+    _t = int(v) + 1
+    _raw = meta["raw_dialog"]
+    _L = int(meta["L"])
+    _hist = [list(_raw[_x]) for _x in range(_t)]
+    _hist_full = [tok for _x in range(_t) for tok in _raw[_x]]
+    if _t < _L:
+        _ctx2 = [tok for _x in range(_t, _t + 2) for tok in _raw[_x]]
+        return [
+            (1, _hist + [list(_raw[_t])] + [list(_raw[_t + 1])],
+             [_hist_full] + [list(_raw[_t])] + [list(_raw[_t + 1])],
+             0.5),
+            (2, _hist + [_ctx2] + [list(_raw[_L + 1])],
+             [_hist_full] + [_ctx2] + [list(_raw[_L + 1])],
+             0.5),
+        ]
+    return [(1, _hist + [list(_raw[_L])] + [list(_raw[_L + 1])],
+             [_hist_full] + [list(_raw[_L])] + [list(_raw[_L + 1])],
+             1.0)]
 
 
 def batch_surrogate(z_rows_by_oid, batch_terms, lam, device):
@@ -1038,15 +1255,93 @@ def _json_safe(obj):
     return obj
 
 
-def treewise_feasibility_projection(g_task_gamma, gamma_params, G, kappa,
-                                    iters=400, cert_tol=1e-6, min_norm=1e-9):
+def adamw_proposal(optimizer, params, grads, step_count,
+                   lr_override=None):
+    """SHADOW AdamW proposal WITHOUT stepping (review 2026-09-22,
+    proposal-space treewise projection).
+
+    Feeds ``grads`` through the optimizer's CURRENT first/second
+    moments (exp_avg / exp_avg_sq, read but NOT written) and returns the
+    AdamW update vector
+
+        d = -lr * (m_hat / (sqrt(v_hat) + eps) + wd * theta)
+
+    with m_hat/v_hat bias-corrected by ``step_count`` (the step the
+    optimizer WOULD take).  beta1/beta2/eps/lr are read from the
+    param_groups; theta is detached.  This is the proposal vector the
+    QP projects in the native actuation line: because AdamW carries
+    momentum, second moments and coordinate-wise preconditioning,
+
+        g -> Proj(g) -> AdamW   !=   g -> AdamW(g) -> Proj(d)
+
+    and the frozen method definition (paper logic) is the
+    proposal-space projection — project the AdamW proposal, then write
+    the projected vector back as the parameter update.
+
+    lr_override (review 2026-09-22 warmup fix): lr is a COMMON scalar
+    factor of the proposal — the QP direction space and the lambda
+    calibration ratio are lr-invariant, so those callers pass
+    lr_override=1.0 (direction space); the write-back multiplies by the
+    real current lr (0 during warmup step 0 keeps the warmup
+    semantics).  Callers that need the exact optimizer step (test 5)
+    leave it None to read the real lr."""
+    out = []
+    for p, g in zip(params, grads):
+        _pg = optimizer.param_groups[0]
+        for _grp in optimizer.param_groups:
+            if any(pp is p for pp in _grp["params"]):
+                _pg = _grp
+                break
+        grp = optimizer.param_groups[0]
+        betas = tuple(grp["betas"])
+        eps = float(grp.get("eps", 1e-8))
+        lr = (float(_pg["lr"]) if lr_override is None
+              else float(lr_override))
+        wd = float(_pg.get("weight_decay", 0.0))
+        st = optimizer.state.get(p, {})
+        m = st.get("exp_avg", torch.zeros_like(p))
+        v = st.get("exp_avg_sq", torch.zeros_like(p))
+        b1, b2 = betas
+        m_new = b1 * m + (1.0 - b1) * g
+        v_new = b2 * v + (1.0 - b2) * g * g
+        bc1 = 1.0 - b1 ** max(int(step_count), 1)
+        bc2 = 1.0 - b2 ** max(int(step_count), 1)
+        m_hat = m_new / bc1
+        v_hat = v_new / bc2
+        step_dir = m_hat / (v_hat.sqrt() + eps)
+        if wd:
+            step_dir = step_dir + wd * p.detach()
+        out.append(-lr * step_dir.to(p.dtype))
+    return out
+
+
+def proposal_norm(optimizer, params, step_count, lr_override=None):
+    """L2 norm of the shadow AdamW proposal for the params' CURRENT
+    .grad (calibration: r_eff measured in proposal space on the native
+    line; the gamma line keeps the plain gradient-norm calibration).
+    lr_override=1.0 for the lambda calibration: lr is a common factor,
+    so the r_eff RATIO is lr-invariant (warmup may set the real lr to
+    0 at theta_0, which would make both norms trivially zero)."""
+    grads = [p.grad.detach().float() if p.grad is not None
+             else torch.zeros_like(p, dtype=torch.float32)
+             for p in params]
+    props = adamw_proposal(optimizer, params, grads, step_count,
+                           lr_override=lr_override)
+    return float(
+        torch.cat([d.reshape(-1) for d in props]).double().norm())
+
+
+def treewise_feasibility_projection(g_task_repr, repr_params, G, kappa,
+                                    iters=400, cert_tol=1e-6, min_norm=1e-9,
+                                    b_norm=None, device=None):
     """Tree-wise RPBE Feasibility Projection — TGN final-spec alignment
     (2026-09-15, ported from tgb_link_loop._cstr_group_close_treewise,
     the b523cf3 lineage; the Cimmino refinement there is kappa=0-only and
     is NOT needed on the kappa>0 path CCM runs).
 
-    One global task direction t = -g_task; every per-oid RPBE direction
-    g_j stays SEPARATE and contributes one half-space
+    One global center direction t (whose MEANING is given by the
+    caller's vector space); every per-oid RPBE direction g_j stays
+    SEPARATE and contributes one half-space
     g_j.d >= -kappa*||g_j||*||t||.  Solve
 
         d* = argmin_d 1/2||d - t||^2   s.t.  H d >= b,  b_j = -kappa*||t||
@@ -1055,22 +1350,53 @@ def treewise_feasibility_projection(g_task_gamma, gamma_params, G, kappa,
     normalization — the same constraint set, a far better-conditioned
     dual), through the N x N dual (mu >= 0): d* = t + H^T mu.  After
     solving, EVERY row is certified against the 1e-6 tolerance (the
-    final-spec full certificate).  On success writes ONLY Gamma:
-    p.grad = g_task - sum_j mu_j g_j.  On certificate FAILURE returns
-    ok=False WITHOUT writing anything — the caller must SKIP the
-    representation step (reviewer requirement: no constrained update is
-    executed on an uncertified solution).
+    final-spec full certificate).  On success writes ONLY the
+    representation params: p.grad = g_task - sum_j mu_j g_j.  On
+    certificate FAILURE returns ok=False WITHOUT writing anything — the
+    caller must SKIP the representation step (reviewer requirement: no
+    constrained update is executed on an uncertified solution).
+
+    VECTOR SPACE of t / G is the CALLER's choice (review 2026-09-22):
+    the gamma line passes the GRADIENT-space joint proposal
+    (t = -g_task_repr); the native line passes the AdamW
+    PROPOSAL-space center (t = d_0 from adamw_proposal, with
+    b_j = -kappa*||g_j||*||d_task||).  The QP math is identical — the
+    frozen method definition is the proposal-space projection, because
+    g -> Proj(g) -> AdamW != g -> AdamW(g) -> Proj(d).
+
+    Method fact (review 2026-09-22): lambda does NOT affect the pure
+    half-space feasibility region (q_i -> lambda q_i cancels on both
+    sides of the inequality).  Lambda is meaningful only through the
+    JOINT proposal center d_0 = d_joint(lambda), which is why the
+    method is joint-proposal + feasibility (scheme B), not pure
+    feasibility (scheme A).
 
     CCM scale note: the window keeps N ~ 1-3 hundred directions, far
     below the TGN 2000+ regime, so the ACTIVE SET is the full row set
     (the TGN 3-round one-row-at-a-time expansion is a solver-capacity
     device for large N and would only add rounds here).  The projection
     runs on SCALED (fp16 GradScaler) gradients — the QP is invariant to
-    a uniform positive rescaling of t and G, so the math is unaffected."""
-    sizes = [p.numel() for p in gamma_params]
-    t = torch.cat([-x.flatten().float() for x in g_task_gamma])
+    a uniform positive rescaling of t and G, so the math is unaffected.
+
+    CPU-memory streaming (2026-09-23, S4 2Obs at 5.9M repr dims): the
+    S4-2Obs window holds ~600 rows x 5.9M fp32 (~14GB); stacking the
+    full G, H and K matrices peaked at ~80GB of CPU RAM and the system
+    OOM-killer took the training process.  The row normalization is
+    per-row, the Gram K = H H^T and the matvecs are exact block sums —
+    every stage streams in 64-row blocks, so the peak is the G list
+    itself (~14GB) + one block (~1.5GB).  The math is UNCHANGED
+    (exact streaming Gram; review 2026-09-22 pre-authorized).  G may be
+    a tensor (gamma line) or a list of rows (native line — no stack).
+    """
+    sizes = [p.numel() for p in repr_params]
+    t = torch.cat([-x.flatten().float() for x in g_task_repr])
     nt = float(t.norm())
-    diag = {"n_dirs": int(G.shape[0]) if G is not None else 0,
+    if isinstance(G, torch.Tensor):
+        _G_rows = list(G)
+    else:
+        _G_rows = list(G)
+    n_rows = len(_G_rows) if _G_rows else 0
+    diag = {"n_dirs": n_rows,
             "task_norm": nt, "cos_mean": None, "cos_med": None,
             "cos_p5": None, "cos_min": None, "frac_below": None,
             "frac_below_grid": None, "feasible_d0": None,
@@ -1086,43 +1412,81 @@ def treewise_feasibility_projection(g_task_gamma, gamma_params, G, kappa,
     def _write_task_only():
         # Gamma .grad <- the aggregate task gradient alone (d = t), the
         # degenerate / feasible / probe close semantics.
-        for gt, p in zip(g_task_gamma, gamma_params):
+        for gt, p in zip(g_task_repr, repr_params):
             p.grad = gt.to(p.device)
 
-    if G is None or G.numel() == 0:
+    if not _G_rows:
         diag["note"] = "no_dirs"
         return True, diag
     if nt <= 1e-12:
         diag["note"] = "zero_task"
         _write_task_only()
         return True, diag
-    Gf = G.flatten(1).float()
-    ng = Gf.norm(dim=1)
+    # b_norm (native proposal-space line, review 2026-09-22): the
+    # half-space bound is -kappa*||q_j||*||d_task|| — the TASK proposal
+    # norm, NOT the joint-center norm ||t|| = ||d_0||.  The gamma line
+    # passes b_norm=None and keeps b_j = -kappa*||t|| (V11 semantics
+    # unchanged).
+    nb = float(b_norm) if b_norm is not None else nt
+    diag["b_norm"] = nb
+    k_eff = kappa * (nb / max(nt, 1e-30))
+    _CH = 64
+    # GPU offload (2026-09-23): the two-level block Gram is the per-
+    # window CPU bottleneck (~4-6 min).  With device set, each block is
+    # uploaded (64 x 5.9M x 4B ~ 1.5GB per transfer, ~10s total over
+    # PCIe for all 100 pairs) and the matmuls run on the GPU in
+    # milliseconds; the n x n results come back to the CPU (FISTA stays
+    # CPU, 600x600 is small).  None keeps the pure-CPU path (tests,
+    # gamma line).
+    _dev = device
+    _t_q = t.to(_dev) if _dev is not None else t
+
+    def _blocks():
+        for _c0 in range(0, n_rows, _CH):
+            yield _G_rows[_c0:_c0 + _CH], _c0
+
+    # ---- pass 1: norms + valid mask (streaming) ----------------------
+    ng_parts = []
+    for _blk, _ in _blocks():
+        _Gc = torch.stack(_blk).float()
+        ng_parts.append(_Gc.norm(dim=1))
+        del _Gc
+    ng = torch.cat(ng_parts)
     valid = ng > min_norm
     if not bool(valid.any()):
         diag["note"] = "no_valid_dirs"
         _write_task_only()
         return True, diag
-    Gv = Gf[valid]
-    n_valid = int(Gv.shape[0])
-    # ---- row-normalized half spaces (final spec) ----------------------
-    H = Gv / Gv.norm(dim=1, keepdim=True).clamp(min=min_norm)
-    cos = (H @ t) / nt          # h_j^T t / ||t|| = cos(g_j, t)
-    cos_np = cos.detach().cpu().numpy()
+    v_idx = torch.nonzero(valid).reshape(-1)
+    n_valid = int(v_idx.numel())
+    _pos_of = {int(_r): int(_k) for _k, _r in enumerate(v_idx.tolist())}
+
+    # ---- cos statistics (streaming H @ t) ----------------------------
+    cos_parts = []
+    for _blk, _ in _blocks():
+        _Gc = torch.stack(_blk).float()
+        _ngc = _Gc.norm(dim=1).clamp(min=min_norm)
+        _Hc = _Gc / _ngc[:, None]
+        cos_parts.append((_Hc.to(_dev) if _dev is not None else _Hc)
+                         @ _t_q)
+        del _Gc, _Hc
+    cos = torch.cat([_p.cpu() for _p in cos_parts]) / nt
+    cos_valid = cos[valid]
+    cos_np = cos_valid.detach().cpu().numpy()
     diag["proj_n_valid"] = n_valid
     diag["cos_mean"] = float(np.mean(cos_np))
     diag["cos_med"] = float(np.median(cos_np))
     diag["cos_p5"] = float(np.percentile(cos_np, 5.0))
     diag["cos_min"] = float(np.min(cos_np))
     diag["proj_cos_min"] = float(np.min(cos_np))
-    diag["frac_below"] = float(np.mean(cos_np < -kappa))
+    diag["frac_below"] = float(np.mean(cos_np < -k_eff))
     diag["frac_below_grid"] = {
         ("%.2f" % kk): float(np.mean(cos_np < -kk))
         for kk in (0.0, 0.02, 0.05, 0.1, 0.15, 0.2, 0.3)}
-    diag["feasible_d0"] = bool(np.all(cos_np >= -kappa))
+    diag["feasible_d0"] = bool(np.all(cos_np >= -k_eff))
     diag["proj_max_viol_before"] = float(
-        np.clip(-cos_np - kappa, 0.0, None).max())
-    viol0 = np.flatnonzero(cos_np < -kappa)
+        np.clip(-cos_np - k_eff, 0.0, None).max())
+    viol0 = np.flatnonzero(cos_np < -k_eff)
     diag["proj_n_active_init"] = int(len(viol0))
     if len(viol0) == 0:
         # d0 = t is already feasible: task-only close (final-spec path)
@@ -1130,15 +1494,75 @@ def treewise_feasibility_projection(g_task_gamma, gamma_params, G, kappa,
         diag["max_viol"] = 0.0
         _write_task_only()
         return True, diag
-    # ---- full-set QP: K = H H^T, c = b - H t, b_j = -kappa*||t|| -------
-    b = -kappa * nt * torch.ones(n_valid, device=t.device)
-    K = H @ H.t()
-    c = b - (H @ t)
-    mu = _fista_nonneg(K, c, iters)
-    corr = H.t() @ mu              # = sum_j mu_j h_j  (= d* - t)
+    # ---- full-set QP: K = H H^T, c = b - H t (streaming exact sums) ---
+    # K[i,j] = h_i . h_j pairs exist ACROSS blocks, so the Gram needs a
+    # two-level block loop (each row pair computed exactly once); the
+    # single-level block-diagonal sum silently dropped every cross-block
+    # entry (caught by the multi-block equivalence test, 2026-09-23).
+    _blk_list = list(range(0, n_rows, _CH))
+
+    def _blk_H(_c0):
+        _blk = _G_rows[_c0:_c0 + _CH]
+        _Gc = torch.stack(_blk).float()
+        _ngc = _Gc.norm(dim=1).clamp(min=min_norm)
+        _m = _ngc > min_norm
+        if not bool(_m.any()):
+            return None, None
+        _Hv = _Gc[_m] / _ngc[_m, None]
+        if _dev is not None:
+            _Hv = _Hv.to(_dev)
+        _pos = [_pos_of[_c0 + _k] for _k in range(len(_m))
+                if bool(_m[_k])]
+        return _Hv, _pos
+
+    K = torch.zeros(n_valid, n_valid)
+    c_vec = -kappa * nb * torch.ones(n_valid)
+    for _c0 in _blk_list:
+        _H0, _p0 = _blk_H(_c0)
+        if _H0 is None:
+            continue
+        c_vec[_p0] -= (_H0 @ _t_q).cpu()
+        for _c1 in _blk_list:
+            _H1, _p1 = _blk_H(_c1)
+            if _H1 is None:
+                continue
+            _k_sub = (_H0 @ _H1.t()).cpu()
+            K[torch.tensor(_p0).unsqueeze(1),
+              torch.tensor(_p1).unsqueeze(0)] += _k_sub
+        del _H0
+    mu = _fista_nonneg(K, c_vec, iters)
+    # ---- corr = H^T mu (streaming) -----------------------------------
+    corr = torch.zeros(t.numel())
+    for _blk, _c0 in _blocks():
+        _Gc = torch.stack(_blk).float()
+        _ngc = _Gc.norm(dim=1).clamp(min=min_norm)
+        _m = _ngc > min_norm
+        if not bool(_m.any()):
+            del _Gc
+            continue
+        _Hv = _Gc[_m] / _ngc[_m, None]
+        _pos = [_pos_of[_c0 + _k] for _k in range(len(_m))
+                if bool(_m[_k])]
+        if _dev is not None:
+            corr += (_Hv.to(_dev).t()
+                     @ mu[_pos].to(_dev)).cpu()
+        else:
+            corr += _Hv.t() @ mu[_pos]
+        del _Gc, _Hv
     d = t + corr
-    # ---- full certificate: every row must satisfy h_j d >= -kappa*||t||
-    viol = (-kappa * nt - (H @ d)) / (nt + 1e-30)
+    # ---- full certificate (streaming H @ d) --------------------------
+    viol_parts = []
+    for _blk, _ in _blocks():
+        _Gc = torch.stack(_blk).float()
+        _ngc = _Gc.norm(dim=1).clamp(min=min_norm)
+        _Hc = _Gc / _ngc[:, None]
+        if _dev is not None:
+            viol_parts.append((_Hc.to(_dev) @ d.to(_dev)).cpu())
+        else:
+            viol_parts.append(_Hc @ d)
+        del _Gc, _Hc
+    viol = ((-kappa * nb - torch.cat(viol_parts)[valid])
+            / (nt + 1e-30))
     max_viol = float(viol.max()) if viol.numel() else 0.0
     diag["active"] = int((mu > 1e-8).sum())
     diag["proj_n_mu_pos"] = int((mu > 1e-8).sum())
@@ -1155,8 +1579,8 @@ def treewise_feasibility_projection(g_task_gamma, gamma_params, G, kappa,
         diag["cert_fail"] = True
         return False, diag
     with torch.no_grad():
-        for p, cp, gt in zip(gamma_params, torch.split(corr, sizes),
-                             g_task_gamma):
+        for p, cp, gt in zip(repr_params, torch.split(corr, sizes),
+                             g_task_repr):
             # .to(p.device): the QP runs on CPU (V11 OOM fix — the
             # G matrix GPU peak was the last 4GB that blew the card).
             p.grad = (gt - cp.view_as(p)).to(p.device)
@@ -1340,8 +1764,44 @@ def main():
             "[micro-batch] RPBE arms require --micro-batch 1 (the "
             "two-pass replay and window machinery are batch=1 "
             "protocols); batch>1 is currently a task-only option")
-    if use_rpbe:
+    if use_rpbe and not args.rpbe_native_compression:
         attach_gamma(model, hidden=args.gamma_hidden)
+    if args.rpbe_native_compression and use_rpbe:
+        # Native actuation (review 2026-09-22): the RPBE recursion node
+        # is the native CCM merge step (M_{t-1}, u_t) -> M_t; the
+        # actuated parameters are the native compression params —
+        # conditional LoRA + COMP/SUM comp-embedding rows.  Everything
+        # else (the backbone) is frozen, so task and RPBE gradients only
+        # move the compression params.  No Gamma module is attached, so
+        # the SUM-block K/V states lifted by extract_z ARE the pure
+        # CCM mean M_t (Z_t = M_t by construction).
+        n_frozen = 0
+        for _n, _p in model.named_parameters():
+            if "lora_" in _n or "comp_embeddings" in _n:
+                continue
+            if _p.requires_grad:
+                _p.requires_grad_(False)
+                n_frozen += 1
+        # NOTE: peft's get_peft_model usually already froze the base
+        # (mark_only_lora_as_trainable), so n_frozen is often 0 — the
+        # loop is an idempotent guard, the RESULTING state is what
+        # matters (trainable = LoRA + comp rows).
+        _base = model
+        while not hasattr(_base, "layers") and hasattr(_base, "model"):
+            _base = _base.model
+        assert not getattr(_base, "_gamma_attached", False), \
+            "native actuation must not carry an attached Gamma"
+        for _layer in _base.layers:
+            assert getattr(_layer.self_attn, "gamma", None) is None, \
+                "native actuation: found a layer-attached Gamma"
+        # The LoRA stays train() (dropout pinned to 0.0 in wrap_lora),
+        # so pass-1/pass-2 replay remains bit-identical (the RNG
+        # protocol precondition).
+        model.train()
+        print("[native-compression] frozen {} backbone params; "
+              "trainable = conditional LoRA + COMP/SUM rows (pure "
+              "CCM-merge forward, Z_t = M_t)".format(n_frozen),
+              flush=True)
     if args.init_from:
         # Two-stage init: the merge checkpoint carries LoRA + COMP rows
         # (trainable in stage 2) but NO Gamma — Gamma keeps its zero
@@ -1373,20 +1833,40 @@ def main():
             if "gamma" not in n and p.requires_grad:
                 p.requires_grad_(False)
                 n_frozen += 1
+        # Review ruling (2026-09-21): the frozen host must run its
+        # forward EXACTLY as at inference.  The official conditional
+        # LoRA carries lora_dropout=0.05, which stays ACTIVE while the
+        # model is in train() mode — frozen params would still perturb
+        # the host forward.  eval() the whole host, then re-enable
+        # train() ONLY on the Gamma modules (gradients keep flowing
+        # through the frozen host to Gamma either way).
+        model.eval()
+        for _m in model.modules():
+            if isinstance(_m, GammaResidual):
+                _m.train()
         print("[freeze-host] frozen {} non-Gamma trainable params "
-              "(train Gamma only)".format(n_frozen), flush=True)
+              "(train Gamma only); host eval() + Gamma train()"
+              .format(n_frozen), flush=True)
     cfg = model.model.config
-    # Tree-wise projection scope: the Gamma parameters of every layer.
-    gamma_params = []
+    # Projection scope: the RPBE-actuated representation parameters.
+    # gamma line: the Gamma residual of every layer (post-merge
+    # correction).  native line (review 2026-09-22): the native
+    # compression params — conditional LoRA + COMP/SUM rows — which
+    # equals the full trainable set after the backbone freeze.
+    repr_params = []
     if use_rpbe:
-        _base = model
-        while not hasattr(_base, "layers") and hasattr(_base, "model"):
-            _base = _base.model
-        for _layer in _base.layers:
-            _g = getattr(_layer.self_attn, "gamma", None)
-            if _g is not None:
-                gamma_params.extend(list(_g.parameters()))
-    gamma_set = {id(p) for p in gamma_params}
+        if args.rpbe_native_compression:
+            repr_params = [p for p in model.parameters()
+                           if p.requires_grad]
+        else:
+            _base = model
+            while not hasattr(_base, "layers") and hasattr(_base, "model"):
+                _base = _base.model
+            for _layer in _base.layers:
+                _g = getattr(_layer.self_attn, "gamma", None)
+                if _g is not None:
+                    repr_params.extend(list(_g.parameters()))
+    repr_set = {id(p) for p in repr_params}
 
     # RNG protocol precondition: zero dropout everywhere (pass-1/pass-2
     # replay must be identical; LLaMA ships with dropout 0).
@@ -1444,12 +1924,12 @@ def main():
     # --rpbe-lr (R9 add, 2026-09-16): an independent base lr for the
     # Gamma group; the single scheduler multiplies BOTH groups by the
     # same warmup/cosine factor, so the group ratio is preserved.
-    if args.rpbe_lr is not None and gamma_params:
-        gamma_ids = {id(p) for p in gamma_params}
+    if args.rpbe_lr is not None and repr_params:
+        repr_ids = {id(p) for p in repr_params}
         optimizer = torch.optim.AdamW(
-            [{"params": [p for p in params if id(p) in gamma_ids],
+            [{"params": [p for p in params if id(p) in repr_ids],
               "lr": args.rpbe_lr},
-             {"params": [p for p in params if id(p) not in gamma_ids],
+             {"params": [p for p in params if id(p) not in repr_ids],
               "lr": args.lr}],
             lr=args.lr, weight_decay=0.0)
     else:
@@ -1457,10 +1937,19 @@ def main():
     total_steps = max(1, int(args.schedule_total_steps
                             if args.schedule_total_steps is not None
                             else args.max_steps))
-    warmup_steps = max(1, int(0.03 * total_steps))
+    # Fork semantics (review 2026-09-23): --init-from continues from an
+    # ALREADY-TRAINED theta (e.g. merge s300/s500), so the warmup that
+    # exists for random initializations is skipped — the first window
+    # steps at the peak lr and the cosine descends from there.  (The old
+    # behavior restarted the scheduler from zero, wasting ~30 of the 50
+    # windows in the warmup trough.)  --no-warmup forces the same on a
+    # RESUME of a fork arm (resume rebuilds the scheduler; without the
+    # flag it would reintroduce the 30-step warmup).
+    warmup_steps = 0 if (args.init_from or args.no_warmup) \
+        else max(1, int(0.03 * total_steps))
 
     def _lr_lambda(s):
-        if s < warmup_steps:
+        if warmup_steps > 0 and s < warmup_steps:
             return float(s) / float(warmup_steps)
         progress = float(s - warmup_steps) / float(
             max(1, total_steps - warmup_steps))
@@ -1516,11 +2005,11 @@ def main():
                  "replay cap {}".format(q_alpha, max_replays))
         + "; one original dialogue per window; fixed prefix = "
           "n_turns_of_L[L] = L + 2 turns",
-        "note_L1": "depth L=1 dialogues (3 turns) carry task CE only: "
-                   "with meta.k = len(blocks) + 1 = L + 1 the cut index "
-                   "v = meta.k - 3 = L - 2 is negative at L=1, so L=1 "
-                   "emits no RPBE row (legacy protocol semantics, "
-                   "unchanged by round 8)",
+        "note_L1": "depth L=1 dialogues (3 turns) emit the TERMINAL cut "
+                   "t=1=L with (C, Y) = (c, y), w=1 — one RPBE row "
+                   "(review ruling 2026-09-21: Gamma and RPBE now cover "
+                   "every compression layer t=1..L, so L=1 is inside the "
+                   "method).",
     })
 
     def next_batch():
@@ -1583,14 +2072,22 @@ def main():
                 "degenerate depth window: every dialogue already seen "
                 "(window grew past the whole pool)")
         batch = collator(items)
+        # Review ruling (2026-09-21): the RAW tokenized turns ride along
+        # with the batch — chi/phi are built from these, never from
+        # spans carved out of the collated ids.
+        raw_dialogs = [list(item["dialog"]) for item in items]
         sample_cursor += len(items)
-        return batch, sample_cursor - len(items), orig_ids, Ls
+        return batch, sample_cursor - len(items), orig_ids, Ls, \
+            raw_dialogs
 
     threshold = window._threshold(MEM_TAU) if window else None
     save_json(out / "config.json", {
         "arm": args.arm, "seed": args.seed, "cli": vars(args),
         "paired_seed_hash": paired_seed_hash(args.seed, model)
         if use_rpbe else "n/a",
+        "actuation": "native" if args.rpbe_native_compression else "gamma",
+        "theta0_digest": params_digest(params),
+        "n_repr_params": len(repr_params),
         "threshold": threshold,
     })
     print("arm={} seed={} threshold={} n_train={}".format(
@@ -1662,7 +2159,7 @@ def main():
     # the dedup set and per-window counters reset with the window.
     depth_diag_path = out / "depth_diag.jsonl"
 
-    def close_depth_window(n_mb, step_val, n_cuts):
+    def close_depth_window(n_mb, step_val, n_cuts, n_rows=None):
         uniq = len(seen_dialogs)
         with depth_diag_path.open("a") as f:
             f.write(json.dumps({
@@ -1672,9 +2169,12 @@ def main():
                 "unique_dialogs": int(uniq),
                 "dup_rate": float(1.0 - uniq / max(int(n_mb), 1)),
                 "n_cuts": int(n_cuts),
-                # rows w=0.5: ESS=2*n_cuts (L=1 microbatches carry no
-                # RPBE row: v = k - 3 >= 1 requires depth L >= 2)
-                "ess_rows": float(2 * n_cuts),
+                # Review ruling (2026-09-21): rows per cut are 2 for
+                # t < L and 1 for the terminal cut (L=1 emits its
+                # terminal row) — pass the exact count from cut_records
+                # when available (RPBE arms), else the 2*n_cuts bound.
+                "ess_rows": float(n_rows if n_rows is not None
+                                  else 2 * n_cuts),
                 "L13_cover": float(depth_win[13] / max(int(n_mb), 1)),
             }) + "\n")
         seen_dialogs.clear()
@@ -1781,7 +2281,8 @@ def main():
                 _t = time.perf_counter()
                 rows = collect_rows(meta, adapter, builder, utter_embed,
                                      phi_embed,
-                                    embed_tokens, batch, device)
+                                    embed_tokens, batch, device,
+                                    supervisor_mode=args.supervisor_mode)
                 _pf("collect_rows", _t)
                 if rows:
                     _t = time.perf_counter()
@@ -1901,14 +2402,14 @@ def main():
         return not amp_skipped
 
     while step < args.max_steps:
-        batch, sample_id, orig_id, L = next_batch()
+        batch, sample_id, orig_id, L, raw_dialogs = next_batch()
         for _l in L:
             depth_win[_l] += 1
         # Data-stream hash for every arm (parse_meta is pure, no RNG).
         # Review round 8: the stream records the STABLE dialogue id and
         # its depth level — the per-step cursor is no longer the identity.
         metas = parse_meta(batch, comp_ids, sum_ids, sample_id,
-                           orig_ids=orig_id)
+                           orig_ids=orig_id, raw_dialogs=raw_dialogs)
         for m in metas:
             data_flow_hash.update(struct.pack(
                 ">qq", int(m["orig_id"]) if m["orig_id"] >= 0
@@ -1916,12 +2417,12 @@ def main():
             data_flow_len += 1
         with data_flow_path.open("a") as f:
             for m in metas:
-                # meta.k = len(blocks) + 1, so the compressed-history depth
-                # L = meta.k - 1 (dialog prefix = L + 2 turns).
+                # L = compressed-history turns (blocks); k = L + 1 keeps
+                # the legacy context-turn convention.
                 f.write(json.dumps({
                     "did": int(m["orig_id"]) if m["orig_id"] >= 0
                     else int(m["sample_id"]) % n_items,
-                    "L": int(m["k"]) - 1,
+                    "L": int(m["L"]),
                     "k": int(m["k"])}) + "\n")
         if window_start_state is None:
             # Builder counters are NOT rewound here: pass 2 never touches
@@ -1933,10 +2434,11 @@ def main():
             # Incremental pass 1: RNG restored after each microbatch so
             # the data-sampling stream matches the single-pass arm; the
             # cut rows and their occurrence ids accumulate monotonically.
-            # Microbatches with NO possible cut (k < 4) skip the pass-1
+            # Microbatches with NO possible cut (L < 1) skip the pass-1
             # forward entirely: no row can come from them (L6.5 perf:
             # DailyDialog's effective-cut rate is ~50%, halving the
-            # pass-1 cost).
+            # pass-1 cost).  Review ruling (2026-09-21): L = 1 now DOES
+            # emit the terminal (c, y) cut, so the gate is L >= 1.
             # P0 fix (R10, review 2026-09-16): the official Step-2 LoRA
             # carries lora_dropout=0.05 and the model is in TRAIN mode —
             # dropout consumes CUDA RNG inside the forward.  Pass 1
@@ -1948,7 +2450,7 @@ def main():
             # pass-2 forward: mask_i^pass2 == mask_i^pass1.
             state = {"rng": _rng_state()}
             pass1_rngs.append(state["rng"])
-            if any(m["ok"] and m["k"] >= 3 for m in metas):
+            if any(m["ok"] and m["L"] >= 1 for m in metas):
                 batch_cuts = pass1_one(batch, metas)
             else:
                 batch_cuts = []
@@ -2035,6 +2537,12 @@ def main():
                     # g_task uses the real training scale (per-microbatch
                     # MEAN divided by len(pending)); g_kf uses the real
                     # pass-2 scale (aux NOT divided — review P0-3).
+                    # Native line (review 2026-09-22): r_eff is measured
+                    # in PROPOSAL space via the shadow AdamW proposal —
+                    # lambda scales the predictive proposal inside the
+                    # joint center d_0, so the ratio must be the
+                    # proposal-norm ratio.  At theta_0 the optimizer
+                    # state is empty (first bias-correction step).
                     optimizer.zero_grad(set_to_none=True)
                     _restore_rng(window_start_state["rng"])
                     for b, sid in pending:
@@ -2044,7 +2552,20 @@ def main():
                             fwd_out, b["labels"], device)
                         (task_sum_m / max(n_valid_m, 1)
                          / float(len(pending))).backward()
-                    g_task = repr_grad_norm(gamma_params)
+                    if os.environ.get("CCM_CALIB_DIAG") == "1":
+                        _gd = [p for p in repr_params
+                               if p.grad is not None]
+                        print("CALIBDIAG task: n_grad={}/{} lr={} "
+                              "g_abs0={}".format(
+                                  len(_gd), len(repr_params),
+                                  optimizer.param_groups[0]["lr"],
+                                  float(_gd[0].grad.abs().sum())
+                                  if _gd else None), flush=True)
+                    if args.rpbe_native_compression:
+                        g_task = proposal_norm(optimizer, repr_params, 1,
+                                               lr_override=1.0)
+                    else:
+                        g_task = repr_grad_norm(repr_params)
                     g_task_all = repr_grad_norm(params)
                     optimizer.zero_grad(set_to_none=True)
                     _restore_rng(window_start_state["rng"])
@@ -2069,7 +2590,11 @@ def main():
                         if n_aux:
                             aux.backward()
                     _restore_rng(resume_rng)
-                    g_kf = repr_grad_norm(gamma_params)
+                    if args.rpbe_native_compression:
+                        g_kf = proposal_norm(optimizer, repr_params, 1,
+                                             lr_override=1.0)
+                    else:
+                        g_kf = repr_grad_norm(repr_params)
                     g_kf_all = repr_grad_norm(params)
                     if params_digest(params) != digest0:
                         raise RuntimeError(
@@ -2079,21 +2604,37 @@ def main():
                     r_eff_all = g_kf_all / max(g_task_all, 1e-30)
                     derived = 0.1 / max(r_eff, 1e-30)
                     save_json(out / "calibration.json", {
-                        "g_task_gamma": g_task, "g_kf_gamma": g_kf,
+                        "g_task_repr": g_task, "g_kf_gamma": g_kf,
                         "r_eff_gamma": r_eff,
                         "g_task_all": g_task_all, "g_kf_all": g_kf_all,
                         "r_eff_all": r_eff_all,
                         "derived_lambda": derived,
                         "optimizer_steps": 0, "scheduler_steps": 0,
-                        "rule": "R10 gamma-scope calibration "
-                                "(review 2026-09-16): lambda = 0.1 / "
-                                "r_eff measured on the GAMMA group only "
-                                "at theta_0, chain-wise window"})
-                    print(json.dumps({"g_task_gamma": g_task,
+                        "scope": "native" if args.rpbe_native_compression
+                        else "gamma",
+                        "space": "proposal" if args.rpbe_native_compression
+                        else "gradient",
+                        "rule": (
+                            "native-scope calibration (review "
+                            "2026-09-22): lambda = 0.1 / r_eff measured "
+                            "in PROPOSAL space on the native compression "
+                            "params at theta_0"
+                            if args.rpbe_native_compression else
+                            "R10 gamma-scope calibration (review "
+                            "2026-09-16): lambda = 0.1 / r_eff measured "
+                            "on the GAMMA group only at theta_0, "
+                            "chain-wise window")})
+                    print(json.dumps({"g_task_repr": g_task,
                                       "g_kf_gamma": g_kf,
                                       "r_eff_gamma": r_eff,
                                       "r_eff_all": r_eff_all,
                                       "derived_lambda": derived,
+                                      "scope": "native"
+                                      if args.rpbe_native_compression
+                                      else "gamma",
+                                      "space": "proposal"
+                                      if args.rpbe_native_compression
+                                      else "gradient",
                                       "theta0_verified": True},
                                      indent=2), flush=True)
                     return
@@ -2116,85 +2657,317 @@ def main():
                     # into the intersection of the per-tree half-spaces
                     # and certifies EVERY row at 1e-6; a failed
                     # certificate skips the representation step below.
-                    for i, (b, sid) in enumerate(pending):
-                        _restore_rng(pass1_rngs[i])   # P0: mask == pass1
-                        # V11 (review): the QP center is the JOINT
-                        # proposal q = t + a_lambda, not the bare task
-                        # proposal t.  Running pass2_one with the real
-                        # lambda accumulates the aggregate RPBE gradient
-                        # ONTO the Gamma task gradient, so the snapshot
-                        # below (g_task_gamma) is exactly the joint
-                        # proposal direction; the projection then trims
-                        # only the components that hurt a local
-                        # interface.  Non-Gamma params keep pure task
-                        # (rpbe_gamma_only structure, unchanged).
-                        task_mean, task_raw, n_valid, _aux, _n = pass2_one(
-                            b, cut_records[i], g_by_oid,
-                            0.0 if args.arm == "gamma_task_only"
-                            else lambda_kf)
-                        if task_mean.requires_grad:
-                            # freeze-host fix: k<3 batches carry no
-                            # COMP/SUM rows, so Gamma never touches the
-                            # output and task_mean has no graph.  Skip
-                            # their (zero) backward instead of dying.
-                            scaler.scale(
-                                task_mean
-                                / float(len(pending))).backward(
-                                    retain_graph=True)
-                        if _n and args.arm == "ours" and _aux.requires_grad:
-                            # V11: accumulate the aggregate RPBE gradient
-                            # onto Gamma so the snapshot below is the
-                            # joint proposal q = t + a_lambda (mirrors
-                            # the aggregate branch's aux backward).
-                            # freeze-host fix: _n>0 but a graph-less _aux
-                            # (all oids filtered out) has nothing to add.
-                            scaler.scale(_aux).backward()
-                        task_sum += float(task_raw.detach())
-                        n_tokens += n_valid
-                    task_grads = {id(p): p.grad.detach().clone()
-                                  for p in params if p.grad is not None}
+                    if args.rpbe_native_compression:
+                        # Native proposal-space line (review 2026-09-22):
+                        # the QP needs BOTH the pure task proposal
+                        # (constraint norm ||d_task||) and the joint
+                        # proposal (center d_0).  OOM fix (2026-09-22,
+                        # second): with the LoRA trainable, EVERY
+                        # layer's hidden carries grad, so one tree's
+                        # graph holds the full 36-layer saved
+                        # activations — retaining the whole window's
+                        # graphs (128 trees) blew the 40GB card twice.
+                        # Per-batch: task backward (retain for THIS
+                        # batch's aux) -> accumulate the PURE task
+                        # increment (grad delta) -> aux backward FREES
+                        # the graph.  pure_acc holds the exact pure
+                        # task gradient in scaled space.
+                        pure_acc = {}
+                        for i, (b, sid) in enumerate(pending):
+                            _restore_rng(pass1_rngs[i])  # P0: mask==pass1
+                            task_mean, task_raw, n_valid, _aux, _n = \
+                                pass2_one(b, cut_records[i], g_by_oid,
+                                          (0.0 if args.s4_supervisor
+                                           else lambda_kf))
+                            _before = {
+                                id(p): p.grad.detach().clone()
+                                for p in params if p.grad is not None}
+                            if task_mean.requires_grad:
+                                # S4 supervisor (review 2026-09-23):
+                                # NO retain — the S4 loop runs its OWN
+                                # per-observation forwards, so the
+                                # sketch surrogate graph is not needed.
+                                scaler.scale(
+                                    task_mean
+                                    / float(len(pending))).backward(
+                                        retain_graph=(
+                                            not args.s4_supervisor))
+                            for p in params:
+                                if p.grad is None:
+                                    continue
+                                _prev = _before.get(id(p))
+                                _inc = p.grad.detach() - (
+                                    _prev if _prev is not None
+                                    else torch.zeros_like(p.grad))
+                                if id(p) in pure_acc:
+                                    pure_acc[id(p)].add_(_inc)
+                                else:
+                                    pure_acc[id(p)] = _inc.clone()
+                            if _n and _aux.requires_grad \
+                                    and not args.s4_supervisor:
+                                scaler.scale(_aux).backward()  # frees graph
+                            task_sum += float(task_raw.detach())
+                            n_tokens += n_valid
+                        task_grads_pure = pure_acc
+                        if not args.s4_supervisor:
+                            task_grads = {
+                                id(p): p.grad.detach().clone()
+                                for p in params if p.grad is not None}
+                    else:
+                        for i, (b, sid) in enumerate(pending):
+                            _restore_rng(pass1_rngs[i])   # P0: mask == pass1
+                            # V11 (review): the QP center is the JOINT
+                            # proposal q = t + a_lambda, not the bare
+                            # task proposal t.  Running pass2_one with
+                            # the real lambda accumulates the aggregate
+                            # RPBE gradient ONTO the Gamma task
+                            # gradient, so the snapshot below
+                            # (g_task_repr) is exactly the joint
+                            # proposal direction; the projection then
+                            # trims only the components that hurt a
+                            # local interface.  Non-Gamma params keep
+                            # pure task (rpbe_gamma_only structure,
+                            # unchanged).
+                            task_mean, task_raw, n_valid, _aux, _n = \
+                                pass2_one(
+                                    b, cut_records[i], g_by_oid,
+                                    0.0 if args.arm == "gamma_task_only"
+                                    else lambda_kf)
+                            if task_mean.requires_grad:
+                                # freeze-host fix: k<3 batches carry no
+                                # COMP/SUM rows, so Gamma never touches
+                                # the output and task_mean has no graph.
+                                # Skip their (zero) backward instead of
+                                # dying.
+                                scaler.scale(
+                                    task_mean
+                                    / float(len(pending))).backward(
+                                        retain_graph=True)
+                            if _n and args.arm == "ours" \
+                                    and _aux.requires_grad:
+                                # V11: accumulate the aggregate RPBE
+                                # gradient onto Gamma so the snapshot
+                                # below is the joint proposal
+                                # q = t + a_lambda (mirrors the aggregate
+                                # branch's aux backward).  freeze-host
+                                # fix: _n>0 but a graph-less _aux (all
+                                # oids filtered out) has nothing to add.
+                                scaler.scale(_aux).backward()
+                            task_sum += float(task_raw.detach())
+                            n_tokens += n_valid
+                        task_grads = {
+                            id(p): p.grad.detach().clone()
+                            for p in params if p.grad is not None}
                     optimizer.zero_grad(set_to_none=True)
                     aux_other = {id(p): torch.zeros_like(p)
                                  for p in params
-                                 if id(p) not in gamma_set}
+                                 if id(p) not in repr_set}
+                    native_g_joint = None   # true-value g_joint for the
+                    native_amp_skip = False  # native proposal write-back
                     dirs = []
-                    for i, (b, sid) in enumerate(pending):
-                        _restore_rng(pass1_rngs[i])  # P0: mask == pass1
-                        fwd_out = run_forward(model, b, device,
-                                              grad_enabled=True)
-                        for meta, oid, v in cut_records[i]:
-                            g = g_by_oid.get(oid)
-                            if g is None:
-                                continue
-                            optimizer.zero_grad(set_to_none=True)
-                            z = collect_replay_z(meta, adapter, device,
-                                                 v=v)
-                            gd = g.detach()
-                            aux_i = -lambda_kf * ((gd * z).sum()
-                                                  - (gd * z.detach()).sum())
-                            # retain_graph: the SAME fwd_out graph is
-                            # replayed for every cut of this batch
-                            # (treewise bug found by the probe audit:
-                            # the second cut's backward died on a freed
-                            # graph — treewise mode had never run).
-                            aux_i.backward(retain_graph=True)
-                            # CPU-side accumulation (OOM fix):
-                            # the dirs matrix is ~n_dirs x n_gamma fp32
-                            # (~4GB for 1098 dirs); keeping the list on
-                            # GPU plus the torch.stack copy doubled the
-                            # peak and blew the 40GB card.
-                            dirs.append(torch.cat(
-                                [p.grad.reshape(-1).float()
-                                 for p in gamma_params]).cpu())
-                            for p in params:
-                                if id(p) not in gamma_set \
-                                        and p.grad is not None:
-                                    aux_other[id(p)].add_(p.grad.detach())
-                        adapter.clear()
+                    s4_pred_acc = {}
+                    if args.rpbe_native_compression \
+                            and args.s4_supervisor:
+                        # S4 formal supervisor (review 2026-09-23
+                        # frozen candidate): the treewise directions are
+                        # the per-observation real-token NLL gap
+                        # gradients q_{t,h} = grad_theta w_h * Delta,
+                        # Delta = l_comp - sg(l_full).  Each observation
+                        # runs its OWN comp-dialogue forward (grad) and
+                        # full-dialogue forward (no_grad, detach) with
+                        # the SAME future conditioning — only the
+                        # history compression differs.  The per-obs
+                        # backward also accumulates the lambda-weighted
+                        # aggregate predictive gradient (the joint
+                        # proposal center d_0).
+                        # Speed fix (2026-09-23): the observations of
+                        # ONE tree batch into a single multi-row
+                        # forward (<=2 rows); the per-row CE backwards
+                        # share that graph (retain until the last row —
+                        # the same rolling-release pattern as the
+                        # sketch dirs loop).  Method-identical to the
+                        # per-obs forwards, ~2x fewer forwards.
+                        # --s4-ref-cache: the full-reference NLLs for
+                        # the WHOLE window are precomputed in chunked
+                        # no_grad forwards before the loop and looked
+                        # up per observation (q_{t,h} is unchanged —
+                        # l_full is a stop-grad scalar).
+                        _ref_table = {}
+                        if args.s4_ref_cache:
+                            _ref_items = []
+                            for _i2 in range(len(pending)):
+                                for meta, oid, v in cut_records[_i2]:
+                                    if g_by_oid.get(oid) is None:
+                                        continue
+                                    for _h, _cd, _fd, _w in s4_obs_list(
+                                            meta, int(v)):
+                                        _ref_items.append(
+                                            ((oid, _h), _fd))
+                            with torch.no_grad():
+                                for _c0 in range(
+                                        0, len(_ref_items),
+                                        args.s4_ref_chunk):
+                                    _chunk = _ref_items[
+                                        _c0:_c0 + args.s4_ref_chunk]
+                                    _b3 = collator(
+                                        [{"dialog": _d,
+                                          "fixed_depth": True}
+                                         for _, _d in _chunk])
+                                    _b3 = {kk: vv.to(device)
+                                           for kk, vv in _b3.items()}
+                                    _f3 = run_forward(
+                                        model, _b3, device,
+                                        grad_enabled=False)
+                                    _sh3 = _f3.logits[..., :-1, :] \
+                                        .contiguous()
+                                    _sl3 = _b3["labels"][..., 1:] \
+                                        .contiguous()
+                                    for _j3, (_key, _d) in \
+                                            enumerate(_chunk):
+                                        _m3 = _sl3[_j3] != -100
+                                        _ref_table[_key] = float(
+                                            F.cross_entropy(
+                                                _sh3[_j3][_m3],
+                                                _sl3[_j3][_m3]))
+                        for i, (b, sid) in enumerate(pending):
+                            for meta, oid, v in cut_records[i]:
+                                if g_by_oid.get(oid) is None:
+                                    continue
+                                _obs = s4_obs_list(meta, int(v))
+                                _b2 = collator(
+                                    [{"dialog": _d, "fixed_depth": True}
+                                     for _, _d, _, _ in _obs])
+                                _b2 = {kk: vv.to(device)
+                                       for kk, vv in _b2.items()}
+                                _f2 = run_forward(model, _b2, device,
+                                                  grad_enabled=True)
+                                _sh2 = _f2.logits[..., :-1, :] \
+                                    .contiguous()
+                                _sl2 = _b2["labels"][..., 1:] \
+                                    .contiguous()
+                                for _j, (_h, _cdlg, _fdlg, _w) in \
+                                        enumerate(_obs):
+                                    _m2 = _sl2[_j] != -100
+                                    _ce_c = F.cross_entropy(
+                                        _sh2[_j][_m2], _sl2[_j][_m2])
+                                    if _ref_table:
+                                        _ce_f = _ref_table[(oid, _h)]
+                                        _ce_f = torch.tensor(
+                                            _ce_f, dtype=_ce_c.dtype,
+                                            device=_ce_c.device)
+                                    else:
+                                        with torch.no_grad():
+                                            _b3 = collator(
+                                                [{"dialog": _fdlg,
+                                                  "fixed_depth": True}])
+                                            _b3 = {kk: vv.to(device)
+                                                   for kk, vv
+                                                   in _b3.items()}
+                                            _f3 = run_forward(
+                                                model, _b3, device,
+                                                grad_enabled=False)
+                                            _sh3 = _f3.logits[
+                                                ..., :-1, :] \
+                                                .contiguous()
+                                            _sl3 = _b3["labels"][
+                                                ..., 1:].contiguous()
+                                            _m3 = _sl3 != -100
+                                            _ce_f = F.cross_entropy(
+                                                _sh3[_m3], _sl3[_m3])
+                                    # raw gap, stop-grad full reference
+                                    _loss_h = scaler.scale(
+                                        lambda_kf * _w
+                                        * (_ce_c - _ce_f.detach()))
+                                    optimizer.zero_grad(
+                                        set_to_none=True)
+                                    _loss_h.backward(
+                                        retain_graph=(
+                                            _j < len(_obs) - 1))
+                                    dirs.append(torch.cat(
+                                        [p.grad.reshape(-1).float()
+                                         if p.grad is not None else
+                                         torch.zeros(p.numel(),
+                                                     dtype=torch.float32,
+                                                     device=p.device)
+                                         for p in repr_params]).cpu())
+                                    for p in params:
+                                        if p.grad is None:
+                                            continue
+                                        if id(p) in s4_pred_acc:
+                                            s4_pred_acc[id(p)].add_(
+                                                p.grad.detach())
+                                        else:
+                                            s4_pred_acc[id(p)] = (
+                                                p.grad.detach().clone())
+                                adapter.clear()
+                        # joint (scaled space) = pure task + lambda-w-
+                        # eighted aggregate S4 gradient.
+                        task_grads = {}
+                        for p in params:
+                            _v = task_grads_pure.get(id(p))
+                            _v = (_v.clone() if _v is not None
+                                  else torch.zeros_like(p))
+                            _e = s4_pred_acc.get(id(p))
+                            if _e is not None:
+                                _v = _v + _e
+                            task_grads[id(p)] = _v
+                    else:
+                        for i, (b, sid) in enumerate(pending):
+                            _restore_rng(pass1_rngs[i])  # P0: mask==pass1
+                            fwd_out = run_forward(model, b, device,
+                                                  grad_enabled=True)
+                            # OOM fix (review 2026-09-22): retain_graph on
+                            # EVERY cut kept this batch's full graph alive
+                            # for the whole window — with the LoRA trainable
+                            # (native), all 36 layers' activations carry
+                            # grad, so 128 trees of retained graphs blew the
+                            # 40GB card.  Retain only until the batch's LAST
+                            # cut; its backward frees the graph.  Gradient
+                            # VALUES are unchanged (retain only controls
+                            # graph lifetime).
+                            _cuts = [(meta, oid, v) for meta, oid, v
+                                     in cut_records[i]
+                                     if g_by_oid.get(oid) is not None]
+                            for _j, (meta, oid, v) in enumerate(_cuts):
+                                g = g_by_oid.get(oid)
+                                optimizer.zero_grad(set_to_none=True)
+                                z = collect_replay_z(meta, adapter, device,
+                                                     v=v)
+                                gd = g.detach()
+                                aux_i = -lambda_kf * ((gd * z).sum()
+                                                      - (gd * z.detach()).sum())
+                                # retain_graph: the SAME fwd_out graph is
+                                # replayed for every cut of this batch
+                                # (treewise bug found by the probe audit:
+                                # the second cut's backward died on a freed
+                                # graph — treewise mode had never run).
+                                aux_i.backward(
+                                    retain_graph=(_j < len(_cuts) - 1))
+                                # CPU-side accumulation (OOM fix):
+                                # the dirs matrix is ~n_dirs x n_gamma fp32
+                                # (~4GB for 1098 dirs); keeping the list on
+                                # GPU plus the torch.stack copy doubled the
+                                # peak and blew the 40GB card.  Structural
+                                # zeros (native): the last layer's q/o LoRA
+                                # has NO path in z's graph -> grad None,
+                                # pad with zeros (review 2026-09-22).
+                                dirs.append(torch.cat(
+                                    [p.grad.reshape(-1).float()
+                                     if p.grad is not None else
+                                     torch.zeros(p.numel(),
+                                                 dtype=torch.float32,
+                                                 device=p.device)
+                                     for p in repr_params]).cpu())
+                                for p in params:
+                                    if id(p) not in repr_set \
+                                            and p.grad is not None:
+                                        aux_other[id(p)].add_(
+                                            p.grad.detach())
+                            adapter.clear()
                     optimizer.zero_grad(set_to_none=True)
-                    g_task_gamma = [
+                    g_task_repr = [
                         task_grads.get(id(p), torch.zeros_like(p))
-                        for p in gamma_params]
+                        for p in repr_params]
                     if os.environ.get("CCM_TREEWISE_PROBE") == "1" \
                             and dirs:
                         # Audit (review): cos(g_task, g_v) distribution
@@ -2207,7 +2980,7 @@ def main():
                         import numpy as _np
                         _t_flat = torch.cat(
                             [x.reshape(-1).float()
-                             for x in g_task_gamma])
+                             for x in g_task_repr])
                         _nt = float(_t_flat.norm())
                         _G = torch.stack(dirs)
                         _nr = _G.norm(dim=1)
@@ -2243,45 +3016,987 @@ def main():
                         raise SystemExit(
                             "CCM_TREEWISE_PROBE: window probed, "
                             "no optimizer step executed")
-                    proj_ok, proj_diag = treewise_feasibility_projection(
-                        [x.detach().cpu() for x in g_task_gamma],
-                        gamma_params,
-                        (torch.stack(dirs)
-                         if dirs else None),
-                        args.rpbe_kappa, iters=args.proj_iters,
-                        # V11 (self-ruled 2026-09-21): the TGN final-spec
-                        # 1e-6 certificate is a fp32 contract; CCM runs
-                        # the QP on fp16 GradScaler-SCALED gradients, so
-                        # the achievable max_viol floors at ~1e-5
-                        # (measured: 8.37e-06 / 1e-05 across the first
-                        # windows).  Keeping 1e-6 made EVERY window
-                        # cert_fail and skipped every repr update — the
-                        # V11 joint-QP experiment would degenerate to
-                        # task-only.  1e-4 is the fp16-achievable line;
-                        # the skip-on-failure semantics is unchanged.
-                        cert_tol=1e-4)
-                    cert_fail = bool(proj_diag.get("cert_fail"))
-                    if not proj_ok:
-                        # CERT_FAIL: no constrained update is executed —
-                        # zero the non-Gamma grads too and skip the
-                        # representation step (final-spec reviewer
-                        # requirement; TGN: "skipping repr step").
-                        for p in params:
-                            if id(p) in gamma_set:
-                                p.grad = None
+                    if args.rpbe_native_compression:
+                        # Shared pre-projection block (P0 fix +
+                        # interface probe share): NO live p.grad exists
+                        # here — the pure/joint snapshots taken BEFORE
+                        # the dirs loop are the only gradient source.
+                        # They were recorded in SCALED space: divide by
+                        # the current scale to recover the true values
+                        # (no scaler.unscale_ needed).
+                        scale_f = float(scaler.get_scale())
+                        g_joint_true = [
+                            (task_grads.get(id(p), torch.zeros_like(p))
+                             .detach() / scale_f)
+                            for p in repr_params]
+                        g_task_true = [
+                            (task_grads_pure.get(
+                                id(p), torch.zeros_like(p)).detach()
+                             / scale_f)
+                            for p in repr_params]
+                        _inf = any(
+                            not bool(torch.isfinite(g).all())
+                            for g in g_joint_true)
+                    if args.rpbe_native_compression \
+                            and os.environ.get("CCM_INTERFACE_PROBE") == "1":
+                        # Interface-space probe (review 2026-09-23):
+                        # compare the predictive adjoint lifted BACK to
+                        # memory space, r_pred = J_mem^T a_i, with the
+                        # CE gradient AT the memory, r_task =
+                        # grad_{M_i} L_task — BEFORE either is pulled
+                        # through the LoRA Jacobian.  cos ~ 0 here =>
+                        # the phi/J predictive notion itself is
+                        # task-orthogonal (supervision geometry);
+                        # cos clearly negative here but ~0 in parameter
+                        # space => actuation/Jacobian support.
+                        _lift = adapter.j_mem
+                        cos_if = []
+                        for i, (b, sid) in enumerate(pending):
+                            _restore_rng(pass1_rngs[i])
+                            optimizer.zero_grad(set_to_none=True)
+                            fwd_out = run_forward(model, b, device,
+                                                  grad_enabled=True)
+                            for _entry in adapter._cache:
+                                if _entry is not None:
+                                    _entry[0].retain_grad()
+                                    _entry[1].retain_grad()
+                            _tsm, _nvm = task_ce_shifted(
+                                fwd_out, b["labels"], device)
+                            (_tsm / max(_nvm, 1)
+                             / float(len(pending))).backward()
+                            for meta, oid, v in cut_records[i]:
+                                _a = g_by_oid.get(oid)
+                                if _a is None:
+                                    continue
+                                _pos = torch.tensor(
+                                    [[meta["blocks"][v][1],
+                                      meta["blocks"][v][1] + 1]],
+                                    dtype=torch.long, device=device)
+                                _kp, _vp = [], []
+                                for _entry in adapter._cache:
+                                    _k, _v = _entry[0], _entry[1]
+                                    _idx = _pos.unsqueeze(1).expand(
+                                        -1, _k.shape[1], -1)
+                                    _idx = _idx.unsqueeze(-1).expand(
+                                        -1, -1, -1, _k.shape[-1])
+                                    _kp.append(torch.gather(_k.grad, 2,
+                                                            _idx))
+                                    _vp.append(torch.gather(_v.grad, 2,
+                                                            _idx))
+                                _r_task = JMemLift.pack_sum_mem(
+                                    _kp, _vp)[0]        # [full_dim]
+                                _r_pred = _lift.transpose(
+                                    _a.unsqueeze(0))[0]  # [full_dim]
+                                # dtype align: K/V grads are bf16, the
+                                # adjoint is float32.
+                                _rt = _r_task.float()
+                                _rp = _r_pred.float()
+                                _den = (_rt.norm()
+                                        * _rp.norm()).clamp(
+                                            min=1e-12)
+                                cos_if.append(
+                                    float((_rt @ _rp) / _den))
+                            adapter.clear()
+                        cos_if = [float(c) for c in cos_if]
+                        _ci = np.array(cos_if)
+                        # Block-wise support overlap (review 2026-09-23):
+                        # split the flat repr dims by (layer, proj) and
+                        # measure per-block energy shares and the
+                        # block-level cos(q_i^block, g_task^block).
+                        _gt_flat = torch.cat(
+                            [g.reshape(-1).float().cpu()
+                             for g in g_task_true])
+                        _G = torch.stack(dirs)
+                        _blocks = []
+                        _off = 0
+                        for _n, _p in model.named_parameters():
+                            if not _p.requires_grad:
+                                continue
+                            _num = _p.numel()
+                            _blocks.append((_n, _off, _off + _num))
+                            _off += _num
+                        _bnorm_ratio_q = {}
+                        _bnorm_ratio_t = {}
+                        _bcos = {}
+                        _beta_b = {}
+                        _gnorms = _G.norm(dim=1).clamp(min=1e-12)
+                        for _n, _s, _e in _blocks:
+                            _qb = _G[:, _s:_e]
+                            _gb = _gt_flat[_s:_e]
+                            _bnorm_ratio_q[_n] = float(
+                                (_qb.norm(dim=1) / _gnorms).mean())
+                            _bnorm_ratio_t[_n] = float(
+                                _gb.norm() / _gt_flat.norm().clamp(
+                                    min=1e-12))
+                            _bcos[_n] = float(
+                                ((_qb @ _gb) / (
+                                    _qb.norm(dim=1).clamp(min=1e-12)
+                                    * _gb.norm().clamp(min=1e-12)))
+                                .mean())
+                            # eta_b (review 2026-09-23): the block's
+                            # TRUE contribution to the global alignment
+                            # q^T d / (||q|| ||d||) — a large local cos
+                            # on a tiny-energy block contributes ~0.
+                            _beta_b[_n] = float(
+                                ((_qb @ _gb) / (
+                                    _gnorms
+                                    * _gt_flat.norm().clamp(
+                                        min=1e-12))).mean())
+                        _probe = {
+                            "interface_cos_mean": float(_ci.mean()),
+                            "interface_cos_med": float(np.median(_ci)),
+                            "interface_cos_p5": float(
+                                np.percentile(_ci, 5.0)),
+                            "interface_cos_min": float(_ci.min()),
+                            "interface_cos_max": float(_ci.max()),
+                            "n_cuts": int(len(cos_if)),
+                            "block_norm_ratio_q": _bnorm_ratio_q,
+                            "block_norm_ratio_t": _bnorm_ratio_t,
+                            "block_cos": _bcos,
+                            "block_eta": _beta_b,
+                        }
+                        with (out / "interface_probe.json").open("w") \
+                                as _f:
+                            json.dump(_probe, _f, indent=1)
+                        _top_q = sorted(
+                            _bnorm_ratio_q.items(),
+                            key=lambda kv: -kv[1])[:4]
+                        _top_t = sorted(
+                            _bnorm_ratio_t.items(),
+                            key=lambda kv: -kv[1])[:4]
+                        print("[interface-probe] n_cuts={} cos: "
+                              "mean={:.4f} med={:.4f} p5={:.4f} "
+                              "min={:.4f} max={:.4f}".format(
+                                  len(cos_if), _probe["interface_cos_mean"],
+                                  _probe["interface_cos_med"],
+                                  _probe["interface_cos_p5"],
+                                  _probe["interface_cos_min"],
+                                  _probe["interface_cos_max"]),
+                              flush=True)
+                        print("[interface-probe] top energy q: {} | "
+                              "top energy t: {}".format(
+                                  _top_q, _top_t), flush=True)
+                        optimizer.zero_grad(set_to_none=True)
+                    if args.rpbe_native_compression \
+                            and os.environ.get("CCM_S3_PROBE") == "1":
+                        # S3 probe (review 2026-09-23): full-context
+                        # teacher vs compressed prediction at EVERY cut.
+                        # The recursive interface stays Z_t = M_t; what
+                        # changes is the future predictive test:
+                        #   pi_full_j = p(·| u_{1:L}, c, y_{<j})   (frozen
+                        #       teacher, the standard CCM forward at y)
+                        #   pi_comp_j = p(·| M_t, u_{t+1:L}, c, y_{<j})
+                        #       — a REORGANIZED dialogue: u_1..u_t
+                        #       compressed into M_t, the remaining
+                        #       suffix as the context turn, y as target
+                        #   D_t = mean_j KL(pi_full_j || pi_comp_j)
+                        #   a^S3 = grad_{M_t} D_t  (memory space),
+                        #   q^S3 = grad_theta D_t (parameter space)
+                        # Four numbers vs the CE task direction.
+                        _gt_flat = torch.cat(
+                            [g.reshape(-1).float().cpu()
+                             for g in g_task_true])
+                        r_task_cache = {}
+                        teacher_cache = {}
+                        for i, (b, sid) in enumerate(pending):
+                            _restore_rng(pass1_rngs[i])
+                            optimizer.zero_grad(set_to_none=True)
+                            fwd_out = run_forward(model, b, device,
+                                                  grad_enabled=True)
+                            _lg = fwd_out.logits
+                            _lb = b["labels"]
+                            _sh = _lg[..., :-1, :].contiguous()
+                            _sl = _lb[..., 1:].contiguous()
+                            _mask = _sl != -100
+                            _t_logits = _sh[_mask].detach()
+                            for _entry in adapter._cache:
+                                if _entry is not None:
+                                    _entry[0].retain_grad()
+                                    _entry[1].retain_grad()
+                            _tsm, _nvm = task_ce_shifted(
+                                fwd_out, b["labels"], device)
+                            (_tsm / max(_nvm, 1)
+                             / float(len(pending))).backward()
+                            for meta, oid, v in cut_records[i]:
+                                _pos = torch.tensor(
+                                    [[meta["blocks"][v][1],
+                                      meta["blocks"][v][1] + 1]],
+                                    dtype=torch.long, device=device)
+                                _kp, _vp = [], []
+                                for _entry in adapter._cache:
+                                    _k, _v = _entry[0], _entry[1]
+                                    _idx = _pos.unsqueeze(1).expand(
+                                        -1, _k.shape[1], -1)
+                                    _idx = _idx.unsqueeze(-1).expand(
+                                        -1, -1, -1, _k.shape[-1])
+                                    _kp.append(torch.gather(_k.grad, 2,
+                                                            _idx))
+                                    _vp.append(torch.gather(_v.grad, 2,
+                                                            _idx))
+                                r_task_cache[oid] = JMemLift.pack_sum_mem(
+                                    _kp, _vp)[0].float()
+                            teacher_cache[i] = (_t_logits,
+                                               int(_mask.sum()))
+                            adapter.clear()
+                        cos_mem_s3 = []
+                        cos_par_s3 = []
+                        q_agg = None
+                        for i, (b, sid) in enumerate(pending):
+                            for meta, oid, v in cut_records[i]:
+                                if g_by_oid.get(oid) is None:
+                                    continue
+                                _t = int(v) + 1
+                                _raw = meta["raw_dialog"]
+                                _L = int(meta["L"])
+                                _suffix = [tok for _x in
+                                           range(_t, _L + 1)
+                                           for tok in _raw[_x]]
+                                _new_dialog = ([list(_raw[_x])
+                                                for _x in range(_t)]
+                                               + [_suffix]
+                                               + [list(_raw[_L + 1])])
+                                _item = {"dialog": _new_dialog,
+                                         "fixed_depth": True}
+                                _b2 = collator([_item])
+                                _b2 = {kk: vv.to(device)
+                                       for kk, vv in _b2.items()}
+                                optimizer.zero_grad(set_to_none=True)
+                                _f2 = run_forward(model, _b2, device,
+                                                  grad_enabled=True)
+                                for _entry in adapter._cache:
+                                    if _entry is not None:
+                                        _entry[0].retain_grad()
+                                        _entry[1].retain_grad()
+                                _lg2 = _f2.logits
+                                _lb2 = _b2["labels"]
+                                _sh2 = _lg2[..., :-1, :].contiguous()
+                                _sl2 = _lb2[..., 1:].contiguous()
+                                _mask2 = _sl2 != -100
+                                _s_logits = _sh2[_mask2]
+                                _t_logits, _n_tok = teacher_cache[i]
+                                _n_s = int(_mask2.sum())
+                                _n_min = min(_n_tok, _n_s)
+                                _kl = F.kl_div(
+                                    torch.log_softmax(
+                                        _s_logits[:_n_min], dim=-1),
+                                    torch.softmax(
+                                        _t_logits[:_n_min], dim=-1),
+                                    reduction="none").sum(-1)
+                                _D = _kl.mean()
+                                _D.backward()
+                                _meta2 = parse_meta(_b2, comp_ids,
+                                                    sum_ids, sid)[0]
+                                _pos2 = torch.tensor(
+                                    [[_meta2["blocks"][_t - 1][1],
+                                      _meta2["blocks"][_t - 1][1] + 1]],
+                                    dtype=torch.long, device=device)
+                                _kp2, _vp2 = [], []
+                                for _entry in adapter._cache:
+                                    _k, _v = _entry[0], _entry[1]
+                                    _idx = _pos2.unsqueeze(1).expand(
+                                        -1, _k.shape[1], -1)
+                                    _idx = _idx.unsqueeze(-1).expand(
+                                        -1, -1, -1, _k.shape[-1])
+                                    _kp2.append(torch.gather(_k.grad, 2,
+                                                             _idx))
+                                    _vp2.append(torch.gather(_v.grad, 2,
+                                                             _idx))
+                                _a_s3 = JMemLift.pack_sum_mem(
+                                    _kp2, _vp2)[0].float()
+                                _r_task = r_task_cache[oid]
+                                _den_m = (_a_s3.norm()
+                                          * _r_task.norm()).clamp(
+                                              min=1e-12)
+                                cos_mem_s3.append(
+                                    float((_a_s3 @ _r_task) / _den_m))
+                                _q_flat = torch.cat(
+                                    [p.grad.reshape(-1).float()
+                                     if p.grad is not None else
+                                     torch.zeros(p.numel(),
+                                                 dtype=torch.float32,
+                                                 device=p.device)
+                                     for p in repr_params]).cpu()
+                                _den_p = (_q_flat.norm()
+                                          * _gt_flat.norm()).clamp(
+                                              min=1e-12)
+                                cos_par_s3.append(
+                                    float((_q_flat @ _gt_flat)
+                                          / _den_p))
+                                q_agg = (_q_flat if q_agg is None
+                                         else q_agg + _q_flat)
+                            adapter.clear()
+                        cos_mem_s3 = [float(c) for c in cos_mem_s3]
+                        cos_par_s3 = [float(c) for c in cos_par_s3]
+                        _cm = np.array(cos_mem_s3)
+                        _cp = np.array(cos_par_s3)
+                        _agg_cos_s3 = float(
+                            ((q_agg @ _gt_flat)
+                             / (q_agg.norm()
+                                * _gt_flat.norm()).clamp(
+                                    min=1e-12))) if q_agg is not None \
+                            else 0.0
+                        _s3 = {
+                            "n_cuts": int(len(cos_mem_s3)),
+                            "cos_mem_mean": float(_cm.mean()),
+                            "cos_mem_med": float(np.median(_cm)),
+                            "cos_mem_p5": float(np.percentile(_cm, 5.0)),
+                            "cos_mem_min": float(_cm.min()),
+                            "cos_mem_max": float(_cm.max()),
+                            "cos_par_mean": float(_cp.mean()),
+                            "cos_par_med": float(np.median(_cp)),
+                            "cos_par_p5": float(np.percentile(_cp, 5.0)),
+                            "cos_par_min": float(_cp.min()),
+                            "frac_par_neg_kappa": float(
+                                np.mean(_cp < -args.rpbe_kappa)),
+                            "cos_agg": _agg_cos_s3,
+                        }
+                        with (out / "s3_probe.json").open("w") as _f:
+                            json.dump(_s3, _f, indent=1)
+                        print("[s3-probe] n={} mem_cos: mean={:.4f} "
+                              "p5={:.4f} min={:.4f} | par_cos: "
+                              "mean={:.4f} p5={:.4f} min={:.4f} "
+                              "Pr<-k={:.4f} | AGG={:.4f}".format(
+                                  _s3["n_cuts"],
+                                  _s3["cos_mem_mean"], _s3["cos_mem_p5"],
+                                  _s3["cos_mem_min"],
+                                  _s3["cos_par_mean"], _s3["cos_par_p5"],
+                                  _s3["cos_par_min"],
+                                  _s3["frac_par_neg_kappa"],
+                                  _s3["cos_agg"]), flush=True)
+                        optimizer.zero_grad(set_to_none=True)
+                    if args.rpbe_native_compression \
+                            and os.environ.get("CCM_S4_PROBE") == "1":
+                        # S4 probe (review 2026-09-23): ground-truth
+                        # next-token predictive GAP.  Same geometry as
+                        # the final task (real tokens, real logits,
+                        # real CE):
+                        #   l_full  = -log p(y_j | U_t, C_t, y_<j)
+                        #             (the standard CCM forward at y)
+                        #   l_comp  = -log p(y_j | M_t, C_t, y_<j)
+                        #             (reorganized dialogue: u_1..u_t
+                        #             compressed, suffix as context)
+                        #   Delta_t = mean_j(l_comp - l_full)
+                        #   a^S4 = grad_{M_t} l_comp  (the hinge [.]+
+                        #   is a training-time choice; the probe reads
+                        #   the raw Delta distribution and the
+                        #   directions)
+                        # Four numbers + the Delta distribution.
+                        _gt_flat = torch.cat(
+                            [g.reshape(-1).float().cpu()
+                             for g in g_task_true])
+                        r_task_cache = {}
+                        teacher_ce_cache = {}
+                        for i, (b, sid) in enumerate(pending):
+                            _restore_rng(pass1_rngs[i])
+                            optimizer.zero_grad(set_to_none=True)
+                            fwd_out = run_forward(model, b, device,
+                                                  grad_enabled=True)
+                            for _entry in adapter._cache:
+                                if _entry is not None:
+                                    _entry[0].retain_grad()
+                                    _entry[1].retain_grad()
+                            _tsm, _nvm = task_ce_shifted(
+                                fwd_out, b["labels"], device)
+                            (_tsm / max(_nvm, 1)
+                             / float(len(pending))).backward()
+                            teacher_ce_cache[i] = float(
+                                _tsm / max(_nvm, 1))
+                            for meta, oid, v in cut_records[i]:
+                                _pos = torch.tensor(
+                                    [[meta["blocks"][v][1],
+                                      meta["blocks"][v][1] + 1]],
+                                    dtype=torch.long, device=device)
+                                _kp, _vp = [], []
+                                for _entry in adapter._cache:
+                                    _k, _v = _entry[0], _entry[1]
+                                    _idx = _pos.unsqueeze(1).expand(
+                                        -1, _k.shape[1], -1)
+                                    _idx = _idx.unsqueeze(-1).expand(
+                                        -1, -1, -1, _k.shape[-1])
+                                    _kp.append(torch.gather(_k.grad, 2,
+                                                            _idx))
+                                    _vp.append(torch.gather(_v.grad, 2,
+                                                            _idx))
+                                r_task_cache[oid] = JMemLift.pack_sum_mem(
+                                    _kp, _vp)[0].float()
+                            adapter.clear()
+                        delta_list = []
+                        cos_mem_s4 = []
+                        cos_par_s4 = []
+                        q_agg = None
+                        for i, (b, sid) in enumerate(pending):
+                            for meta, oid, v in cut_records[i]:
+                                if g_by_oid.get(oid) is None:
+                                    continue
+                                _t = int(v) + 1
+                                _raw = meta["raw_dialog"]
+                                _L = int(meta["L"])
+                                _suffix = [tok for _x in
+                                           range(_t, _L + 1)
+                                           for tok in _raw[_x]]
+                                _new_dialog = ([list(_raw[_x])
+                                                for _x in range(_t)]
+                                               + [_suffix]
+                                               + [list(_raw[_L + 1])])
+                                _item = {"dialog": _new_dialog,
+                                         "fixed_depth": True}
+                                _b2 = collator([_item])
+                                _b2 = {kk: vv.to(device)
+                                       for kk, vv in _b2.items()}
+                                optimizer.zero_grad(set_to_none=True)
+                                _f2 = run_forward(model, _b2, device,
+                                                  grad_enabled=True)
+                                for _entry in adapter._cache:
+                                    if _entry is not None:
+                                        _entry[0].retain_grad()
+                                        _entry[1].retain_grad()
+                                _lg2 = _f2.logits
+                                _lb2 = _b2["labels"]
+                                _sh2 = _lg2[..., :-1, :].contiguous()
+                                _sl2 = _lb2[..., 1:].contiguous()
+                                _mask2 = _sl2 != -100
+                                _s_logits = _sh2[_mask2]
+                                _s_labs = _sl2[_mask2]
+                                _ce_s = F.cross_entropy(_s_logits,
+                                                        _s_labs)
+                                _delta = float(
+                                    _ce_s.detach()) - teacher_ce_cache[i]
+                                delta_list.append(_delta)
+                                _ce_s.backward()
+                                _meta2 = parse_meta(_b2, comp_ids,
+                                                    sum_ids, sid)[0]
+                                _pos2 = torch.tensor(
+                                    [[_meta2["blocks"][_t - 1][1],
+                                      _meta2["blocks"][_t - 1][1] + 1]],
+                                    dtype=torch.long, device=device)
+                                _kp2, _vp2 = [], []
+                                for _entry in adapter._cache:
+                                    _k, _v = _entry[0], _entry[1]
+                                    _idx = _pos2.unsqueeze(1).expand(
+                                        -1, _k.shape[1], -1)
+                                    _idx = _idx.unsqueeze(-1).expand(
+                                        -1, -1, -1, _k.shape[-1])
+                                    _kp2.append(torch.gather(_k.grad, 2,
+                                                             _idx))
+                                    _vp2.append(torch.gather(_v.grad, 2,
+                                                             _idx))
+                                _a_s4 = JMemLift.pack_sum_mem(
+                                    _kp2, _vp2)[0].float()
+                                _r_task = r_task_cache[oid]
+                                _den_m = (_a_s4.norm()
+                                          * _r_task.norm()).clamp(
+                                              min=1e-12)
+                                cos_mem_s4.append(
+                                    float((_a_s4 @ _r_task) / _den_m))
+                                _q_flat = torch.cat(
+                                    [p.grad.reshape(-1).float()
+                                     if p.grad is not None else
+                                     torch.zeros(p.numel(),
+                                                 dtype=torch.float32,
+                                                 device=p.device)
+                                     for p in repr_params]).cpu()
+                                _den_p = (_q_flat.norm()
+                                          * _gt_flat.norm()).clamp(
+                                              min=1e-12)
+                                cos_par_s4.append(
+                                    float((_q_flat @ _gt_flat)
+                                          / _den_p))
+                                q_agg = (_q_flat if q_agg is None
+                                         else q_agg + _q_flat)
+                            adapter.clear()
+                        delta_list = [float(d) for d in delta_list]
+                        cos_mem_s4 = [float(c) for c in cos_mem_s4]
+                        cos_par_s4 = [float(c) for c in cos_par_s4]
+                        _dd = np.array(delta_list)
+                        _cm4 = np.array(cos_mem_s4)
+                        _cp4 = np.array(cos_par_s4)
+                        _agg_cos_s4 = float(
+                            ((q_agg @ _gt_flat)
+                             / (q_agg.norm()
+                                * _gt_flat.norm()).clamp(
+                                    min=1e-12))) if q_agg is not None \
+                            else 0.0
+                        _s4 = {
+                            "n_cuts": int(len(delta_list)),
+                            "delta_mean": float(_dd.mean()),
+                            "delta_med": float(np.median(_dd)),
+                            "delta_p5": float(np.percentile(_dd, 5.0)),
+                            "delta_min": float(_dd.min()),
+                            "delta_max": float(_dd.max()),
+                            "frac_delta_neg": float(
+                                np.mean(_dd < 0.0)),
+                            "frac_delta_gt_0p1": float(
+                                np.mean(_dd > 0.1)),
+                            "cos_mem_mean": float(_cm4.mean()),
+                            "cos_mem_med": float(np.median(_cm4)),
+                            "cos_mem_p5": float(np.percentile(_cm4, 5.0)),
+                            "cos_mem_min": float(_cm4.min()),
+                            "cos_par_mean": float(_cp4.mean()),
+                            "cos_par_p5": float(np.percentile(_cp4, 5.0)),
+                            "cos_par_min": float(_cp4.min()),
+                            "frac_par_neg_kappa": float(
+                                np.mean(_cp4 < -args.rpbe_kappa)),
+                            "cos_agg": _agg_cos_s4,
+                        }
+                        with (out / "s4_probe.json").open("w") as _f:
+                            json.dump(_s4, _f, indent=1)
+                        print("[s4-probe] n={} delta: mean={:.4f} "
+                              "med={:.4f} p5={:.4f} min={:.4f} "
+                              "frac_neg={:.4f} frac>0.1={:.4f} | "
+                              "mem_cos: mean={:.4f} p5={:.4f} | "
+                              "par_cos: mean={:.4f} p5={:.4f} "
+                              "Pr<-k={:.4f} | AGG={:.4f}".format(
+                                  _s4["n_cuts"], _s4["delta_mean"],
+                                  _s4["delta_med"], _s4["delta_p5"],
+                                  _s4["delta_min"],
+                                  _s4["frac_delta_neg"],
+                                  _s4["frac_delta_gt_0p1"],
+                                  _s4["cos_mem_mean"],
+                                  _s4["cos_mem_p5"],
+                                  _s4["cos_par_mean"],
+                                  _s4["cos_par_p5"],
+                                  _s4["frac_par_neg_kappa"],
+                                  _s4["cos_agg"]), flush=True)
+                        optimizer.zero_grad(set_to_none=True)
+                    if args.rpbe_native_compression \
+                            and os.environ.get("CCM_S42OBS_PROBE") == "1":
+                        # S4-2Obs probe (review 2026-09-23): KEEP the
+                        # original 2Obs recursive topology and swap only
+                        # the scoring geometry — every observation
+                        # becomes a real-token NLL gap:
+                        #   l_comp = -log p(Y | M_t, C),   l_full =
+                        #   -log p_ref(Y | U_t, C) with U_t given as an
+                        #   UNCOMPRESSED single context turn (a 1-turn
+                        #   merge is lossless).
+                        #   h=1 local:  C=u_{t+1}, Y=u_{t+2}
+                        #   h=2 upward: C=(u_{t+1},u_{t+2}), Y=y
+                        #   t=L:       C=c, Y=y (single obs)
+                        # Report cos_mem / cos_param / AGG / Pr<-k and
+                        # the Delta distribution SEPARATELY per obs and
+                        # for the 0.5/0.5 merge.
+                        _gt_flat = torch.cat(
+                            [g.reshape(-1).float().cpu()
+                             for g in g_task_true])
+                        r_task_cache = {}
+                        for i, (b, sid) in enumerate(pending):
+                            _restore_rng(pass1_rngs[i])
+                            optimizer.zero_grad(set_to_none=True)
+                            fwd_out = run_forward(model, b, device,
+                                                  grad_enabled=True)
+                            for _entry in adapter._cache:
+                                if _entry is not None:
+                                    _entry[0].retain_grad()
+                                    _entry[1].retain_grad()
+                            _tsm, _nvm = task_ce_shifted(
+                                fwd_out, b["labels"], device)
+                            (_tsm / max(_nvm, 1)
+                             / float(len(pending))).backward()
+                            for meta, oid, v in cut_records[i]:
+                                _pos = torch.tensor(
+                                    [[meta["blocks"][v][1],
+                                      meta["blocks"][v][1] + 1]],
+                                    dtype=torch.long, device=device)
+                                _kp, _vp = [], []
+                                for _entry in adapter._cache:
+                                    _k, _v = _entry[0], _entry[1]
+                                    _idx = _pos.unsqueeze(1).expand(
+                                        -1, _k.shape[1], -1)
+                                    _idx = _idx.unsqueeze(-1).expand(
+                                        -1, -1, -1, _k.shape[-1])
+                                    _kp.append(torch.gather(_k.grad, 2,
+                                                            _idx))
+                                    _vp.append(torch.gather(_v.grad, 2,
+                                                            _idx))
+                                r_task_cache[oid] = JMemLift.pack_sum_mem(
+                                    _kp, _vp)[0].float()
+                            adapter.clear()
+
+                        def _fwd_ce(dialog_turns):
+                            _item = {"dialog": dialog_turns,
+                                     "fixed_depth": True}
+                            _b2 = collator([_item])
+                            _b2 = {kk: vv.to(device)
+                                   for kk, vv in _b2.items()}
+                            _f2 = run_forward(model, _b2, device,
+                                              grad_enabled=True)
+                            _lg2 = _f2.logits
+                            _lb2 = _b2["labels"]
+                            _sh2 = _lg2[..., :-1, :].contiguous()
+                            _sl2 = _lb2[..., 1:].contiguous()
+                            _mask2 = _sl2 != -100
+                            return _f2, _sh2[_mask2], _sl2[_mask2], _b2
+
+                        stats = {h: {"delta": [], "mem_cos": [],
+                                     "par_cos": [], "q_agg": None}
+                                 for h in (1, 2)}
+                        for i, (b, sid) in enumerate(pending):
+                            for meta, oid, v in cut_records[i]:
+                                if g_by_oid.get(oid) is None:
+                                    continue
+                                _t = int(v) + 1
+                                _raw = meta["raw_dialog"]
+                                _L = int(meta["L"])
+                                _hist = [list(_raw[_x])
+                                         for _x in range(_t)]
+                                _hist_full = [tok for _x in range(_t)
+                                              for tok in _raw[_x]]
+                                _obs = []
+                                if _t < _L:
+                                    # h=1 local: u_{t+1} -> u_{t+2}
+                                    _obs.append((1,
+                                                 _hist + [list(_raw[_t])]
+                                                 + [list(_raw[_t + 1])],
+                                                 [_hist_full]
+                                                 + [list(_raw[_t])]
+                                                 + [list(_raw[_t + 1])]))
+                                    # h=2 upward: (u_{t+1}, u_{t+2}) -> y
+                                    _obs.append((2,
+                                                 _hist
+                                                 + [[tok for _x in
+                                                     range(_t, _t + 2)
+                                                     for tok in
+                                                     _raw[_x]]]
+                                                 + [list(_raw[_L + 1])],
+                                                 [_hist_full]
+                                                 + [[tok for _x in
+                                                     range(_t, _t + 2)
+                                                     for tok in
+                                                     _raw[_x]]]
+                                                 + [list(_raw[_L + 1])]))
+                                else:
+                                    # terminal: c -> y
+                                    _obs.append((1,
+                                                 _hist + [list(_raw[_L])]
+                                                 + [list(_raw[_L + 1])],
+                                                 [_hist_full]
+                                                 + [list(_raw[_L])]
+                                                 + [list(_raw[_L + 1])]))
+                                for _h, _comp_dlg, _full_dlg in _obs:
+                                    optimizer.zero_grad(set_to_none=True)
+                                    _f2, _s_logits, _s_labs, _b2 = \
+                                        _fwd_ce(_comp_dlg)
+                                    for _entry in adapter._cache:
+                                        if _entry is not None:
+                                            _entry[0].retain_grad()
+                                            _entry[1].retain_grad()
+                                    _ce_s = F.cross_entropy(_s_logits,
+                                                            _s_labs)
+                                    # backward BEFORE the full-context
+                                    # forward: the no_grad full forward
+                                    # would overwrite the adapter cache
+                                    # with graph-less tensors, leaving
+                                    # .grad None at the gather below.
+                                    _ce_s.backward()
+                                    _meta2 = parse_meta(_b2, comp_ids,
+                                                        sum_ids, sid)[0]
+                                    _L2 = int(_meta2["L"])
+                                    _pos2 = torch.tensor(
+                                        [[_meta2["blocks"][_L2 - 1][1],
+                                          _meta2["blocks"][_L2 - 1][1]
+                                          + 1]],
+                                        dtype=torch.long, device=device)
+                                    _kp2, _vp2 = [], []
+                                    for _entry in adapter._cache:
+                                        _k, _v = _entry[0], _entry[1]
+                                        _idx = _pos2.unsqueeze(1).expand(
+                                            -1, _k.shape[1], -1)
+                                        _idx = _idx.unsqueeze(-1).expand(
+                                            -1, -1, -1, _k.shape[-1])
+                                        _kp2.append(torch.gather(
+                                            _k.grad, 2, _idx))
+                                        _vp2.append(torch.gather(
+                                            _v.grad, 2, _idx))
+                                    _a_h = JMemLift.pack_sum_mem(
+                                        _kp2, _vp2)[0].float()
+                                    _q_flat = torch.cat(
+                                        [p.grad.reshape(-1).float()
+                                         if p.grad is not None else
+                                         torch.zeros(p.numel(),
+                                                     dtype=torch.float32,
+                                                     device=p.device)
+                                         for p in repr_params]).cpu()
+                                    with torch.no_grad():
+                                        _f3, _t_logits, _t_labs, _b3 = \
+                                            _fwd_ce(_full_dlg)
+                                        _ce_f = F.cross_entropy(
+                                            _t_logits, _t_labs)
+                                    _delta = float(
+                                        _ce_s.detach()) - float(
+                                            _ce_f.detach())
+                                    stats[_h]["delta"].append(_delta)
+                                    _r_task = r_task_cache[oid]
+                                    _den_m = (_a_h.norm()
+                                              * _r_task.norm()).clamp(
+                                                  min=1e-12)
+                                    stats[_h]["mem_cos"].append(
+                                        float((_a_h @ _r_task) / _den_m))
+                                    _den_p = (_q_flat.norm()
+                                              * _gt_flat.norm()).clamp(
+                                                  min=1e-12)
+                                    stats[_h]["par_cos"].append(
+                                        float((_q_flat @ _gt_flat)
+                                              / _den_p))
+                                    _q = stats[_h]["q_agg"]
+                                    stats[_h]["q_agg"] = (
+                                        _q_flat if _q is None
+                                        else _q + _q_flat)
+                                    adapter.clear()
+                        s42 = {}
+                        for _h in (1, 2):
+                            _st = stats[_h]
+                            _dd = np.array(_st["delta"])
+                            _cm = np.array(_st["mem_cos"])
+                            _cp = np.array(_st["par_cos"])
+                            _qa = _st["q_agg"]
+                            _agg = float(
+                                ((_qa @ _gt_flat)
+                                 / (_qa.norm()
+                                    * _gt_flat.norm()).clamp(
+                                        min=1e-12))) if _qa is not None \
+                                else 0.0
+                            s42["obs{}".format(_h)] = {
+                                "n": int(len(_st["delta"])),
+                                "delta_mean": float(_dd.mean()),
+                                "delta_med": float(np.median(_dd)),
+                                "delta_p5": float(
+                                    np.percentile(_dd, 5.0)),
+                                "frac_delta_neg": float(
+                                    np.mean(_dd < 0.0)),
+                                "frac_delta_gt_0p1": float(
+                                    np.mean(_dd > 0.1)),
+                                "mem_cos_mean": float(_cm.mean()),
+                                "mem_cos_p5": float(
+                                    np.percentile(_cm, 5.0)),
+                                "par_cos_mean": float(_cp.mean()),
+                                "par_cos_p5": float(
+                                    np.percentile(_cp, 5.0)),
+                                "frac_par_neg_kappa": float(
+                                    np.mean(_cp < -args.rpbe_kappa)),
+                                "cos_agg": _agg,
+                            }
+                        # 0.5/0.5 merge (terminal rows count once).
+                        _ddm = np.array(stats[1]["delta"]
+                                        + stats[2]["delta"])
+                        _cmm = np.array(stats[1]["mem_cos"]
+                                        + stats[2]["mem_cos"])
+                        _cpm = np.array(stats[1]["par_cos"]
+                                        + stats[2]["par_cos"])
+                        _qam = None
+                        for _h in (1, 2):
+                            if stats[_h]["q_agg"] is not None:
+                                _qam = (stats[_h]["q_agg"] if _qam is None
+                                        else _qam + stats[_h]["q_agg"])
+                        s42["merge"] = {
+                            "n": int(len(_ddm)),
+                            "delta_mean": float(_ddm.mean()),
+                            "mem_cos_mean": float(_cmm.mean()),
+                            "par_cos_mean": float(_cpm.mean()),
+                            "frac_par_neg_kappa": float(
+                                np.mean(_cpm < -args.rpbe_kappa)),
+                            "cos_agg": float(
+                                ((_qam @ _gt_flat)
+                                 / (_qam.norm()
+                                    * _gt_flat.norm()).clamp(
+                                        min=1e-12)))
+                            if _qam is not None else 0.0,
+                        }
+                        with (out / "s4_2obs_probe.json").open("w") \
+                                as _f:
+                            json.dump(s42, _f, indent=1)
+                        print("[s4-2obs] " + json.dumps(
+                            {k: {kk: (round(vv, 4) if isinstance(
+                                vv, float) else vv)
+                                 for kk, vv in v.items()}
+                             for k, v in s42.items()},
+                            indent=1), flush=True)
+                        optimizer.zero_grad(set_to_none=True)
+                    if args.rpbe_native_compression:
+                        # Native proposal-space projection (review
+                        # 2026-09-22).  P0 fix (2026-09-22 review): the
+                        # dirs-collection loop ends with
+                        # zero_grad(set_to_none=True), so NO live p.grad
+                        # exists here — computed in the shared
+                        # pre-projection block above.
+                        if _inf:
+                            # AMP overflow: no proposal / no QP / no
+                            # update.  scaler backs off; the window
+                            # closes like a normal skip.
+                            proj_ok, proj_diag = True, {
+                                "note": "amp_skip", "cert_fail": False,
+                                "amp_skip": True, "n_dirs": 0,
+                                "task_norm": 0.0, "b_norm": 0.0}
+                            cert_fail = False
+                            native_amp_skip = True
+                        else:
+                            native_amp_skip = False
+                            # Global clip, the same threshold as
+                            # grad_step, applied to EACH proposal's
+                            # gradient source INDEPENDENTLY: g_task is
+                            # the exact gradient the task-only arm's
+                            # optimizer would consume, g_joint the one
+                            # the ours arm consumes.
+                            def _clip_gs(gs):
+                                _tot = math.sqrt(sum(
+                                    float((g.double() ** 2).sum())
+                                    for g in gs))
+                                if _tot > args.grad_clip:
+                                    _c = args.grad_clip / _tot
+                                    for g in gs:
+                                        g.mul_(_c)
+                            _clip_gs(g_joint_true)
+                            _clip_gs(g_task_true)
+                            native_g_joint = g_joint_true
+                            _bc = optimizer_steps_executed + 1
+                            # Direction space (warmup fix, review
+                            # 2026-09-22): lr is a common scalar factor,
+                            # the QP and ||d_task|| are lr-invariant —
+                            # project the lr=1 direction, multiply the
+                            # real current lr back at write-back (0 at
+                            # warmup step 0 keeps the warmup semantics).
+                            d0 = adamw_proposal(
+                                optimizer, repr_params, g_joint_true,
+                                _bc, lr_override=1.0)
+                            d_task = adamw_proposal(
+                                optimizer, repr_params, g_task_true,
+                                _bc, lr_override=1.0)
+                            d_task_norm = float(
+                                torch.cat([x.reshape(-1) for x in d_task])
+                                .double().norm())
+                            # Streaming (2026-09-23): pass the dirs
+                            # LIST (no stack — the QP streams in
+                            # 64-row blocks); the sign flip negates
+                            # each row.
+                            _G = [-_r for _r in dirs] if dirs else None
+                            proj_ok, proj_diag = \
+                                treewise_feasibility_projection(
+                                    [x.detach().cpu() for x in d0],
+                                    repr_params, _G,
+                                    args.rpbe_kappa,
+                                    iters=args.proj_iters,
+                                    cert_tol=1e-4,
+                                    b_norm=d_task_norm,
+                                    device=device)
+                            proj_diag["space"] = "proposal"
+                            proj_diag["d_task_norm"] = d_task_norm
+                            # Proposal-space conflict statistics (short
+                            # test C, review 2026-09-22): the frozen
+                            # method works in PROPOSAL space, so the
+                            # meaningful conflict measure is
+                            # c_i = q_i^T d_task / (||q_i|| ||d_task||)
+                            # — "if I took the task-only AdamW update,
+                            # how many predictive interfaces would
+                            # violate the tolerance band?".  The
+                            # corr_ratio from the QP diag is exactly
+                            # ||d* - d_0|| / ||d_0|| (corr = d*_qp - t,
+                            # ||t|| = ||d_0||).
+                            if dirs:
+                                _dt_flat = torch.cat(
+                                    [x.reshape(-1).float().cpu()
+                                     for x in d_task])
+                                # Streaming (2026-09-23): per-row cos
+                                # values in blocks + the aggregate as a
+                                # running sum (no full stack).
+                                _c_parts = []
+                                _agg = None
+                                for _c0 in range(0, len(dirs), 64):
+                                    _Gb = torch.stack(
+                                        dirs[_c0:_c0 + 64]).float()
+                                    _nrb = _Gb.norm(dim=1)
+                                    _c_parts.append(
+                                        ((_Gb @ _dt_flat)
+                                         / (_nrb
+                                            * _dt_flat.norm()).clamp(
+                                                min=1e-12)))
+                                    _sb = _Gb.sum(0)
+                                    _agg = (_sb if _agg is None
+                                            else _agg + _sb)
+                                    del _Gb, _sb
+                                _c = torch.cat(_c_parts).numpy()
+                                # Aggregate predictive direction vs the
+                                # task proposal (supervisor sweep,
+                                # review 2026-09-23): distinguishes
+                                # "treewise normalization eats the
+                                # signal" from "the supervisor itself
+                                # produces a task-orthogonal direction".
+                                # (dirs are scaled-space gradients; the
+                                # cosine is scale-invariant.)
+                                _agg_cos = float(
+                                    ((_agg @ _dt_flat)
+                                     / (_agg.norm()
+                                        * _dt_flat.norm()).clamp(
+                                            min=1e-12)))
+                                proj_diag.update({
+                                    "conflict_cos_mean":
+                                        float(_c.mean()),
+                                    "conflict_cos_med":
+                                        float(np.median(_c)),
+                                    "conflict_cos_p5":
+                                        float(np.percentile(_c, 5.0)),
+                                    "conflict_cos_min":
+                                        float(_c.min()),
+                                    "conflict_frac_neg_kappa":
+                                        float(np.mean(
+                                            _c < -args.rpbe_kappa)),
+                                    "conflict_agg_cos":
+                                        _agg_cos,
+                                })
+                            cert_fail = bool(
+                                proj_diag.get("cert_fail"))
+                            if not proj_ok:
+                                for p in params:
+                                    p.grad = None
                             else:
-                                p.grad = torch.zeros_like(p)
+                                # The QP wrote p.grad = the projected
+                                # proposal d* for every repr param
+                                # (repr_set == all trainable params
+                                # under native actuation).
+                                pass
                     else:
-                        for p in params:
-                            if id(p) in gamma_set:
-                                continue  # projection already wrote .grad
-                            p.grad = task_grads.get(
-                                id(p), torch.zeros_like(p))
-                            if not args.rpbe_gamma_only:
-                                # R10 structure: discard the non-Gamma
-                                # auxiliary gradient (review 2026-09-16)
-                                p.grad = (p.grad + aux_other.get(
-                                    id(p), torch.zeros_like(p)))
+                        proj_ok, proj_diag = treewise_feasibility_projection(
+                            [x.detach().cpu() for x in g_task_repr],
+                            repr_params,
+                            (torch.stack(dirs)
+                             if dirs else None),
+                            args.rpbe_kappa, iters=args.proj_iters,
+                            # V11 (self-ruled 2026-09-21): the TGN
+                            # final-spec 1e-6 certificate is a fp32
+                            # contract; CCM runs the QP on fp16
+                            # GradScaler-SCALED gradients, so the
+                            # achievable max_viol floors at ~1e-5
+                            # (measured: 8.37e-06 / 1e-05 across the
+                            # first windows).  Keeping 1e-6 made EVERY
+                            # window cert_fail and skipped every repr
+                            # update — the V11 joint-QP experiment
+                            # would degenerate to task-only.  1e-4 is
+                            # the fp16-achievable line; the
+                            # skip-on-failure semantics is unchanged.
+                            cert_tol=1e-4)
+                        cert_fail = bool(proj_diag.get("cert_fail"))
+                        if not proj_ok:
+                            # CERT_FAIL: no constrained update is
+                            # executed — zero the non-Gamma grads too
+                            # and skip the representation step
+                            # (final-spec reviewer requirement; TGN:
+                            # "skipping repr step").
+                            for p in params:
+                                if id(p) in repr_set:
+                                    p.grad = None
+                                else:
+                                    p.grad = torch.zeros_like(p)
+                        else:
+                            for p in params:
+                                if id(p) in repr_set:
+                                    continue  # projection already
+                                              # wrote .grad
+                                p.grad = task_grads.get(
+                                    id(p), torch.zeros_like(p))
+                                if not args.rpbe_gamma_only:
+                                    # R10 structure: discard the
+                                    # non-Gamma auxiliary gradient
+                                    # (review 2026-09-16)
+                                    p.grad = (p.grad + aux_other.get(
+                                        id(p),
+                                        torch.zeros_like(p)))
                     with (out / "window_diag.jsonl").open("a") as _f:
                         _f.write(json.dumps(_json_safe(
                             {"step": int(step), "event": "treewise_proj",
@@ -2292,6 +4007,132 @@ def main():
                                   kf_closed + 1,
                                   proj_diag.get("max_viol", float("inf"))),
                               flush=True)
+                    aux_terms += n_cut_win
+                elif args.rpbe_native_compression \
+                        and args.s4_supervisor:
+                    # S4 AGGREGATE phase (review 2026-09-23 two-phase
+                    # form): after the treewise phase has pruned the
+                    # predictive gap, the per-interface conflict dies
+                    # out (active -> 0-3) and the QP idles.  The
+                    # aggregate phase keeps the lambda-weighted S4
+                    # gradient WITHOUT dirs/QP: joint = task + lambda *
+                    # sum w_h q_{t,h}, one ordinary AdamW step.  Cost
+                    # drops to the comp-dialogue forwards only.
+                    pure_acc = {}
+                    for i, (b, sid) in enumerate(pending):
+                        _restore_rng(pass1_rngs[i])  # P0: mask==pass1
+                        task_mean, task_raw, n_valid, _aux, _n = \
+                            pass2_one(b, cut_records[i], g_by_oid, 0.0)
+                        _before = {
+                            id(p): p.grad.detach().clone()
+                            for p in params if p.grad is not None}
+                        if task_mean.requires_grad:
+                            scaler.scale(
+                                task_mean
+                                / float(len(pending))).backward()
+                        for p in params:
+                            if p.grad is None:
+                                continue
+                            _prev = _before.get(id(p))
+                            _inc = p.grad.detach() - (
+                                _prev if _prev is not None
+                                else torch.zeros_like(p.grad))
+                            if id(p) in pure_acc:
+                                pure_acc[id(p)].add_(_inc)
+                            else:
+                                pure_acc[id(p)] = _inc.clone()
+                        task_sum += float(task_raw.detach())
+                        n_tokens += n_valid
+                    # Reference table (chunked batch, same as treewise).
+                    _ref_table = {}
+                    if args.s4_ref_cache:
+                        _ref_items = []
+                        for _i2 in range(len(pending)):
+                            for meta, oid, v in cut_records[_i2]:
+                                if g_by_oid.get(oid) is None:
+                                    continue
+                                for _h, _cd, _fd, _w in s4_obs_list(
+                                        meta, int(v)):
+                                    _ref_items.append(((oid, _h), _fd))
+                        with torch.no_grad():
+                            for _c0 in range(0, len(_ref_items),
+                                             args.s4_ref_chunk):
+                                _chunk = _ref_items[
+                                    _c0:_c0 + args.s4_ref_chunk]
+                                _b3 = collator(
+                                    [{"dialog": _d,
+                                      "fixed_depth": True}
+                                     for _, _d in _chunk])
+                                _b3 = {kk: vv.to(device)
+                                       for kk, vv in _b3.items()}
+                                _f3 = run_forward(
+                                    model, _b3, device,
+                                    grad_enabled=False)
+                                _sh3 = _f3.logits[..., :-1, :] \
+                                    .contiguous()
+                                _sl3 = _b3["labels"][..., 1:] \
+                                    .contiguous()
+                                for _j3, (_key, _d) in \
+                                        enumerate(_chunk):
+                                    _m3 = _sl3[_j3] != -100
+                                    _ref_table[_key] = float(
+                                        F.cross_entropy(
+                                            _sh3[_j3][_m3],
+                                            _sl3[_j3][_m3]))
+                    # Per-tree comp forwards, gradients ACCUMULATED
+                    # (no per-obs isolation, no dirs).
+                    for i, (b, sid) in enumerate(pending):
+                        for meta, oid, v in cut_records[i]:
+                            if g_by_oid.get(oid) is None:
+                                continue
+                            _obs = s4_obs_list(meta, int(v))
+                            _b2 = collator(
+                                [{"dialog": _d, "fixed_depth": True}
+                                 for _, _d, _, _ in _obs])
+                            _b2 = {kk: vv.to(device)
+                                   for kk, vv in _b2.items()}
+                            _f2 = run_forward(model, _b2, device,
+                                              grad_enabled=True)
+                            _sh2 = _f2.logits[..., :-1, :] \
+                                .contiguous()
+                            _sl2 = _b2["labels"][..., 1:] \
+                                .contiguous()
+                            for _j, (_h, _cdlg, _fdlg, _w) in \
+                                    enumerate(_obs):
+                                _m2 = _sl2[_j] != -100
+                                _ce_c = F.cross_entropy(
+                                    _sh2[_j][_m2], _sl2[_j][_m2])
+                                if _ref_table:
+                                    _ce_f = torch.tensor(
+                                        _ref_table[(oid, _h)],
+                                        dtype=_ce_c.dtype,
+                                        device=_ce_c.device)
+                                else:
+                                    with torch.no_grad():
+                                        _b3 = collator(
+                                            [{"dialog": _fdlg,
+                                              "fixed_depth": True}])
+                                        _b3 = {kk: vv.to(device)
+                                               for kk, vv
+                                               in _b3.items()}
+                                        _f3 = run_forward(
+                                            model, _b3, device,
+                                            grad_enabled=False)
+                                        _sh3 = _f3.logits[
+                                            ..., :-1, :] \
+                                            .contiguous()
+                                        _sl3 = _b3["labels"][
+                                            ..., 1:].contiguous()
+                                        _m3 = _sl3 != -100
+                                        _ce_f = F.cross_entropy(
+                                            _sh3[_m3], _sl3[_m3])
+                                _loss_h = scaler.scale(
+                                    lambda_kf * _w
+                                    * (_ce_c - _ce_f.detach()))
+                                _loss_h.backward(
+                                    retain_graph=(
+                                        _j < len(_obs) - 1))
+                        adapter.clear()
                     aux_terms += n_cut_win
                 else:
                     for i, (b, sid) in enumerate(pending):
@@ -2324,7 +4165,7 @@ def main():
                             task_snap = {id(p): p.grad.detach().clone()
                                          for p in params
                                          if p.grad is not None
-                                         and id(p) not in gamma_set}
+                                         and id(p) not in repr_set}
                             if os.environ.get("CCM_GRAD_GROUP") == "1":
                                 task_snap_all = {
                                     id(p): p.grad.detach().clone()
@@ -2343,7 +4184,7 @@ def main():
                                           "comp": [], "other": []}
                                 for n, p in model.named_parameters():
                                     if p.requires_grad and p.grad is not None:
-                                        if id(p) in gamma_set:
+                                        if id(p) in repr_set:
                                             groups["gamma"].append((n, p))
                                         elif "lora_" in n:
                                             groups["lora"].append((n, p))
@@ -2373,7 +4214,7 @@ def main():
                                               _na / max(_nt, 1e-30)),
                                           flush=True)
                             for p in params:
-                                if id(p) not in gamma_set:
+                                if id(p) not in repr_set:
                                     p.grad = task_snap.get(id(p))
                         else:
                             loss = task_mean / float(len(pending)) + aux
@@ -2424,9 +4265,91 @@ def main():
                     # boundary records and checkpoint cadence advance
                     # identically to a successful close.
                     cert_skip_steps += 1
+                elif treewise and args.rpbe_native_compression:
+                    # Native proposal-space write-back (review
+                    # 2026-09-22): the QP wrote the projected proposal
+                    # d* into p.grad for every repr param (== all
+                    # trainable params).  theta <- theta + d* directly;
+                    # the optimizer moments are updated with the
+                    # true-value JOINT gradient g_joint so the next
+                    # window's proposal starts from a consistent AdamW
+                    # state.  No scaler.step() — the parameter update
+                    # is the projected proposal itself.
+                    if native_amp_skip:
+                        # AMP overflow detected at unscale: back the
+                        # scale off and discard the update (mirrors
+                        # grad_step's skip semantics).  The unscale_
+                        # records the per-device inf check the
+                        # GradScaler.update() assertion requires.
+                        scaler.unscale_(optimizer)
+                        scaler.update()
+                        optimizer_steps_executed += 1
+                        amp_skipped_steps += 1
+                    else:
+                        with torch.no_grad():
+                            b1, b2 = tuple(
+                                optimizer.param_groups[0]["betas"])
+                            for p, g in zip(repr_params,
+                                            native_g_joint):
+                                st = optimizer.state[p]
+                                # torch only initializes state["step"]
+                                # inside optimizer.step(); the manual
+                                # write-back never calls step(), so
+                                # maintain it here (state_dict /
+                                # resume compatibility, 2026-09-23).
+                                st["step"] = torch.tensor(
+                                    float(optimizer_steps_executed + 1))
+                                if "exp_avg" in st:
+                                    st["exp_avg"].mul_(b1).add_(
+                                        g, alpha=1.0 - b1)
+                                else:
+                                    st["exp_avg"] = (
+                                        (1.0 - b1) * g).clone()
+                                if "exp_avg_sq" in st:
+                                    st["exp_avg_sq"].mul_(b2).addcmul_(
+                                        g, g, value=1.0 - b2)
+                                else:
+                                    st["exp_avg_sq"] = (
+                                        (1.0 - b2) * g * g).clone()
+                            _lr_eff = float(
+                                optimizer.param_groups[0]["lr"])
+                            for p in repr_params:
+                                # theta <- theta + lr_eff * d* (QP
+                                # wrote the lr=1 projected proposal;
+                                # fp32 -> param dtype for the add; the
+                                # real current lr restores the warmup
+                                # semantics — 0 at warmup step 0).
+                                p.data.add_(
+                                    (p.grad.to(p.dtype)) * _lr_eff)
+                        # The unscale_ records the per-device inf check
+                        # GradScaler.update() asserts on (p.grad holds
+                        # the already-consumed d* — its rescale is
+                        # harmless; the real AMP check ran on the
+                        # g_joint snapshot in the projection branch).
+                        scaler.unscale_(optimizer)
+                        scaler.update()
+                        optimizer_steps_executed += 1
+                        scheduler.step()
+                        scheduler_steps += 1
+                    assert optimizer_steps_executed \
+                        == scheduler_steps + amp_skipped_steps, (
+                            "step counters diverged: executed={} "
+                            "sched={} skips={}".format(
+                                optimizer_steps_executed, scheduler_steps,
+                                amp_skipped_steps))
                 else:
                     grad_step()  # counters live inside grad_step (nonlocal)
                 _pf("grad_step", _t)
+                # CPU-memory hygiene (2026-09-23): the S4-2Obs window
+                # builds ~600 collated mini-batches and the QP streams
+                # ~100 block transfers per close; the Python-side cycle
+                # garbage (autograd graph wrappers, collator temporaries)
+                # is not reclaimed by refcounting alone and the RSS
+                # crept 98 -> 113GB across windows (the system OOM
+                # trigger sits at ~115GB).  A forced collection at the
+                # window boundary returns the allocator cache to the
+                # reuse pool.
+                gc.collect()
                 if profile:
                     n_cut = sum(1 for cr in cut_records for _ in cr)
                     parts = ["profile win={} n_mb={} n_cut_mb={}:".format(
@@ -2465,7 +4388,10 @@ def main():
                 boundary_records.append(
                     "w{}:{}:{}{}".format(
                         kf_closed, len(pending), n_cut_win, _skip_tag))
-                close_depth_window(len(pending), step, n_cut_win)
+                _n_rows = sum(
+                    2 if int(v) != int(meta["L"]) - 1 else 1
+                    for _rec in cut_records for meta, _oid, v in _rec)
+                close_depth_window(len(pending), step, n_cut_win, _n_rows)
                 pending = []
                 cut_records = []
                 pass1_rngs = []
@@ -2489,7 +4415,7 @@ def main():
             # exposure; --merge-cadence official keeps the fixed cadence
             # for the ccm_merge_official reproduction reference only.
             eff = sum(1 for m in metas
-                      if m["ok"] and m["k"] >= 3)
+                      if m["ok"] and m["L"] >= 1)
             if args.merge_cadence == "window-matched":
                 merge_eff_cuts += eff
             fire = (args.merge_cadence == "window-matched"

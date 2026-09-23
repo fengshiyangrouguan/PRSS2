@@ -29,10 +29,11 @@
   ],
   "lambda_calibration": {
    "rule": "R10 gamma-scope calibration (review 2026-09-16): lambda = 0.1 / r_eff measured on the GAMMA group only at theta_0, chain-wise window",
-   "lambda_kf": 0.0048453063315041746,
-   "lambda_kf_note": "V11 recalibrated 2026-09-21 on the new local-closure supervision (Y2=u_{v+3}, b_{v+1}). Source outputs/ccm_qwen3/calib_v11/calibration.json: optimizer_steps=0, g_task_gamma=0.048232, g_kf_gamma=0.995443, r_eff_gamma=20.6385 at theta_0 = merge checkpoint_step550, derived lambda = 0.1/20.6385 = 0.0048453063. Neither the Llama value 0.00594 nor the earlier Qwen3 0.01507 was reused. The trainer refuses the ours arm while this field is null."
+   "lambda_kf": 0.0061412852569679615,
+   "lambda_kf_note": "RECALIBRATED 2026-09-21 on the review-fix code (Gamma at t=1..L, new cut set, frozen host + eval mode, theta_0 = merge s550): g_task_gamma=0.052665, g_kf_gamma=0.857559, r_eff_gamma=16.283, derived lambda = 0.1/16.283 = 0.0061412853.  Source outputs/ccm_qwen3/calib_reviewfix/calibration.json.  The V11 value 0.0048453 (old cuts/scope) is retired."
   },
-  "z_v_source": "J_mem(M_v) fixed adapter; GQA hosts lift the memory from the KV heads (8) with head_dim 128",
+  "z_v_source": "J_mem(M_t) fixed adapter at block_idx = t - 1 for t = 1..L (one cut per actual compression layer; review ruling 2026-09-21); GQA hosts lift the memory from the KV heads (8) with head_dim 128",
+  "cut_supervision": "t < L: obs1 (C=u_{t+1}, Y=u_{t+2}, w=0.5) + obs2 (C=(u_{t+1}, u_{t+2}, one-update), Y=y, w=0.5); t = L: single row (C=c, Y=y, w=1.0).  chi/phi are built from the RAW tokenized turns, never from spans of the collated ids.",
   "witness": "none (main experiment)",
   "sketch_ensemble_n_branches": 4,
   "oas_shrinkage": {
@@ -41,21 +42,28 @@
   }
  },
  "gamma": {
-  "placement": "one module per layer, shared across the K/V merges and the two COMP/SUM slots",
+  "placement": "one module per layer, shared across the K/V merges and the two COMP/SUM slots; recurrence M_t = mean(h_1..h_t) + R_Gamma(M_{t-1}, h_t, t) for EVERY t = 1..L with M_0 = 0 (review ruling 2026-09-21: the first compression layer is inside the method, L=1 included)",
   "hidden": 64,
   "time_dim": 16,
   "init_scale": 0.02,
-  "zero_init": "U0=0 zero-output projection init; step 0 residual is bit-for-bit zero",
+  "zero_init": "U0=0 zero-output projection init; step 0 residual is bit-for-bit zero.  Gradient note: with U_0 = 0 the first step updates only U (dR/dV vanishes at U = 0).",
   "parameter_budget": "36 layers (Qwen3-4B) x ~25.7k = ~925k < 1M"
+ },
+ "freeze_host": {
+  "scope": "backbone + conditional LoRA + COMP/SUM embeddings all frozen (train Gamma ONLY); optimizer holds only the Gamma group",
+  "mode": "host model.eval() + Gamma modules train() — the official conditional LoRA dropout (0.05) must not perturb the frozen host forward; gradients still flow through the host to Gamma",
+  "checkpoint": "Stage-2 checkpoints save the Gamma state only (trainable_state_dict = requires_grad params)",
+  "eval_reconstruction": "build_official_host -> attach_gamma -> load Gamma-only checkpoint -> freeze non-Gamma -> eval; same construction as training",
+  "enabled": true
  },
  "window": {
   "min_effective_cuts": 128,
-  "collection": "adaptive by effective cut count (dialogues with k>=4)",
+  "collection": "adaptive by effective cut count (dialogues with L>=1; review ruling 2026-09-21: L=1 emits the terminal cut)",
   "cadence": "identical task samples and scheduler cadence across the three arms"
  },
  "training": {
   "steps": 60,
-  "steps_note": "V11 arms: 60 windows (user ruling 2026-09-21).",
+  "steps_note": "Review-fix rerun (2026-09-21): 60 windows, task-only / ours from the SAME theta_0 (merge checkpoint_step550, frozen host, zero-init Gamma).  The V11 numbers (trainable LoRA/COMP scope, old cut set, old lambda) are retired as diagnostic records only.",
   "grad_clip": 1.0,
   "merge_cadence": "window-matched",
   "two_pass_replay": "pass1 no-grad statistics forward, pass2 grad replay forward (RPBE arms only)",
@@ -64,7 +72,8 @@
   "seeds": 1,
   "checkpoint_every": 10,
   "schedule_total_steps": 1000,
-  "schedule_note": "original 1000-step warmup/cosine schedule kept"
+  "schedule_note": "original 1000-step warmup/cosine schedule kept",
+  "checkpoint_selection": "validation only (the official val+test pooled protocol remains a CCM-reproduction report, never a checkpoint selector)"
  },
  "sampling": {
   "depth_levels": [
@@ -75,6 +84,7 @@
    13
   ],
   "n_turns_of_L": "L + 2 TURNS (fixed prefix length in turns per depth; NOT meta.k = len(blocks)+1 = L + 1)",
+  "cut_depths": "every sample at endpoint L contributes cuts at LOCAL depths t = 1..L (maps.pv depth = t; Llmmaps registers local depths 1..13, out-of-range values fail fast — no modulo fold)",
   "rule": "LEGACY R10 sampling (ablation arm): q_L ~ 1/sqrt(n_L) with 3x-uniform oversampling cap, NO per-dialogue replay cap; one original dialogue per window."
  }
 }

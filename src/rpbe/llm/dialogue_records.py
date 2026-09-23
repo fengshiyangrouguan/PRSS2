@@ -1,24 +1,26 @@
-"""Dialogue cut records: one cut -> two horizon rows (plan v2 L4).
+"""Dialogue cut records: one cut -> one or two horizon rows.
 
-A dialogue sampled with a random prefix of k turns yields ONE cut at
-turn v = k - 3 (the last turn whose memory block is fully in the past of
-the query).  Its memory M_v (the SUM-token K/V pair, lifted to z_v by
-J_mem) is supervised by the two strictly future utterances:
+Review ruling (2026-09-21): a dialogue sampled at compressed-history
+depth L yields ONE cut per actual compression layer t = 1..L
+(block_idx = t - 1).  Its memory M_t (the SUM-token K/V pair, lifted to
+z_t by J_mem) is supervised by strictly future utterances:
 
-    row 1: (z_v, p_{v,1}, w=0.5, cut_id)   p_1 = Sketch([1; chi_1] (x) phi_1)
-    row 2: (z_v, p_{v,2}, w=0.5, cut_id)   p_2 = Sketch([1; chi_2] (x) phi_2)
+    t < L:  row 1: (z_t, p_{t,1}, w=0.5)  p_1 = Sketch([1; chi_1] (x) phi_1)
+            row 2: (z_t, p_{t,2}, w=0.5)  p_2 = Sketch([1; chi_2] (x) phi_2)
+            chi_1 = chi(u_{t+1}), phi_1 = phi(u_{t+2})
+            chi_2 = chi((u_{t+1}, u_{t+2}, one-update)), phi_2 = phi(y)
+    t = L:  single row (z_L, p, w=1.0) with chi = chi(c), phi = phi(y)
+            — the terminal cut's only legal future is (context, target);
+            no second future is fabricated.
 
-where chi_1 = chi(u_{v+1}), chi_2 = chi(u_{v+2}) with the one-update
-marker (u_{v+2} is one memory update further into the future), and
-phi_1/phi_2 are fixed horizon signatures.  Both rows share the SAME
-cut_id and enter the same Ky Fan window; the clustered correction runs
-through the existing WeightedWelford path.  Dialogues with k = 3 keep
-their task CE and carry NO RPBE row (w_RPBE = 0).
-
-There are no node ids or timestamps here: ``tree_id`` carries the sample
-identity (one dialogue = one independent history, which is what the
-window's unique-tree gate counts) and ``node`` is a placeholder for the
-shared CutRecord schema.
+where u_1..u_L are the history turns, c the context turn and y the
+target (raw tokenized utterances, never spans of the collated ids).
+Both rows of a cut share the SAME cut_id and enter the same Ky Fan
+window; the clustered correction runs through the existing
+WeightedWelford path.  There are no node ids or timestamps here:
+``tree_id`` carries the sample identity (one dialogue = one independent
+history, which is what the window's unique-tree gate counts) and
+``node`` is a placeholder for the shared CutRecord schema.
 """
 
 from dataclasses import dataclass
@@ -31,12 +33,11 @@ from rpbe.records import CutRecord
 
 MEM_TAU = "mem"
 HORIZON_WEIGHTS = (0.5, 0.5)
-# Review round 8 (depth-stratified legal cuts): the candidate pool spans
-# depths L in {1, 2, 4, 8, 13} where L = compressed-history turn count and
-# k = L + 2.  L = 1 gives k = 3 and v = k - 3 = 0: the memory after the
-# FIRST turn's compression, supervised by u_1 and u_2 — a legal cut (both
-# futures exist inside the same fixed-k prefix).  MIN_K = 3 admits it.
-MIN_K = 3  # k >= 3 gives v = k - 3 >= 0 (one compressed turn suffices)
+# Review ruling (2026-09-21): the candidate pool spans endpoint depths
+# L in {1, 2, 4, 8, 13} (L = compressed-history turn count, T = L + 2
+# turns).  L = 1 yields the terminal cut t = 1 = L with (c, y) — a legal
+# single-row cut.  (MIN_K deleted 2026-09-21: the old k >= 3 read invited
+# k-based cut derivations; the builder judges on L < 1 directly.)
 
 
 def _fixed_binary(shape, seed):
@@ -121,7 +122,13 @@ class Llmmaps(nn.Module):
 
     def _bucket(self, r: int, L) -> torch.Tensor:
         if L not in self.DEPTH_LEVELS:
-            L = self.DEPTH_LEVELS[int(L) % len(self.DEPTH_LEVELS)]
+            # Review ruling (2026-09-21): local cut depths are t = 1..13
+            # BY CONSTRUCTION (t = v + 1); the old modulo fold silently
+            # collapsed distinct chain positions onto one signature.  An
+            # out-of-range value is a caller bug — fail fast.
+            raise ValueError(
+                "local cut depth L={} outside DEPTH_LEVELS {}".format(
+                    L, self.DEPTH_LEVELS))
         return getattr(self, "bucket_L{}_{}".format(int(L), r))
 
     def pv(self, chi: torch.Tensor, phi: torch.Tensor,
@@ -176,12 +183,20 @@ class DialogueMeta:
     """
 
     sample_id: int
-    k: int                      # fixed depth prefix length (turn count)
+    k: int                      # context-turn count (= L + 1, kept for
+                                # the data_flow.jsonl legacy convention)
     sum_positions: List[tuple]  # per turn (0-indexed block turns)
     utterance_spans: List[tuple]  # per turn, aligned with sum blocks
     orig_id: int = -1           # stable ORIGINAL dialogue id (dataset row
                                 # index); review round 8 tree identity.
                                 # -1 = legacy stream-cursor path.
+    L: int = 0                  # compressed-history turn count (review
+                                # ruling 2026-09-21: the canonical depth;
+                                # L = k - 1)
+    raw_dialog: Optional[List] = None  # tokenized turns
+                                # [u_1..u_L, c, y] (len L + 2); chi/phi
+                                # inputs are built from THESE tokens,
+                                # never from spans of the collated ids
 
 
 class DialogueCutBuilder:
@@ -206,38 +221,50 @@ class DialogueCutBuilder:
               phi_1: torch.Tensor, phi_2: torch.Tensor,
               stats: Optional[dict] = None,
               v: Optional[int] = None,
-              skip_context_obs: bool = True) -> List[CutRecord]:
+              skip_context_obs: bool = True,
+              single: bool = False) -> List[CutRecord]:
         """One cut -> two horizon rows sharing the cut_id.
 
-        R10 chain-wise RPBE (review 2026-09-16): ``v`` selects the cut
-        position (default k - 3 = the historical penultimate-memory cut);
-        callers enumerate EVERY legal v (0..k-3) so the window realizes
-        the Theorem-4 local-defect SUM over the chain, not a single
-        position.
+        Review ruling (2026-09-21): cuts are t = 1..L with
+        ``v = block_idx = t - 1`` (L = compressed-history turns).  Every
+        t < L emits the 2Obs pair (w = 0.5 each); the TERMINAL cut
+        t = L (v = L - 1) has only (c, y) left in its future and emits
+        the single legal observation with full weight 1.0 — no fabricated
+        second future.
+
+        ``single=True`` (supervisor sweep, review 2026-09-23): EVERY cut
+        emits exactly one (chi_1, phi_1) row at weight 1.0 — the
+        root-only supervision variant where every t supervises the final
+        target y with the remaining suffix as the context.
 
         ``z_v`` keeps its graph (pass 2 replays the exact gradient);
         ``chi_1/2`` are constants (the UtteranceEmbed path is no_grad).
-        Returns [] for k < MIN_K (task CE keeps its own gradient).
+        Returns [] for L < 1 (task CE keeps its own gradient).
         """
         k = int(meta.k)
-        if k < MIN_K:
+        L = int(meta.L) if getattr(meta, "L", None) else int(k) - 1
+        if L < 1:
             if stats is not None:
-                stats.setdefault("skipped_k_lt_3", 0)
-                stats["skipped_k_lt_3"] += 1
+                stats.setdefault("skipped_L_lt_1", 0)
+                stats["skipped_L_lt_1"] += 1
             return []
         if v is None:
-            v = k - 3
+            v = L - 1          # terminal cut block index
         cut_occurrence = self._next_oid
         self._next_oid += 1
         rows: List[CutRecord] = []
-        # R10 (review 2026-09-16): the DEEPEST cut (v == k - 3) has
-        # obs1 Y = u_{v+2} = u_{k-1} = the immediate CONTEXT turn —
-        # a non-compressed, decoder-visible utterance that must NOT be
-        # supervised as a predictive target (invalid supervision: the
-        # context turn is not compressed and predicting it serves the
+        # The terminal cut (t = L) has obs1 Y = c, the immediate CONTEXT
+        # turn — a non-compressed, decoder-visible utterance that must
+        # NOT be supervised as a predictive target (invalid supervision:
+        # the context turn is not compressed and predicting it serves the
         # final target in no causal way).  Skip obs1 there and give the
         # single obs2 row the full cut weight 1.0.
-        horizons = (2,) if (v == k - 3 and skip_context_obs) else (1, 2)
+        if single:
+            horizons = (1,)
+        elif v == L - 1 and skip_context_obs:
+            horizons = (2,)
+        else:
+            horizons = (1, 2)
         for horizon in horizons:
             chi = chi_1 if horizon == 1 else chi_2
             phi = phi_1 if horizon == 1 else phi_2
@@ -245,10 +272,8 @@ class DialogueCutBuilder:
                 chi = chi[0]
             if phi.dim() == 2:
                 phi = phi[0]
-            # V11 (review): local-interface depth L_v = v + 1 — the
-            # measurement now identifies WHICH chain position this cut
-            # is (whole-prefix L = meta.k - 1 carried no position info
-            # and let all 12 cuts of a chain share one signature).
+            # Local-interface depth signature: L_v = v + 1 = t — the
+            # measurement identifies WHICH chain position this cut is.
             p = self.maps.pv(chi, phi, L=int(v) + 1)
             # Review round 8: tree identity = the STABLE original dialogue
             # id, not the per-step stream cursor (which would count every

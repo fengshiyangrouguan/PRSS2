@@ -1,0 +1,112 @@
+{
+ "_comment": "GEMMA4 Stage-B history-Gamma spec (review 2026-09-24): theta_0 = the Stage-A native-compress best checkpoint (treewise s10) with the compressor FROZEN; trainable = the zero-init history-branch Gamma ONLY (residual enters with (t-1)/t, persistent history branch r_t=(t-1)/t*(r_{t-1}+R_t)).  lambda_kf is null — the native-compress lambda (0.09987) was calibrated in the LoRA/COMP space and does NOT transfer to the Gamma-only geometry; recalibrate on theta_0 before the formal run.",
+ "frozen_source": "Qwen3 native-actuation frozen spec (frozen_method_qwen3_native.json, review 2026-09-22) re-instantiated on the gemma4 host; gemma merge protocol per frozen_method_gemma4.json / CCM_Gemma4_Porting_Spec.md",
+ "actuation": {
+  "mode": "native",
+  "scope": "conditional LoRA q/k/v/o r=8 (shared layers q/o only — a gemma architecture fact) + COMP/SUM comp_embeddings rows (SeparatedEmbedding); recursion node = native merge step (M_{t-1}, u_t) -> M_t, depth D=L; Z_t = M_t via JMemLift unchanged",
+  "theta0": "frozen Gemma-4-E4B base + Step-1 default-LoRA foundation merge (train_ccm_merge build chain) + init-from Stage-2 merge checkpoint_step600.pt (LoRA + COMP rows loaded; no Gamma exists)",
+  "projection_space": "AdamW proposal space (same as qwen3 native line): d_0 = shadow-AdamW joint proposal from g_task + lambda*g_pred; d* = argmin 1/2||d-d_0||^2 s.t. q_i^T d >= -kappa*||q_i||*||d_task||; theta <- theta + d* written back directly",
+  "lambda_fact": "lambda does NOT affect the pure half-space feasibility region (cancels on both sides); lambda is meaningful only through the joint proposal center d_0"
+ },
+ "backbone": {
+  "model": "Gemma-4-E4B base (text-only decoder from the released multimodal ckpt)",
+  "hf_identifier": "google/gemma-4-E4B",
+  "transformers": "5.17 (5.x stack; 4.x does not register gemma4)",
+  "attn_type": "merge_recur",
+  "n_tok_lock": 2,
+  "torch_compile": "disabled",
+  "dtype": "bf16",
+  "kv_sharing": "layers 24-41 share k/v proj — LoRA targets q/o there; SUM merge/Γ/mem_callback live on non-shared layers only (ccm_gemma4.py)"
+ },
+ "adapter": {
+  "lora_r": 8,
+  "lora_alpha": 16,
+  "lora_dropout": 0.0,
+  "lora_r_note": "r=8 conditional LoRA q/k/v/o (shared layers q/o) + COMP/SUM rows — the ONLY trainable params under native actuation. lora_dropout pinned 0.0 for the two-pass replay identity."
+ },
+ "rpbe": {
+  "ridge_eps": 0.001,
+  "sketch_dim_m": 32,
+  "rpbe_map_seed": 0,
+  "z_v_dim": 128,
+  "horizon_weights": [
+   0.5,
+   0.5
+  ],
+  "lambda_calibration": {
+   "rule": "same as the qwen3 native line: r_eff = lambda * ||d_pred|| / ||d_task|| ~ 0.1 measured at theta_0 (init-from step600) on the first closed window, native proposal-space (lr=1 direction space), then frozen.",
+   "lambda_kf": null,
+   "lambda_kf_note": "NULL PENDING RECALIBRATION (review 2026-09-24): history-Gamma trains a DIFFERENT parameter space than the native lambda was calibrated in.  Calibrate once on the Stage-B theta_0 and commit here."
+  },
+  "z_v_source": "J_mem(M_v) fixed adapter; GQA hosts lift the memory from the KV heads; native mode lifts the PURE CCM mean (no Gamma residual exists)",
+  "witness": "none (main experiment)",
+  "sketch_ensemble_n_branches": 4,
+  "sketch_ensemble_note": "four independent 32-dim branches (J_ens = mean_r J_r); depth bucket b(L_v) modulates the future signature phi_r.",
+  "oas_shrinkage": {
+   "enabled": true,
+   "rule": "paired OAS covariance shrinkage per branch; the fixed ridge keeps only its numerical-safety role."
+  }
+ },
+ "gamma": {
+  "placement": "NOT ATTACHED in native mode (kept for the enforce_frozen gamma.hidden binding)",
+  "hidden": 64,
+  "time_dim": 16
+ },
+ "window": {
+  "min_effective_cuts": 128,
+  "collection": "adaptive by effective cut count (dialogues with k>=4), not a mechanical microbatch count",
+  "cadence": "identical task samples and scheduler cadence across the two native arms"
+ },
+ "training": {
+  "steps": 20,
+  "steps_note": "Stage-B: 20 windows from the Stage-A s10 checkpoint, history-Gamma only, S4/QP unchanged.",
+  "official_protocol": {
+   "arm": "ccm_merge_official",
+   "merge_cadence": "official",
+   "grad_accum": 128,
+   "random_k": true,
+   "data_stream": "shuffled epoch loop (each dialogue exactly once per epoch)",
+   "thresholds": "train max_len_total 400, val/test 600 (official data.py)",
+   "micro_batch": 1,
+   "micro_batch_note": "RPBE arms require micro-batch 1 (two-pass replay protocol)"
+  },
+  "grad_clip": 1.0,
+  "grad_clip_source": "official HF Trainer default (max_grad_norm)",
+  "merge_cadence": "window-matched",
+  "two_pass_replay": "pass1 no-grad statistics forward, pass2 grad replay forward (RPBE arms only)",
+  "rpbe_gamma_only": false,
+  "rpbe_lr": null,
+  "proposal_space": {
+   "center": "d_0 = shadow AdamW proposal of g_joint = g_task + lambda*g_pred (moments read from the CURRENT optimizer state, never stepped)",
+   "constraint_norm": "||d_task|| = shadow AdamW proposal norm of the PURE task gradient (snapshotted before the aux accumulation)",
+   "half_spaces": "q_i^T d* >= -kappa*||q_i||*||d_task|| (lower bound in update space)",
+   "write_back": "theta <- theta + d*; optimizer moments updated with the true-value clipped joint gradient; scheduler/scaler cadence identical to the task-only arm",
+   "cert_fail": "whole-window skip including the task update (inherited gamma-line semantics), cert_skip_steps recorded"
+  },
+  "seeds": 1,
+  "seeds_note": "seed 0 only (same ruling as the qwen3 line)",
+  "eval": "gemma Stage-2 ckpts evaluate via eval_ccm_depth.py --mode ccm --host gemma4 --foundation <step1> --ours-ckpt X --pooled (protocol B buckets; NLL output, PPL = exp(nll))",
+  "checkpoint_every": 2,
+  "checkpoint_every_note": "Stage-B checkpoints every 2 windows",
+  "schedule_total_steps": 1000,
+  "schedule_note": "warmup/cosine over 1000 steps (warmup ratio 0.03); --no-warmup on the fork: the first window steps at the peak lr and the cosine descends from there"
+ },
+ "sampling": {
+  "depth_levels": [
+   1,
+   2,
+   4,
+   8,
+   13
+  ],
+  "k_of_L": "L + 2 (fixed prefix length per depth)",
+  "q_alpha": 1.0,
+  "q_alpha_note": "q_L ∝ n_L^q_alpha, q_alpha=1 (natural frequency) with the replay cap — same convention as the qwen3 native line",
+  "max_replays": 12,
+  "rule": "depth-stratified legal cuts with natural-frequency depth weights + per-dialogue replay cap; ONE original dialogue per window (tree_id = stable original dialogue id); L=1 dialogues carry task CE only."
+ },
+ "freeze_host": {
+  "enabled": false,
+  "scope": "Stage-B freezes the native compressor (LoRA + COMP) via --history-gamma; trainable = Gamma only."
+ }
+}

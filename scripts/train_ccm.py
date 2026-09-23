@@ -432,9 +432,12 @@ def _frozen_path(args):
     if getattr(args, "frozen", ""):
         return Path(args.frozen)
     if getattr(args, "rpbe_native_compression", False):
-        _name = ("frozen_method_qwen3_native.json"
-                 if getattr(args, "host", "llama") == "qwen3"
-                 else "frozen_method_gemma4_native.json")
+        if getattr(args, "history_gamma", False):
+            _name = "frozen_method_gemma4_stageB.json"
+        else:
+            _name = ("frozen_method_qwen3_native.json"
+                     if getattr(args, "host", "llama") == "qwen3"
+                     else "frozen_method_gemma4_native.json")
         return Path(__file__).resolve().parents[1] / "configs" / "ccm" \
             / _name
     name = ("frozen_method_qwen3.json"
@@ -1879,7 +1882,19 @@ def main():
         # The LoRA stays train() (dropout pinned to 0.0 in wrap_lora),
         # so pass-1/pass-2 replay remains bit-identical (the RNG
         # protocol precondition).
-        model.train()
+        if getattr(args, "history_gamma", False):
+            # Stage-B (review 2026-09-24): frozen host eval() + Gamma
+            # train().
+            model.eval()
+            _base2 = model
+            while not hasattr(_base2, "layers") \
+                    and hasattr(_base2, "model"):
+                _base2 = _base2.model
+            for _layer in _base2.layers:
+                if _layer.self_attn.gamma is not None:
+                    _layer.self_attn.gamma.train()
+        else:
+            model.train()
         print("[native-compression] frozen {} backbone params; "
               "trainable = {}".format(
                   n_frozen,

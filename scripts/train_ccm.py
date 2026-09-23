@@ -3910,7 +3910,7 @@ def main():
                                 # dump, then exit before the QP.
                                 _dt_flat = torch.cat(
                                     [x.reshape(-1).double()
-                                     for x in d_task])
+                                     for x in d_task]).cpu()
                                 _cells = {}
                                 _tot = 0.0
                                 for _L, _h, _q in audit_rows:

@@ -195,6 +195,12 @@ def load_ccm_arm(args, device, ckpt):
         model.update_comp_token(
             [tokenizer.comp_token_id[k] for k in range(tc.N_TOK)],
             [tokenizer.sum_token_id[k] for k in range(tc.N_TOK)])
+        if a.history_gamma:
+            from rpbe.hosts.ccm.ccm_patch import attach_gamma
+            attach_gamma(model, hidden=64)
+            for _n, _p in model.named_parameters():
+                if "gamma" in _n:
+                    _p.requires_grad_(True)
         dummy = torch.optim.AdamW(
             [p for p in model.parameters() if p.requires_grad], lr=1e-3)
         tc.load_trainable(ckpt, model, dummy, device, load_optimizer=False)
@@ -343,6 +349,12 @@ def main():
                          "the Step-1 adapter-only ckpt merged into the "
                          "base INSIDE build_model before the "
                          "conditional LoRA attach)")
+    ap.add_argument("--history-gamma", action="store_true",
+                    help="Stage-B evaluation: attach the history-branch "
+                         "Gamma (zero-init) before loading the ckpt so "
+                         "the trained Gamma weights take effect — "
+                         "without it a Stage-B ckpt evaluates as the "
+                         "frozen Stage-A compressor.")
     ap.add_argument("--model-name-or-path",
                     default="/root/autodl-tmp/llama-7b-hf")
     ap.add_argument("--dialog-mirror",

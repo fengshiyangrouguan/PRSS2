@@ -268,6 +268,27 @@ def build_model_merge(args, device):
             [text_cfg.vocab_size + k for k in range(N_TOK)],
             [text_cfg.vocab_size + N_TOK + k for k in range(N_TOK)])
         return model.to(device)
+    if args.host == "qwen3":
+        # Qwen3 official host (eval_qwen3_pooled parity, review
+        # 2026-09-25 concat line): aligned instruct backbone, bf16,
+        # SeparatedEmbedding COMP/SUM rows; the main() flow wraps the
+        # conditional LoRA (wrap_lora_merge) and re-updates comp ids to
+        # the tokenizer slots.
+        from transformers.models.qwen3.configuration_qwen3 import \
+            Qwen3Config
+        from src.arch.ccm_qwen3 import Qwen3ForCausalLM_CCM
+        from src.utils import SeparatedEmbedding
+        config = Qwen3Config.from_pretrained(args.model_name_or_path)
+        config.comp_relative_embedding = args.relative_embedding
+        model = Qwen3ForCausalLM_CCM.from_pretrained(
+            args.model_name_or_path, config=config,
+            torch_dtype=torch.bfloat16).to(device)
+        model.model.embed_tokens = SeparatedEmbedding(
+            model.model.embed_tokens, 2 * N_TOK)
+        model.update_comp_token(
+            [config.vocab_size + k for k in range(N_TOK)],
+            [config.vocab_size + N_TOK + k for k in range(N_TOK)])
+        return model
     if args.host == "llama":
         # Official merged host (review 2026-09-25 concat line): fp32
         # base + Step-1 foundation merged + SeparatedEmbedding COMP
@@ -474,7 +495,13 @@ def main():
         [tokenizer.sum_token_id[k] for k in range(N_TOK)])
     dialog, collator = build_dataset(args, tokenizer)
     train_items = dialog.trainset
-    n_items = len(train_items)
+    if args.host == "llama":
+        # llama trainset is a dict-of-lists: len() would count the KEYS
+        # ("dialog"/"act"), silently training only 2 dialogues
+        # (review 2026-09-25 P0).
+        n_items = len(train_items["dialog"])
+    else:
+        n_items = len(train_items)
 
     params = [p for p in model.parameters() if p.requires_grad]
     optimizer = torch.optim.AdamW(params, lr=args.lr, weight_decay=0.0)
@@ -654,7 +681,7 @@ def main():
 
     save_trainable(out / "final.pt", model, step=step)
     save_json(out / "summary.json", {
-        "arm": "ccm_merge_official", "protocol": "official Step-2 merge",
+        "arm": "ccm_merge_official", "protocol": "official Step-2 {}".format(args.ccm_topology),
         "seed": args.seed, "steps": step,
         "mean_task_ce_per_token": total_loss / max(total_tokens, 1),
         "task_valid_tokens": total_tokens, "epochs": n_epochs,

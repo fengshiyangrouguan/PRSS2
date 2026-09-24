@@ -320,6 +320,13 @@ def parse_args():
                         "only (never the QP rows), window-mean "
                         "normalized over ALL observations, e.g. "
                         "'0.5,1.0,1.5'.  Empty = no depth weighting.")
+    p.add_argument("--aliased-measurement", action="store_true",
+                   help="probe switch (review 2026-09-24): sketch EVERY "
+                        "logical layer in J_mem (the old aliased "
+                        "behavior) instead of the unique physical KV "
+                        "providers — used only for the paired probe "
+                        "comparing q-norm/task-cosine/Pr between the "
+                        "two measurements.")
     p.add_argument("--history-gamma", action="store_true",
                    help="Stage-B history-branch correction (review "
                         "2026-09-24): keep the native compressor "
@@ -2003,8 +2010,9 @@ def main():
             # once in J_mem (aliased sketching distorted the predictive
             # gradient norm AND direction).
             _n_shared = int(getattr(cfg, "num_kv_shared_layers", 0))
-            unique_layer_ids = list(
-                range(cfg.num_hidden_layers - _n_shared))
+            unique_layer_ids = (
+                None if getattr(args, "aliased_measurement", False)
+                else list(range(cfg.num_hidden_layers - _n_shared)))
         else:
             n_heads = cfg.num_attention_heads
             head_dim = cfg.hidden_size // cfg.num_attention_heads

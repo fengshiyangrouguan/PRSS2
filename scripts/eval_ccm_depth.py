@@ -52,7 +52,8 @@ def bucket_of(dialog):
 def build_eval_dataset(args, tokenizer, pooled, online, comp_type):
     """Official DialogueDataset under the requested protocol."""
     from src.arguments import CompressionArguments
-    comp_args = CompressionArguments(attn_type="merge_recur",
+    comp_args = CompressionArguments(
+        attn_type=getattr(args, "ccm_topology", "merge_recur"),
                                      num_comp_tokens=tc.N_TOK,
                                      add_comp_token=True,
                                      relative_embedding=args.relative_embedding,
@@ -359,6 +360,10 @@ def eval_truncated(model, collator, dialogs, device, limit, name,
 
 def main():
     ap = argparse.ArgumentParser()
+    ap.add_argument("--ccm-topology", default="merge_recur",
+                    choices=["merge_recur", "concat_recur"],
+                    help="CCM topology override (concat line, "
+                         "review 2026-09-25)")
     ap.add_argument("--mode", choices=["ccm", "ref"], required=True)
     ap.add_argument("--taskonly-ckpt", default="")
     ap.add_argument("--ours-ckpt", default="")

@@ -449,9 +449,15 @@ def _frozen_path(args):
         if getattr(args, "history_gamma", False):
             _name = "frozen_method_gemma4_stageB.json"
         else:
-            _name = ("frozen_method_qwen3_native.json"
-                     if getattr(args, "host", "llama") == "qwen3"
-                     else "frozen_method_gemma4_native.json")
+            _topo = getattr(args, "ccm_topology", "merge_recur")
+            if getattr(args, "host", "llama") == "qwen3":
+                _name = ("frozen_method_qwen3_concat_native.json"
+                         if _topo == "concat_recur"
+                         else "frozen_method_qwen3_native.json")
+            else:
+                _name = ("frozen_method_gemma4_concat_native.json"
+                         if _topo == "concat_recur"
+                         else "frozen_method_gemma4_native.json")
         return Path(__file__).resolve().parents[1] / "configs" / "ccm" \
             / _name
     name = ("frozen_method_qwen3.json"

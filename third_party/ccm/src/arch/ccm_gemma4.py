@@ -435,10 +435,14 @@ class Gemma4CCMTextAttention(nn.Module):
                             1, sum_row_pos[b].reshape(-1),
                             res_all_v[b].reshape(n_heads, -1, head_dim))
 
-                # RPBE: memory extraction (post-merge, pre-attention).
-                if self.mem_callback is not None:
-                    self.mem_callback(key_states, value_states, sum_mask,
-                                      sum_row_pos)
+            # RPBE: memory extraction (post-merge, pre-attention).
+            # concat line (review 2026-09-25): under concat_recur the
+            # SUM merge block never runs (no per-turn SUM rows), so the
+            # provider callback must fire for EVERY topology to keep
+            # adapter._cache populated (same fix as ccm_qwen3 cebd590).
+            if self.mem_callback is not None:
+                self.mem_callback(key_states, value_states, sum_mask,
+                                  sum_row_pos)
 
             if self.store_full_length_kv:
                 # Backward-only physical-state normalization (review

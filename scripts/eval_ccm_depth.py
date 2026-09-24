@@ -307,6 +307,7 @@ def main():
     import types
     args = types.SimpleNamespace(
         arm="ours", model_name_or_path=a.model_name_or_path,
+        ccm_topology=a.ccm_topology,
         dialog_mirror=a.dialog_mirror, relative_embedding="skip",
         lora_r=8, z_dim=128, rpbe_seed=0, sketch_dim=64, gamma_hidden=64,
         host=a.host, official_host=False, foundation="",

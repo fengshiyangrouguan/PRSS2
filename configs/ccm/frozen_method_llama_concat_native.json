@@ -4,7 +4,7 @@
  "actuation": {
   "mode": "native",
   "scope": "conditional LoRA (released Step-2 adapter) + COMP/SUM comp_embeddings rows (SeparatedEmbedding); recursion node = native merge step (M_{t-1}, u_t) -> M_t, depth D=L; Z_t = M_t",
-  "theta0": "official merged host: llama-7b-hf + Step-1 foundation (llama-7b-no, merged) + released Step-2 compression adapter (llama-7b-no-online-merge_recur-ntok2) + SeparatedEmbedding COMP rows (build_official_host; fp32 throughout per review round 7)",
+  "theta0": "Stage-C0 trained CCM-concat checkpoint (Step-1 foundation + CCM-concat LoRA/COMP), loaded through --init-from; the released merge adapter is used only to instantiate the compatible conditional-LoRA structure before overwrite",
   "projection_space": "AdamW proposal space (same as the qwen3 native line): d_0 = shadow-AdamW joint proposal from g_task + lambda*g_pred; d* = argmin 1/2||d-d_0||^2 s.t. q_i^T d >= -kappa*||q_i||*||d_task||; theta <- theta + d* written back directly",
   "lambda_fact": "lambda does NOT affect the pure half-space feasibility region (cancels on both sides); lambda is meaningful only through the joint proposal center d_0",
   "recursion_note": "concat_recur: M_t = [M_{t-1}; h_t] (retained COMP states, memory grows with depth)"
@@ -36,7 +36,7 @@
   "lambda_calibration": {
    "rule": "same as the qwen3 native line: r_eff = lambda * ||d_pred|| / ||d_task|| ~ 0.1 measured at theta_0 (the official merged host) on the first closed window, native proposal-space (lr=1 direction space), then frozen.",
    "lambda_kf": 0.09974519358869541,
-   "lambda_kf_note": "Calibrated 2026-09-24 (llama official merged host, native proposal-space r_eff at theta_0): r_eff = 1.0026, derived lambda = 0.1/1.0026 = 0.0997.  Matches qwen3 (0.0998, r_eff 1.002) and gemma4 (0.0999, r_eff 1.001) — the proposal-space r_eff on native compression params is ~1 across all three hosts."
+   "lambda_kf_note": "held fixed from the matched CCM-M native protocol for the topology comparison (NOT recalibrated on the concat geometry, review 2026-09-25)"
   },
   "z_v_source": "J_mem(M_v) fixed adapter; llama host lifts the memory from all attention heads (32, head_dim = hidden / heads)",
   "witness": "none (main experiment)",
@@ -107,7 +107,7 @@
  },
  "official_host": {
   "enabled": true,
-  "note": "llama native REQUIRES --official-host (the merged official model): the trainer refuses the ours arm without it.  The CLI also needs --foundation <llama-7b-no> and --official-adapter <llama-7b-no-online-merge_recur-ntok2> (build_official_host reads both; on the seetacloud box they live under /root/autodl-tmp/result/dialog/)."
+  "note": "concat line: build_official_host instantiates the conditional-LoRA skeleton from the released merge adapter; --init-from Stage-C0 concat checkpoint then overwrites LoRA + COMP rows (review 2026-09-25)"
  },
  "freeze_host": {
   "enabled": false,

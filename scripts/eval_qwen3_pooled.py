@@ -39,6 +39,10 @@ def main():
     ap.add_argument("--dialog-mirror",
                     default="/root/autodl-tmp/dailydialog_mirror/"
                             "ijcnlp_dailydialog")
+    ap.add_argument("--ccm-topology", default="merge_recur",
+                    choices=["merge_recur", "concat_recur"],
+                    help="CCM topology override (concat line, "
+                         "review 2026-09-25)")
     ap.add_argument("--ckpt", required=True,
                     help="checkpoint.pt (or INIT for the step-0 baseline)")
     ap.add_argument("--no-gamma", action="store_true",
@@ -162,7 +166,7 @@ def main():
     from src.arguments import CompressionArguments
     from src.data.dialogue.qwen3_data import (
         Qwen3DialogueDataset, Qwen3DialogueCollator)
-    comp_args = CompressionArguments(attn_type="merge_recur",
+    comp_args = CompressionArguments(attn_type=a.ccm_topology,
                                      num_comp_tokens=tc.N_TOK,
                                      add_comp_token=True,
                                      relative_embedding="skip")

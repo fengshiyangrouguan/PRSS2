@@ -382,6 +382,7 @@ def main():
         dialog_mirror=a.dialog_mirror, relative_embedding="skip",
         lora_r=8, z_dim=128, rpbe_seed=0, sketch_dim=64, gamma_hidden=64,
         host=a.host, official_host=False, foundation=a.foundation,
+        history_gamma=a.history_gamma,
         official_adapter="")
 
     tokenizer = tc.build_tokenizer(args)

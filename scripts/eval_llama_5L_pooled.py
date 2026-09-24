@@ -65,6 +65,10 @@ def build_official_host(device):
 
 def main():
     ap = argparse.ArgumentParser()
+    ap.add_argument("--ccm-topology", default="merge_recur",
+                    choices=["merge_recur", "concat_recur"],
+                    help="CCM topology override (concat line, "
+                         "review 2026-09-25)")
     ap.add_argument("--ckpt", required=True,
                     help="checkpoint from train_ccm --official-host "
                          "(or NONE for the un-trained official merge)")
@@ -79,7 +83,7 @@ def main():
     from src.arguments import CompressionArguments
     from src.data.dialogue.data import DialogueDataset
     from src.data.dialogue.collator import DataCollatorForDialogue_LLAMA
-    comp_args = CompressionArguments(attn_type="merge_recur",
+    comp_args = CompressionArguments(attn_type=a.ccm_topology,
                                      num_comp_tokens=tc.N_TOK,
                                      add_comp_token=True,
                                      relative_embedding="skip")

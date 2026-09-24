@@ -50,6 +50,11 @@ N_TOK = 2  # official dialog line: n_tok = 2 (2 COMP + 2 SUM)
 def parse_args():
     p = argparse.ArgumentParser(
         "CCM merge training (official Step-2 protocol, self-contained)")
+    p.add_argument("--ccm-topology", default="merge_recur",
+                   choices=["merge_recur", "concat_recur"],
+                   help="CCM topology: merge_recur (default) "
+                        "or concat_recur (CCM-concat line, "
+                        "review 2026-09-25)")
     p.add_argument("--model-name-or-path", required=True)
     p.add_argument("--host", default="qwen3", choices=["llama", "qwen3"])
     p.add_argument("--dialog-mirror", required=True)
@@ -184,8 +189,9 @@ def wrap_lora_merge(model, r, dropout):
 def build_dataset(args, tokenizer):
     from src.arguments import CompressionArguments
     os.environ["DIALOG_MIRROR"] = args.dialog_mirror
-    comp_args = CompressionArguments(attn_type="merge_recur",
-                                     num_comp_tokens=N_TOK,
+    comp_args = CompressionArguments(
+        attn_type=args.ccm_topology,
+        num_comp_tokens=N_TOK,
                                      add_comp_token=True,
                                      relative_embedding=args.relative_embedding)
     if args.host == "qwen3":

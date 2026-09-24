@@ -262,6 +262,83 @@ class Gemma4CCMTextAttention(nn.Module):
             key_states, value_states = shared_kv_states[self.layer_type]
             key_states = key_states.to(query_states.device)
             value_states = value_states.to(query_states.device)
+            # Shared-layer history-branch Gamma (review 2026-09-24):
+            # the inherited K/V carries the provider merge; inject THIS
+            # layer's OWN Gamma correction on a clone so all 42 layers
+            # are active (llama parity — every layer corrects).  The
+            # current h_t is gathered from the inherited COMP rows
+            # (sum_row_pos - n_slots), the previous state from the
+            # inherited SUM rows.
+            if self.gamma is not None and sum_row_pos is not None \
+                    and int(sum_row_pos.shape[1]) >= 1:
+                bsz_s = input_shape[0]
+                key_states = key_states.clone()
+                value_states = value_states.clone()
+                n_heads_s = key_states.shape[1]
+                head_dim_s = key_states.shape[3]
+                n_slots_s = int(sum_row_pos.shape[2])
+                t_max_s = int(sum_row_pos.shape[1])
+                n_rows_s = t_max_s * n_slots_s
+                _idx = sum_row_pos.reshape(bsz_s, n_rows_s) \
+                    .unsqueeze(1)
+                _idx = _idx.expand(bsz_s, n_heads_s, n_rows_s)
+                _idx = _idx.unsqueeze(-1).expand(
+                    -1, -1, -1, head_dim_s)
+                k_sum = torch.gather(key_states, 2, _idx).reshape(
+                    bsz_s, n_heads_s, t_max_s, n_slots_s, head_dim_s)
+                v_sum = torch.gather(value_states, 2, _idx).reshape(
+                    bsz_s, n_heads_s, t_max_s, n_slots_s, head_dim_s)
+                _cidx = (sum_row_pos - n_slots_s).reshape(
+                    bsz_s, n_rows_s).unsqueeze(1)
+                _cidx = _cidx.expand(bsz_s, n_heads_s, n_rows_s)
+                _cidx = _cidx.unsqueeze(-1).expand(
+                    -1, -1, -1, head_dim_s)
+                k_comp = torch.gather(key_states, 2, _cidx).reshape(
+                    bsz_s, n_heads_s, t_max_s, n_slots_s, head_dim_s)
+                v_comp = torch.gather(value_states, 2, _cidx).reshape(
+                    bsz_s, n_heads_s, t_max_s, n_slots_s, head_dim_s)
+                res_prev_k = torch.zeros(
+                    bsz_s, n_heads_s, n_slots_s, head_dim_s,
+                    dtype=key_states.dtype, device=key_states.device)
+                res_prev_v = torch.zeros_like(res_prev_k)
+                res_list_k = []
+                res_list_v = []
+                valid_s = sum_row_valid.to(key_states.dtype) \
+                    .unsqueeze(1).unsqueeze(-1)
+                for t_i in range(1, t_max_s + 1):
+                    tt = torch.full((bsz_s, 1), t_i,
+                                    dtype=torch.float32,
+                                    device=key_states.device)
+                    if t_i == 1:
+                        prev_k = torch.zeros_like(k_sum[:, :, 0])
+                        prev_v = torch.zeros_like(v_sum[:, :, 0])
+                    else:
+                        prev_k = k_sum[:, :, t_i - 2] + res_prev_k
+                        prev_v = v_sum[:, :, t_i - 2] + res_prev_v
+                    _tfac = (t_i - 1.0) / float(t_i)
+                    _raw_k = self.gamma(
+                        prev_k, k_comp[:, :, t_i - 1], tt) \
+                        * valid_s[:, :, t_i - 1]
+                    res_t_k = _tfac * (res_prev_k + _raw_k)
+                    _raw_v = self.gamma(
+                        prev_v, v_comp[:, :, t_i - 1], tt) \
+                        * valid_s[:, :, t_i - 1]
+                    res_t_v = _tfac * (res_prev_v + _raw_v)
+                    res_prev_k = res_t_k
+                    res_prev_v = res_t_v
+                    res_list_k.append(res_t_k)
+                    res_list_v.append(res_t_v)
+                res_all_k = torch.stack(res_list_k, dim=2)
+                res_all_v = torch.stack(res_list_v, dim=2)
+                for b in range(bsz_s):
+                    key_states[b] = key_states[b].index_add(
+                        1, sum_row_pos[b].reshape(-1),
+                        res_all_k[b].reshape(
+                            n_heads_s, -1, head_dim_s))
+                    value_states[b] = value_states[b].index_add(
+                        1, sum_row_pos[b].reshape(-1),
+                        res_all_v[b].reshape(
+                            n_heads_s, -1, head_dim_s))
             # RPBE: the inherited K/V already carries the provider
             # layer's SUM merge — fill the memory cache here too so the
             # per-layer JMemLift sees every layer (review fix

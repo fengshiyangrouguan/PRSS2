@@ -201,6 +201,26 @@ def load_ccm_arm(args, device, ckpt):
             for _n, _p in model.named_parameters():
                 if "gamma" in _n:
                     _p.requires_grad_(True)
+                else:
+                    _p.requires_grad_(False)
+            # Stage-B checkpoints carry the Gamma weights ONLY (the
+            # frozen compressor is not stored) — load the Stage-A
+            # compressor weights first, then the Stage-B gamma.
+            _ia = getattr(args, "history_gamma_init_from", "")
+            if not _ia:
+                raise SystemExit(
+                    "--history-gamma requires "
+                    "--history-gamma-init-from <Stage-A ckpt>")
+            _pA = torch.load(_ia, map_location=device,
+                             weights_only=False)
+            _miss, _unexp = model.load_state_dict(_pA["model"],
+                                                  strict=False)
+            if _unexp:
+                raise RuntimeError("Stage-A unexpected keys: {}"
+                                   .format(sorted(_unexp)[:5]))
+            print("[history-gamma] Stage-A loaded: {} missing (Gamma "
+                  "kept zero-init until the Stage-B load)".format(
+                      len(_miss)), flush=True)
         dummy = torch.optim.AdamW(
             [p for p in model.parameters() if p.requires_grad], lr=1e-3)
         tc.load_trainable(ckpt, model, dummy, device, load_optimizer=False)
@@ -355,6 +375,10 @@ def main():
                          "the trained Gamma weights take effect — "
                          "without it a Stage-B ckpt evaluates as the "
                          "frozen Stage-A compressor.")
+    ap.add_argument("--history-gamma-init-from", default="",
+                    help="Stage-A checkpoint holding the frozen "
+                         "compressor weights (LoRA + COMP) that the "
+                         "Stage-B ckpt does not store")
     ap.add_argument("--model-name-or-path",
                     default="/root/autodl-tmp/llama-7b-hf")
     ap.add_argument("--dialog-mirror",
@@ -383,6 +407,7 @@ def main():
         lora_r=8, z_dim=128, rpbe_seed=0, sketch_dim=64, gamma_hidden=64,
         host=a.host, official_host=False, foundation=a.foundation,
         history_gamma=a.history_gamma,
+        history_gamma_init_from=a.history_gamma_init_from,
         official_adapter="")
 
     tokenizer = tc.build_tokenizer(args)

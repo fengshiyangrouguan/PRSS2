@@ -65,6 +65,13 @@ def main():
     ap.add_argument("--ckpt", required=True)
     ap.add_argument("--out", default="eval_llama_pooled_B.json")
     ap.add_argument("--limit", type=int, default=0)
+    ap.add_argument("--history-gamma", action="store_true",
+                    help="Stage-B: attach the history-branch Gamma and "
+                         "load a Stage-B ckpt (gamma-only) on top of the "
+                         "Stage-A compressor weights")
+    ap.add_argument("--history-gamma-init-from", default="",
+                    help="Stage-A ckpt holding the frozen compressor "
+                         "(LoRA + COMP) the Stage-B ckpt does not store")
     a = ap.parse_args()
     device = torch.device("cuda", 0)
 
@@ -89,12 +96,34 @@ def main():
         label_pad_token_id=-100)
 
     model = build_official_host(device)
-    # NO gamma attach (native S4 line, 2026-09-24): the train side runs
-    # the official host WITHOUT Gamma; attaching it here triggers the
-    # ccm_llama.py recur-scan block whose n_heads binding only happens
-    # under t_max>=2 — turn_3 dialogues (L=1, t_max=1) then raise
-    # UnboundLocalError n_heads.  The merge baseline and the native
-    # treewise checkpoints are all Gamma-free.
+    if a.history_gamma:
+        # Stage-B (review 2026-09-24): attach zero-init Gamma, load the
+        # Stage-A compressor weights, then the gamma-only Stage-B ckpt.
+        from rpbe.hosts.ccm.ccm_patch import attach_gamma
+        attach_gamma(model, hidden=64)
+        for _n, _p in model.named_parameters():
+            if "gamma" in _n:
+                _p.requires_grad_(True)
+            else:
+                _p.requires_grad_(False)
+        if not a.history_gamma_init_from:
+            raise SystemExit("--history-gamma requires "
+                             "--history-gamma-init-from")
+        _pA = torch.load(a.history_gamma_init_from, map_location=device,
+                         weights_only=False)
+        _miss, _unexp = model.load_state_dict(_pA["model"], strict=False)
+        if _unexp:
+            raise RuntimeError("Stage-A unexpected keys: {}"
+                               .format(sorted(_unexp)[:5]))
+        # fp16 host: cast the fp32 Gamma params explicitly (R8 parity).
+        _b = model
+        while not hasattr(_b, "layers") and hasattr(_b, "model"):
+            _b = _b.model
+        for _layer in _b.layers:
+            if _layer.self_attn.gamma is not None:
+                _layer.self_attn.gamma.half()
+        print("[history-gamma] Stage-A loaded (missing {})".format(
+            len(_miss)), flush=True)
     if a.ckpt != "NONE":
         payload = torch.load(a.ckpt, map_location=device,
                              weights_only=False)

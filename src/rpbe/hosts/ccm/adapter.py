@@ -30,7 +30,8 @@ class CCMHostAdapter:
 
     def __init__(self, model, *, n_layers: int, n_heads: int,
                  n_slots: int = 2, kv_pairs: int = 2, head_dim: int = 128,
-                 z_dim: int = 128, seed: int = 0, per_layer_dims=None):
+                 z_dim: int = 128, seed: int = 0, per_layer_dims=None,
+                 unique_layer_ids=None):
         from .ccm_patch import _base_model
         base = _base_model(model)
         if len(getattr(base, "layers", [])) != int(n_layers):
@@ -39,16 +40,31 @@ class CCMHostAdapter:
         self.n_heads = int(n_heads)
         self.n_slots = int(n_slots)
         self.head_dim = int(head_dim)
+        # Unique-provider measurement (review 2026-09-24): KV-sharing
+        # hosts (gemma4) reference ONE physical K/V from several logical
+        # layers — sketching every alias counts the same state multiple
+        # times and distorts the predictive gradient (norm AND
+        # direction).  unique_layer_ids restricts extract_z to the
+        # physical providers; None = every layer (llama/qwen3).
+        if unique_layer_ids is not None:
+            self.unique_ids = [int(x) for x in unique_layer_ids]
+            self.n_used = len(self.unique_ids)
+        else:
+            self.unique_ids = None
+            self.n_used = int(n_layers)
+        _pld = per_layer_dims
+        if _pld is not None and self.unique_ids is not None:
+            _pld = [_pld[i] for i in self.unique_ids]
         # The CountSketch index tables (2.1M entries x 3) must live on the
         # model device: this class is NOT an nn.Module, so nothing moves
         # them otherwise and every extract_z() would re-upload them from
         # CPU (L6.5 review performance fix).
         device = next(base.parameters()).device
-        self.j_mem = JMemLift(n_layers=n_layers, n_heads=n_heads,
+        self.j_mem = JMemLift(n_layers=self.n_used, n_heads=n_heads,
                               n_slots=n_slots, kv_pairs=kv_pairs,
                               head_dim=head_dim, z_dim=z_dim,
                               seed=seed,
-                              per_layer_dims=per_layer_dims).to(device)
+                              per_layer_dims=_pld).to(device)
         self.z_dim = int(z_dim)
         self._cache: List[Optional[tuple]] = [None] * self.n_layers
 
@@ -83,7 +99,10 @@ class CCMHostAdapter:
                 self.n_slots))
         k_parts: List[torch.Tensor] = []
         v_parts: List[torch.Tensor] = []
-        for entry in self._cache:
+        _layers = (self.unique_ids if self.unique_ids is not None
+                   else range(self.n_layers))
+        for _li in _layers:
+            entry = self._cache[_li]
             if entry is None:
                 raise RuntimeError(
                     "memory cache empty: run the model forward first "

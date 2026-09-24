@@ -1997,6 +1997,14 @@ def main():
                 int(cfg.per_layer_config[i].num_key_value_heads)
                 * int(cfg.per_layer_config[i].head_dim)
                 for i in range(cfg.num_hidden_layers)]
+            # Unique-provider measurement (review 2026-09-24): the
+            # shared KV layers alias ONE physical provider K/V — sketch
+            # only the providers so each physical memory state counts
+            # once in J_mem (aliased sketching distorted the predictive
+            # gradient norm AND direction).
+            _n_shared = int(getattr(cfg, "num_kv_shared_layers", 0))
+            unique_layer_ids = list(
+                range(cfg.num_hidden_layers - _n_shared))
         else:
             n_heads = cfg.num_attention_heads
             head_dim = cfg.hidden_size // cfg.num_attention_heads
@@ -2004,7 +2012,11 @@ def main():
                                  n_heads=n_heads,
                                  head_dim=head_dim,
                                  z_dim=args.z_dim, seed=args.rpbe_seed,
-                                 per_layer_dims=per_layer_dims)
+                                 per_layer_dims=per_layer_dims,
+                                 unique_layer_ids=(
+                                     unique_layer_ids
+                                     if args.host == "gemma4"
+                                     else None))
         # Review round 8: FOUR independent 32-dim sketch branches (the
         # single 64-dim sketch had too much collision variance for the
         # rare turn-14 rows).  J_ens = mean_r J_r at window close; the

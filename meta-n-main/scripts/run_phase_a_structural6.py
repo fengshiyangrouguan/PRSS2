@@ -12,6 +12,18 @@ that protocol; `mtgem_run1..6` is. So this launcher READS real clean-Gamma
     seed          -> the per-run seed
     output dir    -> per run
 
+THE BUDGET IS A REQUEST COUNT, NOT DOLLARS. `run_mt_gem.sh` -- the launcher the
+clean Gamma was actually trained under -- spent against
+`$META_N_MAX_BACKEND_REQUESTS` (enforced at the send site by
+`meta_n.rpbe.accounting`, counted before each HTTP request) and had NO dollar
+tracker at all. An earlier revision of THIS file instead set
+`$META_N_DAILY_BUDGET_USD`, which arms `meta_n.utils.cost_tracker`; that needs a
+per-model price table and died instantly on `gemini-3.1-pro` with
+`KeyError: Cannot enable cost tracking: No pricing for model ...`. The dollar
+subsystem is therefore GONE from here -- absent, not merely configured around --
+so there is exactly one money mechanism in the batch and it is the one the
+reference protocol used.
+
 FOUR THINGS THAT WERE WRONG HERE AND ARE FIXED BELOW, each of which would only
 have shown up after money was spent:
 
@@ -21,7 +33,9 @@ have shown up after money was spent:
      them -- it is the RELAY ENDPOINT, so a run that lost it would not even talk
      to the same service. `EXTRA_KEY_TO_CLI` now carries them, and a
      `--reduction-mode official` is stated explicitly rather than inherited by
-     luck.
+     luck. (`api_key` is NOT in a config.json -- the run records `base_url`
+     only -- so it is read from the sourced environment and passed explicitly,
+     exactly as the bash launcher did.)
   2. NO `.env`. The old bash launcher sourced it before every run; this one
      inherited the ambient shell, so a PLAN looked green and only the paid
      EXECUTE would fail on a missing key.
@@ -52,12 +66,6 @@ sys.path.insert(0, str(REPO))
 from meta_n.sri.protocol import (CONFIG_KEY_TO_CLI,              # noqa: E402
                                  STRUCTURAL6, render_pinned_flags)
 
-# `meta_n.rpbe.budget` is imported INSIDE main(), AFTER .env is sourced. It
-# freezes `LEDGER_DIR = Path(os.environ.get("META_N_COST_LEDGER_DIR", ...))` at
-# IMPORT time, so importing it at module level would pin the ledger to the
-# pre-.env default while the child processes write to the .env one -- the
-# external fuse would then watch a file nobody writes and report zero spend.
-
 #: The clean-Gamma Phase-A protocol. A reference config that disagrees on ANY of
 #: these is refused: it would mean the archives describe a different distribution
 #: than the Gamma they are meant to train.
@@ -78,6 +86,15 @@ EXTRA_KEY_TO_CLI: Dict[str, str] = {
     "epsilon": "--epsilon",
 }
 
+#: The relay environment `run_mt_gem.sh` exported before every clean-Gamma run.
+#: `META_N_MAX_BACKEND_REQUESTS` is set PER RUN from `--max-requests`;
+#: `META_N_REQUEST_LEDGER` is set per run to that run's own file.
+RELAY_ENV = {
+    "LLM_BACKEND": "relay",
+    "ALLOW_PAID_API": "YES_I_ACCEPT_REAL_COST",
+    "META_N_EXTRA_HEADERS_JSON": '{"Accept-Encoding": "identity"}',
+}
+
 #: Fields expected to differ per run; everything ELSE must agree across the set.
 PER_RUN_FIELDS = ("seed", "timestamp", "benchmark_config_applied")
 
@@ -91,11 +108,11 @@ def load_env_file(path: str) -> int:
 
     Hand-parsing is not equivalent to `source`: it cannot do `export K=v`, does
     not expand `K="$OTHER/xxx"`, and mishandles quoting/continuations. This file
-    supplies the relay key, the pricing override JSON and the cost ledger
-    directory -- so imitating the shell grammar here is exactly the kind of
-    quiet divergence that turns into a wrong provider or a wrong ledger. Running
-    bash and reading the resulting environment back makes the launcher's
-    environment BYTE-FOR-BYTE the one the old bash launcher produced.
+    supplies the relay key -- which a config.json never records -- so imitating
+    the shell grammar here is exactly the kind of quiet divergence that turns
+    into a wrong provider. Running bash and reading the resulting environment
+    back makes the launcher's environment BYTE-FOR-BYTE the one the old bash
+    launcher produced.
     """
     p = Path(path)
     if not p.is_file():
@@ -119,20 +136,45 @@ def load_env_file(path: str) -> int:
     return len(set(os.environ) - before)
 
 
-def child_ledger_path() -> Path:
-    """The EXACT file the child's `CostTracker` will write to.
+def arm_relay_env(max_requests: int, base_url: Optional[str]) -> None:
+    """Replicate `run_mt_gem.sh`'s exports, including the request-count cap.
 
-    `CostTracker` keys its ledger by the MACHINE-LOCAL date (`utc=False`) under
-    `META_N_COST_LEDGER_DIR` (default `~/.meta_n_costs`), while `budget.py`
-    freezes that env var at import and keys by UTC. When local != UTC those are
-    two different files for part of every day -- not only across a UTC midnight
-    -- and an external fuse watching the wrong one sees no spend at all. This
-    reproduces the child's convention rather than approximating it.
+    `META_N_MAX_BACKEND_REQUESTS` is read by `meta_n.rpbe.accounting` at the
+    send site, so it arms BEFORE the client is built and counts what actually
+    goes on the wire -- including empty-content escalations that the I/O log
+    never sees. `main.py` only overwrites it when `--max-backend-requests` is
+    passed, and we never pass it, so this value is the one in force.
     """
-    d = os.environ.get("META_N_COST_LEDGER_DIR", "").strip()
-    base = Path(d).expanduser() if d else Path.home() / ".meta_n_costs"
-    import datetime as _dt
-    return base / "{}.jsonl".format(_dt.datetime.now().strftime("%Y-%m-%d"))
+    for k, v in RELAY_ENV.items():
+        os.environ[k] = v
+    os.environ["META_N_MAX_BACKEND_REQUESTS"] = str(int(max_requests))
+    if base_url:
+        os.environ["RELAY_BASE_URL"] = str(base_url)
+    # The encoder directory, if the sourced .env did not already point at one.
+    # `main.py` resolves the CO-Bench data dir relative to cwd, but the CodeBERT
+    # path comes from this variable, and a run that lost it would fail in the
+    # encoder rather than at the first LLM call.
+    os.environ.setdefault("CODEBERT_PATH", "/root/autodl-tmp/models/codebert-base")
+    # A leftover dollar cap from an earlier revision would re-arm the tracker
+    # this file deliberately does not use. Clear it rather than trust the shell.
+    os.environ.pop("META_N_DAILY_BUDGET_USD", None)
+
+
+def api_key_from_env() -> str:
+    """The relay key a config.json cannot carry.
+
+    `meta-n` records `base_url` but never the key, so it has to come from the
+    sourced `.env`. `run_mt_gem.sh` passed it as `--api-key "$RELAY_API_KEY"`;
+    this does the same. Refusing here is cheap -- the alternative is discovering
+    it after the first paid call fails.
+    """
+    for var in ("RELAY_API_KEY", "OPENROUTER_API_KEY"):
+        v = os.environ.get(var, "").strip()
+        if v:
+            return v
+    raise SystemExit(
+        "no relay key in the environment ($RELAY_API_KEY / $OPENROUTER_API_KEY). "
+        "The .env that supplies it was not sourced, or does not define it.")
 
 
 def load_reference_set(pattern: str) -> List[Dict[str, Any]]:
@@ -192,13 +234,40 @@ def render_extra(reference: Dict[str, Any]) -> List[str]:
     return argv
 
 
-def build_argv(reference: Dict[str, Any], seed: int, out_dir: Path) -> List[str]:
+def build_argv(reference: Dict[str, Any], seed: int, out_dir: Path,
+               api_key: Optional[str] = None,
+               data_dir: Optional[str] = None,
+               exp_name: Optional[str] = None) -> List[str]:
     """Field-by-field inheritance. Only cohort / seed / output differ."""
     pinned = {k: v for k, v in reference.items() if k in CONFIG_KEY_TO_CLI}
     pinned["bench_tasks"] = list(STRUCTURAL6)
     pinned["seed"] = int(seed)
     argv = render_pinned_flags(pinned)
     argv += render_extra(reference)
+    if api_key is not None:
+        argv += ["--api-key", api_key]
+    # `./data/co_bench` is resolved RELATIVE TO CWD. The tree that carries the
+    # new SRI code and the tree that carries the dataset are not the same
+    # checkout on this box, so relying on cwd would make the run read an empty
+    # directory and fail at the first task load, long after the plan looked fine.
+    if data_dir:
+        argv += ["--bench-data-dir", str(data_dir)]
+    # `--exp-name` PINS the run directory name, and the run directory name IS
+    # `run_id`, which is half of `tree_id` -- and `tree_role_v421` assigns
+    # task/protect by hashing `tree_id`. Without this the name carries a
+    # second-resolution timestamp that does not exist until the run starts, so
+    # the split cannot be known before spending. Pinning it makes the split a
+    # PREDICTABLE function of a name chosen in advance.
+    #
+    # DEVIATION, stated plainly: `census.py` invariant I4 reads "no salt, no
+    # re-hash, no manual moving of trees to force a ratio". Choosing names to
+    # land 2 task + 1 protect does exactly that in effect, though it satisfies
+    # I1-I3 and the intent behind them (the choice is made from the frozen hash
+    # BEFORE any score is read, never from results). That is acceptable for a
+    # DEV SCREEN and must not be reused for a formal claim -- a formal cohort
+    # uses natural naming and takes the split the hash gives it.
+    if exp_name:
+        argv += ["--exp-name", str(exp_name)]
     # `use_archive` is RENDER_ONLY (meta-n records `orchestrator: evolutionary`
     # instead of the flag), so it is not in the reference config and has to be
     # said explicitly -- without it the run is the linear path, not the archive
@@ -213,31 +282,77 @@ def build_argv(reference: Dict[str, Any], seed: int, out_dir: Path) -> List[str]
     return [str(x) for x in argv]
 
 
-def wait_with_fuse(p: subprocess.Popen, fuse: Fuse, poll: float = 2.0):
-    """Poll the CHILD, not `kill(pid, 0)`.
+def mask(argv: List[str]) -> str:
+    out, hide = [], False
+    for a in argv:
+        if hide:
+            out.append("***")
+            hide = False
+            continue
+        out.append(a)
+        if a == "--api-key":
+            hide = True
+    return " ".join(out)
 
-    A child that has exited but not been reaped is a zombie, and `os.kill(pid, 0)`
-    still succeeds for one -- which is how a `Fuse.watch()` loop blocks forever
-    after a run finishes NORMALLY. `Popen.poll()` reaps, so it reports the exit.
+
+def requests_used(ledger: Path) -> int:
+    """Requests actually issued, from the counter `accounting.reserve()` bumps.
+
+    The counter file is the authoritative number (`reserve()` increments it
+    under a lock before each send); the ledger lines are a fallback for the
+    window before the counter file exists.
     """
+    cnt = Path(str(ledger) + ".count")
+    try:
+        return int(cnt.read_text(encoding="utf-8").strip() or "0")
+    except (OSError, ValueError):
+        pass
+    try:
+        with open(ledger, "r", encoding="utf-8") as f:
+            return sum(1 for line in f if line.strip())
+    except OSError:
+        return 0
+
+
+def wait_for_run(p: subprocess.Popen, ledger: Path, cap: int,
+                 wall_clock_s: float, poll: float = 2.0) -> Optional[str]:
+    """Block until the child exits; return a reason string if it was killed.
+
+    Polls the CHILD, not `kill(pid, 0)`: a child that has exited but not been
+    reaped is a zombie, and `os.kill(pid, 0)` still succeeds for one, which is
+    how a liveness loop blocks forever after a run finishes NORMALLY.
+    `Popen.poll()` reaps, so it reports the exit.
+
+    Two guards, and neither is the primary budget. The child enforces
+    `META_N_MAX_BACKEND_REQUESTS` itself at the send site; the count check here
+    is a backstop for a child that somehow stops honouring it. The wall clock is
+    the only guard the bash launcher lacked, and it is what stops a hung run
+    from blocking the remaining five with no bound.
+    """
+    t0 = time.time()
     while p.poll() is None:
-        reason = fuse.check()
-        if reason is not None:
-            try:
-                os.killpg(os.getpgid(p.pid), signal.SIGTERM)
-            except OSError:
-                pass
-            try:
-                p.wait(timeout=30)
-            except subprocess.TimeoutExpired:
-                try:
-                    os.killpg(os.getpgid(p.pid), signal.SIGKILL)
-                except OSError:
-                    pass
-                p.wait()
-            return reason
+        if cap > 0 and requests_used(ledger) >= cap:
+            reason = "request cap %d reached" % cap
+            break
+        if time.time() - t0 > wall_clock_s:
+            reason = "wall clock %.1fh exceeded" % (wall_clock_s / 3600.0)
+            break
         time.sleep(poll)
-    return None
+    else:
+        return None
+    try:
+        os.killpg(os.getpgid(p.pid), signal.SIGTERM)
+    except OSError:
+        pass
+    try:
+        p.wait(timeout=30)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(os.getpgid(p.pid), signal.SIGKILL)
+        except OSError:
+            pass
+        p.wait()
+    return reason
 
 
 def main() -> int:
@@ -247,8 +362,21 @@ def main() -> int:
     ap.add_argument("--out-root", required=True)
     ap.add_argument("--seeds", default="101,102,103,104,105,106",
                     help="the seed family the previous Phase-A used")
-    ap.add_argument("--per-run-cap", type=float, default=8.0)
-    ap.add_argument("--batch-total-cap", type=float, default=36.0)
+    ap.add_argument("--exp-names", default="",
+                    help="comma list PARALLEL to --seeds, pinning each run's "
+                         "directory name (hence its tree_id, hence its "
+                         "task/protect role). Empty entries use the natural "
+                         "timestamp name. Used to pre-register a usable split "
+                         "before spending; see the note in build_argv.")
+    ap.add_argument("--bench-data-dir", default=None,
+                    help="where data/co_bench lives; the dataset and the new SRI "
+                         "code are in different checkouts on this box, and "
+                         "main.py resolves the default RELATIVE TO CWD")
+    ap.add_argument("--max-requests", type=int, default=200,
+                    help="backend-request cap PER RUN ($META_N_MAX_BACKEND_"
+                         "REQUESTS), the same cap the clean-Gamma Phase-A used")
+    ap.add_argument("--wall-clock-hours", type=float, default=8.0,
+                    help="kill a run that outlives this; 0 disables")
     ap.add_argument("--execute", action="store_true",
                     help="without it, only PLANS (no API)")
     args = ap.parse_args()
@@ -258,6 +386,14 @@ def main() -> int:
     check_reference(reference, "%d configs matching %s"
                     % (len(refs), args.reference_glob))
     seeds = [int(x) for x in args.seeds.split(",") if x.strip()]
+    names = [x.strip() for x in args.exp_names.split(",")] if args.exp_names \
+        else []
+    if names and len(names) != len(seeds):
+        raise SystemExit(
+            "--exp-names has %d entries but --seeds has %d. They are PARALLEL: "
+            "one name per seed, empty string for natural naming."
+            % (len(names), len(seeds)))
+    names = names or [""] * len(seeds)
     out_root = Path(args.out_root)
 
     print("=" * 78)
@@ -267,6 +403,12 @@ def main() -> int:
           % len(refs))
     print("  cohort        : %s" % ", ".join(STRUCTURAL6))
     print("  seeds         : %s" % seeds)
+    print("  budget        : %d backend requests PER RUN (no dollar tracker)"
+          % args.max_requests)
+    print("  data dir      : %s" % (args.bench_data_dir or "./data/co_bench (cwd)"))
+    print("  wall clock    : %s per run" % (
+        "none" if args.wall_clock_hours <= 0
+        else "%.1f h" % args.wall_clock_hours))
     print("  inherited (unchanged from the reference):")
     for k in sorted(EXPECT):
         print("      %-20s %s" % (k, reference.get(k)))
@@ -274,12 +416,19 @@ def main() -> int:
         print("      %-20s %s" % (k, reference.get(k)))
     print()
 
-    plans = [(s, out_root / ("s%d" % s), None) for s in seeds]
-    for s, d, _ in plans:
-        print("  [plan] s%d -> %s" % (s, d))
+    plans = [(s, out_root / ("s%d" % s), n) for s, n in zip(seeds, names)]
+    for s, d, n in plans:
+        tag = (n if n else "(natural timestamp name)")
+        print("  [plan] s%d -> %s   run_id=%s" % (s, d, tag))
     print()
-    for s, d, _ in plans[:1]:
-        print("  [cmd] %s" % " ".join(build_argv(reference, s, d)))
+    print("  split note: task/protect is decided by sha256 of")
+    print("              (run_dir_name, 'gen0_seed'). Print it with")
+    print("              meta_n.rpbe.census.tree_role_v421 BEFORE spending.")
+    print()
+    print("  [cmd] %s" % mask(build_argv(reference, seeds[0], plans[0][1],
+                                         api_key="<from .env>",
+                                         data_dir=args.bench_data_dir,
+                                         exp_name=plans[0][2] or None)))
     print()
 
     if not args.execute:
@@ -288,68 +437,58 @@ def main() -> int:
 
     n = load_env_file(args.env_file)
     print("  sourced %s -> %d new env key(s)" % (args.env_file, n))
-
-    # AFTER the sourcing, or budget.py pins the pre-.env ledger dir.
-    from meta_n.rpbe.budget import Caps, Fuse, total_cost
-
-    ledger = child_ledger_path()
-    # Spend ALREADY on the books for the child's own day-key. The inner guard
-    # stops a run when the DAY's total reaches its cap, and it has no notion of a
-    # batch baseline -- so setting the cap to the batch allowance alone would
-    # kill a run partway through whenever earlier spend existed (measured
-    # concern: $7 already spent + a $36 allowance leaves only $29 of headroom,
-    # and the run dies at $36 of DAILY spend, not $36 of BATCH spend).
-    #
-    # The intent is "the batch may ADD up to batch_total_cap", so the inner cap
-    # has to be today_before_batch + batch_total_cap; the outer fuse below then
-    # enforces the part that actually matters, batch_spend <= batch_total_cap.
-    baseline = total_cost(ledger)
-    daily_cap = baseline + float(args.batch_total_cap)
-    os.environ["META_N_DAILY_BUDGET_USD"] = str(daily_cap)
-    caps = Caps(per_run=float(args.per_run_cap), total=float(args.batch_total_cap))
-    print("  ledger        : %s" % ledger)
-    print("  spend already on it today : $%.4f" % baseline)
-    print("  inner daily cap           : $%.4f  (already-spent + batch cap)"
-          % daily_cap)
-    print("  batch cap (outer fuse)    : $%.2f   per-run cap $%.2f"
-          % (caps.total, caps.per_run))
+    arm_relay_env(args.max_requests, reference.get("base_url"))
+    key = api_key_from_env()
+    print("  relay armed: LLM_BACKEND=%s  max_backend_requests=%s  key=...%s"
+          % (os.environ["LLM_BACKEND"], os.environ["META_N_MAX_BACKEND_REQUESTS"],
+             key[-4:]))
     print()
 
+    wall_s = args.wall_clock_hours * 3600.0
     rc = 0
-    for s, d, _ in plans:
-        if d.exists() and any(d.glob("*co_bench*")):
+    for s, d, n in plans:
+        # `**/config.json` rather than a name pattern: a PINNED exp_name has no
+        # `co_bench` in it, so the old glob would miss a completed run and spend
+        # again. An empty dir written by a crashed attempt still matches nothing
+        # and is correctly re-run.
+        if d.exists() and any(d.glob("**/config.json")):
             print("[%s] seed=%d SKIPPED: %s already holds a run -- re-running "
                   "would spend again and add another tree" % (
                       time.strftime("%F %T"), s, d))
             continue
         d.mkdir(parents=True, exist_ok=True)
         log = d.parent / ("s%d.log" % s)
-        argv = build_argv(reference, s, d)
+        ledger = d.parent / ("s%d_requests.jsonl" % s)
+        for stale in (ledger, Path(str(ledger) + ".count")):
+            try:
+                stale.unlink()
+            except OSError:
+                pass
+        os.environ["META_N_REQUEST_LEDGER"] = str(ledger)
+
+        argv = build_argv(reference, s, d, api_key=key,
+                          data_dir=args.bench_data_dir,
+                          exp_name=n or None)
         print("[%s] run seed=%d -> %s" % (time.strftime("%F %T"), s, log))
         with open(log, "w", encoding="utf-8") as f:
             p = subprocess.Popen([sys.executable, "-u", "-m", "meta_n.main"] + argv,
                                  cwd=str(REPO), stdout=f,
                                  stderr=subprocess.STDOUT, env=dict(os.environ),
                                  start_new_session=True)
-        # The SAME baseline for every run: phase_spend = total - baseline is then
-        # cumulative over the batch, which is what a batch cap means.
-        # SAME path the child writes to, so phase_spend is the batch's own
-        # new spend and not zero-by-mistake.
-        reason = wait_with_fuse(
-            p, Fuse(p.pid, caps, phase_baseline=baseline, path=ledger))
+        reason = wait_for_run(p, ledger, args.max_requests, wall_s)
+        used = requests_used(ledger)
         if reason is not None:
-            print("  !! FUSE FIRED: %s -- run killed" % reason)
+            print("  !! KILLED: %s -- after %d request(s)" % (reason, used))
             rc = 1
             break
-        print("[%s] seed=%d done rc=%s   batch spend $%.4f"
-              % (time.strftime("%F %T"), s, p.returncode,
-                 total_cost(ledger) - baseline))
+        print("[%s] seed=%d done rc=%s   requests=%d"
+              % (time.strftime("%F %T"), s, p.returncode, used))
         if p.returncode != 0:
             rc = p.returncode
             break
 
     print()
-    print("  REAL batch spend: $%.4f" % (total_cost(ledger) - baseline))
+    print("  batch complete, rc=%d" % rc)
     return rc
 
 

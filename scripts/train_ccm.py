@@ -216,6 +216,13 @@ def parse_args():
                         "frozen_method.json training.grad_clip is "
                         "authoritative and an explicit override is "
                         "refused)")
+    p.add_argument("--ccm-topology", default="merge_recur",
+                   choices=["merge_recur", "concat_recur"],
+                   help="CCM topology (concat line, review "
+                        "2026-09-25): merge_recur = CCM-merge "
+                        "(fixed-width SUM recursion, default); "
+                        "concat_recur = CCM-concat (retained "
+                        "COMP states, memory grows with depth)")
     p.add_argument("--relative-embedding", default="skip",
                    choices=["skip", "base"])
     # RPBE
@@ -885,7 +892,7 @@ def wrap_lora(model, r):
 def build_dataset(args, tokenizer):
     from src.arguments import CompressionArguments
     os.environ["DIALOG_MIRROR"] = args.dialog_mirror
-    comp_args = CompressionArguments(attn_type="merge_recur",
+    comp_args = CompressionArguments(attn_type=args.ccm_topology,
                                      num_comp_tokens=N_TOK,
                                      add_comp_token=True,
                                      relative_embedding=args.relative_embedding)
@@ -1003,7 +1010,7 @@ def depth_sampling_probs(pools, alpha=None):
 
 
 def parse_meta(batch, comp_ids, sum_ids, sample_id_global, orig_ids=None,
-               raw_dialogs=None):
+               raw_dialogs=None, topology="merge_recur"):
     """Deterministic per-sample metadata from the padded collator batch.
 
     Returns a list (one per batch row) of dicts: k, L, blocks (C0/S0
@@ -1025,12 +1032,20 @@ def parse_meta(batch, comp_ids, sum_ids, sample_id_global, orig_ids=None,
         blocks = []
         ok = True
         for pos in c0:
-            if pos + 3 >= L or row[pos + 1] != comp_ids[1] \
-                    or row[pos + 2] not in sum_ids \
-                    or row[pos + 3] not in sum_ids:
-                ok = False
-                break
-            blocks.append((pos, pos + 2))  # (C0 pos, S0 pos)
+            if topology == "concat_recur":
+                # concat block = [C0, C1] (no SUM token per turn;
+                # memory = the retained COMP states themselves)
+                if pos + 1 >= L or row[pos + 1] != comp_ids[1]:
+                    ok = False
+                    break
+                blocks.append((pos, pos + 1))  # (C0 pos, C1 pos)
+            else:
+                if pos + 3 >= L or row[pos + 1] != comp_ids[1] \
+                        or row[pos + 2] not in sum_ids \
+                        or row[pos + 3] not in sum_ids:
+                    ok = False
+                    break
+                blocks.append((pos, pos + 2))  # (C0 pos, S0 pos)
         n_completion = int((labels[b] != -100).sum())
         prompt_end = L - n_completion
         k = len(blocks) + 1  # context turns = blocks + final blockless turn
@@ -1040,7 +1055,8 @@ def parse_meta(batch, comp_ids, sum_ids, sample_id_global, orig_ids=None,
         prev_end = -1
         for (c0_pos, _s0) in blocks:
             utterance_spans.append((prev_end + 1, c0_pos))
-            prev_end = c0_pos + 3  # S1 position
+            prev_end = c0_pos + (1 if topology == "concat_recur"
+                                 else 3)
         utterance_spans.append((prev_end + 1, prompt_end))
         raw = None
         if raw_dialogs is not None and b < len(raw_dialogs):
@@ -1141,23 +1157,51 @@ def task_ce_rows(out, labels, device):
     return row_sum, row_n
 
 
-def collect_replay_z(meta, adapter, device, v=None):
+def state_positions_for_cut(meta, v, topology="merge_recur"):
+    """Topology-aware Z_t state positions (concat line, review
+    2026-09-25).
+
+    merge_recur: Z_t = the cut turn's SUM pair (fixed width).
+    concat_recur: Z_t = M_t = [h_1..h_t], EVERY retained COMP pair
+    up to cut t (v = t - 1); the memory grows with depth.
+    """
+    if v is None:
+        v = int(meta["L"]) - 1
+    if topology == "concat_recur":
+        return [(meta["blocks"][i][0], meta["blocks"][i][0] + 1)
+                for i in range(v + 1)]
+    return [(meta["blocks"][v][1], meta["blocks"][v][1] + 1)]
+
+
+def extract_z_mean(adapter, spans, device):
+    """Lift z per retained span and average (gradient-connected).
+
+    extract_z only accepts batch-1 single-row [1, n_slots] input; a
+    multi-row tensor would index batch 1..n against a batch-1
+    cache.  Each span is lifted separately and averaged -- the
+    concat-line masked-mean z_t (review 2026-09-25).
+    """
+    zs = [adapter.extract_z(torch.tensor([list(sp)],
+                                         dtype=torch.long,
+                                         device=device))[0]
+          for sp in spans]
+    return torch.stack(zs).mean(0)
+
+
+def collect_replay_z(meta, adapter, device, v=None,
+                     topology="merge_recur"):
     """Pass-2 extraction ONLY: z_t at block_idx v = t - 1 (gradient-
     connected).  No builder, no chi, no p — those finished their job at
     the pass-1 window close (L6.5 review structural fix).  Review ruling
     (2026-09-21): block_idx = t - 1 is the ONLY cut indexing rule; v=None
     means the terminal cut t = L (block_idx L - 1)."""
-    if v is None:
-        v = int(meta["L"]) - 1
-    s0_pos = meta["blocks"][v][1]
-    sum_positions = torch.tensor([[s0_pos, s0_pos + 1]],
-                                 dtype=torch.long, device=device)
-    return adapter.extract_z(sum_positions)[0]
+    return extract_z_mean(
+        adapter, state_positions_for_cut(meta, v, topology), device)
 
 
 def collect_rows(meta, adapter, builder, utter_embed, phi_embed,
                  embed_tokens, batch, device,
-                 supervisor_mode="current"):
+                 supervisor_mode="current", topology="merge_recur"):
     """Review ruling (2026-09-21): ONE CUT PER ACTUAL COMPRESSION LAYER.
 
       t = 1..L,  block_idx = t - 1   (the ONLY cut indexing rule)
@@ -1191,13 +1235,16 @@ def collect_rows(meta, adapter, builder, utter_embed, phi_embed,
     # a multi-row [n_cuts, 2] input would index batch 1..n_cuts against
     # a batch-1 cache.  Extract one cut at a time (each call is a cheap
     # per-layer gather, not a forward).
-    zs = [adapter.extract_z(torch.tensor(
-        [[meta["blocks"][t - 1][1], meta["blocks"][t - 1][1] + 1]],
-        dtype=torch.long, device=device))[0]
+    zs = [extract_z_mean(
+        adapter, state_positions_for_cut(meta, t - 1, topology),
+        device)
         for t in range(1, L + 1)]  # [L, z_dim]
     dm = DialogueMeta(sample_id=int(meta["sample_id"]), k=int(meta["k"]),
-                      sum_positions=[(p + 2, p + 3) for (p, _s)
-                                     in meta["blocks"]],
+                      sum_positions=(
+                          [(p, p + 1) for (p, _s) in meta["blocks"]]
+                          if topology == "concat_recur"
+                          else [(p + 2, p + 3) for (p, _s)
+                                in meta["blocks"]]),
                       utterance_spans=list(meta["utterance_spans"]),
                       orig_id=int(meta.get("orig_id", -1)),
                       L=L, raw_dialog=list(raw))
@@ -2415,7 +2462,8 @@ def main():
                 rows = collect_rows(meta, adapter, builder, utter_embed,
                                      phi_embed,
                                     embed_tokens, batch, device,
-                                    supervisor_mode=args.supervisor_mode)
+                                    supervisor_mode=args.supervisor_mode,
+                                    topology=args.ccm_topology)
                 _pf("collect_rows", _t)
                 if rows:
                     _t = time.perf_counter()
@@ -2461,8 +2509,9 @@ def main():
             for meta, oid, v in cut_meta:
                 g = g_by_oid.get(oid)
                 if g is not None:
-                    z_by_oid[oid] = collect_replay_z(meta, adapter,
-                                                     device, v=v)
+                    z_by_oid[oid] = collect_replay_z(
+                        meta, adapter, device, v=v,
+                        topology=args.ccm_topology)
                     batch_terms.append((oid, g))
             adapter.clear()
             _pf("collect_z", _t)
@@ -2542,7 +2591,8 @@ def main():
         # Review round 8: the stream records the STABLE dialogue id and
         # its depth level — the per-step cursor is no longer the identity.
         metas = parse_meta(batch, comp_ids, sum_ids, sample_id,
-                           orig_ids=orig_id, raw_dialogs=raw_dialogs)
+                           orig_ids=orig_id, raw_dialogs=raw_dialogs,
+                           topology=args.ccm_topology)
         for m in metas:
             data_flow_hash.update(struct.pack(
                 ">qq", int(m["orig_id"]) if m["orig_id"] >= 0
@@ -2713,7 +2763,8 @@ def main():
                             g = g_by_oid.get(oid)
                             if g is not None:
                                 z_by_oid[oid] = collect_replay_z(
-                                    meta, adapter, device, v=v)
+                                    meta, adapter, device, v=v,
+                                    topology=args.ccm_topology)
                                 batch_terms.append((oid, g))
                         adapter.clear()
                         aux, n_aux = batch_surrogate(
@@ -3167,8 +3218,9 @@ def main():
                             for _j, (meta, oid, v) in enumerate(_cuts):
                                 g = g_by_oid.get(oid)
                                 optimizer.zero_grad(set_to_none=True)
-                                z = collect_replay_z(meta, adapter, device,
-                                                     v=v)
+                                z = collect_replay_z(
+                                    meta, adapter, device, v=v,
+                                    topology=args.ccm_topology)
                                 gd = g.detach()
                                 aux_i = -lambda_kf * ((gd * z).sum()
                                                       - (gd * z.detach()).sum())

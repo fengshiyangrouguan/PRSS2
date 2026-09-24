@@ -303,10 +303,13 @@ class Qwen3CCMAttention(nn.Module):
                 key_states = torch.stack(_k_list, dim=0)
                 value_states = torch.stack(_v_list, dim=0)
 
-            # RPBE: memory extraction (post-merge, pre-attention).
-            if self.mem_callback is not None:
-                self.mem_callback(key_states, value_states, sum_mask,
-                                  sum_row_pos)
+        # RPBE: memory extraction (post-merge, pre-attention).
+        # concat line (review 2026-09-25): under concat_recur the SUM
+        # merge block never runs (no per-turn SUM rows), so the callback
+        # must fire for EVERY topology to keep adapter._cache populated.
+        if self.mem_callback is not None:
+            self.mem_callback(key_states, value_states, sum_mask,
+                              sum_row_pos)
 
         past_key_value = None
 

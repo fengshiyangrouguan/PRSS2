@@ -195,7 +195,7 @@ def load_ccm_arm(args, device, ckpt):
         model.update_comp_token(
             [tokenizer.comp_token_id[k] for k in range(tc.N_TOK)],
             [tokenizer.sum_token_id[k] for k in range(tc.N_TOK)])
-        if a.history_gamma:
+        if getattr(args, "history_gamma", False):
             from rpbe.hosts.ccm.ccm_patch import attach_gamma
             attach_gamma(model, hidden=64)
             for _n, _p in model.named_parameters():

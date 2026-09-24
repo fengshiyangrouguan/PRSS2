@@ -156,6 +156,32 @@ def update_position_ids(comp_mask, comp_token, attention_mask=None,
     return position_ids
 
 
+class _ScaleGrad(torch.autograd.Function):
+    """Forward-identity, backward-scale hook (review 2026-09-24).
+
+    The shared KV layers alias ONE physical provider K/V; in the
+    backward pass the provider Gamma therefore receives the summed
+    gradient of every consumer (e.g. 16x on layer 22).  This hook
+    renormalizes the summed gradient by 1/(1 + n_consumers) so one
+    physical state counts once — the forward value is UNCHANGED
+    (Gemma host semantics untouched).
+    """
+    @staticmethod
+    def forward(ctx, x, s):
+        ctx.s = s
+        return x
+
+    @staticmethod
+    def backward(ctx, g):
+        return g * ctx.s, None
+
+
+def scale_grad(x, s):
+    if s == 1.0:
+        return x
+    return _ScaleGrad.apply(x, s)
+
+
 class Gemma4CCMTextAttention(nn.Module):
     """Gemma4 hybrid attention with the CCM merge/visibility semantics.
 
@@ -198,6 +224,17 @@ class Gemma4CCMTextAttention(nn.Module):
             not self.is_kv_shared_layer
             and layer_idx == len(prev_layers) - 1
             - prev_layers[::-1].index(config.layer_types[layer_idx]))
+        # Shared-consumer multiplicity (review 2026-09-24): how many
+        # shared layers of the SAME type consume this provider's K/V.
+        if self.store_full_length_kv:
+            _first_shared = config.num_hidden_layers - getattr(
+                config, "num_kv_shared_layers", 0)
+            self._shared_consumer_count = sum(
+                1 for _i in range(_first_shared,
+                                   config.num_hidden_layers)
+                if config.layer_types[_i] == self.layer_type)
+        else:
+            self._shared_consumer_count = 0
 
         self.q_proj = LinearMask(
             config.hidden_size, config.num_attention_heads * self.head_dim,
@@ -404,7 +441,14 @@ class Gemma4CCMTextAttention(nn.Module):
                                       sum_row_pos)
 
             if self.store_full_length_kv:
-                shared_kv_states[self.layer_type] = key_states, value_states
+                # Backward-only physical-state normalization (review
+                # 2026-09-24): the shared consumers sum their gradients
+                # onto this provider — average them so one physical
+                # state counts once (forward value unchanged).
+                _s = 1.0 / float(1 + self._shared_consumer_count)
+                shared_kv_states[self.layer_type] = (
+                    scale_grad(key_states, _s),
+                    scale_grad(value_states, _s))
 
         # GQA attention: repeat KV heads, additive 4D mask, fp32 softmax.
         # NOTE (gemma4 delta): native Gemma4 sets self.scaling = 1.0, so

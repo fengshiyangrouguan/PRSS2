@@ -56,7 +56,12 @@ def parse_args():
                         "or concat_recur (CCM-concat line, "
                         "review 2026-09-25)")
     p.add_argument("--model-name-or-path", required=True)
-    p.add_argument("--host", default="qwen3", choices=["llama", "qwen3"])
+    p.add_argument("--no-warmup", action="store_true",
+                   help="skip warmup on resume (fork semantics)")
+    p.add_argument("--host", default="qwen3",
+                   choices=["llama", "qwen3", "gemma4"])
+    p.add_argument("--foundation", default="",
+                   help="gemma4 Stage-1 adapter checkpoint to merge into the base before the conditional LoRA (official two-stage)")
     p.add_argument("--dialog-mirror", required=True)
     p.add_argument("--output", required=True)
     p.add_argument("--seed", type=int, default=0)
@@ -78,6 +83,13 @@ def parse_args():
     p.add_argument("--checkpoint-every", type=int, default=50)
     p.add_argument("--log-every", type=int, default=10)
     p.add_argument("--resume-from", default="")
+    p.add_argument("--official-adapter", default="",
+                   help="llama released Step-2 compression adapter dir "
+                        "(llama-7b-no-online-merge_recur-ntok2)")
+    p.add_argument("--with-gamma", action="store_true",
+                   help="attach the post-merge Gamma residual and make "
+                        "it trainable (gemma joint control, user ruling "
+                        "2026-09-24)")
     return p.parse_args()
 
 
@@ -99,6 +111,25 @@ def save_json(path, obj):
 
 
 def build_tokenizer(args):
+    if args.host == "llama":
+        from transformers import LlamaTokenizer
+        tok = LlamaTokenizer.from_pretrained(args.model_name_or_path)
+        tok.pad_token = tok.eos_token
+        tok.pad_token_id = tok.pad_token_id if tok.pad_token_id is not None \
+            else tok.eos_token_id
+        tok.bos_token_id = tok.bos_token_id or 1
+        tok.eos_token_id = tok.eos_token_id or 2
+        tok.padding_side = "left"
+        added = [f"<COMP{k}>" for k in range(N_TOK)] \
+            + [f"<SUM{k}>" for k in range(N_TOK)]
+        tok.add_special_tokens({"additional_special_tokens": added})
+        ids = [tok.convert_tokens_to_ids(f"<COMP{k}>")
+               for k in range(N_TOK)] \
+            + [tok.convert_tokens_to_ids(f"<SUM{k}>")
+               for k in range(N_TOK)]
+        tok.comp_token_id = ids[:N_TOK]
+        tok.sum_token_id = ids[N_TOK:]
+        return tok
     if args.host == "qwen3":
         from transformers import AutoTokenizer
         from transformers.models.qwen3.configuration_qwen3 import Qwen3Config
@@ -118,7 +149,31 @@ def build_tokenizer(args):
         added = [f"<COMP{k}>" for k in range(N_TOK)] \
             + [f"<SUM{k}>" for k in range(N_TOK)]
         tok.add_special_tokens({"additional_special_tokens": added})
-        ids = tok.additional_special_tokens_ids[-2 * N_TOK:]
+        ids = [tok.convert_tokens_to_ids(f"<COMP{k}>") for k in range(N_TOK)]  + [tok.convert_tokens_to_ids(f"<SUM{k}>") for k in range(N_TOK)]
+        assert ids[0] >= cfg_vocab
+        tok.comp_token_id = ids[:N_TOK]
+        tok.sum_token_id = ids[N_TOK:]
+        return tok
+    if args.host == "gemma4":
+        from transformers import AutoTokenizer
+        from transformers.models.gemma4.configuration_gemma4 import (
+            Gemma4TextConfig)
+        tok = AutoTokenizer.from_pretrained(args.model_name_or_path)
+        if tok.pad_token_id is None:
+            tok.pad_token_id = 0
+            tok.pad_token = "<pad>"
+        tok.padding_side = "left"
+        cfg_vocab = Gemma4TextConfig.from_pretrained(
+            args.model_name_or_path).vocab_size
+        if len(tok) < cfg_vocab:
+            tok.add_tokens(
+                ["<|extra_{}|>".format(i)
+                 for i in range(cfg_vocab - len(tok))])
+        added = [f"<COMP{k}>" for k in range(N_TOK)]             + [f"<SUM{k}>" for k in range(N_TOK)]
+        tok.add_special_tokens({"additional_special_tokens": added})
+        ids = [tok.convert_tokens_to_ids(f"<COMP{k}>")
+               for k in range(N_TOK)] + [tok.convert_tokens_to_ids(
+                   f"<SUM{k}>") for k in range(N_TOK)]
         assert ids[0] >= cfg_vocab
         tok.comp_token_id = ids[:N_TOK]
         tok.sum_token_id = ids[N_TOK:]
@@ -134,7 +189,7 @@ def build_tokenizer(args):
     added = [f"<COMP{k}>" for k in range(N_TOK)] \
         + [f"<SUM{k}>" for k in range(N_TOK)]
     tok.add_special_tokens({"additional_special_tokens": added})
-    ids = tok.additional_special_tokens_ids[-2 * N_TOK:]
+    ids = [tok.convert_tokens_to_ids(f"<COMP{k}>") for k in range(N_TOK)]  + [tok.convert_tokens_to_ids(f"<SUM{k}>") for k in range(N_TOK)]
     tok.comp_token_id = ids[:N_TOK]
     tok.sum_token_id = ids[N_TOK:]
     return tok
@@ -144,9 +199,104 @@ def build_model_merge(args, device):
     """Official-host semantics: SeparatedEmbedding with TRAINABLE
     COMP/SUM rows; the lm_head stays at the base vocab (comp tokens have
     no output rows); no resize_token_embeddings."""
-    if args.host != "qwen3":
-        raise NotImplementedError(
-            "train_ccm_merge currently targets the qwen3 host")
+    if args.host == "gemma4":
+        import re as _re
+        from transformers.models.gemma4.configuration_gemma4 import (
+            Gemma4TextConfig)
+        from transformers.models.gemma4.modeling_gemma4 import (
+            Gemma4ForConditionalGeneration)
+        from src.arch.ccm_gemma4 import Gemma4ForCausalLM_CCM
+        text_cfg = Gemma4TextConfig.from_pretrained(
+            args.model_name_or_path)
+        text_cfg.comp_relative_embedding = args.relative_embedding
+        model = Gemma4ForCausalLM_CCM(text_cfg)
+        dtype = torch.bfloat16 if device.type == "cuda" else torch.float32
+        full = Gemma4ForConditionalGeneration.from_pretrained(
+            args.model_name_or_path, torch_dtype=dtype)
+        prefix = "model.language_model."
+        text_sd = {}
+        for k, v in full.state_dict().items():
+            if k.startswith(prefix):
+                text_sd["model." + k[len(prefix):]] = v
+            elif k == "lm_head.weight":
+                text_sd[k] = v
+        del full
+        torch.cuda.empty_cache() if device.type == "cuda" else None
+        missing, unexpected = model.load_state_dict(text_sd, strict=False)
+        if unexpected:
+            raise RuntimeError("unexpected keys: {}".format(
+                unexpected[:8]))
+        model.to(device, dtype)
+        if args.foundation:
+            ck = torch.load(args.foundation, map_location=device,
+                            weights_only=False)
+            tsd = ck.get("trainable_state_dict", ck)
+            n_merged = 0
+            with torch.no_grad():
+                for k in list(tsd):
+                    if ".lora_A." not in k:
+                        continue
+                    b_key = k.replace(".lora_A.", ".lora_B.")
+                    base_key = _re.sub(
+                        r"^base_model\.model\.model\.layers\.(\d+)\."
+                        r"self_attn\.(\w+_proj)\.lora_A\.default\."
+                        r"weight$",
+                        r"model.layers.\1.self_attn.\2.weight", k)
+                    if base_key == k:
+                        continue
+                    A = tsd[k].float().to(device)
+                    B = tsd[b_key].float().to(device)
+                    delta = (B @ A) * (16.0 / 8.0)
+                    tgt = dict(model.named_parameters())[base_key]
+                    tgt.data += delta.to(tgt.dtype)
+                    n_merged += 1
+            print("[merge] foundation merged: {} LoRA modules".format(
+                n_merged), flush=True)
+        # SeparatedEmbedding (official-host semantics, same as qwen3):
+        # the COMP/SUM rows live in a TRAINABLE separate table routed by
+        # id >= vocab_size; the lm_head keeps the base vocab (comp
+        # tokens have no output rows).  No resize on gemma either.
+        from src.utils import SeparatedEmbedding
+        model.model.embed_tokens = SeparatedEmbedding(
+            model.model.embed_tokens, 2 * N_TOK)
+        # The PLE table is looked up by the SAME input_ids — without a
+        # resize its 262144 rows cannot serve the comp ids (device
+        # assert on the lookup).  Grow it to match (zero rows, frozen).
+        model.model.resize_ple_embeddings(
+            text_cfg.vocab_size + 2 * N_TOK)
+        model.update_comp_token(
+            [text_cfg.vocab_size + k for k in range(N_TOK)],
+            [text_cfg.vocab_size + N_TOK + k for k in range(N_TOK)])
+        return model.to(device)
+    if args.host == "llama":
+        # Official merged host (review 2026-09-25 concat line): fp32
+        # base + Step-1 foundation merged + SeparatedEmbedding COMP
+        # rows.  The conditional LoRA is wrapped ONCE by the main()
+        # flow (wrap_lora_merge) -- building the peft model here would
+        # double-wrap and break the base_model.model path.
+        from transformers.models.llama.configuration_llama import \
+            LlamaConfig
+        from src.arch.ccm_llama import LlamaForCausalLM_CCM
+        from src.model import load_lora_weight
+        from src.utils import SeparatedEmbedding
+        config = LlamaConfig.from_pretrained(args.model_name_or_path)
+        config.comp_relative_embedding = args.relative_embedding
+        model = LlamaForCausalLM_CCM.from_pretrained(
+            args.model_name_or_path, config=config,
+            torch_dtype=torch.float32).to(device)
+        load_lora_weight(args.foundation, model, merge=True)
+        model.update_comp_token([32000 + k for k in range(N_TOK)],
+                                [32000 + N_TOK + k
+                                 for k in range(N_TOK)])
+        model.model.embed_tokens = SeparatedEmbedding(
+            model.model.embed_tokens, 2 * N_TOK)
+        if args.official_adapter:
+            raise NotImplementedError(
+                "--official-adapter continuation is not supported on "
+                "this path; train from scratch (concat line)")
+        return model
+    raise NotImplementedError(
+        "train_ccm_merge currently targets the qwen3 host")
     from transformers.models.qwen3.configuration_qwen3 import Qwen3Config
     from src.arch.ccm_qwen3 import Qwen3ForCausalLM_CCM
     from src.utils import SeparatedEmbedding
@@ -179,8 +329,16 @@ def wrap_lora_merge(model, r, dropout):
     for _n, _p in model.named_parameters():
         if "lora_" in _n:
             _p.requires_grad_(True)
-    model.base_model.model.model.embed_tokens.comp_embeddings.weight \
-        .requires_grad_(True)
+    # Unified path: qwen3/gemma4 use SeparatedEmbedding under
+    # base_model.model.MODEL; llama's CausalLM wraps the LlamaModel
+    # directly (one level shallower).
+    if model.base_model.model.model is not None \
+            and hasattr(model.base_model.model.model, "embed_tokens"):
+        model.base_model.model.model.embed_tokens \
+            .comp_embeddings.weight.requires_grad_(True)
+    else:
+        model.base_model.model.embed_tokens \
+            .comp_embeddings.weight.requires_grad_(True)
     n_tr = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print("[merge] trainable params:", n_tr, flush=True)
     return model
@@ -194,6 +352,18 @@ def build_dataset(args, tokenizer):
         num_comp_tokens=N_TOK,
                                      add_comp_token=True,
                                      relative_embedding=args.relative_embedding)
+    if args.host == "gemma4":
+        from src.data.dialogue.gemma4_data import (
+            Gemma4DialogueDataset, Gemma4DialogueCollator)
+        dialog = Gemma4DialogueDataset(tokenizer,
+                                       mirror=args.dialog_mirror)
+        collator = Gemma4DialogueCollator(
+            dataset=dialog, tokenizer=tokenizer, comp_args=comp_args,
+            comp_token=tokenizer.comp_token_id,
+            sum_token=tokenizer.sum_token_id,
+            pad_token=tokenizer.pad_token_id,
+            label_pad_token_id=-100)
+        return dialog, collator
     if args.host == "qwen3":
         from src.data.dialogue.qwen3_data import (
             Qwen3DialogueDataset, Qwen3DialogueCollator)
@@ -291,6 +461,14 @@ def main():
     tokenizer = build_tokenizer(args)
     model = build_model_merge(args, device)
     model = wrap_lora_merge(model, args.lora_r, args.lora_dropout)
+    if args.with_gamma:
+        from rpbe.hosts.ccm.ccm_patch import attach_gamma
+        attach_gamma(model, hidden=64)
+        for _n, _p in model.named_parameters():
+            if "gamma" in _n:
+                _p.requires_grad_(True)
+        print("[merge] Gamma attached (trainable, joint control)",
+              flush=True)
     model.update_comp_token(
         [tokenizer.comp_token_id[k] for k in range(N_TOK)],
         [tokenizer.sum_token_id[k] for k in range(N_TOK)])
@@ -301,10 +479,10 @@ def main():
     params = [p for p in model.parameters() if p.requires_grad]
     optimizer = torch.optim.AdamW(params, lr=args.lr, weight_decay=0.0)
     total_steps = max(1, args.max_steps)
-    warmup_steps = max(1, int(0.03 * total_steps))
+    warmup_steps = 0 if args.no_warmup else max(1, int(0.03 * total_steps))
 
     def _lr_lambda(s):
-        if s < warmup_steps:
+        if warmup_steps > 0 and s < warmup_steps:
             return float(s) / float(warmup_steps)
         progress = float(s - warmup_steps) / float(
             max(1, total_steps - warmup_steps))
@@ -326,7 +504,17 @@ def main():
                 random.shuffle(shuf_order)
                 epoch_pos = 0
                 n_epochs += 1
-            items.append(dict(train_items[int(shuf_order[epoch_pos])]))
+            idx = int(shuf_order[epoch_pos])
+            if args.host == "llama":
+                # llama trainset is a dict-of-lists ({"dialog": [...],
+                # "act": [...]}), NOT a list-of-dicts like qwen3/gemma4.
+                item = {"dialog": list(train_items["dialog"][idx])}
+                if "act" in train_items:
+                    item["act"] = list(train_items["act"][idx])
+                item["is_train"] = True
+                items.append(item)
+            else:
+                items.append(dict(train_items[idx]))
             epoch_pos += 1
         # NO fixed_depth -> the collator applies the official random_k
         return collator(items)
@@ -337,6 +525,75 @@ def main():
     pending = []
     total_tokens = 0
     total_loss = 0.0
+
+    if args.resume_from:
+        ck = torch.load(args.resume_from, map_location="cpu",
+                        weights_only=False)
+        incompat = model.load_state_dict(
+            {k: v.to(device) for k, v in ck["model"].items()},
+            strict=False)
+        # Graceful degradation: checkpoints written before the resume
+        # state was folded into save_trainable carry only
+        # {"model", "step"}.  Restore everything present and report
+        # loudly on what is not, so a resume never dies on a KeyError.
+        step = int(ck["step"])
+        restored = ["model({} tensors)".format(len(ck["model"]))]
+        degraded = []
+        if ck.get("optimizer_state") is not None:
+            try:
+                optimizer.load_state_dict(ck["optimizer_state"])
+                restored.append("optimizer")
+            except ValueError:
+                # Joint control (--with-gamma) adds a parameter group
+                # the old checkpoint lacks — moments restart from zero.
+                degraded.append("optimizer group mismatch (joint "
+                                "Gamma added) — moments restart")
+        else:
+            degraded.append("Adam moments restart from zero "
+                            "(weights and step counter unaffected)")
+        if ck.get("scheduler_state") is not None:
+            scheduler.load_state_dict(ck["scheduler_state"])
+            restored.append("scheduler")
+        else:
+            # Fast-forward the warmup+cosine schedule instead of
+            # re-entering warmup at 0.  Pin last_epoch so the next
+            # scheduler.step() lands on step+1, and set the live group
+            # LR to lambda(step) for the first resumed update.
+            scheduler.last_epoch = step
+            lr_now = args.lr * float(scheduler.lr_lambdas[0](step))
+            for _g in optimizer.param_groups:
+                _g["lr"] = lr_now
+            restored.append("scheduler fast-forwarded to step {} "
+                            "(lr={:.3e})".format(step, lr_now))
+        if ck.get("shuf_order") is not None:
+            shuf_order = ck["shuf_order"]
+            epoch_pos = int(ck["epoch_pos"])
+            n_epochs = int(ck["n_epochs"])
+            restored.append("data cursor epoch={} pos={}".format(
+                n_epochs, epoch_pos))
+        else:
+            degraded.append("data cursor restarts at epoch 0 pos 0")
+        for _key, _setter in (("py_rng", random.setstate),
+                              ("np_rng", np.random.set_state),
+                              ("torch_rng", torch.random.set_rng_state)):
+            if ck.get(_key) is not None:
+                _setter(ck[_key])
+            else:
+                degraded.append("{} not restored".format(_key))
+        total_loss = float(ck.get("total_loss", 0.0))
+        total_tokens = int(ck.get("total_tokens", 0))
+        print("[resume] from {} -> step={}".format(
+            args.resume_from, step), flush=True)
+        print("[resume]   restored: " + "; ".join(restored), flush=True)
+        if degraded:
+            print("[resume]   DEGRADED: " + "; ".join(degraded),
+                  flush=True)
+        print("[resume]   {} backbone tensors absent (expected: "
+              "trainable-only save)".format(len(incompat.missing_keys)),
+              flush=True)
+        if incompat.unexpected_keys:
+            print("[resume]   WARNING unexpected keys: {}".format(
+                list(incompat.unexpected_keys)[:5]), flush=True)
     model.train()
 
     while step < args.max_steps:
@@ -382,7 +639,17 @@ def main():
                           time.time() - t_start, n_epochs), flush=True)
             if step % args.checkpoint_every == 0:
                 save_trainable(out / f"checkpoint_step{step}.pt", model,
-                               step=step)
+                               step=step,
+                               optimizer_state=optimizer.state_dict(),
+                               scheduler_state=scheduler.state_dict(),
+                               shuf_order=shuf_order,
+                               epoch_pos=epoch_pos,
+                               n_epochs=n_epochs,
+                               py_rng=random.getstate(),
+                               np_rng=np.random.get_state(),
+                               torch_rng=torch.random.get_rng_state(),
+                               total_loss=total_loss,
+                               total_tokens=total_tokens)
                 print("[ckpt] saved step {}".format(step), flush=True)
 
     save_trainable(out / "final.pt", model, step=step)

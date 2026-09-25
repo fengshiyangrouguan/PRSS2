@@ -136,7 +136,9 @@ class DialogueDataset:
         ``turns``: [{"kind": "utt"|"marker", "tokens": [...]}, ...]
         ``utt_turn_idx``: turn index of each utterance (utt-space -> turns)
         ``utt_sessions``: session id of each utterance
-        ``sess_utt_end``: [s] = exclusive utt-space end of session s
+        ``sess_utt_end``: [j] = EXCLUSIVE utt-space end of session
+        j+1 (so session s spans [sess_utt_end[s-2], sess_utt_end[s-1]),
+        with the implicit sess_utt_end[-1] := 0.
         """
         turns, utt_sessions, utt_turn_idx = [], [], []
         for si, sess in enumerate(row["sessions"]):
@@ -247,9 +249,16 @@ class DialogueDataset:
             for s in sessions:
                 if s > ep["n_sessions"]:
                     continue
-                i0 = ep["sess_utt_end"][s - 1]
-                i1 = (ep["sess_utt_end"][s]
-                      if s < ep["n_sessions"] else ep["n_utt"])
+                # sess_utt_end[j] is the EXCLUSIVE end of session j+1
+                # (cumulative prefix sum over utt_sessions), so session s
+                # spans [sess_utt_end[s-2], sess_utt_end[s-1]) with the
+                # implicit sess_utt_end[-1] := 0.  Fix 2026-09-26: the old
+                # code used sess_utt_end[s-1] as the session START, which
+                # shifted every session label by one (s measured real
+                # session s+1) and made the last session (s == n_sessions)
+                # come out empty.
+                i0 = ep["sess_utt_end"][s - 2] if s >= 2 else 0
+                i1 = ep["sess_utt_end"][s - 1]
                 n_ex = (i1 - i0) // 2        # exchanges in session s
                 for e in range(n_ex):
                     last = ep["utt_turn_idx"][i0 + 2 * e + 1]

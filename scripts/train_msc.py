@@ -356,8 +356,17 @@ def train(args):
             row_idx = sample_row()
             row = ds.train_dataset[row_idx]
             batch = collator([dict(row)])
+            # raw_dialogs: tokenized utterance turns of the cut window
+            # (markers excluded — structural metadata, not dialogue
+            # content).  Length == L + 2: L history turns + context +
+            # target, matching collect_rows' assertion.  Fix 2026-09-26:
+            # the MSC path never passed raw_dialogs, so meta["raw_dialog"]
+            # was None and collect_rows crashed on len(None).
+            raw_dialogs = [[list(t["tokens"]) for t in row["dialog"]
+                            if t["kind"] == "utt"]]
             metas = parse_meta(batch, comp_ids, sum_ids,
-                               len(pending), orig_ids=[int(row["orig_id"])])
+                               len(pending), orig_ids=[int(row["orig_id"])],
+                               raw_dialogs=raw_dialogs)
             pending.append((batch, metas))
             state = {"rng": _rng_state()}
             pass1_rngs.append(state["rng"])
@@ -592,6 +601,14 @@ def eval(args):
             model = LlamaForCausalLM_CCM.from_pretrained(
                 args.model_name_or_path, config=cfg,
                 torch_dtype=torch.float16).to(device)
+            # the CCM arch's position/mask path requires comp tokens to
+            # be declared even for the raw full-context arm (fix
+            # 2026-09-26: comp_mask=None crashed update_position_ids);
+            # the full arm's data carries no comp ids -> zero mask
+            model.update_comp_token([32000, 32001], [32002, 32003])
+            from src.utils import SeparatedEmbedding
+            model.model.embed_tokens = SeparatedEmbedding(
+                model.model.embed_tokens, 4)
             model.eval()
         elif arm == "merge":
             assert args.msc_adapter, "--msc-adapter required for the merge arm"

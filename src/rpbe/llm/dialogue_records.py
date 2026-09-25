@@ -77,7 +77,7 @@ class Llmmaps(nn.Module):
     # the modulo fold below silently collapsed distinct chain positions
     # onto the same signature.  Sampling stratification in train_ccm
     # keeps its own 5-level DEPTH_LEVELS (frozen spec, untouched).
-    DEPTH_LEVELS = tuple(range(1, 14))  # L_v = local interface depth
+    DEPTH_LEVELS = tuple(range(1, 129))  # L_v = local interface depth (MSC fix 2026-09-26: windows reach ~56 history turns)
 
     def __init__(self, d_chi: int = 64, d_phi: int = 32, m: int = 32,
                  seed: int = 0, repeats: int = 3, n_branches: int = 4):

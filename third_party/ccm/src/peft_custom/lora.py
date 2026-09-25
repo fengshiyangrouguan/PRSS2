@@ -25,11 +25,10 @@ import torch.nn.functional as F
 from transformers.pytorch_utils import Conv1D
 
 from peft.import_utils import is_bnb_available
+from peft.config import PeftConfig, PeftType  # peft>=0.21 location
 from peft.utils import (
     TRANSFORMERS_MODELS_TO_LORA_TARGET_MODULES_MAPPING,
     ModulesToSaveWrapper,
-    PeftConfig,
-    PeftType,
     _freeze_adapter,
     _get_submodules,
     transpose,
@@ -586,8 +585,13 @@ class Linear(nn.Linear, LoraLayer):
             result_add = (self.lora_B[self.active_adapter](self.lora_A[self.active_adapter](
                 self.lora_dropout[self.active_adapter](x))) * self.scaling[self.active_adapter])
 
-            comp_mask = comp_mask.unsqueeze(-1).to(result_add.dtype)
-            result += comp_mask * result_add
+            if comp_mask is not None:
+                comp_mask = comp_mask.unsqueeze(-1).to(result_add.dtype)
+                result += comp_mask * result_add
+            else:
+                # plain-LM path (Step-1 / no compression tokens, review
+                # 2026-09-25): no comp positions to gate
+                result += result_add
 
         else:
             result = F.linear(x, transpose(self.weight, self.fan_in_fan_out), bias=self.bias)

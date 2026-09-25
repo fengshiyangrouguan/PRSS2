@@ -48,7 +48,8 @@ def build_official_host(device):
     load_lora_weight(BASE + "/result/dialog/llama-7b-no", model, merge=True)
     model.update_comp_token([32000, 32001], [32002, 32003])
     model.model.embed_tokens = SeparatedEmbedding(model.model.embed_tokens, 4)
-    adapter_dir = BASE + "/result/dialog/llama-7b-no-online-merge_recur-ntok2"
+    adapter_dir = os.environ.get("EVAL_ADAPTER_DIR") or \
+        BASE + "/result/dialog/llama-7b-no-online-merge_recur-ntok2"
     lora_cfg = LoraConfig().from_pretrained(adapter_dir)
     model = peft_custom.get_peft_model(model, lora_cfg)
     load_lora_weight(adapter_dir, model, merge=False)
@@ -72,8 +73,23 @@ def main():
     ap.add_argument("--history-gamma-init-from", default="",
                     help="Stage-A ckpt holding the frozen compressor "
                          "(LoRA + COMP) the Stage-B ckpt does not store")
+    ap.add_argument("--adapter-dir", default="",
+                    help="Step-2 adapter override (official concat_recur "
+                         "release, review 2026-09-25)")
+    ap.add_argument("--eval-attn-type", default="merge_recur",
+                    choices=["merge_recur", "merge", "concat_recur",
+                             "concat"],
+                    help="evaluation topology override (review "
+                         "2026-09-24 context-only probe): merge = "
+                         "context-only compression (SUM once at the "
+                         "end), merge_recur = recursive memory "
+                         "propagation. Same checkpoint, data-level "
+                         "mask change only.")
     a = ap.parse_args()
     device = torch.device("cuda", 0)
+
+    _attn = getattr(a, "eval_attn_type", "merge_recur")
+    print("[eval-attn-type] {}".format(_attn), flush=True)
 
     import types as _t
     tok = tc.build_tokenizer(_t.SimpleNamespace(
@@ -81,7 +97,7 @@ def main():
     from src.arguments import CompressionArguments
     from src.data.dialogue.data import DialogueDataset
     from src.data.dialogue.collator import DataCollatorForDialogue_LLAMA
-    comp_args = CompressionArguments(attn_type="merge_recur",
+    comp_args = CompressionArguments(attn_type=_attn,
                                      num_comp_tokens=tc.N_TOK,
                                      add_comp_token=True,
                                      relative_embedding="skip")

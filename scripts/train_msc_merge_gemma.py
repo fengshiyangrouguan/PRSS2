@@ -135,8 +135,14 @@ def main():
     params = [p for p in model0.parameters() if p.requires_grad]
     other_params = [[p for p in m.parameters() if p.requires_grad]
                     for m in models[1:]]
+    # Review 2026-09-26 P0: sync trainable state to ALL replicas BEFORE
+    # the first step — the LoRA init is random per build, so without
+    # this the first microbatch gradients come from different points.
+    for op in other_params:
+        for p0, p in zip(params, op):
+            p.data.copy_(p0.data)
     print("[msc-merge] trainable:", sum(p.numel() for p in params),
-          "on", n_gpu, "gpu(s)", flush=True)
+          "on", n_gpu, "gpu(s); step-0 replicas synced", flush=True)
     opt = torch.optim.AdamW(params, lr=a.lr)
     warmup = max(1, int(0.03 * a.max_steps))
     total = a.max_steps
@@ -174,7 +180,12 @@ def main():
                              sl.reshape(-1), ignore_index=-100,
                              reduction="sum")
         n_valid = (sl != -100).sum()
-        (ce / float(a.grad_accum)).backward()
+        # Review 2026-09-26 P0: normalize by n_valid FIRST (official
+        # CausalLM token-mean semantics); the old unnormalized sum made
+        # the baseline optimize a token-weighted loss (longer targets
+        # dominate) while the R10 task component uses the token mean.
+        ce_mean = ce / n_valid.clamp_min(1)
+        (ce_mean / float(a.grad_accum)).backward()
         # NO float()/int() here — those force GPU sync and serialize the
         # two cards.  Detached tensors are summed at the step end.
         return ce.detach(), n_valid.detach()

@@ -68,6 +68,22 @@ def build_merge(device, foundation, adapter_ckpt):
     return model
 
 
+def build_ours(device, foundation, adapter_ckpt, rpbe_ckpt,
+               gamma_hidden):
+    """Ours arm: merge host + Gamma + the R10 Stage-2 trainable state."""
+    from rpbe.hosts.ccm.ccm_patch import attach_gamma
+    model = build_merge(device, foundation, adapter_ckpt)
+    attach_gamma(model, hidden=gamma_hidden)
+    ck = torch.load(rpbe_ckpt, map_location=device, weights_only=False)
+    _m, _u = model.load_state_dict(ck["model"], strict=False)
+    if _u:
+        raise RuntimeError("unexpected keys: {}".format(sorted(_u)[:5]))
+    print("[msc-gemma-eval] ours ckpt step={} loaded: {} missing keys"
+          .format(ck.get("step"), len(_m)), flush=True)
+    model.eval()
+    return model
+
+
 def eval_full_collate(tok, rows, ds_full):
     inputs, labels = [], []
     for r in rows:
@@ -99,6 +115,13 @@ def main():
     ap.add_argument("--foundation",
                     default=BASE + "/result/msc/gemma_MSC_no/final.pt")
     ap.add_argument("--msc-adapter", default="")
+    ap.add_argument("--arm", default="", choices=["full", "merge", "ours"],
+                    help="empty = full if no msc-adapter else merge")
+    ap.add_argument("--rpbe-ckpt", default="",
+                    help="R10 Stage-2 ckpt (ckpt_stepN.pt) for the "
+                         "ours arm — attach Gamma and load the "
+                         "trainable state over the merge host")
+    ap.add_argument("--gamma-hidden", type=int, default=64)
     ap.add_argument("--output", required=True)
     a = ap.parse_args()
 
@@ -145,10 +168,18 @@ def main():
         padding="left", pad_token=tok.pad_token_id,
         label_pad_token_id=-100)
 
-    arms = ["full"] if not a.msc_adapter else ["merge"]
+    if a.arm:
+        arms = [a.arm]
+    else:
+        arms = ["full"] if not a.msc_adapter else ["merge"]
     for arm in arms:
         if arm == "full":
             model = build_full(device)
+        elif arm == "ours":
+            assert a.msc_adapter and a.rpbe_ckpt, (
+                "--msc-adapter and --rpbe-ckpt required for the ours arm")
+            model = build_ours(device, a.foundation, a.msc_adapter,
+                               a.rpbe_ckpt, a.gamma_hidden)
         else:
             model = build_merge(device, a.foundation, a.msc_adapter)
         print("[msc-gemma-eval] arm={} ready".format(arm), flush=True)

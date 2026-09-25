@@ -168,9 +168,15 @@ class DialogueDataset:
                 "utt_turn_idx": utt_turn_idx, "sess_utt_end": sess_utt_end}
 
     def _turn_cost(self, t):
+        """Token cost of a turn in the window budget.
+
+        Review 2026-09-26: merge_recur emits COMP + SUM pairs (each
+        N_TOK wide) on every history utterance, so the budget counts
+        BOTH — the old cost counted COMP only and under-budgeted by
+        2 * N_TOK per history turn."""
         c = len(t["tokens"]) + len(self.sep_token)
         if t["kind"] == "utt" and self.online:
-            c += len(self.comp_token)
+            c += 2 * len(self.comp_token)   # COMP pair + SUM pair
         return c
 
     def _cut_window(self, ep, v, budget=None):

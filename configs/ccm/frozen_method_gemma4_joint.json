@@ -1,0 +1,88 @@
+{
+ "_comment": "GEMMA4 JOINT variant (user ruling 2026-09-25): gamma + comp JOINT training control from the gemma Stage-2 merge step600 — conditional LoRA + COMP rows + Gamma ALL trainable (freeze_host.enabled=false), sketch/RPBE supervision on the ours arm, aggregate constraint mode, lr 3e-4 (Joint's LoRA lr), OLD lambda 0.005936691082765761 adopted DIRECTLY without recalibration (user ruling 2026-09-25), 100 windows, checkpoint every 10, warmup ON.  Mirrors the llama Joint protocol on the gemma host.",
+ "frozen_source": "review ruling 2026-09-21 (cut collector / Gamma placement / raw-turn chi-phi / freeze-host / validation-only selection); steps 50->100 and lambda per user ruling 2026-09-25",
+ "backbone": {
+  "model": "gemma-4-E4B text decoder (released Gemma-4-E4B, text-only strip)",
+  "hf_identifier": "google/gemma-4-E4B",
+  "vendored_commit": "feature_GEMMA 232a848",
+  "attn_type": "merge_recur",
+  "n_tok_lock": 2,
+  "torch_compile": "disabled on all three arms",
+  "host_path": "gemma merge chain (train_ccm.build_model gemma4 branch, review fix 2026-09-23 SeparatedEmbedding layout) + --init-from merge step600"
+ },
+ "adapter": {
+  "lora_r": 8,
+  "lora_r_note": "LoRA rank for the conditional adapter (r=8 fixed for the formal runs)"
+ },
+ "rpbe": {
+  "ridge_eps": 0.001,
+  "sketch_dim_m": 32,
+  "rpbe_map_seed": 0,
+  "z_v_dim": 128,
+  "horizon_weights": [
+   0.5,
+   0.5
+  ],
+  "lambda_calibration": {
+   "rule": "R10 gamma-scope calibration (review 2026-09-16): lambda = 0.1 / r_eff measured on the GAMMA group only at theta_0, first full window, before ANY optimizer step",
+   "lambda_kf": 0.005936691082765761,
+   "lambda_kf_note": "OLD R10/Joint lambda adopted directly (user ruling 2026-09-25: no recalibration on the gemma host). Same value as the llama R10 v5 and llama Joint runs (llama r_eff=16.844 calibration)."
+  },
+  "z_v_source": "J_mem(M_t) fixed adapter at block_idx = t - 1 for t = 1..L (one cut per actual compression layer; review ruling 2026-09-21)",
+  "cut_supervision": "t < L: obs1 (C=u_{t+1}, Y=u_{t+2}, w=0.5) + obs2 (C=(u_{t+1}, u_{t+2}, one-update), Y=y, w=0.5); t = L: single row (C=c, Y=y, w=1.0).  chi/phi are built from the RAW tokenized turns [u_1..u_L, c, y], never from spans of the collated ids.",
+  "witness": "none (main experiment)",
+  "sketch_ensemble_n_branches": 4,
+  "sketch_ensemble_note": "four independent 32-dim branches (J_ens = mean_r J_r; never concatenated into one 128-dim covariance).  Depth bucket b(L) modulates the future signature with LOCAL cut depth L=t in 1..13.",
+  "oas_shrinkage": {
+   "enabled": true,
+   "rule": "paired OAS covariance shrinkage per branch"
+  }
+ },
+ "gamma": {
+  "placement": "one module per layer, shared across the K/V merges and the two COMP/SUM slots; recurrence M_t = mean(h_1..h_t) + R_Gamma(M_{t-1}, h_t, t) for EVERY t = 1..L with M_0 = 0 (review ruling 2026-09-21: the first compression layer is inside the method, L=1 included)",
+  "hidden": 64,
+  "time_dim": 16,
+  "init_scale": 0.02,
+  "zero_init": "U0=0 zero-output projection init; step 0 residual is bit-for-bit zero.  Gradient note: with U_0 = 0 the first step updates only U (dR/dV vanishes at U = 0).",
+  "parameter_budget": "42 layers x ~25.7k = ~1.08M"
+ },
+ "freeze_host": {
+  "enabled": false,
+  "scope": "NOT frozen in the joint control: trainable = conditional LoRA + COMP/SUM rows + Gamma (the llama Joint protocol analogue on gemma).",
+  "mode": "host model.eval() + Gamma modules train() — the released conditional LoRA dropout (0.05) must not perturb the frozen host forward; gradients still flow through the host to Gamma"
+ },
+ "official_host": {
+  "enabled": false,
+  "note": "the gemma4 host builds from the released Gemma-4-E4B checkpoint + --foundation merge + --init-from merge step600 (the --official-host flag is a Llama-line artifact and is refused on gemma4)."
+ },
+ "window": {
+  "min_effective_cuts": 128,
+  "collection": "adaptive by effective cut count (dialogues with L>=1; review ruling 2026-09-21: L=1 emits its terminal cut)",
+  "cadence": "identical task samples and scheduler cadence across the three arms"
+ },
+ "training": {
+  "steps": 100,
+  "steps_note": "User ruling 2026-09-25: Joint arm runs 100 windows from the gemma merge step600 (the llama Joint ran 60 + 续训 to 100 without a max-windows cap; gemma runs 100 directly), aggregate mode, warmup ON (schedule-total 1000). lr=3e-4 / rpbe-lr=5e-5 (the llama Joint values).",
+  "grad_clip": 1.0,
+  "merge_cadence": "window-matched",
+  "two_pass_replay": "pass1 no-grad statistics forward, pass2 grad replay forward (RPBE arms only)",
+  "rpbe_gamma_only": true,
+  "checkpoint_every": 10,
+  "schedule_total_steps": 1000,
+  "schedule_note": "original 1000-step warmup/cosine schedule kept (warmup ON, matching the llama Joint launch which had no --no-warmup)",
+  "checkpoint_selection": "validation only (clean_split=True, eval_source=val).  The official val+test pooled protocol remains a CCM-reproduction report only and never selects a checkpoint.",
+  "checkpoint_every_note": "every 10 windows"
+ },
+ "sampling": {
+  "depth_levels": [
+   1,
+   2,
+   4,
+   8,
+   13
+  ],
+  "n_turns_of_L": "L + 2 TURNS (fixed prefix length in turns per depth; NOT meta.k = len(blocks)+1 = L + 1)",
+  "cut_depths": "every sample at endpoint L contributes cuts at LOCAL depths t = 1..L (maps.pv depth = t; Llmmaps registers local depths 1..13, out-of-range values fail fast — no modulo fold)",
+  "rule": "q_L ~ 1/sqrt(n_L) with 3x-uniform oversampling cap; ONE original dialogue per window (tree_id = stable original dialogue id)."
+ }
+}

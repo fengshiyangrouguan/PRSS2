@@ -77,12 +77,20 @@ class Llmmaps(nn.Module):
     # the modulo fold below silently collapsed distinct chain positions
     # onto the same signature.  Sampling stratification in train_ccm
     # keeps its own 5-level DEPTH_LEVELS (frozen spec, untouched).
-    DEPTH_LEVELS = tuple(range(1, 129))  # L_v = local interface depth (MSC fix 2026-09-26: windows reach ~56 history turns)
+    DEPTH_LEVELS = tuple(range(1, 14))  # L_v = local interface depth
+    # (host-scoped, review 2026-09-26): the DailyDialog default stays
+    # 1..13 fail-fast; MSC windows reach ~56 history turns and pass
+    # depth_levels=range(1, 129) explicitly at construction.
 
     def __init__(self, d_chi: int = 64, d_phi: int = 32, m: int = 32,
-                 seed: int = 0, repeats: int = 3, n_branches: int = 4):
+                 seed: int = 0, repeats: int = 3, n_branches: int = 4,
+                 depth_levels=None):
         super().__init__()
         self.d_chi = int(d_chi)
+        # host-scoped depth domain (review 2026-09-26): MSC passes
+        # range(1, 129); everything else keeps the class default 1..13.
+        self.DEPTH_LEVELS = (tuple(depth_levels) if depth_levels is not None
+                             else type(self).DEPTH_LEVELS)
         self.d_phi = int(d_phi)
         self.m = int(m)              # per-branch output dim (m = 32)
         self.n_branches = int(n_branches)

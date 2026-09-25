@@ -14,6 +14,7 @@ seed0 on GPU 0, seed1 on GPU 1.
 """
 import argparse
 import json
+import math
 import random
 import sys
 import time
@@ -144,7 +145,8 @@ def main():
         unique_layer_ids=unique_layer_ids)
     maps = Llmmaps(d_chi=64, d_phi=32, m=32,
                    n_branches=Llmmaps.N_BRANCHES,
-                   seed=a.rpbe_seed).to(device)
+                   seed=a.rpbe_seed,
+                   depth_levels=range(1, 129)).to(device)
     builder = DialogueCutBuilder(maps, z_dim=a.z_dim, seed=a.rpbe_seed)
     utter_embed = UtteranceEmbed(hidden_dim=cfg.hidden_size, d_chi=64,
                                  seed=a.rpbe_seed, combine_dim=1).to(device)

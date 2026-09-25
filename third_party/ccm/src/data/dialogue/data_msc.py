@@ -138,7 +138,7 @@ class DialogueDataset:
         ``utt_sessions``: session id of each utterance
         ``sess_utt_end``: [j] = EXCLUSIVE utt-space end of session
         j+1 (so session s spans [sess_utt_end[s-2], sess_utt_end[s-1]),
-        with the implicit sess_utt_end[-1] := 0.
+        with lower boundary 0 for session 1 (no implicit -1 index).
         """
         turns, utt_sessions, utt_turn_idx = [], [], []
         for si, sess in enumerate(row["sessions"]):
@@ -194,10 +194,16 @@ class DialogueDataset:
         context = []
         for t in hist:
             tk = list(t["tokens"])
-            if t["kind"] == "utt" and self.online:
-                tk += self.comp_token
-            if sum_recur:
-                tk += sum_token
+            if t["kind"] == "utt":
+                # COMP and SUM belong to UTTERANCES only (review
+                # 2026-09-26): a session marker getting a SUM token made
+                # the model count it as an extra recurrence step, so the
+                # Gamma depth diverged from the observer's utterance-only
+                # cut depth.  Markers keep raw text + separator only.
+                if self.online:
+                    tk += self.comp_token
+                if sum_recur:
+                    tk += sum_token
             context += tk + self.sep_token
         if hist:
             context = context[:-len(self.sep_token)]
@@ -252,7 +258,7 @@ class DialogueDataset:
                 # sess_utt_end[j] is the EXCLUSIVE end of session j+1
                 # (cumulative prefix sum over utt_sessions), so session s
                 # spans [sess_utt_end[s-2], sess_utt_end[s-1]) with the
-                # implicit sess_utt_end[-1] := 0.  Fix 2026-09-26: the old
+                # lower boundary 0 for session 1.  Fix 2026-09-26: the old
                 # code used sess_utt_end[s-1] as the session START, which
                 # shifted every session label by one (s measured real
                 # session s+1) and made the last session (s == n_sessions)

@@ -249,7 +249,8 @@ def train(args):
                                  z_dim=args.z_dim, seed=args.rpbe_seed)
         maps = Llmmaps(d_chi=64, d_phi=32, m=32,
                        n_branches=Llmmaps.N_BRANCHES,
-                       seed=args.rpbe_seed).to(device)
+                       seed=args.rpbe_seed,
+                       depth_levels=range(1, 129)).to(device)
         builder = DialogueCutBuilder(maps, z_dim=args.z_dim,
                                      seed=args.rpbe_seed)
         utter_embed = UtteranceEmbed(hidden_dim=cfg.hidden_size, d_chi=64,

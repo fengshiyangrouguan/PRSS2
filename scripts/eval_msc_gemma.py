@@ -202,7 +202,8 @@ def main():
             sum(acc[s]["all_sum"] for s in range(2, 6))
             / max(sum(acc[s]["all_n"] for s in range(2, 6)), 1))))
         json.dump(result,
-                  open(Path(a.output) / "eval_{}_valid.json".format(arm),
+                  open(Path(a.output) / "eval_{}_{}.json".format(arm,
+                                                                 split),
                        "w"), indent=2)
         print("[msc-gemma-eval] arm={} overall_opening_ppl={:.4f} "
               "({:.0f}s)".format(arm, result["overall_opening_ppl"],

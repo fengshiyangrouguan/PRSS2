@@ -98,7 +98,9 @@ def parse_args():
     p.add_argument("--checkpoint-every", type=int, default=50)
     p.add_argument("--resume-from", default="")
     # eval mode
-    p.add_argument("--eval-split", default="test", choices=["val", "test"])
+    p.add_argument("--eval-split", default="test",
+                   choices=["val", "test", "pooled"],
+                   help="pooled = val+test merged cohort")
     p.add_argument("--eval-arm", default="all",
                    choices=["full", "merge", "ours", "all"])
     p.add_argument("--eval-batch", type=int, default=4)
@@ -598,9 +600,17 @@ def eval(args):
                    eval_source="val", max_length=EVAL_MAX_LENGTH,
                    msc_dir=MSC_DATA_DIR)
     collator = build_collator(ds, tok, device)
-    split = "valid" if args.eval_split == "val" else "test"
-    sessions = tuple(int(s) for s in args.eval_sessions.split(","))
-    instances = list(ds.exchange_instances(split, sessions=sessions))
+    sessions = tuple(int(x) for x in args.eval_sessions.split(","))
+    if args.eval_split == "pooled":
+        split = "pooled"
+        instances = (list(ds.exchange_instances("valid",
+                                                sessions=sessions)) +
+                     list(ds.exchange_instances("test",
+                                                sessions=sessions)))
+    else:
+        split = "valid" if args.eval_split == "val" else "test"
+        sessions = tuple(int(s) for s in args.eval_sessions.split(","))
+        instances = list(ds.exchange_instances(split, sessions=sessions))
     if args.opening_only:
         instances = [r for r in instances if r["is_opening"]]
     if args.max_episodes > 0:

@@ -651,14 +651,23 @@ def eval(args):
                 else:
                     batch = collator(rows)
                     out_f = run_forward(model, batch, device, False)
-                row_sum, row_n = task_ce_rows(out_f, batch["labels"], device)
-                for r in range(row_sum.shape[0]):
+                # Protocol A (review freeze, 2026-09-26): EOS excluded —
+                # mask the final EOS label of every row; dialogue-equal
+                # aggregation (per-dialogue mean NLL, then the mean
+                # across dialogues), NOT token-pooled.
+                labs = batch["labels"]
+                last_valid = (labs != -100).sum(-1) - 1
+                labs = labs.clone()
+                labs[torch.arange(labs.shape[0]), last_valid] = -100
+                row_sum, row_n = task_ce_rows(out_f, labs, device)
+                row_mean = row_sum / row_n.clamp(min=1)
+                for r in range(row_mean.shape[0]):
                     s, o = metas[r]
-                    acc[s]["all_sum"] += float(row_sum[r])
-                    acc[s]["all_n"] += int(row_n[r])
+                    acc[s]["all_sum"] += float(row_mean[r])
+                    acc[s]["all_n"] += 1
                     if o:
-                        acc[s]["opening_sum"] += float(row_sum[r])
-                        acc[s]["opening_n"] += int(row_n[r])
+                        acc[s]["opening_sum"] += float(row_mean[r])
+                        acc[s]["opening_n"] += 1
                 if i % (args.eval_batch * 50) == 0 and i:
                     print("[msc-eval] {} {}/{} {:.0f}s".format(
                         arm, i, len(instances), time.time() - t0),
@@ -669,10 +678,10 @@ def eval(args):
             result["sessions"]["S{}".format(s)] = {
                 "opening_ppl": float(torch.exp(torch.tensor(
                     acc[s]["opening_sum"] / max(acc[s]["opening_n"], 1)))),
-                "opening_tokens": acc[s]["opening_n"],
+                "opening_dialogues": acc[s]["opening_n"],
                 "all_ppl": float(torch.exp(torch.tensor(
                     acc[s]["all_sum"] / max(acc[s]["all_n"], 1)))),
-                "all_tokens": acc[s]["all_n"],
+                "all_dialogues": acc[s]["all_n"],
             }
         osum = sum(acc[s]["opening_sum"] for s in range(2, 6))
         on = sum(acc[s]["opening_n"] for s in range(2, 6))

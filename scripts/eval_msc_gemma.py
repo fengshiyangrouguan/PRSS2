@@ -107,7 +107,9 @@ def eval_full_collate(tok, rows, ds_full):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--gpu", type=int, default=1)
-    ap.add_argument("--eval-split", default="val")
+    ap.add_argument("--eval-split", default="val",
+                    choices=["val", "test", "pooled"],
+                    help="pooled = val+test merged cohort")
     ap.add_argument("--eval-sessions", default="2,3,4,5")
     ap.add_argument("--opening-only", action="store_true", default=True)
     ap.add_argument("--max-episodes", type=int, default=250)
@@ -143,16 +145,34 @@ def main():
                              online=True, add_comp_token=True,
                              eval_source="val", max_length=2048,
                              msc_dir=MSC_DATA_DIR)
-    split = "valid" if a.eval_split == "val" else "test"
     sessions = tuple(int(s) for s in a.eval_sessions.split(","))
-    instances = list(ds_full.exchange_instances(split, sessions=sessions))
+    if a.eval_split == "pooled":
+        split = "pooled"
+        instances = []
+        for _s in ("valid", "test"):
+            for r in ds_full.exchange_instances(_s, sessions=sessions):
+                r["split"] = _s      # composite identity for sampling
+                instances.append(r)
+    else:
+        split = "valid" if a.eval_split == "val" else "test"
+        instances = list(ds_full.exchange_instances(split,
+                                                    sessions=sessions))
     if a.opening_only:
         instances = [r for r in instances if r["is_opening"]]
     if a.max_episodes > 0:
         rng = random.Random(1234)
-        eids = sorted({r["orig_id"] for r in instances})
-        keep = set(rng.sample(eids, min(a.max_episodes, len(eids))))
-        instances = [r for r in instances if r["orig_id"] in keep]
+        if a.eval_split == "pooled":
+            # composite (split, orig_id) identity — exactly N episodes
+            # (the bare orig_id aliases val/test dialogues with the
+            # same row number and over-samples).
+            eids = sorted({(r["split"], r["orig_id"]) for r in instances})
+            keep = set(rng.sample(eids, min(a.max_episodes, len(eids))))
+            instances = [r for r in instances
+                         if (r["split"], r["orig_id"]) in keep]
+        else:
+            eids = sorted({r["orig_id"] for r in instances})
+            keep = set(rng.sample(eids, min(a.max_episodes, len(eids))))
+            instances = [r for r in instances if r["orig_id"] in keep]
     print("[msc-gemma-eval] {} exchanges on {} (opening_only={} "
           "sessions={} max_episodes={})".format(
               len(instances), split, a.opening_only, sessions,

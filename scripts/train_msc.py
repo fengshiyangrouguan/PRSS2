@@ -673,7 +673,14 @@ def eval(args):
             if _u:
                 raise RuntimeError("unexpected keys: {}".format(
                     sorted(_u)[:5]))
-            _bad = [k for k in sorted(set(_m)) if "gamma" not in k]
+            # The R10 ckpt stores TRAINABLE params only (LoRA + comp +
+            # Gamma); the frozen base weights are absent BY DESIGN and
+            # must not trip the coverage check (fix 2026-09-26 — the old
+            # check listed the whole frozen backbone as "missing").
+            _trainable = {n for n, p in model.named_parameters()
+                          if p.requires_grad}
+            _bad = [k for k in sorted(set(_m))
+                    if k in _trainable and "gamma" not in k]
             if _bad:
                 raise RuntimeError("ckpt missing trainable keys: {}".format(
                     _bad[:5]))

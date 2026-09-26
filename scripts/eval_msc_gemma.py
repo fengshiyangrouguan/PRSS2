@@ -186,8 +186,8 @@ def main():
 
         acc = {}
         for s in range(2, 6):
-            acc[s] = {"opening_sum": 0.0, "opening_n": 0,
-                      "all_sum": 0.0, "all_n": 0}
+            acc[s] = {"opening_sum": 0.0, "opening_dlg": 0,
+                      "all_sum": 0.0, "all_dlg": 0}
         t0 = time.time()
         with torch.no_grad():
             for i in range(0, len(instances), a.eval_batch):
@@ -202,15 +202,24 @@ def main():
                 else:
                     batch = collator(rows)
                     out_f = tc.run_forward(model, batch, device, False)
-                row_sum, row_n = tc.task_ce_rows(
-                    out_f, batch["labels"], device)
-                for r in range(row_sum.shape[0]):
+                # Protocol A: EOS excluded — mask the final EOS label
+                # of every row (labels are left-padded; the last valid
+                # position of each row is the EOS token).
+                labs = batch["labels"]
+                last_valid = (labs != -100).sum(-1) - 1
+                labs = labs.clone()
+                labs[torch.arange(labs.shape[0]), last_valid] = -100
+                row_sum, row_n = tc.task_ce_rows(out_f, labs, device)
+                # dialogue-mean: per-dialogue mean NLL, then the mean
+                # across dialogues (NOT token-pooled).
+                row_mean = row_sum / row_n.clamp(min=1)
+                for r in range(row_mean.shape[0]):
                     s, o = metas[r]
-                    acc[s]["all_sum"] += float(row_sum[r])
-                    acc[s]["all_n"] += int(row_n[r])
+                    acc[s]["all_sum"] += float(row_mean[r])
+                    acc[s]["all_dlg"] += 1
                     if o:
-                        acc[s]["opening_sum"] += float(row_sum[r])
-                        acc[s]["opening_n"] += int(row_n[r])
+                        acc[s]["opening_sum"] += float(row_mean[r])
+                        acc[s]["opening_dlg"] += 1
                 if i % (a.eval_batch * 50) == 0 and i:
                     print("[msc-gemma-eval] {} {}/{} {:.0f}s".format(
                         arm, i, len(instances), time.time() - t0),
@@ -220,18 +229,19 @@ def main():
         for s in range(2, 6):
             result["sessions"]["S{}".format(s)] = {
                 "opening_ppl": float(torch.exp(torch.tensor(
-                    acc[s]["opening_sum"] / max(acc[s]["opening_n"], 1)))),
-                "opening_tokens": acc[s]["opening_n"],
+                    acc[s]["opening_sum"]
+                    / max(acc[s]["opening_dlg"], 1)))),
+                "opening_dialogues": acc[s]["opening_dlg"],
                 "all_ppl": float(torch.exp(torch.tensor(
-                    acc[s]["all_sum"] / max(acc[s]["all_n"], 1)))),
-                "all_tokens": acc[s]["all_n"],
+                    acc[s]["all_sum"] / max(acc[s]["all_dlg"], 1)))),
+                "all_dialogues": acc[s]["all_dlg"],
             }
         result["overall_opening_ppl"] = float(torch.exp(torch.tensor(
             sum(acc[s]["opening_sum"] for s in range(2, 6))
-            / max(sum(acc[s]["opening_n"] for s in range(2, 6)), 1))))
+            / max(sum(acc[s]["opening_dlg"] for s in range(2, 6)), 1))))
         result["overall_all_ppl"] = float(torch.exp(torch.tensor(
             sum(acc[s]["all_sum"] for s in range(2, 6))
-            / max(sum(acc[s]["all_n"] for s in range(2, 6)), 1))))
+            / max(sum(acc[s]["all_dlg"] for s in range(2, 6)), 1))))
         json.dump(result,
                   open(Path(a.output) / "eval_{}_{}.json".format(arm,
                                                                  split),

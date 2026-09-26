@@ -603,22 +603,33 @@ def eval(args):
     sessions = tuple(int(x) for x in args.eval_sessions.split(","))
     if args.eval_split == "pooled":
         split = "pooled"
-        instances = (list(ds.exchange_instances("valid",
-                                                sessions=sessions)) +
-                     list(ds.exchange_instances("test",
-                                                sessions=sessions)))
+        instances = []
+        for _s in ("valid", "test"):
+            for r in ds.exchange_instances(_s, sessions=sessions):
+                r["split"] = _s      # composite identity for sampling
+                instances.append(r)
     else:
         split = "valid" if args.eval_split == "val" else "test"
-        sessions = tuple(int(s) for s in args.eval_sessions.split(","))
         instances = list(ds.exchange_instances(split, sessions=sessions))
     if args.opening_only:
         instances = [r for r in instances if r["is_opening"]]
     if args.max_episodes > 0:
         rng = random.Random(1234)          # fixed subset across ckpts
-        eids = sorted({r["orig_id"] for r in instances})
-        keep = set(rng.sample(
-            eids, min(args.max_episodes, len(eids))))
-        instances = [r for r in instances if r["orig_id"] in keep]
+        if args.eval_split == "pooled":
+            # composite (split, orig_id) identity — val and test each
+            # number episodes from 0, so the bare orig_id aliases two
+            # DIFFERENT dialogues and a 100-draw silently over-sampled
+            # (~144 episodes).  Composite ids give exactly N episodes.
+            eids = sorted({(r["split"], r["orig_id"]) for r in instances})
+            keep = set(rng.sample(
+                eids, min(args.max_episodes, len(eids))))
+            instances = [r for r in instances
+                         if (r["split"], r["orig_id"]) in keep]
+        else:
+            eids = sorted({r["orig_id"] for r in instances})
+            keep = set(rng.sample(
+                eids, min(args.max_episodes, len(eids))))
+            instances = [r for r in instances if r["orig_id"] in keep]
     print("[msc-eval] {} exchanges on {} (opening_only={} "
           "sessions={} max_episodes={})".format(
               len(instances), split, args.opening_only,

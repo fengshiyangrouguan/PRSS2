@@ -305,6 +305,31 @@ def train(args):
     random.shuffle(row_order)
     cursor = 0
 
+    if args.resume_from:
+        # Resume (2026-09-26): restore trainable state, step, optimizer,
+        # scheduler, scaler and RNG from the checkpoint.  The data-stream
+        # order/cursor was never saved by the old ckpts, so it is
+        # re-initialized here — the uniform cut pool makes the resumed
+        # stream statistically equivalent (same distribution, fresh
+        # shuffle).  Caller must pass the SAME cli (lr / lambda / dims).
+        payload = torch.load(args.resume_from, map_location="cpu",
+                             weights_only=False)
+        _m, _u = model.load_state_dict(payload["model"], strict=False)
+        if _u:
+            raise RuntimeError("unexpected keys: {}".format(
+                sorted(_u)[:5]))
+        step = int(payload.get("step", 0))
+        if "optimizer" in payload:
+            optimizer.load_state_dict(payload["optimizer"])
+        if "scheduler" in payload:
+            scheduler.load_state_dict(payload["scheduler"])
+        if "scaler" in payload:
+            scaler.load_state_dict(payload["scaler"])
+        if "rng" in payload:
+            _restore_rng(payload["rng"])
+        print("[msc] resume step={} from {} ({} missing keys)".format(
+            step, args.resume_from, len(_m)), flush=True)
+
     def sample_row():
         nonlocal cursor
         if cursor >= n_rows:                     # next epoch
@@ -342,7 +367,8 @@ def train(args):
             adapter.clear()
         return batch_cuts
 
-    step = 0
+    if not args.resume_from:
+        step = 0
     kf_closed = 0
     aux_terms = 0
     total_task_sum = 0.0
